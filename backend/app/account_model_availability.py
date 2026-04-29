@@ -133,6 +133,30 @@ def account_success_rate_7d(
     return sum(1 for e in events if e.get("success")) / len(events)
 
 
+def account_success_rate_7d_for_type(
+    account: Mapping[str, Any],
+    task_type: str,
+    now: datetime | None = None,
+) -> float | None:
+    """Return the 7-day task success rate for ``account`` scoped to ``task_type``.
+
+    Returns None when fewer than SUCCESS_RATE_MIN_SAMPLES typed outcomes exist —
+    callers should fall back to ``account_success_rate_7d()`` for the aggregate.
+    Uses the same naive-UTC timestamp convention as ``account_success_rate_7d``.
+    """
+    _now = (now if now is not None else datetime.now(timezone.utc)).replace(tzinfo=None)
+    cutoff = _now - SUCCESS_RATE_WINDOW
+    events = [
+        e for e in account.get("outcome_events", [])
+        if e.get("at") is not None
+        and e["at"] > cutoff
+        and e.get("task_type") == task_type
+    ]
+    if len(events) < SUCCESS_RATE_MIN_SAMPLES:
+        return None
+    return sum(1 for e in events if e.get("success")) / len(events)
+
+
 async def refresh_account_available_models(
     account: dict[str, Any],
     *,

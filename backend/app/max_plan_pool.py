@@ -506,6 +506,7 @@ _HEALTH_SCORE_DISQUALIFY_THRESHOLD = -4
 # this margin below the pool median are deprioritized when alternatives exist.
 # Sparse accounts (< 3 outcomes) return None and are never penalized.
 _SUCCESS_RATE_DEPRIORITIZE_MARGIN = 0.20
+_LATENCY_MIN_SAMPLES = 3
 
 
 def _compute_health_score(acct: Dict[str, Any], now: datetime | None = None) -> float:
@@ -537,6 +538,51 @@ def _compute_success_rate_7d(acct: Dict[str, Any], now: datetime | None = None) 
     return sum(1 for e in events if e["success"]) / len(events)
 
 
+def _compute_success_rate_7d_for_type(
+    acct: Dict[str, Any], task_type: str, now: datetime | None = None
+) -> float | None:
+    """Return 7-day success rate scoped to task_type; None when < 3 typed outcomes.
+
+    Sparse accounts return None so callers can fall back to the aggregate.
+    """
+    now = now or _utcnow()
+    cutoff = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+    events = [
+        e for e in acct.get("outcome_events", [])
+        if e["at"] > cutoff and e.get("task_type") == task_type
+    ]
+    if len(events) < 3:
+        return None
+    return sum(1 for e in events if e["success"]) / len(events)
+
+
+def _effective_success_rate(
+    acct: Dict[str, Any], task_type: str | None, now: datetime
+) -> float | None:
+    """Task-type-scoped success rate, falling back to aggregate when the typed
+    sample is too sparse or task_type is unknown."""
+    if task_type:
+        rate = _compute_success_rate_7d_for_type(acct, task_type, now)
+        if rate is not None:
+            return rate
+    return _compute_success_rate_7d(acct, now)
+
+
+def _compute_avg_duration_24h(acct: Dict[str, Any], now: datetime | None = None) -> float | None:
+    """Return 24h average task duration in seconds, or None when fewer than
+    _LATENCY_MIN_SAMPLES completions exist so noise doesn't whip the picker."""
+    now = now or _utcnow()
+    cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
+    durations = [
+        e["duration_seconds"]
+        for e in acct.get("completion_events", [])
+        if e["at"] > cutoff and e.get("duration_seconds") is not None
+    ]
+    if len(durations) < _LATENCY_MIN_SAMPLES:
+        return None
+    return sum(durations) / len(durations)
+
+
 def get_account_health_stats(acct: Dict[str, Any], now: datetime | None = None) -> Dict[str, Any]:
     """Return observable health stats for an account (used by admin endpoints)."""
     now = now or _utcnow()
@@ -544,12 +590,21 @@ def get_account_health_stats(acct: Dict[str, Any], now: datetime | None = None) 
     rl_events = [t for t in acct.get("rl_events", []) if t > cutoff]
     completion_events = [e for e in acct.get("completion_events", []) if e["at"] > cutoff]
     durations = [e["duration_seconds"] for e in completion_events if e.get("duration_seconds") is not None]
+    outcome_cutoff_7d = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
+    outcome_events_7d = [e for e in acct.get("outcome_events", []) if e["at"] > outcome_cutoff_7d]
+    task_types = sorted({e.get("task_type") for e in outcome_events_7d if e.get("task_type")})
+    success_by_type: dict[str, float] = {}
+    for tt in task_types:
+        typed = [e for e in outcome_events_7d if e.get("task_type") == tt]
+        if len(typed) >= 3:
+            success_by_type[tt] = round(sum(1 for e in typed if e["success"]) / len(typed), 4)
     return {
         "rl_events_24h": len(rl_events),
         "completions_24h": len(completion_events),
         "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
         "health_score": _compute_health_score(acct, now=now),
         "success_rate_7d": _compute_success_rate_7d(acct, now=now),
+        "success_rate_by_type_7d": success_by_type if success_by_type else None,
     }
 
 
@@ -569,7 +624,9 @@ def _prune_outcome_events(acct: Dict[str, Any], now: datetime) -> None:
         acct["outcome_events"] = [e for e in acct["outcome_events"] if e["at"] > cutoff]
 
 
-async def record_completion_event(acct_id: str, duration_seconds: float) -> None:
+async def record_completion_event(
+    acct_id: str, duration_seconds: float, task_type: str | None = None
+) -> None:
     """Record a successful task completion for account health tracking.
 
     Should be called whenever a Max Plan task completes successfully.
@@ -587,10 +644,14 @@ async def record_completion_event(acct_id: str, duration_seconds: float) -> None
         acct.setdefault("completion_events", []).append(
             {"at": now, "duration_seconds": duration_seconds}
         )
-        acct.setdefault("outcome_events", []).append({"at": now, "success": True})
+        acct.setdefault("outcome_events", []).append(
+            {"at": now, "success": True, "task_type": task_type}
+        )
 
 
-async def record_task_outcome(acct_id: str, success: bool) -> None:
+async def record_task_outcome(
+    acct_id: str, success: bool, task_type: str | None = None
+) -> None:
     """Record a task outcome for 7-day success-rate tracking.
 
     Call for CODE_ERROR and ACCOUNT_FAILURE endings where no other hook
@@ -606,7 +667,9 @@ async def record_task_outcome(acct_id: str, success: bool) -> None:
             return
         now = _utcnow()
         _prune_outcome_events(acct, now)
-        acct.setdefault("outcome_events", []).append({"at": now, "success": success})
+        acct.setdefault("outcome_events", []).append(
+            {"at": now, "success": success, "task_type": task_type}
+        )
 
 
 # Backward compat: flat view for code that needs all accounts
@@ -711,7 +774,11 @@ async def load_max_plan_pool():
                     if at_str:
                         at_dt = datetime.fromisoformat(at_str)
                         if at_dt > oe_cutoff:
-                            restored_oe.append({"at": at_dt, "success": bool(ev.get("success"))})
+                            restored_oe.append({
+                                "at": at_dt,
+                                "success": bool(ev.get("success")),
+                                "task_type": ev.get("task_type"),
+                            })
                 if restored_oe:
                     entry["outcome_events"] = restored_oe
             _max_plan_pools.setdefault(acct.user_id, []).append(entry)
@@ -1057,10 +1124,14 @@ def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
     """Serialize an account's rate-limit state (disabled_models + outcome_events) for DB."""
     dm = acct.get("disabled_models") or {}
     cutoff = _utcnow() - timedelta(seconds=_OUTCOME_WINDOW_SECONDS)
-    pruned_outcomes = [
-        {"at": e["at"].isoformat(), "success": e["success"]}
-        for e in acct.get("outcome_events", []) if e["at"] > cutoff
-    ]
+    pruned_outcomes = []
+    for e in acct.get("outcome_events", []):
+        if e["at"] <= cutoff:
+            continue
+        entry: dict[str, Any] = {"at": e["at"].isoformat(), "success": e["success"]}
+        if e.get("task_type"):
+            entry["task_type"] = e["task_type"]
+        pruned_outcomes.append(entry)
     out: dict[str, Any] = {}
     if dm:
         out["disabled_models"] = {m: _serialize_disabled_model_info(i) for m, i in dm.items()}
@@ -1091,6 +1162,7 @@ async def select_max_plan_account_balanced(
     user_id: str,
     provider_models: List[tuple[str, str | None]],
     blacklist: List[str] | None = None,
+    task_type: str | None = None,
 ) -> tuple[Dict[str, Any], str, str | None] | None:
     """Balanced-mode selection: flatten all accounts across the given providers
     into one pool and pick the single best by (health_score, -active_tasks).
@@ -1165,7 +1237,7 @@ async def select_max_plan_account_balanced(
                 # Sparse accounts (< 3 outcomes) return None and are treated as
                 # neutral so brand-new accounts are never starved.
                 if len(candidates_healthy) > 1:
-                    rates = [_compute_success_rate_7d(c[0], now) for c in candidates_healthy]
+                    rates = [_effective_success_rate(c[0], task_type, now) for c in candidates_healthy]
                     sampled = [r for r in rates if r is not None]
                     if sampled:
                         pool_median = sorted(sampled)[len(sampled) // 2]
@@ -1178,12 +1250,14 @@ async def select_max_plan_account_balanced(
             winner = min(
                 candidates_healthy,
                 # Primary: fewest active_tasks. Secondary: higher 7d success rate
-                # (None → neutral 0.5 so sparse accounts aren't penalised).
-                # Tiebreak: deterministic by id so concurrent selects give
-                # different results when load is equal.
+                # (task-type-scoped when confident, aggregate fallback, None → 0.5
+                # so sparse accounts aren't penalised).
+                # Tertiary: faster avg duration (None → neutral 0 penalty so sparse
+                # accounts aren't penalised). Tiebreak: deterministic by id.
                 key=lambda c: (
                     c[0].get("active_tasks", 0),
-                    -(_compute_success_rate_7d(c[0], now) or 0.5),
+                    -(_effective_success_rate(c[0], task_type, now) or 0.5),
+                    _compute_avg_duration_24h(c[0], now) or 0.0,
                     c[0]["id"],
                 ),
             )
@@ -1209,6 +1283,7 @@ async def select_max_plan_account(
     model: str | None = None,
     blacklist: List[str] | None = None,
     provider: str | LLMProviderName | None = None,
+    task_type: str | None = None,
 ) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
@@ -1254,10 +1329,13 @@ async def select_max_plan_account(
                 qualified = [a for a in healthy if _compute_health_score(a, now) >= _HEALTH_SCORE_DISQUALIFY_THRESHOLD]
                 if qualified:
                     healthy = qualified
-            # Rank by health score, then 7d success rate, then fewest active tasks.
+            # Rank by health score, then 7d success rate (task-type-scoped when
+            # confident, aggregate fallback), then latency (faster is better;
+            # None → 0.0 so sparse accounts get no penalty), then fewest active tasks.
             account = max(healthy, key=lambda a: (
                 _compute_health_score(a, now),
-                _compute_success_rate_7d(a, now) or 0.0,
+                _effective_success_rate(a, task_type, now) or 0.0,
+                -(_compute_avg_duration_24h(a, now) or 0.0),
                 -a.get("active_tasks", 0),
             ))
         elif probing:
@@ -1287,6 +1365,7 @@ async def select_llm_runtime_for_task(
     provider_preference = resolve_task_provider_preference(task, runtime_config)
     quality_tier = resolve_task_quality_tier(task, runtime_config)
     explicit_provider = get_task_llm_provider(task) or infer_provider_for_model(explicit_model, runtime_config)
+    routing_task_type = _task_type(task)
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -1330,6 +1409,7 @@ async def select_llm_runtime_for_task(
                 model=model_name,
                 blacklist=blacklist,
                 provider=provider_name,
+                task_type=routing_task_type,
             )
             if account:
                 return LLMSelectionResult(
@@ -1374,6 +1454,7 @@ async def select_llm_runtime_for_task(
                 user_id=user_id,
                 provider_models=provider_models,
                 blacklist=blacklist,
+                task_type=routing_task_type,
             )
             if balanced_result is not None:
                 account, provider_name, chosen_model = balanced_result
@@ -1409,6 +1490,7 @@ async def select_llm_runtime_for_task(
             model=model,
             blacklist=blacklist,
             provider=provider_name,
+            task_type=routing_task_type,
         )
         if account:
             return LLMSelectionResult(
@@ -1434,6 +1516,7 @@ async def select_llm_runtime_for_task(
                 model=fallback,
                 blacklist=blacklist,
                 provider=provider_name,
+                task_type=routing_task_type,
             )
             if account:
                 logger.warning(

@@ -251,6 +251,7 @@ async def get_account_health_summary(
             "disabled_reason": s.get("disabled_reason"),
             "health_score": s["health_score"],
             "success_rate_7d": s.get("success_rate_7d"),
+            "avg_duration_seconds": s.get("avg_duration_seconds"),
             "completions_24h": s["completions_24h"],
             "rl_events_24h": s["rl_events_24h"],
             "rate_limited_models": rate_limited_models,

@@ -3176,6 +3176,71 @@ async def test_digest_direction_progress_no_budget_fields(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_cost_by_provider_model(client: AsyncClient, db_session):
+    """direction_progress entries include cost_by_provider_model breakdown
+    keyed by `<provider>|<model>`; per-provider sums match estimated_cost_usd."""
+    now = _utcnow()
+    project = make_project(
+        directions=[{"id": "dir-pm", "text": "PM split", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks split across (provider, model). One missing both fields buckets
+    # under "unknown|unknown".
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t-anth",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-pm", "scope": "small"},
+        provider="anthropic",
+        model="claude-opus-4-7",
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),
+        vm_spot=False,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t-oai",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-pm", "scope": "small"},
+        provider="openai",
+        model="gpt-5.4",
+        vm_provisioned_at=now - timedelta(minutes=60),
+        vm_stopped_at=now - timedelta(minutes=30),
+        vm_spot=True,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        title="t-legacy",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-pm", "scope": "small"},
+        # No provider/model — legacy row should bucket under "unknown|unknown".
+        vm_provisioned_at=now - timedelta(minutes=20),
+        vm_stopped_at=now - timedelta(minutes=10),
+        vm_spot=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    by_pm = dp["cost_by_provider_model"]
+    assert by_pm is not None
+    assert "anthropic|claude-opus-4-7" in by_pm
+    assert "openai|gpt-5.4" in by_pm
+    assert "unknown|unknown" in by_pm
+    for v in by_pm.values():
+        assert v > 0
+    # Sum of provider/model breakdown matches the direction's overall cost.
+    assert round(sum(by_pm.values()), 2) == dp["estimated_cost_usd"]
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_cost_by_type(client: AsyncClient, db_session):
     """direction_progress entries include cost_by_type breakdown keyed by task type."""
     now = _utcnow()

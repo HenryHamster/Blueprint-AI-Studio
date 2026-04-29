@@ -399,4 +399,50 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
     const badge = screen.getByText('High cost/PR');
     expect(badge.getAttribute('title')).toMatch(/\$45\.00/);
   });
+
+  it('renders provider/model breakdown from retirement_consideration_evidence', () => {
+    const d = makeDirection({
+      cost_per_merge_exceeds_threshold: true,
+      cost_per_merged_pr: 45.00,
+      retirement_consideration_evidence: {
+        window_cycles: 6,
+        direction_cost_per_merge_usd: 45.0,
+        threshold_usd: 15.0,
+        cost_by_provider_model: {
+          'anthropic|claude-opus-4-7': { cost_usd: 36.0, share_pct: 0.8 },
+          'openai|gpt-5.4': { cost_usd: 9.0, share_pct: 0.2 },
+        },
+      },
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('High cost/PR')).toBeInTheDocument();
+    // Top entry rendered with model label and percentage share.
+    expect(screen.getByText(/claude-opus-4-7 80%/)).toBeInTheDocument();
+    expect(screen.getByText(/gpt-5\.4 20%/)).toBeInTheDocument();
+  });
+
+  it('falls back to top-level cost_by_provider_model when evidence breakdown absent', () => {
+    const d = makeDirection({
+      cost_per_merge_exceeds_threshold: true,
+      cost_per_merged_pr: 45.00,
+      cost_by_provider_model: {
+        'anthropic|claude-opus-4-7': 30.0,
+        'openai|gpt-5.4': 10.0,
+      },
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('High cost/PR')).toBeInTheDocument();
+    // 30/40 = 75%, 10/40 = 25%.
+    expect(screen.getByText(/claude-opus-4-7 75%/)).toBeInTheDocument();
+    expect(screen.getByText(/gpt-5\.4 25%/)).toBeInTheDocument();
+  });
+
+  it('renders only the badge (no breakdown) when neither split source is provided', () => {
+    const d = makeDirection({ cost_per_merge_exceeds_threshold: true, cost_per_merged_pr: 45.00 });
+    render(<DirectionCard {...makeProps(d)} />);
+    expect(screen.getByText('High cost/PR')).toBeInTheDocument();
+    // No model labels should appear when there is no breakdown data.
+    expect(screen.queryByText(/claude-opus-4-7/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/gpt-5\.4/)).not.toBeInTheDocument();
+  });
 });

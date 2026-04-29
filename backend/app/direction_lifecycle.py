@@ -558,6 +558,25 @@ async def _process_direction_lifecycle(
                 continue
         return (spend / merged) if merged > 0 else None
 
+    def _cost_by_provider_model_window(direction: dict) -> tuple[dict[str, float], float]:
+        """Sum per-(provider, model) cost across the same rolling window.
+
+        Returns (totals_by_key, total_window_cost). Legacy entries lacking
+        ``cost_by_provider_model`` contribute 0 to the breakdown — the caller
+        falls back to omitting the split for those directions.
+        """
+        history = list(direction.get("research_history") or [])
+        if cpm_window > 0:
+            history = history[-cpm_window:]
+        totals: dict[str, float] = {}
+        for entry in history:
+            for key, val in (entry.get("cost_by_provider_model") or {}).items():
+                try:
+                    totals[key] = totals.get(key, 0.0) + max(0.0, float(val))
+                except (TypeError, ValueError):
+                    continue
+        return totals, sum(totals.values())
+
     try:
         cpm_window = int(_runtime_config.get("direction_cost_per_merge_window", 6) or 6)
     except (TypeError, ValueError):
@@ -684,11 +703,23 @@ async def _process_direction_lifecycle(
             d["retirement_consideration_reason"] = (
                 f"Recent cost/merge ${direction_cpm:.2f} exceeded threshold ${threshold:.2f}."
             )
-            d["retirement_consideration_evidence"] = {
+            evidence: dict = {
                 "window_cycles": cpm_window,
                 "direction_cost_per_merge_usd": round(direction_cpm, 4),
                 "threshold_usd": round(threshold, 4),
             }
+            split_totals, split_total = _cost_by_provider_model_window(d)
+            if split_totals and split_total > 0:
+                evidence["cost_by_provider_model"] = {
+                    key: {
+                        "cost_usd": round(cost, 4),
+                        "share_pct": round(cost / split_total, 4),
+                    }
+                    for key, cost in split_totals.items()
+                }
+            else:
+                evidence["cost_by_provider_model"] = {}
+            d["retirement_consideration_evidence"] = evidence
             directions_modified = True
             logger.warning(
                 f"[AUTONOMOUS] Direction {did} flagged for retirement consideration: "

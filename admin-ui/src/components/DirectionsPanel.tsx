@@ -109,6 +109,17 @@ export interface Direction {
   quality_score?: number | null;
   cost_per_merged_pr?: number | null;
   cost_per_merge_exceeds_threshold?: boolean;
+  // Per-(provider, model) cost breakdown for the digest window. Keys are
+  // `${provider}|${model}` (e.g. `anthropic|claude-opus-4-7`); values are
+  // dollars rounded to 4 places. Null when no tasks have run yet for the
+  // direction in the window.
+  cost_by_provider_model?: Record<string, number> | null;
+  retirement_consideration_evidence?: {
+    window_cycles?: number;
+    direction_cost_per_merge_usd?: number;
+    threshold_usd?: number;
+    cost_by_provider_model?: Record<string, { cost_usd: number; share_pct: number }> | null;
+  } | null;
 }
 
 

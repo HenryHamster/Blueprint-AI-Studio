@@ -308,6 +308,194 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
 
 
 @pytest.mark.asyncio
+async def test_retirement_evidence_includes_provider_model_split(db_session, mocker):
+    """When a research_history entry carries cost_by_provider_model, the rolling
+    aggregate is exposed on retirement_consideration_evidence and sums to the
+    entry-level estimated_cost_usd within rounding."""
+    now = datetime.utcnow()
+    expensive_direction = {
+        "id": "d-expensive-split",
+        "text": "Expensive with split",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [{
+            "timestamp": now.isoformat(),
+            "tasks_created": 2,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 1,
+            "estimated_cost_usd": 10.0,
+            "cost_by_provider_model": {
+                "anthropic|claude-opus-4-7": 8.0,
+                "openai|gpt-5.4": 2.0,
+            },
+        }],
+    }
+    project = Project(
+        name="Split evidence test",
+        user_id="u-split",
+        autonomous_enabled=True,
+        directions=[
+            {
+                "id": "d-split-cheap-1",
+                "text": "Cheap 1",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [{
+                    "timestamp": now.isoformat(),
+                    "tasks_created": 2,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                    "estimated_cost_usd": 1.0,
+                }],
+            },
+            {
+                "id": "d-split-cheap-2",
+                "text": "Cheap 2",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [{
+                    "timestamp": now.isoformat(),
+                    "tasks_created": 2,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                    "estimated_cost_usd": 2.0,
+                }],
+            },
+            expensive_direction,
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch.dict(
+        "app.direction_lifecycle._runtime_config",
+        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        clear=False,
+    )
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=0.0,
+        busy_direction_ids=set(), now=now,
+    )
+    await db_session.refresh(project)
+
+    by_id = {d["id"]: d for d in project.directions}
+    evidence = by_id["d-expensive-split"].get("retirement_consideration_evidence") or {}
+    split = evidence.get("cost_by_provider_model")
+    assert isinstance(split, dict) and split, "provider/model split should be populated"
+    assert "anthropic|claude-opus-4-7" in split
+    assert "openai|gpt-5.4" in split
+    total_split = sum(v["cost_usd"] for v in split.values())
+    assert abs(total_split - 10.0) < 1e-3
+    # share_pct is a 0..1 fraction
+    shares = {k: v["share_pct"] for k, v in split.items()}
+    assert abs(sum(shares.values()) - 1.0) < 1e-3
+    assert abs(shares["anthropic|claude-opus-4-7"] - 0.8) < 1e-3
+
+
+@pytest.mark.asyncio
+async def test_retirement_consideration_still_flagged_without_provider_model_split(db_session, mocker):
+    """Legacy directions without cost_by_provider_model on history entries
+    must still be flagged for retirement; the split is omitted (empty dict)
+    rather than crashing or being skipped."""
+    now = datetime.utcnow()
+    expensive_legacy = {
+        "id": "d-legacy-expensive",
+        "text": "Legacy expensive",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [{
+            "timestamp": now.isoformat(),
+            "tasks_created": 2,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 1,
+            "estimated_cost_usd": 10.0,
+            # No cost_by_provider_model — legacy entry.
+        }],
+    }
+    project = Project(
+        name="Legacy retirement test",
+        user_id="u-legacy",
+        autonomous_enabled=True,
+        directions=[
+            {
+                "id": "d-legacy-cheap-1",
+                "text": "Cheap legacy 1",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [{
+                    "timestamp": now.isoformat(),
+                    "tasks_created": 2,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                    "estimated_cost_usd": 1.0,
+                }],
+            },
+            {
+                "id": "d-legacy-cheap-2",
+                "text": "Cheap legacy 2",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [{
+                    "timestamp": now.isoformat(),
+                    "tasks_created": 2,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                    "estimated_cost_usd": 2.0,
+                }],
+            },
+            expensive_legacy,
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch.dict(
+        "app.direction_lifecycle._runtime_config",
+        {"direction_cost_per_merge_window": 6, "direction_cost_per_merge_multiplier": 2.0},
+        clear=False,
+    )
+
+    await _process_direction_lifecycle(
+        project, db_session, cooldown_minutes=0.0,
+        busy_direction_ids=set(), now=now,
+    )
+    await db_session.refresh(project)
+
+    by_id = {d["id"]: d for d in project.directions}
+    legacy_d = by_id["d-legacy-expensive"]
+    assert legacy_d.get("retirement_consideration_needed") is True
+    evidence = legacy_d.get("retirement_consideration_evidence") or {}
+    # Threshold gating still works for legacy entries.
+    assert evidence.get("threshold_usd") == 4.0
+    # Split is present but empty rather than missing — matches the
+    # documented "{}" fallback shape.
+    assert evidence.get("cost_by_provider_model") == {}
+
+
+@pytest.mark.asyncio
 async def test_process_lifecycle_uses_default_cpm_config_when_runtime_values_invalid(db_session, mocker):
     """Invalid runtime config values should not crash lifecycle processing."""
     direction = {

@@ -1971,6 +1971,85 @@ async def test_update_outcomes_publishes_pipeline_scope_rates(
     assert rates == {"small": 0.8}
 
 
+@pytest.mark.asyncio
+async def test_update_outcomes_writes_cost_by_provider_model(db_session: AsyncSession):
+    """_update_direction_research_outcomes records per-(provider, model) cost on
+    the research_history entry, keyed by f"{provider}|{model}". Tasks lacking
+    provider/model fall under "unknown|unknown" so legacy rows still contribute."""
+    direction_id = "d-pm-rollup"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    now = _utcnow()
+    # Two child tasks across distinct (provider, model) pairs; one legacy without
+    # provider/model. Each runs for a known VM duration so cost is deterministic.
+    t_anth = Task(
+        project_id=project.id,
+        parent_task_id=research_task.id,
+        title="anth",
+        payloads=[{"type": "create", "scope": "small"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        provider="anthropic",
+        model="claude-opus-4-7",
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    t_oai = Task(
+        project_id=project.id,
+        parent_task_id=research_task.id,
+        title="oai",
+        payloads=[{"type": "create", "scope": "small"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        provider="openai",
+        model="gpt-5.4",
+        vm_provisioned_at=now - timedelta(minutes=30),
+        vm_stopped_at=now,
+        vm_spot=True,
+    )
+    t_legacy = Task(
+        project_id=project.id,
+        parent_task_id=research_task.id,
+        title="legacy",
+        payloads=[{"type": "create", "scope": "small"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        # provider/model omitted — legacy row.
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_stopped_at=now,
+        vm_spot=True,
+    )
+    db_session.add_all([t_anth, t_oai, t_legacy])
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    entry = project.directions[0]["research_history"][0]
+    by_pm = entry.get("cost_by_provider_model")
+    assert isinstance(by_pm, dict) and by_pm, "cost_by_provider_model must be populated"
+    assert "anthropic|claude-opus-4-7" in by_pm
+    assert "openai|gpt-5.4" in by_pm
+    assert "unknown|unknown" in by_pm
+    for v in by_pm.values():
+        assert v > 0
+    # The aggregate matches the entry-level estimated_cost_usd within rounding.
+    assert abs(sum(by_pm.values()) - entry["estimated_cost_usd"]) < 1e-3
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Cascade-cancellation exclusion from failure metrics
 # ─────────────────────────────────────────────────────────────────────────────

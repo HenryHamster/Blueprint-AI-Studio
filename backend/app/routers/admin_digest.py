@@ -1337,6 +1337,8 @@ async def _compute_digest(
                 # Audit W1: promoted columns read in the digest funnel.
                 Task.previous_error_fingerprint,
                 Task.auto_remediation,
+                # Per-(provider, model) cost attribution on direction CPM.
+                Task.provider, Task.model,
             ))
             .limit(_DIGEST_TASK_ROW_CAP)
         )
@@ -1365,6 +1367,8 @@ async def _compute_digest(
                 # Audit W1: promoted columns read in the digest funnel.
                 Task.previous_error_fingerprint,
                 Task.auto_remediation,
+                # Per-(provider, model) cost attribution on direction CPM.
+                Task.provider, Task.model,
             ))
             .limit(_DIGEST_TASK_ROW_CAP)
         )
@@ -1607,6 +1611,7 @@ async def _compute_digest(
                 cost_by_scope: Dict[str, float] = {}
                 cost_by_status: Dict[str, float] = {}
                 cost_by_type: Dict[str, float] = {}
+                cost_by_provider_model: Dict[str, float] = {}
                 for t in tasks_for_dir:
                     if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
                         continue
@@ -1623,9 +1628,14 @@ async def _compute_digest(
                     cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
                     type_key = (t.first_payload or {}).get("type", "create")
                     cost_by_type[type_key] = cost_by_type.get(type_key, 0.0) + t_cost
+                    provider_key = t.provider or "unknown"
+                    model_key = t.model or "unknown"
+                    pm_key = f"{provider_key}|{model_key}"
+                    cost_by_provider_model[pm_key] = cost_by_provider_model.get(pm_key, 0.0) + t_cost
                 cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
                 cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
                 cost_by_type = {k: round(v, 4) for k, v in cost_by_type.items()}
+                cost_by_provider_model = {k: round(v, 4) for k, v in cost_by_provider_model.items()}
 
                 dir_fa_measured = [
                     t for t in tasks_for_dir
@@ -1796,6 +1806,7 @@ async def _compute_digest(
                     "cost_by_scope": cost_by_scope or None,
                     "cost_by_status": cost_by_status or None,
                     "cost_by_type": cost_by_type or None,
+                    "cost_by_provider_model": cost_by_provider_model or None,
                     "cost_per_merged_pr": round(dir_cost / prs_merged, 4) if prs_merged > 0 else None,
                     "scope_breakdown": dir_scope_agg or None,
                     "taxonomy_summary": dir_taxonomy_summary or None,

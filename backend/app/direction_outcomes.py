@@ -176,6 +176,30 @@ async def _update_direction_research_outcomes(
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
     if not child_tasks_rows:
         return
+    # Per-(provider, model) cost rollup: keyed by f"{provider}|{model}", values
+    # in USD. Uses VM-runtime × spot/on-demand rate (matching admin_digest math)
+    # so values are consistent even when Task.estimated_cost_usd is unbackfilled
+    # for older rows. Tasks missing both provider and model bucket under
+    # "unknown|unknown" so legacy entries degrade without dropping cost.
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE  # noqa: PLC0415
+    cost_by_provider_model: dict[str, float] = {}
+    cycle_cost_total = 0.0
+    for ct in child_tasks_rows:
+        if not (ct.vm_provisioned_at and ct.vm_stopped_at):
+            continue
+        rate = SPOT_RATE if ct.vm_spot else ON_DEMAND_RATE
+        t_cost = rate * (ct.vm_stopped_at - ct.vm_provisioned_at).total_seconds()
+        if t_cost <= 0:
+            continue
+        provider_key = ct.provider or "unknown"
+        model_key = ct.model or "unknown"
+        bucket_key = f"{provider_key}|{model_key}"
+        cost_by_provider_model[bucket_key] = cost_by_provider_model.get(bucket_key, 0.0) + t_cost
+        cycle_cost_total += t_cost
+    if cost_by_provider_model:
+        entry["cost_by_provider_model"] = {k: round(v, 4) for k, v in cost_by_provider_model.items()}
+        entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
+
     entry["tasks_completed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED)
     entry["tasks_failed"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.FAILED)
     entry["tasks_cancelled"] = sum(1 for ct in child_tasks_rows if ct.status == TaskStatus.CANCELLED)

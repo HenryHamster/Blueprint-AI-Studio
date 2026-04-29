@@ -500,6 +500,185 @@ async def test_capture_success_direction_affinity(db_session: AsyncSession):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for summarize_recent_successes
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_success_entry(
+    success_count: int,
+    *,
+    file_type_distribution: dict | None = None,
+    test_file_count: int = 0,
+    tests_added: bool = False,
+    direction_successes: dict | None = None,
+    updated_at: str | None = None,
+) -> dict:
+    return {
+        "content": f"success ({success_count}x)",
+        "source": "success-pattern",
+        "success_count": success_count,
+        "scope_distribution": {"small": success_count},
+        "direction_successes": direction_successes or {},
+        "file_type_distribution": file_type_distribution or {},
+        "test_file_count": test_file_count,
+        "tests_added": tests_added,
+        "updated_at": updated_at or _utcnow().isoformat(),
+    }
+
+
+def test_summarize_recent_successes_omitted_when_no_entries():
+    """Empty design_doc → returns None."""
+    from app.playbook_learning import summarize_recent_successes
+
+    assert summarize_recent_successes({}, "create", "d-1", "small") is None
+
+
+def test_summarize_recent_successes_omitted_when_only_singletons():
+    """Entries with success_count < 2 are filtered out."""
+    from app.playbook_learning import summarize_recent_successes
+
+    doc = {
+        "playbook/success-create-small": _make_success_entry(1, file_type_distribution={"py": 1}),
+    }
+    assert summarize_recent_successes(doc, "create", None, "small") is None
+
+
+def test_summarize_recent_successes_omitted_for_other_task_type():
+    """Entries for a different task_type → returns None."""
+    from app.playbook_learning import summarize_recent_successes
+
+    doc = {
+        "playbook/success-fix-small": _make_success_entry(5, file_type_distribution={"py": 5}),
+    }
+    assert summarize_recent_successes(doc, "create", None, "small") is None
+
+
+def test_summarize_recent_successes_includes_matching_entries():
+    """Section header + at least one bullet referencing seeded entry shape."""
+    from app.playbook_learning import summarize_recent_successes
+
+    doc = {
+        "playbook/success-create-small": _make_success_entry(
+            8,
+            file_type_distribution={"py": 6, "ts": 2},
+            test_file_count=2,
+            tests_added=True,
+        ),
+        "playbook/success-create-medium": _make_success_entry(
+            3,
+            file_type_distribution={"py": 3},
+        ),
+    }
+    out = summarize_recent_successes(doc, "create", None, "small")
+    assert out is not None
+    assert "## Recent successes" in out
+    assert "create-small" in out
+    assert "8x" in out
+    assert "py" in out
+    # File-type signal surfaced
+    assert "files:" in out
+    # Tests-added signal surfaced
+    assert "tests added" in out
+
+
+def test_summarize_recent_successes_prefers_direction_affinity():
+    """Entries with this direction_id in direction_successes rank first."""
+    from app.playbook_learning import summarize_recent_successes
+
+    doc = {
+        # Higher overall success_count but no direction affinity
+        "playbook/success-create-small": _make_success_entry(
+            10, file_type_distribution={"py": 10}
+        ),
+        # Lower overall success_count but matches the direction
+        "playbook/success-create-medium": _make_success_entry(
+            3,
+            file_type_distribution={"ts": 3},
+            direction_successes={"d-target": 3},
+        ),
+    }
+    out = summarize_recent_successes(doc, "create", "d-target", "small")
+    assert out is not None
+    lines = out.splitlines()
+    # First bullet should be the direction-affined entry (medium scope, ts files)
+    assert "create-medium" in lines[1]
+    assert "this direction: 3" in lines[1]
+
+
+def test_summarize_recent_successes_caps_bullets():
+    """At most max_bullets bullets are emitted regardless of how many qualify."""
+    from app.playbook_learning import summarize_recent_successes
+
+    doc = {
+        f"playbook/success-create-scope{i}": _make_success_entry(
+            5, file_type_distribution={"py": 1}
+        )
+        for i in range(10)
+    }
+    out = summarize_recent_successes(
+        doc, "create", None, "small", max_bullets=3, char_budget=2000
+    )
+    assert out is not None
+    # 1 header + at most 3 bullets
+    assert len(out.splitlines()) <= 4
+    bullet_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
+    assert len(bullet_lines) == 3
+
+
+def test_summarize_recent_successes_enforces_char_budget():
+    """Output never exceeds char_budget; truncation drops trailing bullets, not mid-line."""
+    from app.playbook_learning import summarize_recent_successes
+
+    # 10 large entries — header + each bullet is ~50 chars, so a 200-char
+    # budget should fit only a handful of bullets cleanly.
+    doc = {
+        f"playbook/success-create-suffix{i:02d}": _make_success_entry(
+            5,
+            file_type_distribution={"py": 5, "ts": 3, "tsx": 2},
+            test_file_count=1,
+            tests_added=True,
+        )
+        for i in range(10)
+    }
+    out = summarize_recent_successes(doc, "create", None, "small", char_budget=200)
+    assert out is not None
+    assert len(out) <= 200, f"Output exceeds budget: {len(out)} chars"
+    # Every line must be either the header or a complete bullet — no partial lines.
+    for ln in out.splitlines():
+        assert ln.startswith("## ") or ln.startswith("- "), f"Truncated mid-line: {ln!r}"
+
+
+def test_summarize_recent_successes_returns_none_when_budget_too_small():
+    """When even one bullet doesn't fit, return None rather than malformed output."""
+    from app.playbook_learning import summarize_recent_successes
+
+    doc = {
+        "playbook/success-create-small": _make_success_entry(
+            5, file_type_distribution={"py": 5}
+        ),
+    }
+    # 10 chars cannot fit even the header
+    assert summarize_recent_successes(doc, "create", None, "small", char_budget=10) is None
+
+
+def test_summarize_recent_successes_task_type_agnostic():
+    """Helper itself does not gate by task_type — call sites enforce the allowlist."""
+    from app.playbook_learning import summarize_recent_successes, RECENT_SUCCESSES_TASK_TYPES
+
+    # Non-allowlisted type 'qa'; helper still surfaces matching entries.
+    doc = {
+        "playbook/success-qa-small": _make_success_entry(
+            5, file_type_distribution={"py": 5}
+        ),
+    }
+    out = summarize_recent_successes(doc, "qa", None, "small")
+    assert out is not None
+    assert "qa-small" in out
+    # Confirm 'qa' is not in the call-site allowlist
+    assert "qa" not in RECENT_SUCCESSES_TASK_TYPES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for age-based flagging
 # ─────────────────────────────────────────────────────────────────────────────
 

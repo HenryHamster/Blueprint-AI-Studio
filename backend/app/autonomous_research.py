@@ -20,6 +20,7 @@ from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.time_utils import _utcnow
 from app.autonomous_research_diagnosis import _spawn_direction_diagnosis  # noqa: F401 — re-export for backwards compat
 from app.direction_mode import append_prompt_suffix, is_pause_mode, mode_prompt_hint, normalized_recommended_mode
+from app.playbook_learning import RECENT_SUCCESSES_TASK_TYPES, summarize_recent_successes
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -716,6 +717,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             _coaching = _get_failure_coaching_suffix(str(_dir_id), project.design_doc or {}) if _dir_id else None
             if _coaching:
                 append_prompt_suffix(research_payload, _coaching)
+        # Surface 'what has compounded here' from prior playbook/success-research-* entries.
+        if "research" in RECENT_SUCCESSES_TASK_TYPES:
+            _recent_dir_id = chosen_direction.get("id") if chosen_direction else None
+            _recent = summarize_recent_successes(
+                project.design_doc or {},
+                "research",
+                _recent_dir_id,
+                None,
+            )
+            if _recent:
+                append_prompt_suffix(research_payload, _recent)
         # Pre-extract design doc context for the current direction's system_id
         if chosen_direction:
             dir_system_id = chosen_direction.get("system_id")

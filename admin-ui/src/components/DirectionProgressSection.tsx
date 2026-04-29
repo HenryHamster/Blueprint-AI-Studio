@@ -28,6 +28,7 @@ export interface DirectionProgress {
   cost_by_scope?: Record<string, number> | null;
   cost_by_type?: Record<string, number> | null;
   cost_by_status?: Record<string, number> | null;
+  cost_by_provider_model?: Record<string, number> | null;
   avg_time_to_merge_hours?: number | null;
   auto_paused?: boolean;
   paused_reason?: string | null;

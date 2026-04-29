@@ -838,14 +838,52 @@ function DirectionCardImpl({
               );
             })()}
             {/* Cost-per-merge retirement warning */}
-            {d.cost_per_merge_exceeds_threshold && (
-              <span
-                title={`Cost per merged PR: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — exceeds project median by 3×`}
-                className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
-              >
-                High cost/PR
-              </span>
-            )}
+            {d.cost_per_merge_exceeds_threshold && (() => {
+              // Prefer the rolling-window split from retirement_consideration_evidence (per-(provider,model)
+              // cost summed across the same window the threshold uses); fall back to the digest's
+              // window-level cost_by_provider_model so the badge still shows context for legacy entries.
+              const evidenceSplit = d.retirement_consideration_evidence?.cost_by_provider_model;
+              const ranked: Array<{ key: string; cost: number; share: number | null }> = [];
+              if (evidenceSplit && Object.keys(evidenceSplit).length > 0) {
+                for (const [k, v] of Object.entries(evidenceSplit)) {
+                  ranked.push({ key: k, cost: v.cost_usd, share: v.share_pct });
+                }
+              } else if (d.cost_by_provider_model && Object.keys(d.cost_by_provider_model).length > 0) {
+                const total = Object.values(d.cost_by_provider_model).reduce((a, b) => a + b, 0);
+                for (const [k, v] of Object.entries(d.cost_by_provider_model)) {
+                  ranked.push({ key: k, cost: v, share: total > 0 ? v / total : null });
+                }
+              }
+              ranked.sort((a, b) => (b.share ?? 0) - (a.share ?? 0) || b.cost - a.cost);
+              const top = ranked.slice(0, 3);
+              const tooltip = top.length > 0
+                ? `Cost per merged PR: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — exceeds project median by 3×\n` +
+                  top.map(r => `${r.key}: $${r.cost.toFixed(2)}${r.share != null ? ` (${Math.round(r.share * 100)}%)` : ''}`).join('\n')
+                : `Cost per merged PR: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — exceeds project median by 3×`;
+              return (
+                <>
+                  <span
+                    title={tooltip}
+                    className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
+                  >
+                    High cost/PR
+                  </span>
+                  {top.length > 0 && (
+                    <span
+                      title={tooltip}
+                      className="text-[10px] text-amber-400/80 font-mono"
+                    >
+                      {top.map(r => {
+                        const label = r.key.split('|').pop() || r.key;
+                        return r.share != null
+                          ? `${label} ${Math.round(r.share * 100)}%`
+                          : `${label} $${r.cost.toFixed(2)}`;
+                      }).join(' · ')}
+                    </span>
+                  )}
+                </>
+              );
+            })()}
             {/* Cooldown badge */}
             {key === 'active' && (() => {
               const cooldownStatus = getCooldownStatus(d, cooldownMinutes);

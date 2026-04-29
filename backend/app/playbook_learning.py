@@ -872,6 +872,95 @@ async def capture_success_pattern(
     return key
 
 
+# Task types where surfacing 'recent successes' patterns at spawn time is useful.
+# Other types (review, plan, qa, audit, etc.) treat this signal as noise.
+RECENT_SUCCESSES_TASK_TYPES: frozenset[str] = frozenset({"create", "fix", "research"})
+
+
+def summarize_recent_successes(
+    design_doc: dict,
+    task_type: str,
+    direction_id: Optional[str],
+    scope: Optional[str],
+    *,
+    max_bullets: int = 5,
+    char_budget: int = 600,
+) -> Optional[str]:
+    """Return a markdown 'Recent successes' section drawn from playbook/success-* entries.
+
+    Helper is task-type-agnostic — call sites should gate on
+    ``RECENT_SUCCESSES_TASK_TYPES``. Reads only from *design_doc*; performs no
+    I/O. Returns None when nothing qualifies so callers can omit the section.
+
+    Ranking: direction-affinity (direction_successes[direction_id] > 0), then
+    exact (task_type, scope) match, then ``success_count``, then ``updated_at``
+    recency. Entries with success_count < 2 are filtered out.
+
+    Output is hard-capped at *char_budget* by dropping trailing bullets — never
+    truncated mid-line. Returns None if even the first bullet doesn't fit.
+    """
+    if not isinstance(design_doc, dict) or not task_type:
+        return None
+    prefix = f"playbook/success-{task_type}-"
+    candidates: list[tuple[str, dict]] = []
+    for k, v in design_doc.items():
+        if not isinstance(v, dict) or not k.startswith(prefix):
+            continue
+        if int(v.get("success_count") or 0) < 2:
+            continue
+        candidates.append((k, v))
+    if not candidates:
+        return None
+
+    scope_slug = (scope or "").lower().replace(" ", "-")
+    exact_key = f"playbook/success-{task_type}-{scope_slug}" if scope_slug else None
+
+    def _rank(item: tuple[str, dict]) -> tuple:
+        k, v = item
+        dir_succ = v.get("direction_successes") or {}
+        affinity = int(dir_succ.get(direction_id, 0)) if direction_id and isinstance(dir_succ, dict) else 0
+        scope_match = 1 if exact_key and k == exact_key else 0
+        return (affinity, scope_match, int(v.get("success_count") or 0), v.get("updated_at") or "")
+
+    candidates.sort(key=_rank, reverse=True)
+
+    bullets: list[str] = []
+    for k, v in candidates[:max_bullets]:
+        scope_label = k[len(prefix):] or "unspecified"
+        sc = int(v.get("success_count") or 0)
+        parts = [f"{task_type}-{scope_label} ({sc}x)"]
+        ftd = v.get("file_type_distribution")
+        if isinstance(ftd, dict) and ftd:
+            top_exts = sorted(ftd.items(), key=lambda kv: -int(kv[1] or 0))[:3]
+            parts.append("files: " + ", ".join(f"{ext}:{n}" for ext, n in top_exts))
+        if v.get("tests_added"):
+            tfc = int(v.get("test_file_count") or 0)
+            parts.append(f"tests added ({tfc})" if tfc else "tests added")
+        dir_succ = v.get("direction_successes")
+        if direction_id and isinstance(dir_succ, dict):
+            local = int(dir_succ.get(direction_id, 0))
+            if local > 0:
+                parts.append(f"this direction: {local}")
+        bullets.append("- " + "; ".join(parts))
+
+    if not bullets:
+        return None
+
+    header = "## Recent successes (what has compounded here)"
+    out_lines: list[str] = [header]
+    out_len = len(header)
+    for b in bullets:
+        added = len(b) + 1  # +1 for the joining newline
+        if out_len + added > char_budget:
+            break
+        out_lines.append(b)
+        out_len += added
+
+    if len(out_lines) == 1:
+        return None
+    return "\n".join(out_lines)
+
+
 _MODULE_FEEDBACK_KEY = "module_feedback"
 _MODULE_FEEDBACK_MAX_ENTRIES = 50
 # Grace window (in days) before stale module-feedback entries start to decay.

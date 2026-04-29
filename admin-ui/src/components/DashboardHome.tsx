@@ -62,6 +62,7 @@ interface DirectionProgress {
   avg_time_to_merge_hours?: number | null;
   cost_by_scope?: Record<string, number> | null;
   cost_by_type?: Record<string, number> | null;
+  cost_by_provider_model?: Record<string, number> | null;
   spot_cost_usd?: number | null;
   on_demand_cost_usd?: number | null;
   scope_breakdown?: Record<string, { created: number; merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number; calibrated_in?: number; calibrated_out?: number }> | null;

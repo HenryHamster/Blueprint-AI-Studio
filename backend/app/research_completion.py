@@ -37,6 +37,7 @@ from app.finding_deduplication import (
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
 )
 from app.payload_schemas import validate_internal_payload
+from app.playbook_learning import RECENT_SUCCESSES_TASK_TYPES, summarize_recent_successes
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE, scope_to_effort
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
@@ -1355,6 +1356,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _preventive = _build_preventive_context(
             finding, _directions_by_id, _project_anomalies,
         )
+
+        # Surface 'what has compounded here' from prior playbook/success-* entries.
+        # Additive to the existing scope-bias and design_doc playbook injection.
+        if task_type in RECENT_SUCCESSES_TASK_TYPES and _scope_cal_project is not None:
+            _recent = summarize_recent_successes(
+                _scope_cal_project.design_doc or {},
+                task_type,
+                _pred_dir_id,
+                scope,
+            )
+            if _recent:
+                full_prompt = full_prompt + "\n\n" + _recent
 
         finding_payload = validate_internal_payload({
             "type": task_type,

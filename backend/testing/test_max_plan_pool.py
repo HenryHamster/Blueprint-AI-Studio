@@ -6,15 +6,21 @@ keeping assertions deterministic without fixtures or locks.
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.max_plan_pool import (
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
+    _LATENCY_MIN_SAMPLES,
     _OUTCOME_WINDOW_SECONDS,
     _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
     _account_at_cap,
     _account_available_for_model,
+    _compute_avg_duration_24h,
     _compute_health_score,
     _compute_success_rate_7d,
+    _compute_success_rate_7d_for_type,
+    _effective_success_rate,
     _cooldown_seconds_for_info,
     _daily_reset_if_elapsed,
     _normalize_rl_model,
@@ -109,7 +115,7 @@ class TestGetAccountHealthStats:
         stats = get_account_health_stats(_acct())
         assert set(stats.keys()) == {
             "rl_events_24h", "completions_24h", "avg_duration_seconds", "health_score",
-            "success_rate_7d",
+            "success_rate_7d", "success_rate_by_type_7d",
         }
 
     def test_aggregates_counts_and_durations(self):
@@ -599,6 +605,60 @@ class TestComputeSuccessRate7d:
         assert _compute_success_rate_7d(acct, now) == 0.0
 
 
+# ── _compute_success_rate_7d — per-task-type scoping ─────────────────────────
+
+class TestComputeSuccessRateByType:
+    """TDD specs for task_type-scoped success rate (cluster 1/2 implements the kwarg).
+
+    xfail tests auto-promote to XPASS once _compute_success_rate_7d gains a
+    ``task_type`` kwarg that returns per-type rates with aggregate fallback.
+    The stable test (no task_type arg) must pass both before and after.
+    """
+
+    @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
+    def test_per_type_rate_when_confident(self):
+        """≥3 type-matching events → per-type rate, not the aggregate."""
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=(
+            [{"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
+             for i in range(5)] +
+            [{"at": now - timedelta(hours=i + 6), "success": False, "task_type": "review"}
+             for i in range(5)]
+        ))
+        # aggregate = 5/10 = 0.5; create-type = 5/5 = 1.0
+        rate = _compute_success_rate_7d(acct, task_type="create", now=now)
+        assert rate == 1.0
+
+    @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
+    def test_sparse_type_falls_back_to_aggregate(self):
+        """< 3 type-matching events → aggregate rate used as fallback."""
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=(
+            [{"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
+             {"at": now - timedelta(hours=2), "success": False, "task_type": "create"}] +
+            [{"at": now - timedelta(hours=i + 3), "success": True, "task_type": "review"}
+             for i in range(5)]
+        ))
+        # 2 "create" events (< 3 floor) → fallback to aggregate (6/7)
+        rate = _compute_success_rate_7d(acct, task_type="create", now=now)
+        assert rate is not None
+        assert abs(rate - 6 / 7) < 1e-9
+
+    def test_no_task_type_returns_aggregate_unchanged(self):
+        """Omitting task_type returns the aggregate — backward compatible."""
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=(
+            [{"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
+             for i in range(3)] +
+            [{"at": now - timedelta(hours=i + 4), "success": False, "task_type": "review"}
+             for i in range(3)]
+        ))
+        # 3 successes out of 6 total = 0.5 aggregate
+        rate = _compute_success_rate_7d(acct, now=now)
+        assert rate is not None
+        assert abs(rate - 0.5) < 1e-9
+
+
 # ── selection tiebreaking by success rate ─────────────────────────────────────
 
 class TestSuccessRateTiebreaking:
@@ -741,3 +801,203 @@ class TestBalancedSuccessRateBias:
         # edge (rate=0.8) >= 1.0 - 0.20 = 0.80 → kept; winner is hi (also at 0 active_tasks)
         # both kept means result can be either; just assert no crash and winner is valid
         assert result[0]["id"] in ("hi", "edge")
+
+
+# ── _compute_success_rate_7d_for_type ────────────────────────────────────────
+
+class TestComputeSuccessRate7dForType:
+    def test_returns_none_when_no_typed_events(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "review"}
+            for i in range(5)
+        ])
+        assert _compute_success_rate_7d_for_type(acct, "create", now) is None
+
+    def test_returns_none_below_min_sample_threshold(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
+            {"at": now - timedelta(hours=2), "success": False, "task_type": "create"},
+        ])
+        assert _compute_success_rate_7d_for_type(acct, "create", now) is None
+
+    def test_returns_type_scoped_rate_ignoring_other_types(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
+            {"at": now - timedelta(hours=2), "success": True, "task_type": "create"},
+            {"at": now - timedelta(hours=3), "success": True, "task_type": "create"},
+            # These should NOT count toward "create" rate.
+            {"at": now - timedelta(hours=4), "success": False, "task_type": "review"},
+            {"at": now - timedelta(hours=5), "success": False, "task_type": "review"},
+            {"at": now - timedelta(hours=6), "success": False, "task_type": "review"},
+        ])
+        assert _compute_success_rate_7d_for_type(acct, "create", now) == 1.0
+
+    def test_excludes_events_outside_7d_window(self):
+        now = datetime.utcnow()
+        old = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS + 60)
+        acct = _acct(outcome_events=[
+            {"at": old, "success": True, "task_type": "create"},
+            {"at": old, "success": True, "task_type": "create"},
+            {"at": old, "success": True, "task_type": "create"},
+        ])
+        assert _compute_success_rate_7d_for_type(acct, "create", now) is None
+
+    def test_events_without_task_type_excluded(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True},
+            {"at": now - timedelta(hours=2), "success": True},
+            {"at": now - timedelta(hours=3), "success": True},
+            {"at": now - timedelta(hours=4), "success": True, "task_type": "create"},
+        ])
+        assert _compute_success_rate_7d_for_type(acct, "create", now) is None
+
+
+# ── _effective_success_rate ──────────────────────────────────────────────────
+
+class TestEffectiveSuccessRate:
+    def test_returns_typed_rate_when_sufficient_typed_samples(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
+            for i in range(3)
+        ] + [
+            {"at": now - timedelta(hours=i + 4), "success": False, "task_type": "review"}
+            for i in range(5)
+        ])
+        rate = _effective_success_rate(acct, "create", now)
+        assert rate == 1.0
+
+    def test_falls_back_to_aggregate_when_typed_sample_sparse(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
+            # Only 1 "create" event — sparse; falls back to aggregate of 4 events.
+            {"at": now - timedelta(hours=2), "success": False},
+            {"at": now - timedelta(hours=3), "success": False},
+            {"at": now - timedelta(hours=4), "success": False},
+        ])
+        # Aggregate: 1 success / 4 total = 0.25
+        rate = _effective_success_rate(acct, "create", now)
+        assert rate == 0.25
+
+    def test_falls_back_to_aggregate_when_task_type_is_none(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=i + 1), "success": i < 3} for i in range(5)
+        ])
+        rate = _effective_success_rate(acct, None, now)
+        assert rate == _compute_success_rate_7d(acct, now)
+
+    def test_returns_none_when_both_typed_and_aggregate_sparse(self):
+        now = datetime.utcnow()
+        acct = _acct(outcome_events=[
+            {"at": now - timedelta(hours=1), "success": True, "task_type": "create"},
+        ])
+        assert _effective_success_rate(acct, "create", now) is None
+
+
+# ── _compute_avg_duration_24h ────────────────────────────────────────────────
+
+class TestComputeAvgDuration24h:
+    def test_returns_none_when_no_completions(self):
+        assert _compute_avg_duration_24h(_acct()) is None
+
+    def test_returns_none_below_min_samples(self):
+        now = datetime.utcnow()
+        acct = _acct(completion_events=[
+            {"at": now - timedelta(hours=1), "duration_seconds": 60.0}
+            for _ in range(_LATENCY_MIN_SAMPLES - 1)
+        ])
+        assert _compute_avg_duration_24h(acct, now) is None
+
+    def test_returns_average_at_min_samples(self):
+        now = datetime.utcnow()
+        acct = _acct(completion_events=[
+            {"at": now - timedelta(hours=i + 1), "duration_seconds": float((i + 1) * 60)}
+            for i in range(_LATENCY_MIN_SAMPLES)
+        ])
+        result = _compute_avg_duration_24h(acct, now)
+        assert result is not None
+        expected = sum((i + 1) * 60.0 for i in range(_LATENCY_MIN_SAMPLES)) / _LATENCY_MIN_SAMPLES
+        assert abs(result - expected) < 0.01
+
+    def test_excludes_events_outside_24h_window(self):
+        now = datetime.utcnow()
+        old = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 60)
+        acct = _acct(completion_events=[
+            {"at": old, "duration_seconds": 10.0},
+            {"at": old, "duration_seconds": 10.0},
+            {"at": old, "duration_seconds": 10.0},
+        ])
+        assert _compute_avg_duration_24h(acct, now) is None
+
+    def test_events_missing_duration_are_skipped(self):
+        now = datetime.utcnow()
+        acct = _acct(completion_events=[
+            {"at": now - timedelta(hours=1)},  # no duration_seconds
+            {"at": now - timedelta(hours=2)},
+            {"at": now - timedelta(hours=3)},
+        ])
+        assert _compute_avg_duration_24h(acct, now) is None
+
+
+# ── latency-aware selection ───────────────────────────────────────────────────
+
+class TestLatencyAwareSelection:
+    """Faster accounts are preferred when health/success rate are comparable."""
+
+    _USER = "test-latency-user"
+
+    def _acct_with_duration(self, id_, avg_seconds=None, active_tasks=0, provider="anthropic"):
+        now = datetime.utcnow()
+        acct = {"id": id_, "name": id_, "enabled": True, "active_tasks": active_tasks,
+                "oauth_token": "sk-ant-test", "provider": provider}
+        if avg_seconds is not None:
+            acct["completion_events"] = [
+                {"at": now - timedelta(hours=i + 1), "duration_seconds": avg_seconds}
+                for i in range(_LATENCY_MIN_SAMPLES)
+            ]
+        return acct
+
+    def setup_method(self):
+        _max_plan_pools.pop(self._USER, None)
+
+    def teardown_method(self):
+        _max_plan_pools.pop(self._USER, None)
+
+    async def test_faster_account_preferred_balanced(self):
+        """Balanced picker selects faster account when active_tasks and success rate are equal."""
+        fast = self._acct_with_duration("fast", avg_seconds=60.0)
+        slow = self._acct_with_duration("slow", avg_seconds=300.0)
+        _max_plan_pools[self._USER] = [fast, slow]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        assert result[0]["id"] == "fast"
+
+    async def test_sample_floor_prevents_whip(self):
+        """Account with fewer than _LATENCY_MIN_SAMPLES completions does not lose to a fast one."""
+        now = datetime.utcnow()
+        sparse = {"id": "sparse", "name": "sparse", "enabled": True, "active_tasks": 0,
+                  "oauth_token": "sk-ant-test", "provider": "anthropic",
+                  "completion_events": [
+                      {"at": now - timedelta(hours=1), "duration_seconds": 999.0}
+                      for _ in range(_LATENCY_MIN_SAMPLES - 1)
+                  ]}
+        fast = self._acct_with_duration("fast", avg_seconds=60.0, active_tasks=1)
+        _max_plan_pools[self._USER] = [sparse, fast]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        # sparse wins on load (0 < 1); latency signal is None so doesn't penalise it
+        assert result[0]["id"] == "sparse"
+
+    async def test_slow_account_still_gets_traffic_as_only_option(self):
+        """Very slow account is selected when it is the only healthy candidate."""
+        slow = self._acct_with_duration("slow", avg_seconds=600.0)
+        _max_plan_pools[self._USER] = [slow]
+        result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
+        assert result is not None
+        assert result[0]["id"] == "slow"
