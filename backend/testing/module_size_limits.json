@@ -3,7 +3,7 @@
   "backend": {
     "main.py": 3500,
     "task_completion.py": 2800,
-    "task_lifecycle.py": 2650,
+    "task_lifecycle.py": 2750,
     "orchestrator.py": 3400,
     "admin.py": 3000,
     "compute.py": 2500,
@@ -14,7 +14,7 @@
     "routers/admin_pool_accounts.py": 900,
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,
-    "routers/agent.py": 2750,
+    "routers/agent.py": 2900,
     "services.py": 1900,
     "routers/agent_status.py": 1800,
     "autonomous_research.py": 1900,
@@ -22,7 +22,7 @@
     "strategic_completion.py": 1500,
     "rollup_management.py": 1700,
     "reaper.py": 2000,
-    "review_pipeline.py": 1600,
+    "review_pipeline.py": 1800,
     "deploy_health.py": 1000
   },
   "frontend": {

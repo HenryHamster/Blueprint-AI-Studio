@@ -202,4 +202,6 @@ class TestSweepSummary:
             "autonomous_failure_counts",
             "merge_error_occurrences",
             "user_debug_spawn_times",
+            "vm_last_heartbeat",
+            "warm_pin_clear_events",
         }
