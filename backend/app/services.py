@@ -871,6 +871,62 @@ async def _chain_has_active_pipeline_work(
     return False
 
 
+async def _chain_has_recoverable_failed_work(parent: Task, session) -> bool:
+    """True if the chain has FAILED tasks with infra-class failure_category.
+
+    The 6h EVALUATING wall-clock was designed for live deadlock — child stuck
+    IN_PROGRESS, no heartbeat, parent waiting forever. It misfires when children
+    are FAILED but RECOVERABLE: a PROVISION_FAILURE / RATE_LIMIT / EXTERNAL_API
+    child is eligible for the resurrection sweep once zones recover, and an
+    operator deploying a real fix may requeue these children.  Cascade-killing
+    them at the wall-clock destroys recoverable work.
+
+    Returns True if any direct child OR any chain pipeline task (review/fix
+    matching this parent's chain) is FAILED with failure_category in
+    INFRA_CLASSES. The caller defers the kill in that case for a bounded window.
+    """
+    from app.failure_classification import INFRA_CLASSES
+
+    direct_children = (await session.execute(
+        select(Task).where(Task.parent_task_id == parent.id)
+    )).scalars().all()
+    direct_child_ids = {str(c.id) for c in direct_children}
+
+    for c in direct_children:
+        if c.status != TaskStatus.FAILED:
+            continue
+        cat = (c.context or {}).get("failure_category")
+        if cat in INFRA_CLASSES:
+            return True
+
+    if not direct_child_ids:
+        return False
+
+    # Pipeline / descendant tasks whose original_task_id points at one of our
+    # direct children — covers review/fix tasks attached to create children.
+    try:
+        candidates = (await session.execute(
+            select(Task)
+            .where(Task.project_id == parent.project_id)
+            .where(Task.status == TaskStatus.FAILED)
+            .order_by(Task.created_at.desc())
+            .limit(500)
+        )).scalars().all()
+        for t in candidates:
+            orig = t.first_payload.get("original_task_id") or ""
+            if orig not in direct_child_ids:
+                continue
+            cat = (t.context or {}).get("failure_category")
+            if cat in INFRA_CLASSES:
+                return True
+    except Exception:
+        logger.debug(
+            f"[EVAL TIMEOUT] Failed to check chain recoverability for task {str(parent.id)[:8]}",
+            exc_info=True,
+        )
+    return False
+
+
 async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | None:
     """Return a small summary of the most recent review task on the same chain.
 
@@ -1367,6 +1423,65 @@ async def _check_evaluating_timeouts():
                             f"chain has fresh review/fix heartbeat — skipping kill"
                         )
                         continue
+
+                    # Recoverable-FAILED defer: a child / chain pipeline task in
+                    # FAILED with infra-class failure_category may come back via
+                    # resurrection sweep or operator requeue. Cascade-killing
+                    # mid-recovery destroys salvageable work (incident
+                    # 2026-04-29: PRs #3450/#3408 + parents c30701d3/ddd987fc).
+                    # Defer for a bounded window so a truly stuck case still
+                    # terminates eventually.
+                    EVAL_DEFER_WINDOW_HOURS = 24
+                    first_defer_at = ctx.get("_eval_timeout_first_defer_at")
+                    # Treat a defer marker older than evaluating_since as stale
+                    # (left over from a previous EVALUATING transition).
+                    if first_defer_at:
+                        try:
+                            _fd = datetime.fromisoformat(first_defer_at)
+                            if _fd < evaluating_since:
+                                first_defer_at = None
+                        except (ValueError, TypeError):
+                            first_defer_at = None
+                    has_recoverable = await _chain_has_recoverable_failed_work(task, session)
+                    if has_recoverable:
+                        if first_defer_at:
+                            try:
+                                _fd = datetime.fromisoformat(first_defer_at)
+                                defer_elapsed = (now - _fd).total_seconds()
+                            except (ValueError, TypeError):
+                                defer_elapsed = 0.0
+                            if defer_elapsed <= EVAL_DEFER_WINDOW_HOURS * 3600:
+                                logger.info(
+                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past 6h but chain "
+                                    f"has recoverable FAILED children — deferring "
+                                    f"({round(defer_elapsed/3600, 1)}h into "
+                                    f"{EVAL_DEFER_WINDOW_HOURS}h window)"
+                                )
+                                continue
+                            logger.warning(
+                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} exhausted "
+                                f"{EVAL_DEFER_WINDOW_HOURS}h defer window despite recoverable "
+                                f"FAILED children — proceeding to kill"
+                            )
+                            # fall through to existing kill
+                        else:
+                            from sqlalchemy.orm.attributes import flag_modified
+                            task.context = {**ctx, "_eval_timeout_first_defer_at": now.isoformat()}
+                            flag_modified(task, "context")
+                            session.add(task)
+                            logger.warning(
+                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past 6h with "
+                                f"recoverable FAILED children — deferring cascade-cancel "
+                                f"for up to {EVAL_DEFER_WINDOW_HOURS}h"
+                            )
+                            await _maybe_create_failure_alert(
+                                task, session,
+                                f"Evaluation past 6h with recoverable infra failures in chain — "
+                                f"deferring cascade-cancel for up to {EVAL_DEFER_WINDOW_HOURS}h",
+                            )
+                            await session.commit()
+                            continue
+
                     hours = round(elapsed / 3600, 1)
                     logger.error(
                         f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has been EVALUATING "

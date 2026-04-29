@@ -24,6 +24,7 @@ from sqlmodel import SQLModel
 from app.services import (
     _check_evaluating_timeouts,
     _chain_has_active_pipeline_work,
+    _chain_has_recoverable_failed_work,
     _supersede_long_queued_pipeline_tasks,
 )
 from app.rollup_management import _check_and_trigger_rollup
@@ -1359,3 +1360,245 @@ async def test_supersede_only_matches_chain(eval_db):
     await eval_db.refresh(other_chain_fix)
     assert other_pr_fix.status == TaskStatus.QUEUED
     assert other_chain_fix.status == TaskStatus.QUEUED
+
+
+# ── Recoverable-FAILED defer tests ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(eval_db, mocker):
+    """Parent past 6h with a child FAILED + PROVISION_FAILURE must NOT be killed.
+    The child is eligible for resurrection sweep / operator requeue, so cascade-
+    cancelling it would destroy salvageable work. Regression for incident
+    2026-04-29 (PRs #3450/#3408 + parents c30701d3/ddd987fc)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="Recoverable Defer", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research parent"}],
+        status=TaskStatus.EVALUATING,
+        status_log=[{"t": _naive_utc_ago(hours=7).isoformat(),
+                     "msg": "Status changed: IN_PROGRESS → EVALUATING"}],
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # Need at least one non-terminal child to bypass the missed-rollup path
+    # (all-children-terminal fires _check_and_trigger_rollup before the 6h
+    # branch is reached).
+    in_progress_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "active child"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(in_progress_child)
+    failed_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "create child"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    eval_db.add(failed_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Expected parent to stay EVALUATING (deferred), got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+    # Defer marker recorded
+    assert (parent.context or {}).get("_eval_timeout_first_defer_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(eval_db, mocker):
+    """A FAILED child with CODE_ERROR (not infra-recoverable) must NOT trigger
+    the defer path — the existing 6h kill path runs as before."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="Code Error Kill", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research parent"}],
+        status=TaskStatus.EVALUATING,
+        status_log=[{"t": _naive_utc_ago(hours=7).isoformat(),
+                     "msg": "Status changed: IN_PROGRESS → EVALUATING"}],
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # Need a non-terminal child to bypass the missed-rollup path; a FAILED
+    # CODE_ERROR child alone would be all-terminal and trigger rollup recovery.
+    in_progress_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "active child"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(in_progress_child)
+    code_error_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "code error child"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+    eval_db.add(code_error_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED (no recoverable signal), got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluating_defer_window_exhausted_kills(eval_db, mocker):
+    """A parent that has been deferring for >24h despite recoverable FAILED
+    children must eventually fall through to the kill path — the defer is
+    bounded so a truly stuck operator-intervention case still terminates."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    project = Project(name="Defer Window Exhausted", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # Defer marker recorded 25h ago — past the 24h window
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "long-deferred"}],
+        status=TaskStatus.EVALUATING,
+        status_log=[{"t": _naive_utc_ago(hours=32).isoformat(),
+                     "msg": "Status changed: IN_PROGRESS → EVALUATING"}],
+        context={"_eval_timeout_first_defer_at": _naive_utc_ago(hours=25).isoformat()},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    failed_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "still-failed child"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    eval_db.add(failed_child)
+    # Need at least one non-terminal child or rollup would fire; add one
+    in_progress_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "active child"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(in_progress_child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED after defer-window exhaustion, got {parent.status}: "
+        f"{parent.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chain_has_recoverable_failed_work_via_descendant_pipeline_task(eval_db):
+    """A FAILED review/fix pipeline task whose original_task_id points at one
+    of the parent's direct children, with an infra failure_category, must
+    register as recoverable chain work. This is the c30701d3 shape: research
+    parent → create child (COMPLETED-but-unmerged) → fix task FAILED with
+    PROVISION_FAILURE."""
+    project = Project(name="Chain Recoverable Descendant", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    create_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": False},
+    )
+    eval_db.add(create_child)
+    await eval_db.commit()
+    await eval_db.refresh(create_child)
+
+    fix_descendant = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "fix",
+            "pr_number": 80001,
+            "original_task_id": str(create_child.id),
+        }],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    eval_db.add(fix_descendant)
+    await eval_db.commit()
+
+    assert await _chain_has_recoverable_failed_work(parent, eval_db) is True
+
+
+@pytest.mark.asyncio
+async def test_chain_has_recoverable_failed_work_ignores_code_error(eval_db):
+    """A FAILED descendant with CODE_ERROR (not in INFRA_CLASSES) must NOT
+    register as recoverable — those have already burned retry budget on real
+    code defects."""
+    project = Project(name="Chain Not Recoverable", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    create_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+    )
+    eval_db.add(create_child)
+    await eval_db.commit()
+
+    assert await _chain_has_recoverable_failed_work(parent, eval_db) is False
