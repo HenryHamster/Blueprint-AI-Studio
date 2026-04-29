@@ -1,10 +1,10 @@
 import fs from 'fs';
-import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
-  persistAndPostStatus, apiGet, cloneWithRetry, runClaudeCode,
+  persistAndPostStatus, apiGet, runClaudeCode,
 } from '../index.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
@@ -24,9 +24,11 @@ export async function handleDesignDocUpdate(
 
   statusRef.value = `Cloning ${owner}/${repo} for architecture review...`;
   sendLog(ws, `Starting design document update...\n`);
-  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
   writePlaybookHelper(taskId);
 
   const disallowedTools = configureAgentPermissions('design_doc_update');

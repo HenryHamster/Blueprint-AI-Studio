@@ -25,6 +25,10 @@ vi.mock('../index.js', () => ({
   sendHeartbeatSync: vi.fn(),
 }));
 
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock fs and child_process so handler files that import them at module level
 // don't cause side effects.
 vi.mock('fs', () => ({

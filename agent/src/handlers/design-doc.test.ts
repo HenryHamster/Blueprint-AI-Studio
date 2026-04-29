@@ -12,6 +12,10 @@ vi.mock('../index.js', () => ({
   cloneWithRetry: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../prompt.js', () => ({
   DEFAULT_TOOL_GUIDANCE: '',
   FIRST_TASK_GUIDANCE: '',

@@ -1790,3 +1790,383 @@ class TestOrchestratorClosureSafety:
             "`from app.compute import get_vm_zone` somewhere). Move the import "
             "to module level."
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2c — warm-VM continuity skip-provision branch
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _extract_warm_pin_clear_args(spy):
+    """Helper: pull (vm_id, reason) from a record_warm_pin_clear spy regardless
+    of whether the orchestrator passes them as positional or keyword args.
+
+    record_warm_pin_clear(vm_id: str, reason: str) — orchestrator currently
+    uses positional, but we tolerate both so the assertion stays robust if
+    the call site is later refactored to kwargs."""
+    call = spy.call_args
+    args, kwargs = call.args, call.kwargs
+    if len(args) >= 2:
+        return args[0], args[1]
+    if len(args) == 1 and "reason" in kwargs:
+        return args[0], kwargs["reason"]
+    return kwargs.get("vm_id"), kwargs.get("reason")
+
+
+class TestWarmVMSkipProvision:
+    """Tests for the orchestrator's warm-pin branch in the dispatch loop.
+
+    The full dispatch loop is heavyweight to drive end-to-end (account pool,
+    deadlock detection, etc.), so we use a one-cycle harness like
+    test_pipeline_reliability.py and assert on the post-cycle DB state and
+    on whether ``provision_agent_vm`` was called.
+    """
+
+    @staticmethod
+    def _naive_utcnow():
+        from datetime import timezone as _tz
+        return datetime.now(_tz.utc).replace(tzinfo=None)
+
+    @pytest.fixture()
+    def orch_warm_db(self, mocker):
+        """In-memory DB plus the lazy mocks orchestrator_worker needs."""
+        import asyncio
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from sqlalchemy.dialects.sqlite.base import (
+            SQLiteTypeCompiler as _SQLiteTypeCompiler,
+        )
+        if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
+            _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        import app.orchestrator as _orch_module
+
+        async def _build():
+            _engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.create_all)
+            _Session = sessionmaker(
+                bind=_engine, class_=AsyncSession,
+                autocommit=False, autoflush=False, expire_on_commit=False,
+            )
+            mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+            mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+            mocker.patch("app.main._get_actual_gcp_vm_count", return_value=0)
+            mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
+            mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
+            mocker.patch("app.routers.agent_status.record_task_result")
+            mocker.patch("app.deploy_health._check_monitoring_window", new_callable=AsyncMock)
+            mocker.patch("app.deploy_health._check_external_health", new_callable=AsyncMock)
+            mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
+            mocker.patch("app.autonomous_research._check_idle_research", new_callable=AsyncMock)
+            mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
+            mocker.patch("app.main._create_orchestrator_error_alerts", new_callable=AsyncMock)
+            mocker.patch("app.orchestrator._persist_zone_health", new_callable=AsyncMock)
+            mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+            now = self._naive_utcnow()
+            _orch_module._last_pool_refresh = now
+            _orch_module._last_zone_health_persist = now
+            _orch_module._last_orphan_check = now
+            _orch_module._last_evaluating_timeout_check = now
+            _shared_state.deploy_monitoring["task_results"].clear()
+            return _Session, _engine
+
+        # Run the async setup synchronously so the fixture body returns.
+        loop = asyncio.new_event_loop()
+        try:
+            _Session, _engine = loop.run_until_complete(_build())
+        finally:
+            loop.close()
+        try:
+            yield _Session
+        finally:
+            async def _teardown():
+                async with _engine.begin() as conn:
+                    await conn.run_sync(SQLModel.metadata.drop_all)
+                await _engine.dispose()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_teardown())
+            finally:
+                loop.close()
+
+    @staticmethod
+    async def _run_one_cycle(mocker):
+        import asyncio
+        import contextlib
+        import app.orchestrator as _orch_module
+        mocker.patch("asyncio.sleep", side_effect=asyncio.CancelledError())
+        with contextlib.suppress(asyncio.CancelledError):
+            await _orch_module.orchestrator_worker()
+
+    @pytest.mark.asyncio
+    async def test_warm_pin_with_recent_heartbeat_skips_provision(self, orch_warm_db, mocker):
+        """A QUEUED task with valid warm_target_vm_id + recent VM heartbeat
+        keeps its QUEUED status and does NOT trigger provision_agent_vm."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Warm-Pin Skip", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            target_vm = "agent-vm-warm-target-1"
+            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={
+                    "warm_target_vm_id": target_vm,
+                    "warm_target_pr": "1234",
+                    "warm_handoff_deadline": deadline,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        # Mark VM as alive via the shared-state heartbeat map
+        _shared_state.vm_last_heartbeat[target_vm] = datetime.utcnow()
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.vm_last_heartbeat.pop(target_vm, None)
+
+        prov_mock.assert_not_called()
+
+        async with orch_warm_db() as verify:
+            row = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"Task should remain QUEUED for warm-pin skip, got {row.status}"
+            )
+            ctx = row.context or {}
+            # Skip-provision must not clear the warm fields.
+            assert ctx.get("warm_target_vm_id") == target_vm
+
+    @pytest.mark.asyncio
+    async def test_warm_pin_past_deadline_clears_and_falls_through(self, orch_warm_db, mocker):
+        """When warm_handoff_deadline is in the past, the orchestrator clears
+        the warm fields and proceeds to provision. We verify the warm fields
+        are gone after one cycle, and assert record_warm_pin_clear was invoked
+        with reason='deadline_expired' (Issue 9a)."""
+        from sqlmodel import select as _select
+
+        # Block any actual provision to keep the test fast
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        # Spy on record_warm_pin_clear: it's a sync call inside the dispatch
+        # path. We patch at the orchestrator's _shared_state import binding
+        # so the spy intercepts the in-loop call (Issue 9a).
+        record_clear_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_warm_pin_clear",
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Warm-Pin Expired", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            target_vm = "agent-vm-warm-target-2"
+            past = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={
+                    "warm_target_vm_id": target_vm,
+                    "warm_target_pr": "5555",
+                    "warm_handoff_deadline": past,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        # Heartbeat is fresh, but deadline is past — the warm fields should
+        # still be cleared (deadline takes precedence).
+        _shared_state.vm_last_heartbeat[target_vm] = datetime.utcnow()
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.vm_last_heartbeat.pop(target_vm, None)
+
+        async with orch_warm_db() as verify:
+            row = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+            assert row is not None
+            ctx = row.context or {}
+            assert "warm_target_vm_id" not in ctx, (
+                "Past-deadline warm pin must be cleared from context"
+            )
+            assert "warm_target_pr" not in ctx
+            assert "warm_handoff_deadline" not in ctx
+
+        # Issue 9a: assert record_warm_pin_clear was called with the correct
+        # reason for the deadline-expired path.
+        assert record_clear_spy.called, "record_warm_pin_clear must be invoked"
+        # Match the (vm_id, reason) positional signature; tolerate kwargs too.
+        _vm_arg, _reason_arg = _extract_warm_pin_clear_args(record_clear_spy)
+        assert _vm_arg == target_vm
+        assert _reason_arg == "deadline_expired", (
+            f"Expected reason='deadline_expired', got {_reason_arg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_warm_pin_unresponsive_vm_clears_and_falls_through(self, orch_warm_db, mocker):
+        """A QUEUED task whose warm target VM has no recent heartbeat must
+        have warm fields cleared (deadline still future, but VM is silent).
+        Verifies record_warm_pin_clear is called with reason='vm_unresponsive'
+        (Issue 9a)."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        record_clear_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_warm_pin_clear",
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Warm-Pin Silent VM", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            target_vm = "agent-vm-warm-target-3"
+            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={
+                    "warm_target_vm_id": target_vm,
+                    "warm_target_pr": "9999",
+                    "warm_handoff_deadline": deadline,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        # No heartbeat entry → VM unresponsive
+        _shared_state.vm_last_heartbeat.pop(target_vm, None)
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify:
+            row = (await verify.execute(_select(Task).where(Task.id == task_id))).scalars().first()
+            assert row is not None
+            ctx = row.context or {}
+            assert "warm_target_vm_id" not in ctx, (
+                "Unresponsive-VM warm pin must be cleared from context"
+            )
+            assert "warm_target_pr" not in ctx
+            assert "warm_handoff_deadline" not in ctx
+
+        # Issue 9a: assert record_warm_pin_clear was called with the correct
+        # reason for the silent-VM path.
+        assert record_clear_spy.called, "record_warm_pin_clear must be invoked"
+        _vm_arg, _reason_arg = _extract_warm_pin_clear_args(record_clear_spy)
+        assert _vm_arg == target_vm
+        assert _reason_arg == "vm_unresponsive", (
+            f"Expected reason='vm_unresponsive', got {_reason_arg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_warm_pin_clear_metric_skipped_when_commit_fails(self, orch_warm_db, mocker):
+        """Issue 11: the warm-pin clear metric must NOT fire if the commit
+        that persists the warm-field clear raises. On commit failure the
+        rollback path leaves the warm fields intact, so a re-run of the
+        dispatch loop can record the clear cleanly without double-counting."""
+        from sqlmodel import select as _select
+
+        # Force the dispatch-time PROVISIONING commit to fail. We reach the
+        # main commit path by having an account selected, then the commit
+        # raises. Simpler: drive the unresponsive-VM clear path and patch
+        # session.commit to raise on first call after the warm-clear.
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        record_clear_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_warm_pin_clear",
+        )
+
+        # Force a path between warm-clear (which sets _pending_warm_pin_clear)
+        # and the first commit to raise an unhandled exception. The orch's
+        # outer `except Exception` rolls back the session, so the warm-clear
+        # writes never persist — and the metric must therefore NOT fire
+        # (Issue 11 acceptance: if commit fails, record_warm_pin_clear was
+        # not called).
+        # select_llm_runtime_for_task is lazily imported INSIDE
+        # orchestrator_worker via `from app.max_plan_pool import ...`, so
+        # the binding inside that function resolves through app.max_plan_pool
+        # — patch there to reliably intercept the call.
+        async def _raising_select(*_a, **_kw):
+            raise RuntimeError("simulated runtime selection failure")
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            side_effect=_raising_select,
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Warm-Pin CommitFail", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            target_vm = "agent-vm-warm-target-commitfail"
+            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            task = make_task(
+                project_id=project.id,
+                vm_instance_id=None,
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "fix", "prompt": "x"}],
+                context={
+                    "warm_target_vm_id": target_vm,
+                    "warm_target_pr": "1234",
+                    "warm_handoff_deadline": deadline,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+
+        # No heartbeat entry → VM unresponsive → reaches warm-clear branch.
+        _shared_state.vm_last_heartbeat.pop(target_vm, None)
+        await self._run_one_cycle(mocker)
+
+        # Because select_llm_runtime_for_task raised AFTER warm-clear was
+        # written but BEFORE any commit completed, no commit landed — so
+        # record_warm_pin_clear must NOT have fired (Issue 11 acceptance).
+        assert not record_clear_spy.called, (
+            "record_warm_pin_clear must not be invoked when the commit "
+            "that persists the warm-field clear has not landed"
+        )

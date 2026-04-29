@@ -314,6 +314,19 @@ runtime_config: Dict = {
         "medium": 420,
         "large": 900,
     },
+    # Phase 2 (warm-VM continuity): when True, the review pipeline pins a
+    # downstream review/fix task to the source task's VM (`task.context.
+    # warm_target_vm_id`) and the orchestrator's provisioning loop skips
+    # cold-provisioning a fresh VM as long as the target VM has heartbeated
+    # within the last 90s. The agent on that VM picks the task up via
+    # /api/agent/next-role. Defaults to False — feature ships dark and is
+    # only enabled per-deployment via runtime_config_json.
+    "warm_continuity_enabled": False,
+    # Maximum seconds the agent waits in /api/agent/next-role polling before
+    # falling through to the normal exit path. Bounded by the warm-handoff
+    # window and the typical role transition cadence; tunable down for
+    # tighter slot budgets.
+    "next_role_poll_timeout_secs": 180,
 }
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
@@ -511,6 +524,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set("daily_cost_ceiling_usd", float(config_json["daily_cost_ceiling_usd"]))
                 if "auto_archive_enabled" in config_json:
                     _set("auto_archive_enabled", bool(config_json["auto_archive_enabled"]))
+                if "warm_continuity_enabled" in config_json:
+                    _set("warm_continuity_enabled", bool(config_json["warm_continuity_enabled"]))
                 for int_key in (
                     "max_provision_retries", "max_rollup_retries",
                     "architecture_review_frequency", "max_active_directions",
@@ -522,6 +537,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "evaluating_pipeline_timeout_minutes",
                     "ci_backstop_timeout_minutes",
                     "max_total_research_per_project",
+                    "next_role_poll_timeout_secs",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -689,6 +705,63 @@ def count_merge_error_pattern_prs(project_id: str, normalized_error: str) -> int
         return 0
     cutoff = _utcnow() - timedelta(seconds=MERGE_PATTERN_WINDOW_SECONDS)
     return len({pr for pr, ts in dq if ts >= cutoff})
+
+
+# --- Warm-VM heartbeat tracking (Phase 2) ---
+# Maps vm_instance_id -> last datetime the VM contacted us (claim, status,
+# heartbeat, vm-heartbeat, or next-role poll). Used by the orchestrator's
+# provisioning loop to decide whether a warm-target pin is still honored.
+# Pruned by sweep_stale_in_memory_state — entries older than 1h are removed.
+vm_last_heartbeat: Dict[str, datetime] = {}
+
+
+def record_vm_heartbeat(vm_instance_id: str) -> None:
+    """Record liveness for a VM (warm-VM continuity).
+
+    Called from the agent's vm-heartbeat endpoint AND from the next-role
+    polling endpoint (which doubles as a liveness signal). Stores the
+    current naive UTC timestamp.
+    """
+    if not vm_instance_id:
+        return
+    vm_last_heartbeat[vm_instance_id] = _utcnow()
+
+
+def is_vm_alive(vm_instance_id: str, max_age_seconds: int = 90) -> bool:
+    """True iff the VM heartbeated within the last `max_age_seconds`.
+
+    Used by the orchestrator's provisioning loop to decide whether a
+    QUEUED task with `warm_target_vm_id` should skip provisioning (live
+    target → agent will pick it up via /next-role) or clear the warm
+    fields and provision normally (target unresponsive → cold path).
+    """
+    if not vm_instance_id:
+        return False
+    last = vm_last_heartbeat.get(vm_instance_id)
+    if last is None:
+        return False
+    return (_utcnow() - last).total_seconds() <= max_age_seconds
+
+
+# --- Warm-pin clear-out tracking (Phase 2e observability) ---
+# Each entry: (timestamp, vm_id, reason). Reason is "deadline_expired" or
+# "vm_unresponsive". Sustained >5/hour means warm VMs are dying mid-poll
+# more often than expected — the agent's lifecycle code is leaking state
+# or the reset routine is failing. Pruned by sweep_stale_in_memory_state.
+warm_pin_clear_events: deque = deque(maxlen=200)
+
+
+def record_warm_pin_clear(vm_id: str, reason: str) -> None:
+    """Record a warm-pin clear-out event for the orchestrator's metric."""
+    if not vm_id:
+        return
+    warm_pin_clear_events.append((_utcnow(), vm_id, reason))
+
+
+def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
+    """Distinct clear-out events in the trailing window."""
+    cutoff = _utcnow() - timedelta(seconds=window_seconds)
+    return sum(1 for ts, _, _ in warm_pin_clear_events if ts >= cutoff)
 
 
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
@@ -1080,6 +1153,7 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
         "autonomous_failure_counts": 0,
         "merge_error_occurrences": 0,
         "user_debug_spawn_times": 0,
+        "vm_last_heartbeat": 0,
     }
 
     streak_cutoff = now - timedelta(hours=_STREAK_RETENTION_HOURS)
@@ -1124,6 +1198,24 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
         if not dq:
             del user_debug_spawn_times[pid]
             pruned["user_debug_spawn_times"] += 1
+
+    # Warm-VM heartbeat map: prune entries older than 1h. The orchestrator
+    # only honors warm-pin VMs whose heartbeat is within 90s, so any entry
+    # past 1h is permanently stale and only contributes to memory growth.
+    vm_heartbeat_cutoff = now - timedelta(hours=1)
+    for vm_id, last in list(vm_last_heartbeat.items()):
+        if last < vm_heartbeat_cutoff:
+            del vm_last_heartbeat[vm_id]
+            pruned["vm_last_heartbeat"] += 1
+
+    # Warm-pin clear-out events: bounded deque (maxlen=200) auto-evicts;
+    # this prune pass drops anything outside the 24h reporting window so
+    # count_recent_warm_pin_clears stays cheap.
+    warm_clear_cutoff = now - timedelta(hours=24)
+    pruned["warm_pin_clear_events"] = 0
+    while warm_pin_clear_events and warm_pin_clear_events[0][0] < warm_clear_cutoff:
+        warm_pin_clear_events.popleft()
+        pruned["warm_pin_clear_events"] += 1
 
     return pruned
 

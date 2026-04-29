@@ -3,9 +3,10 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
-  persistAndPostStatus, cloneWithRetry, runClaudeCode,
+  persistAndPostStatus, runClaudeCode,
   getProviderRunner,
 } from '../index.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   describeJsonExtractionResult,
@@ -645,9 +646,11 @@ export async function handlePlan(
   // Clone repo — planner needs codebase context for good decomposition
   statusRef.value = `Cloning ${owner}/${repo} for planning...`;
   sendLog(ws, `Planning task decomposition for: ${prompt.slice(0, 200)}\n`);
-  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--depth', String(DEFAULT_CLONE_DEPTH), '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
+  });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
@@ -790,9 +793,14 @@ export async function handleResearch(
   // Full clone — research needs history context
   statusRef.value = `Cloning ${owner}/${repo} for research...`;
   sendLog(ws, `Starting codebase research...\n`);
-  execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await cloneWithRetry(['clone', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+  // research uses a FULL clone (no --depth) so it can mine git history.
+  // We pass depth=0 to signal full-clone semantics in the cold path; the
+  // helper interprets a non-positive depth as "omit --depth".
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: 0,
+  });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(strVal(payload.research_mode as string, 'research'));

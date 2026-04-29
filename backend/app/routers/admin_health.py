@@ -15,6 +15,7 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
+import app.shared_state as _shared_state
 from app.compute import get_zone_health_summary
 from app.routers.admin_digest import compute_pipeline_health_summary
 from app.routers.admin_debug import _build_stuck_tasks
@@ -332,4 +333,166 @@ async def get_health_overview(
         "actionable_issues": actionable_issues,
         "direction_portfolio": direction_portfolio,
         "queue_depth": queue_depth,
+    }
+
+
+# --- Warm-VM continuity observability ----------------------------------------
+# Surfaces the VM⇄task assignments behind the warm-VM continuity feature so
+# operators can see at a glance: which VMs are alive, what task each is running,
+# how many warm-pinned tasks are queued, and how often the orchestrator is
+# clearing warm pins (a leading indicator of warm-VM instability).
+
+@router.get("/warm-vm-state")
+async def get_warm_vm_state(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Snapshot of active VMs and warm-pin chain state for the admin UI."""
+    now = _utcnow()
+
+    # Build the "set of VMs we care about": union of (a) IDs heartbeating, (b)
+    # IDs running an IN_PROGRESS task, (c) IDs targeted by a QUEUED warm-pin.
+    heartbeat_vms = set(_shared_state.vm_last_heartbeat.keys())
+
+    in_progress_stmt = (
+        select(Task)
+        .where(Task.status == TaskStatus.IN_PROGRESS, Task.vm_instance_id.is_not(None))
+        .options(load_only(
+            Task.id, Task.vm_instance_id, Task.title, Task.payloads,
+            Task.status, Task.context, Task.started_at, Task.project_id,
+        ))
+    )
+    in_progress_tasks = (await session.execute(in_progress_stmt)).scalars().all()
+    inprogress_by_vm: Dict[str, Task] = {}
+    for t in in_progress_tasks:
+        if t.vm_instance_id and t.vm_instance_id not in inprogress_by_vm:
+            inprogress_by_vm[t.vm_instance_id] = t
+
+    pinned_stmt = (
+        select(Task)
+        .where(Task.status == TaskStatus.QUEUED)
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.project_id))
+    )
+    pinned_tasks = (await session.execute(pinned_stmt)).scalars().all()
+    pinned_by_vm: Dict[str, List[Task]] = {}
+    for t in pinned_tasks:
+        ctx = t.context or {}
+        target = ctx.get("warm_target_vm_id")
+        if target:
+            pinned_by_vm.setdefault(target, []).append(t)
+
+    completed_stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.vm_instance_id.is_not(None),
+            Task.last_heartbeat >= now - timedelta(hours=1),
+        )
+        .options(load_only(
+            Task.id, Task.vm_instance_id, Task.payloads, Task.last_heartbeat,
+            Task.status, Task.title,
+        ))
+        .order_by(Task.last_heartbeat.desc())
+        .limit(200)
+    )
+    completed_tasks = (await session.execute(completed_stmt)).scalars().all()
+    completed_by_vm: Dict[str, List[Task]] = {}
+    for t in completed_tasks:
+        if t.vm_instance_id:
+            bucket = completed_by_vm.setdefault(t.vm_instance_id, [])
+            if len(bucket) < 5:
+                bucket.append(t)
+
+    all_vms = heartbeat_vms | inprogress_by_vm.keys() | pinned_by_vm.keys() | completed_by_vm.keys()
+
+    def _payload_type(t: Task) -> str:
+        try:
+            payloads = t.payloads or []
+            if payloads and isinstance(payloads[0], dict):
+                return str(payloads[0].get("type") or "")
+        except Exception:  # noqa: BLE001 — best-effort metadata
+            pass
+        return ""
+
+    def _pr_number(t: Task) -> int | None:
+        try:
+            payloads = t.payloads or []
+            if payloads and isinstance(payloads[0], dict):
+                pr = payloads[0].get("pr_number")
+                if isinstance(pr, int):
+                    return pr
+        except Exception:  # noqa: BLE001 — best-effort metadata
+            pass
+        ctx_pr = (t.context or {}).get("warm_target_pr")
+        if isinstance(ctx_pr, int):
+            return ctx_pr
+        return None
+
+    active_vms_out: List[Dict[str, Any]] = []
+    for vm_id in sorted(all_vms):
+        last_hb = _shared_state.vm_last_heartbeat.get(vm_id)
+        is_alive = _shared_state.is_vm_alive(vm_id)
+
+        cur = inprogress_by_vm.get(vm_id)
+        cur_out: Dict[str, Any] | None = None
+        if cur is not None:
+            timing = (cur.context or {}).get("_timing") or {}
+            cur_out = {
+                "id": str(cur.id),
+                "title": cur.title or "",
+                "task_type": _payload_type(cur),
+                "status": cur.status.value if hasattr(cur.status, "value") else str(cur.status),
+                "warm_start": bool(timing.get("warm_start", False)),
+                "prior_role_vm_id": timing.get("prior_role_vm_id"),
+                "setup_secs": timing.get("setup_secs"),
+                "started_at": cur.started_at.isoformat() if cur.started_at else None,
+                "pr_number": _pr_number(cur),
+                "project_id": str(cur.project_id) if cur.project_id else None,
+            }
+
+        pinned_out = []
+        for t in pinned_by_vm.get(vm_id, []):
+            ctx = t.context or {}
+            pinned_out.append({
+                "id": str(t.id),
+                "task_type": _payload_type(t),
+                "warm_target_pr": ctx.get("warm_target_pr") if isinstance(ctx.get("warm_target_pr"), int) else None,
+                "warm_handoff_deadline": ctx.get("warm_handoff_deadline"),
+            })
+
+        recent_out = []
+        for t in completed_by_vm.get(vm_id, []):
+            recent_out.append({
+                "id": str(t.id),
+                "task_type": _payload_type(t),
+                "completed_at": t.last_heartbeat.isoformat() if t.last_heartbeat else None,
+                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+            })
+
+        active_vms_out.append({
+            "vm_instance_id": vm_id,
+            "last_heartbeat": last_hb.isoformat() if last_hb else None,
+            "is_alive": bool(is_alive),
+            "current_task": cur_out,
+            "warm_pinned_queued": pinned_out,
+            "recent_completions": recent_out,
+        })
+
+    # Distinct VMs that currently host an IN_PROGRESS warm-start task.
+    active_warm_chains = sum(
+        1
+        for t in in_progress_tasks
+        if (t.context or {}).get("_timing", {}).get("warm_start") is True
+    )
+
+    return {
+        "active_vms": active_vms_out,
+        "warm_pin_metrics": {
+            "clears_last_hour": _shared_state.count_recent_warm_pin_clears(3600),
+            "clears_last_24h": _shared_state.count_recent_warm_pin_clears(86400),
+            "active_pinned_queued_total": sum(len(v) for v in pinned_by_vm.values()),
+            "active_warm_chains": active_warm_chains,
+        },
+        "warm_continuity_enabled": bool(_shared_state.runtime_config.get("warm_continuity_enabled", False)),
+        "next_role_poll_timeout_secs": int(_shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)),
     }

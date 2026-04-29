@@ -5901,3 +5901,970 @@ async def test_agent_fetch_gap_handles_active_and_archived(
         f"/api/agent/projects/{project.id}/gaps/g-missing", headers=headers
     )
     assert r3.status_code == 404
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2 (warm-VM continuity): /next-role + /vm-heartbeat
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_records_liveness(client: AsyncClient, db_session):
+    """vm-heartbeat returns 204 and records the VM in vm_last_heartbeat."""
+    import app.shared_state as _shared_state
+
+    project = Project(name="VM-Heartbeat Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-warm-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _shared_state.vm_last_heartbeat.pop("agent-vm-warm-001", None)
+
+    token = create_agent_token(str(task.id), "agent-vm-warm-001")
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": "agent-vm-warm-001"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+    assert "agent-vm-warm-001" in _shared_state.vm_last_heartbeat
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_rejects_jwt_vm_mismatch(client: AsyncClient, db_session):
+    """vm-heartbeat returns 403 when JWT vm_instance_id mismatches body."""
+    project = Project(name="VM-Heartbeat Mismatch", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-real",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-real")
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": "agent-vm-impostor"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_next_role_returns_204_when_no_warm_pinned_task(client: AsyncClient, db_session):
+    """next-role returns 204 when no QUEUED task is pinned to this VM."""
+    project = Project(name="Next-Role Empty", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id, payloads=[{"type": "review"}],
+        vm_instance_id="agent-vm-warm-empty",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-warm-empty")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-warm-empty",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 999,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_next_role_claims_warm_pinned_queued_task(client: AsyncClient, db_session):
+    """next-role atomically claims a QUEUED task whose context.warm_target_vm_id matches."""
+    from datetime import datetime, timedelta
+
+    project = Project(name="Next-Role Claim", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id, payloads=[{"type": "review", "pr_number": 1234}],
+        vm_instance_id="agent-vm-warm-claim",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    # A QUEUED fix pinned to the same VM
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 1234, "branch": "feat/x"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-warm-claim",
+            "warm_target_pr": "1234",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-warm-claim")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-warm-claim",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 1234,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["action"] == "claim"
+    assert body["task_id"] == str(pinned_task.id)
+    assert body["warm_start"] is True
+    # New JWT scoped to the warm-claimed task is included so the agent
+    # can authenticate subsequent task-scoped calls (the prior task's
+    # JWT is terminal and only authenticates the idempotent
+    # next-role/vm-heartbeat paths).
+    assert isinstance(body.get("agent_token"), str) and body["agent_token"]
+    from app.auth import verify_agent_jwt
+    new_claims = verify_agent_jwt(body["agent_token"])
+    assert new_claims["sub"] == str(pinned_task.id)
+    assert new_claims["vm_instance_id"] == "agent-vm-warm-claim"
+    assert new_claims["project_id"] == str(project.id)
+    assert new_claims["task_type"] == "fix"
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.IN_PROGRESS
+    assert pinned_task.vm_instance_id == "agent-vm-warm-claim"
+    assert (pinned_task.context or {}).get("_timing", {}).get("warm_start") is True
+    assert (pinned_task.context or {}).get("_timing", {}).get("prior_role_vm_id") == "agent-vm-warm-claim"
+
+
+@pytest.mark.asyncio
+async def test_next_role_rejects_jwt_vm_mismatch(client: AsyncClient, db_session):
+    """next-role returns 403 when JWT vm_instance_id mismatches body."""
+    project = Project(name="Next-Role JWT Mismatch", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id, payloads=[{"type": "review"}],
+        vm_instance_id="agent-vm-real-vm",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-real-vm")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-impostor-vm",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 555,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_next_role_returns_exit_when_other_vm_owns_pr(client: AsyncClient, db_session):
+    """next-role returns action=exit when an IN_PROGRESS task on the same PR is pinned to a different VM."""
+    project = Project(name="Next-Role Other-VM", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id, payloads=[{"type": "review", "pr_number": 4242}],
+        vm_instance_id="agent-vm-warm-A",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    # An IN_PROGRESS task on the same PR but pinned to a different VM
+    other_vm_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 4242, "branch": "feat/y"}],
+        vm_instance_id="agent-vm-warm-B",
+        status=TaskStatus.IN_PROGRESS,
+        context={"warm_target_pr": "4242"},
+    )
+    db_session.add(other_vm_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-warm-A")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-warm-A",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 4242,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["action"] == "exit"
+    assert body["reason"] == "another_vm_owns_this_pr"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2c (warm-VM continuity) — Subagent S1 review fixes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
+    """A malicious agent MUST NOT be able to inject warm_target_* into a spawned
+    child's context — that would let it hijack another VM's warm chain.
+    """
+    project = Project(name="Spawn Sanitization Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-spawn-parent",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    token = create_agent_token(str(parent_task.id), "agent-vm-spawn-parent")
+    forbidden_context = {
+        "warm_target_vm_id": "victim-vm",
+        "warm_target_pr": 1,
+        "warm_handoff_deadline": "2099-01-01T00:00:00",
+        "_timing": {"warm_start": True, "prior_role_vm_id": "victim-vm"},
+        "other_key": "ok",
+    }
+    resp = await client.post(
+        "/api/agent/spawn",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(parent_task.id),
+            "payloads": [{"type": "create", "title": "child-1", "prompt": "test"}],
+            "context": forbidden_context,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["task_ids"]) == 1
+    child_id = uuid.UUID(body["task_ids"][0])
+
+    child = await db_session.get(Task, child_id)
+    assert child is not None
+    ctx = child.context or {}
+    assert "warm_target_vm_id" not in ctx
+    assert "warm_target_pr" not in ctx
+    assert "warm_handoff_deadline" not in ctx
+    assert "_timing" not in ctx
+    # Non-forbidden keys are preserved
+    assert ctx.get("other_key") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_records_vm_liveness(client: AsyncClient, db_session):
+    """/api/agent/heartbeat MUST update vm_last_heartbeat so the orchestrator's
+    skip-provision branch sees the VM as alive (Phase 2c Race A mitigation).
+    """
+    import app.shared_state as _shared_state
+
+    project = Project(name="Heartbeat VM Liveness Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-hb-liveness",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _shared_state.vm_last_heartbeat.pop("agent-vm-hb-liveness", None)
+
+    token = create_agent_token(str(task.id), "agent-vm-hb-liveness")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status_message": "still running"},
+    )
+    assert resp.status_code == 200
+    assert "agent-vm-hb-liveness" in _shared_state.vm_last_heartbeat
+
+
+@pytest.mark.asyncio
+async def test_claim_records_vm_liveness(client: AsyncClient, db_session):
+    """/api/agent/claim MUST update vm_last_heartbeat — first contact establishes
+    the warm-VM continuity liveness signal (Phase 2c Race A mitigation).
+    """
+    import app.shared_state as _shared_state
+
+    project = Project(name="Claim VM Liveness Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-claim-liveness",
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _shared_state.vm_last_heartbeat.pop("agent-vm-claim-liveness", None)
+
+    token = create_agent_token(str(task.id), "agent-vm-claim-liveness")
+    resp = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+    assert "agent-vm-claim-liveness" in _shared_state.vm_last_heartbeat
+
+
+@pytest.mark.asyncio
+async def test_next_role_token_mint_failure_rolls_back(client: AsyncClient, db_session, mocker):
+    """If create_agent_token raises during the warm-claim path, the task MUST
+    stay QUEUED (rollback) so a retry can succeed. Without rollback the task
+    would be stuck IN_PROGRESS with no live JWT on the agent side.
+    """
+    from datetime import datetime, timedelta
+
+    project = Project(name="Next-Role Mint Failure", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 2222}],
+        vm_instance_id="agent-vm-mint-fail",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 2222, "branch": "feat/mint-fail"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-mint-fail",
+            "warm_target_pr": "2222",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    # Patch the create_agent_token reference in routers.agent (the actual
+    # call site); patching app.auth.create_agent_token wouldn't intercept
+    # because of `from app.auth import create_agent_token`.
+    mocker.patch(
+        "app.routers.agent.create_agent_token",
+        side_effect=RuntimeError("simulated mint failure"),
+    )
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-mint-fail")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-mint-fail",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 2222,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 500
+    # The app's global exception handler wraps HTTPException details into
+    # {"error": {"code": 500, "message": ...}}; tolerate either shape.
+    body = resp.json()
+    assert (
+        body.get("detail") == "token_mint_failed"
+        or body.get("error", {}).get("message") == "token_mint_failed"
+    )
+
+    # Task must still be QUEUED with the warm-pin fields intact so a
+    # retry (after the orchestrator settles) can succeed.
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED
+    ctx = pinned_task.context or {}
+    assert ctx.get("warm_target_vm_id") == "agent-vm-mint-fail"
+    assert ctx.get("warm_target_pr") == "2222"
+
+
+@pytest.mark.asyncio
+async def test_next_role_rejects_empty_vm_instance_id(client: AsyncClient, db_session):
+    """min_length=1 on NextRoleRequest.vm_instance_id rejects empty strings."""
+    project = Project(name="Next-Role Empty VM", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        vm_instance_id="agent-vm-validate",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-validate")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 1,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_rejects_empty_vm_instance_id(client: AsyncClient, db_session):
+    """min_length=1 on VmHeartbeatRequest.vm_instance_id rejects empty strings."""
+    project = Project(name="VM-Heartbeat Empty VM", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-validate-hb",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-validate-hb")
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": ""},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mocker):
+    """A successful warm-claim MUST broadcast task_updated to the project so the UI
+    reflects the IN_PROGRESS transition without waiting for the next status post.
+    """
+    from datetime import datetime, timedelta
+
+    broadcast_mock = mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+
+    project = Project(name="Next-Role Broadcast", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 7777}],
+        vm_instance_id="agent-vm-broadcast",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 7777, "branch": "feat/bcast"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-broadcast",
+            "warm_target_pr": "7777",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-broadcast")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-broadcast",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 7777,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["action"] == "claim"
+
+    broadcast_mock.assert_awaited_once()
+    args, _kwargs = broadcast_mock.call_args
+    assert args[0] == str(project.id)
+    assert args[1] == "task_updated"
+    assert args[2]["task_id"] == str(pinned_task.id)
+    assert args[2]["status"] == TaskStatus.IN_PROGRESS
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue M3 (warm-VM rev): terminal-JWT freshness window for warm-idempotent paths
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A leaked terminal-task JWT can authenticate /vm-heartbeat and /next-role for
+# the JWT's full TTL (8h via the is_idempotent_path exemption). Attacker spam-
+# keepalives a phantom vm_id, blocking warm-pin clearout AND can claim future
+# tasks pinned to that VM. The fix rejects terminal-task tokens whose iat is
+# outside the freshness window (default 30 min, env-tunable). Active-task
+# tokens are unaffected.
+
+def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):
+    """Mint an agent JWT directly so we can control the iat claim.
+
+    create_agent_token always sets iat=now(); to test the freshness window we
+    need to forge a token with a specific iat. Mirrors the production claim
+    set so verify_agent_jwt accepts it normally.
+    """
+    import jwt as _jwt
+    from datetime import timezone as _tz, datetime as _dt, timedelta as _td
+
+    from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
+    now = _dt.now(_tz.utc)
+    iat = now + _td(seconds=iat_offset_secs)
+    exp = iat + _td(hours=8)
+    payload = {
+        "sub": str(task_id),
+        "vm_instance_id": vm_instance_id,
+        "task_type": "",
+        "project_id": "",
+        "exp": exp,
+        "iat": iat,
+    }
+    return _jwt.encode(payload, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_fresh_terminal_jwt_accepted(client: AsyncClient, db_session):
+    """A fresh terminal-task JWT (iat = now-5 min) is allowed on /vm-heartbeat."""
+    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    project = Project(name="M3 Fresh Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-m3-fresh-hb",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _terminated_task_ids.pop(str(task.id), None)
+    _agent_active_cache.pop(str(task.id), None)
+
+    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-fresh-hb", iat_offset_secs=-300)
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": "agent-vm-m3-fresh-hb"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_stale_terminal_jwt_rejected(client: AsyncClient, db_session):
+    """A stale terminal-task JWT (iat = now-60 min) is rejected 401 on /vm-heartbeat."""
+    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    project = Project(name="M3 Stale Heartbeat", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-m3-stale-hb",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _terminated_task_ids.pop(str(task.id), None)
+    _agent_active_cache.pop(str(task.id), None)
+
+    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-stale-hb", iat_offset_secs=-3600)
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": "agent-vm-m3-stale-hb"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 401
+    body = resp.json()
+    detail = body.get("detail") or body.get("error", {}).get("message", "")
+    assert detail == "terminal_token_expired_for_idempotent"
+
+
+@pytest.mark.asyncio
+async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_session):
+    """A stale terminal-task JWT (iat = now-60 min) is rejected 401 on /next-role.
+
+    Same defense as the heartbeat test — a leaked terminal-task token can't
+    spam-claim future warm-pinned tasks once it's outside the freshness window.
+    """
+    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    project = Project(name="M3 Stale Next-Role", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "review", "pr_number": 9999}],
+        vm_instance_id="agent-vm-m3-stale-nr",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _terminated_task_ids.pop(str(task.id), None)
+    _agent_active_cache.pop(str(task.id), None)
+
+    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-stale-nr", iat_offset_secs=-3600)
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-m3-stale-nr",
+            "prior_task_id": str(task.id),
+            "prior_pr_number": 9999,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 401
+    body = resp.json()
+    detail = body.get("detail") or body.get("error", {}).get("message", "")
+    assert detail == "terminal_token_expired_for_idempotent"
+
+
+@pytest.mark.asyncio
+async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_session):
+    """A fresh terminal-task JWT is allowed on /next-role (returns 204 with no work)."""
+    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    project = Project(name="M3 Fresh Next-Role", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "review", "pr_number": 5555}],
+        vm_instance_id="agent-vm-m3-fresh-nr",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _terminated_task_ids.pop(str(task.id), None)
+    _agent_active_cache.pop(str(task.id), None)
+
+    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-fresh-nr", iat_offset_secs=-300)
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-m3-fresh-nr",
+            "prior_task_id": str(task.id),
+            "prior_pr_number": 5555,
+        },
+        headers={"x-agent-token": token},
+    )
+    # No queued task pinned to this VM → 204 (auth passed, just no work).
+    assert resp.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_active_task_jwt_unaffected_by_freshness_check(client: AsyncClient, db_session):
+    """An ACTIVE-task JWT (task NOT in _terminated_task_ids) is unaffected by the
+    freshness check — the check applies only to terminal tasks. A long-running
+    task posting status with a 60-min-old JWT must still succeed.
+    """
+    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    project = Project(name="M3 Active JWT Unaffected", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-m3-active",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Belt-and-suspenders: ensure cache is clean so the check actually runs
+    # against the live DB row.
+    _terminated_task_ids.pop(str(task.id), None)
+    _agent_active_cache.pop(str(task.id), None)
+
+    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-active", iat_offset_secs=-3600)
+    # /vm-heartbeat is a warm-idempotent path: even with a 60-min-old JWT,
+    # an ACTIVE task is unaffected by the freshness window — the freshness
+    # check fires only when the task is terminal.
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={"vm_instance_id": "agent-vm-m3-active"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue H3: warm_claim_origin diagnostic marker
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_next_role_claim_writes_warm_claim_origin(client: AsyncClient, db_session):
+    """The next-role warm-claim writes warm_claim_origin='next_role_endpoint' so
+    post-mortems can distinguish server-side seeding from agent-reported values.
+    Also pins down the idempotent contract: prior values for warm_start are
+    preserved (setdefault) rather than blindly overwritten.
+    """
+    project = Project(name="H3 warm_claim_origin", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id, payloads=[{"type": "review", "pr_number": 4321}],
+        vm_instance_id="agent-vm-h3",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 4321, "branch": "feat/h3"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        # Pre-seed _timing.warm_start with a sentinel value to verify the
+        # endpoint preserves prior values via setdefault rather than
+        # overwriting them.
+        context={
+            "warm_target_vm_id": "agent-vm-h3",
+            "warm_target_pr": "4321",
+            "warm_handoff_deadline": deadline,
+            "_timing": {"warm_start": False, "preexisting": "kept"},
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-h3")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-h3",
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 4321,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(pinned_task)
+    timing = (pinned_task.context or {}).get("_timing", {})
+    assert timing.get("warm_claim_origin") == "next_role_endpoint"
+    # setdefault preserved the pre-existing False value (the agent's status
+    # update is the authoritative source for warm_start).
+    assert timing.get("warm_start") is False
+    # Sibling keys are preserved.
+    assert timing.get("preexisting") == "kept"
+    # prior_role_vm_id is the diagnostic trail of which VM made the claim.
+    assert timing.get("prior_role_vm_id") == "agent-vm-h3"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# handler_duration_secs: schema field + persistence round-trip
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_process_post_commit_persists_handler_duration_secs(db_session):
+    """_process_post_commit persists handler_duration_secs into task._timing.
+
+    Direct unit test of the persistence path (agent-side capture lives in
+    agent/src/index.ts which is in S3's scope — documented as a Wave 5
+    follow-up). Avoids the full /status endpoint to skip the GitHub /
+    completion-handler side effects that aren't relevant to the round-trip.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+
+    project = Project(name="handler_duration_secs Round-Trip", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-handler-duration",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.IN_PROGRESS,
+        setup_secs=12.5,
+        warm_start=True,
+        prior_role_vm_id="agent-vm-handler-duration",
+        handler_duration_secs=87.3,
+    )
+
+    # Pass a fresh-session factory bound to the same engine the test uses, so
+    # _process_post_commit's separate session sees the seeded task.
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(task.id, payload, _session_factory=_factory)
+
+    # Refresh through a fresh session — the test session may have a stale
+    # snapshot of context after _process_post_commit's commit on its own session.
+    async with _factory() as fresh:
+        refetched = await fresh.get(Task, task.id)
+        timing = (refetched.context or {}).get("_timing", {})
+
+    assert timing.get("setup_secs") == 12.5
+    assert timing.get("warm_start") is True
+    assert timing.get("prior_role_vm_id") == "agent-vm-handler-duration"
+    assert timing.get("handler_duration_secs") == 87.3
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_handler_duration_secs_optional(db_session):
+    """A status payload that OMITS handler_duration_secs MUST NOT write the key.
+
+    Older agents that haven't started capturing the field still need to
+    round-trip cleanly — the field is opt-in.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+
+    project = Project(name="handler_duration_secs Optional", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="agent-vm-handler-optional",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.IN_PROGRESS,
+        setup_secs=7.0,
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(Task, task.id)
+        timing = (refetched.context or {}).get("_timing", {})
+
+    assert timing.get("setup_secs") == 7.0
+    # Field absent on payload → absent in storage (forward compatibility
+    # with older agents that don't capture the field yet).
+    assert "handler_duration_secs" not in timing
+
+
+def test_handler_duration_secs_rejects_negative_at_schema_layer():
+    """ge=0 on handler_duration_secs rejects negative values at the Pydantic layer.
+
+    Defensive: a broken agent clock that produces a negative duration would
+    pollute analytics with bogus rows. Pydantic's validator catches it before
+    the status endpoint or _process_post_commit ever sees the value.
+    """
+    from app.schemas import AgentStatusPayload
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(
+            task_id=uuid.uuid4(),
+            status=TaskStatus.IN_PROGRESS,
+            handler_duration_secs=-5.0,
+        )
+
+    # Upper bound (24h) likewise rejects nonsense; this also pins the bound
+    # so a future change to the clamp value is conscious.
+    with pytest.raises(ValidationError):
+        AgentStatusPayload(
+            task_id=uuid.uuid4(),
+            status=TaskStatus.IN_PROGRESS,
+            handler_duration_secs=86401.0,
+        )
+
+    # Sanity: a sensible value passes.
+    ok = AgentStatusPayload(
+        task_id=uuid.uuid4(),
+        status=TaskStatus.IN_PROGRESS,
+        handler_duration_secs=42.0,
+    )
+    assert ok.handler_duration_secs == 42.0

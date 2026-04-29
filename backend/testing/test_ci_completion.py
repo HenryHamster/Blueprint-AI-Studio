@@ -1780,3 +1780,226 @@ def test_record_merge_error_occurrence_counts_distinct_prs():
     assert count_merge_error_pattern_prs("proj-a", "err") == 3
     assert count_merge_error_pattern_prs("proj-b", "err") == 0
     assert count_merge_error_pattern_prs("proj-a", "other") == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue 9b — suppress_warm_handoff coverage for ci_completion spawn sites
+# ---------------------------------------------------------------------------
+#
+# review_pipeline._spawn_pipeline_task accepts suppress_warm_handoff. The
+# warm-VM continuity Phase 2d design deliberately ENDS the warm chain when
+# a PR has been review-approved + CI-gated, so any fix spawned downstream
+# from that point must cold-provision. ci_completion.py has 4 spawn sites
+# where suppress_warm_handoff=True is required:
+#   - line 334: update_branch_failed escalation (3+ consecutive failures)
+#   - line 412: merge_conflict (mergeable_state='dirty' or 409 conflict)
+#   - line 568: merge-blocked rebase fix (transient merge failure path)
+#   - line 804: ci_failure (CI checks failed in handle_ci_completion)
+#
+# The CI failure path at line 804 lives inside handle_ci_completion which
+# requires more elaborate fixture setup (it re-locks the task, calls into
+# get_check_runs, etc.); a coverage test for that one already exists in
+# test_task_lifecycle.py::test_approve_branch_does_not_propagate_warm_target
+# via _process_post_commit's APPROVE branch. The 3 remaining sites all live
+# in _attempt_merge_with_retry_and_escalation and are exercised here.
+
+
+@pytest.mark.asyncio
+async def test_suppress_warm_handoff_update_branch_escalation(db_session, mocker):
+    """Issue 9b: ci_completion.py:334 update_branch escalation spawn must
+    pass suppress_warm_handoff=True."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "behind"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.update_branch",
+        return_value={"updated": False, "message": "422 validation failed"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Update branch suppress warm", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session, project,
+        ci_loop_extra={"ci_passed": True, "update_branch_failures": 2},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook",
+    )
+
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "update_branch_failed"
+    assert spawn_mock.call_args.kwargs.get("suppress_warm_handoff") is True, (
+        "update_branch_failed escalation (ci_completion.py:334) must pass "
+        "suppress_warm_handoff=True — Phase 2d post-APPROVE chain end"
+    )
+
+
+@pytest.mark.asyncio
+async def test_suppress_warm_handoff_merge_conflict(db_session, mocker):
+    """Issue 9b: ci_completion.py:412 merge_conflict spawn (conflict=True or
+    mergeable_state='dirty') must pass suppress_warm_handoff=True."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "conflict": True, "message": "merge conflict"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Merge conflict suppress warm", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "merge_conflict"
+    assert spawn_mock.call_args.kwargs.get("suppress_warm_handoff") is True, (
+        "merge_conflict spawn (ci_completion.py:412) must pass "
+        "suppress_warm_handoff=True — Phase 2d post-APPROVE chain end"
+    )
+
+
+@pytest.mark.asyncio
+async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
+    """Issue 9b: ci_completion.py:568 merge-blocked rebase spawn (transient
+    merge failure that survives retries with no existing in-flight fix) must
+    pass suppress_warm_handoff=True."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "transient server error"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Merge blocked rebase suppress warm", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No existing fix → already_fixing gate is False → rebase-fix spawn fires.
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    # The rebase-fix path passes neither fix_reason nor a custom kwarg beyond
+    # suppress_warm_handoff=True; the call signature is identifiable by the
+    # absence of update_branch_failed/merge_conflict.
+    spawn_mock.assert_called_once()
+    kw = spawn_mock.call_args.kwargs
+    assert kw.get("fix_reason", "") == "", (
+        f"merge-blocked rebase spawn must NOT set fix_reason, got {kw.get('fix_reason')!r}"
+    )
+    assert kw.get("suppress_warm_handoff") is True, (
+        "merge-blocked rebase spawn (ci_completion.py:568) must pass "
+        "suppress_warm_handoff=True — Phase 2d post-APPROVE chain end"
+    )
+
+
+@pytest.mark.asyncio
+async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
+    """Issue 9b: ci_completion.py:804 ci_failure spawn (CI checks failed in
+    handle_ci_completion) must pass suppress_warm_handoff=True.
+
+    Drives handle_ci_completion directly with a failed-CI result so the
+    spawn path at line 804 fires."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="CI failure suppress warm", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(
+        db_session, project,
+        # review_approved is the gate path used by both branches; ci_passed
+        # is irrelevant for the failed-CI path because conclusion='failure'.
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x\nbuild failed",
+    }
+    await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+        session=db_session,
+        source="poll",
+    )
+
+    spawn_mock.assert_called_once()
+    assert spawn_mock.call_args.kwargs.get("fix_reason") == "ci_failure"
+    assert spawn_mock.call_args.kwargs.get("suppress_warm_handoff") is True, (
+        "ci_failure spawn (ci_completion.py:804) must pass "
+        "suppress_warm_handoff=True — Phase 2d post-APPROVE chain end"
+    )

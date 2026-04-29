@@ -336,6 +336,10 @@ async def _attempt_merge_with_retry_and_escalation(
                 fix_prompt=behind_prompt,
                 original_task_id=ci_orig_id,
                 fix_reason="update_branch_failed",
+                # Phase 2d: post-APPROVE — code review already approved, so the
+                # warm chain has ended. The new fix must cold-provision rather
+                # than (potentially) reuse a still-warm reviewer VM.
+                suppress_warm_handoff=True,
             )
             if fix_task:
                 ci_loop["ci_waiting"] = False
@@ -410,6 +414,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 fix_prompt=conflict_prompt,
                 original_task_id=ci_orig_id,
                 fix_reason="merge_conflict",
+                # Phase 2d: post-APPROVE — chain has ended at review approval,
+                # the rebase fix must cold-provision (release-on-APPROVE).
+                suppress_warm_handoff=True,
             )
             if fix_task:
                 ci_loop_ctx = dict(ci_loop)
@@ -562,6 +569,10 @@ async def _attempt_merge_with_retry_and_escalation(
                         task, "fix", session, ci_pr_number, ci_branch, ci_base,
                         fix_prompt=rebase_prompt,
                         original_task_id=ci_orig_id,
+                        # Phase 2d: post-APPROVE — review approved + CI passed
+                        # but merge rejected. Rebase fix must cold-provision
+                        # (release-on-APPROVE).
+                        suppress_warm_handoff=True,
                     )
                     if fix_task:
                         ci_loop["ci_waiting"] = False  # hand off; fix-completion will re-park
@@ -796,6 +807,9 @@ async def handle_ci_completion(
             original_task_id=ci_orig_id,
             fix_reason="ci_failure",
             ci_failure_logs=ci_errors,
+            # Phase 2d: CI ran as a merge gate after review approval —
+            # the warm chain has ended, the new fix must cold-provision.
+            suppress_warm_handoff=True,
         )
         if fix_task:
             from app.rollup_state import _is_rollup_parent_awaiting_merge

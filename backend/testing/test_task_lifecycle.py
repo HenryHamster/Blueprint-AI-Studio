@@ -1660,6 +1660,180 @@ async def test_process_post_commit_task_not_found_returns_accepted(tl_db):
 
 
 @pytest.mark.asyncio
+async def test_process_post_commit_persists_timing_fields(tl_db, mocker):
+    """Phase 0 telemetry: setup_secs, warm_start, prior_role_vm_id round-trip
+    into task.context["_timing"] (mirrors _shown_playbook_keys storage pattern)."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"existing": "value"},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        setup_secs=12.5,
+        warm_start=True,
+        prior_role_vm_id="agent-vm-prior",
+    )
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    await session.refresh(task)
+    timing = (task.context or {}).get("_timing") or {}
+    assert timing.get("setup_secs") == 12.5
+    assert timing.get("warm_start") is True
+    assert timing.get("prior_role_vm_id") == "agent-vm-prior"
+    # Existing context must be preserved.
+    assert (task.context or {}).get("existing") == "value"
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_omits_unsent_timing_fields(tl_db, mocker):
+    """When the agent doesn't send timing fields, _process_post_commit must
+    not write a _timing dict — older agents that pre-date Phase 0 should not
+    have an empty/garbage record imposed on them."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    await session.refresh(task)
+    assert "_timing" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
+    """Phase 2d: when the APPROVE branch hits CI failure and spawns a fix,
+    the spawn must pass suppress_warm_handoff=True so no warm-target pin
+    lands on the new task. We verify by patching _spawn_pipeline_task and
+    asserting on the call kwargs."""
+    # Skip rollup; we don't actually need it for this test.
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+
+    # Capture the suppress_warm_handoff kwarg from _spawn_pipeline_task calls.
+    captured_kwargs: list[dict] = []
+
+    async def _capture(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        return (None, False)
+
+    # _spawn_pipeline_task is referenced in task_lifecycle's globals via
+    # module-level import; patch at the call site's module.
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture)
+    # get_github_token_for_task is lazily imported inside _process_post_commit
+    # — patch at its definition site so the deferred import picks up the mock.
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # get_pull_request needs to return both the head ref equal to "feat/x"
+    # and a sha so the CI-status check has a head_sha to query against.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": "abc123", "ref": "feat/x"}},
+    )
+    # Simulate CI failure so the APPROVE-CI-failure spawn fires.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={
+            "status": "completed",
+            "conclusion": "failure",
+            "failed_logs": "build failed",
+        },
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    # _process_post_commit's APPROVE branch is reached when:
+    #   - task.status == COMPLETED
+    #   - first_payload.type == "review"
+    #   - verdict == APPROVE in payload (parsed from verdict_json)
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    # The original create task whose PR is being reviewed. Must be present
+    # for the merge-blocked / APPROVE path. We give it a vm_instance_id so
+    # later code referencing it doesn't NPE on legacy expectations.
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "review",
+            "pr_number": 5050,
+            "branch": "feat/x",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        }],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={
+            "review_loop": {
+                "pr_number": 5050,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            },
+        },
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/5050",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+
+    try:
+        await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    except Exception:
+        # The harness may fail later in the APPROVE path on environment-specific
+        # mocks (e.g. broadcasting); we just need _spawn_pipeline_task to have
+        # been invoked with suppress_warm_handoff=True before that.
+        pass
+
+    ci_failure_calls = [
+        kw for kw in captured_kwargs
+        if kw.get("fix_reason") == "ci_failure"
+    ]
+    assert ci_failure_calls, "Expected at least one ci_failure spawn from APPROVE path"
+    for kw in ci_failure_calls:
+        assert kw.get("suppress_warm_handoff") is True, (
+            "APPROVE-path CI-failure spawn must pass suppress_warm_handoff=True"
+        )
+
+
+@pytest.mark.asyncio
 async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, mocker):
     """A COMPLETED child task with a parent causes _check_and_trigger_rollup to be called."""
     mock_rollup = mocker.patch(

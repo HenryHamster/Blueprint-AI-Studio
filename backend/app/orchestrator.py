@@ -1841,7 +1841,70 @@ async def orchestrator_worker():
                         await session.rollback()
                         continue
 
-                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery)
+                    # Phase 2c: warm-VM continuity skip-provision branch.
+                    # Three outcomes when warm_target_vm_id is set on the task:
+                    #   (a) deadline expired → clear warm fields, fall through
+                    #       to provision (cold path).
+                    #   (b) target VM heartbeated within 90s → skip provision
+                    #       entirely. Task stays QUEUED and the agent on the
+                    #       target VM will pick it up via /api/agent/next-role.
+                    #   (c) target VM unresponsive → clear warm fields, fall
+                    #       through to provision (cold path).
+                    _warm_ctx = task.context or {}
+                    _warm_target_vm_id = _warm_ctx.get("warm_target_vm_id")
+                    if _warm_target_vm_id:
+                        _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
+                        _warm_expired = False
+                        if _warm_deadline_iso:
+                            try:
+                                _warm_deadline = datetime.fromisoformat(str(_warm_deadline_iso))
+                                if _warm_deadline.tzinfo is not None:
+                                    _warm_deadline = _warm_deadline.astimezone(timezone.utc).replace(tzinfo=None)
+                                _warm_expired = _utcnow() > _warm_deadline
+                            except (ValueError, TypeError):
+                                _warm_expired = True
+                        else:
+                            _warm_expired = True
+
+                        if not _warm_expired and _shared_state.is_vm_alive(_warm_target_vm_id):
+                            # (b) Skip provision: the warm VM is alive. Leave
+                            # the task QUEUED — the agent's /next-role poll
+                            # will claim it without a fresh provision.
+                            logger.info(
+                                f"[ORCHESTRATOR] Warm-pin skip-provision for task {task.id}: "
+                                f"target_vm={_warm_target_vm_id} (heartbeat fresh, deadline {_warm_deadline_iso})"
+                            )
+                            await session.rollback()
+                            continue
+
+                        # (a) or (c): clear warm fields and fall through.
+                        _new_ctx = {
+                            k: v for k, v in _warm_ctx.items()
+                            if k not in ("warm_target_vm_id", "warm_target_pr", "warm_handoff_deadline")
+                        }
+                        task.context = _new_ctx
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(task, "context")
+                        _clear_reason = "deadline_expired" if _warm_expired else "vm_unresponsive"
+                        # Phase 2e observability: track clear-out rate so we
+                        # can detect warm-VM instability. Sustained >5/hour
+                        # means the warm chain is failing more than expected.
+                        # Defer record_warm_pin_clear until AFTER the commit
+                        # that persists the warm-field clear lands — if the
+                        # commit fails and we retry next cycle we'd otherwise
+                        # double-count the metric (Issue 11).
+                        _pending_warm_pin_clear: tuple[str, str] | None = (
+                            _warm_target_vm_id, _clear_reason
+                        )
+                        logger.info(
+                            f"[ORCHESTRATOR] Warm-pin cleared for task {task.id}: "
+                            f"target_vm={_warm_target_vm_id} reason={_clear_reason}"
+                        )
+                    else:
+                        _pending_warm_pin_clear = None
+
+                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery
+                    # OR set to None for warm-pinned tasks whose pin was just cleared).
                     if not task.vm_instance_id:
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                     logger.info(f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})")
@@ -2033,6 +2096,9 @@ async def orchestrator_worker():
                                 logger.exception(f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}")
                             if _auto_failed:
                                 await session.commit()
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(*_pending_warm_pin_clear)
+                                    _pending_warm_pin_clear = None
                                 continue
                             if task.latest_status_message != stall_msg:
                                 # Update directly on the locked task object (separate session would deadlock)
@@ -2046,6 +2112,9 @@ async def orchestrator_worker():
                             ):
                                 _cycle_earliest_recovery = earliest_recovery
                             await session.commit()
+                            if _pending_warm_pin_clear is not None:
+                                _shared_state.record_warm_pin_clear(*_pending_warm_pin_clear)
+                                _pending_warm_pin_clear = None
                             continue
                         # No accounts at all — fall back to raw provider credentials when present
                         (
@@ -2084,6 +2153,9 @@ async def orchestrator_worker():
                             )
                             session.add(task)
                             await session.commit()
+                            if _pending_warm_pin_clear is not None:
+                                _shared_state.record_warm_pin_clear(*_pending_warm_pin_clear)
+                                _pending_warm_pin_clear = None
                             continue
 
                     if _sync_task_payload_runtime_fields(
@@ -2119,6 +2191,14 @@ async def orchestrator_worker():
                         await session.commit()
                         # active_tasks already pre-incremented in select_max_plan_account()
                         logger.info(f"[ORCHESTRATOR] Task {task.id} committed as PROVISIONING — launching VM")
+                        # Issue 11: emit warm-pin-clear metric ONLY after the
+                        # commit that persists the warm-field clear succeeds.
+                        # On commit failure → rollback path below, the metric
+                        # stays unrecorded so the next dispatch cycle can fire
+                        # it cleanly without double-counting.
+                        if _pending_warm_pin_clear is not None:
+                            _shared_state.record_warm_pin_clear(*_pending_warm_pin_clear)
+                            _pending_warm_pin_clear = None
                     except Exception as e:
                         import traceback
                         logger.error(f"[ORCHESTRATOR] FAILED to commit PROVISIONING for task {task.id}: {e}", exc_info=True)

@@ -36,6 +36,7 @@ import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
+import { WarmVmPanel } from './components/WarmVmPanel';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -536,6 +537,8 @@ export default function App() {
         diagnostics={s.diagnostics}
         onViewTask={handleViewTask}
       />
+
+      <WarmVmPanel onViewTask={handleViewTask} />
 
 
       {s.error && (

@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -25,6 +26,7 @@ from app.schemas import (
     GitHubPRReviewCommentRequest, GitHubSubmitPRReviewRequest, GitHubCreateIssueRequest,
     GitHubGetIssuesRequest, GitHubCreateBranchRequest, GitHubCreatePRRequest,
 )
+from pydantic import BaseModel, ConfigDict, Field
 from app.payload_schemas import validate_task_payload
 from app.shared_state import limiter
 import app.shared_state as _shared_state
@@ -91,6 +93,20 @@ _terminated_task_ids: dict[str, float] = {}
 _TERMINATED_TTL = 9 * 3600  # 9h — slightly longer than 8h JWT max lifetime
 _on_task_terminal_callbacks.append(lambda tid: _terminated_task_ids.__setitem__(tid, time.time()))
 
+# Issue M3 (warm-VM continuity audit, deferred): JWTs for terminated tasks
+# remain valid for the JWT's full TTL (8h). The is_idempotent_path branch
+# accepts these terminal-task tokens on /next-role and /vm-heartbeat so a
+# legitimate warm chain can poll for the next role. A leaked terminal-task
+# JWT can therefore spam-keepalive a phantom VM identity (blocking
+# warm-pin clearout for 240s per pinned task) and / or claim any future
+# task pinned to that VM. A normal warm chain transitions roles in
+# minutes; a replay 30+ minutes after the JWT's iat is suspicious. Reject
+# terminal-task tokens that are too old to plausibly be the same agent
+# that was just running the prior role.
+_TERMINAL_IDEMPOTENT_FRESHNESS_SECS = int(
+    os.getenv("AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS", "1800")
+)
+
 # TTL cache for "known active" tasks — avoids DB query per request.
 _agent_active_cache: dict[str, float] = {}
 _AGENT_CACHE_TTL = 60.0  # seconds
@@ -99,6 +115,19 @@ _AGENT_CACHE_MAX = 5000  # evict expired entries when cache exceeds this size
 # Retain strong references to fire-and-forget background tasks so the event loop
 # doesn't GC them before completion (asyncio only holds a weak reference).
 _bg_tasks: set[asyncio.Task] = set()
+
+# Keys an agent JWT-holder MUST NOT be able to inject into a spawned child
+# task's context. Without this filter, a compromised or malicious agent could
+# call /api/agent/spawn with `req.context = {"warm_target_vm_id": "<victim>"}`
+# and the orchestrator's skip-provision branch would honor the pin, hijacking
+# another VM's warm chain. Phase 2c (warm-VM continuity) issue #3.
+_AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset({
+    "warm_target_vm_id",
+    "warm_target_pr",
+    "warm_handoff_deadline",
+    # Defense-in-depth — these are also orchestrator-internal:
+    "_timing",
+})
 
 
 async def verify_agent_token(
@@ -125,14 +154,56 @@ async def verify_agent_token(
     if not task_id:
         return payload
     token_vm = payload.get("vm_instance_id")
+    # /next-role and /vm-heartbeat are reached AFTER a task has terminated
+    # (the agent polls for the next role using the prior task's JWT). Treat
+    # them as idempotent paths so the verify-agent-token guard accepts the
+    # terminal-task JWT, but still rejects a different VM trying to use it.
     is_idempotent_path = request.url.path in (
         "/api/agent/status", "/api/agent/credentials/rotate",
+        "/api/agent/next-role", "/api/agent/vm-heartbeat",
     )
+    # Issue M3 freshness check (warm-VM rev): only the warm-VM idempotent
+    # paths /next-role and /vm-heartbeat carry the replay risk for terminal
+    # tasks (the in-progress paths /status and /credentials/rotate already
+    # guard via vm_instance_mismatch). Apply the freshness window only to
+    # the warm-VM paths so the same-VM /status retry path stays intact.
+    is_warm_idempotent_path = request.url.path in (
+        "/api/agent/next-role", "/api/agent/vm-heartbeat",
+    )
+
+    def _enforce_terminal_freshness() -> None:
+        """Reject a terminal-task JWT on warm-idempotent paths if its iat is
+        outside the freshness window. A leaked JWT replayed an hour later is
+        not a legitimate warm-chain continuation."""
+        if not is_warm_idempotent_path:
+            return
+        iat = payload.get("iat")
+        if iat is None:
+            raise HTTPException(
+                status_code=401,
+                detail="terminal_token_expired_for_idempotent",
+            )
+        try:
+            iat_secs = float(iat)
+        except (TypeError, ValueError) as conv_exc:
+            raise HTTPException(
+                status_code=401,
+                detail="terminal_token_expired_for_idempotent",
+            ) from conv_exc
+        if (time.time() - iat_secs) > _TERMINAL_IDEMPOTENT_FRESHNESS_SECS:
+            raise HTTPException(
+                status_code=401,
+                detail="terminal_token_expired_for_idempotent",
+            )
 
     # Fast path: known terminated (in-memory, O(1))
     # Same-VM retry on idempotent paths is allowed; a different-VM call is rejected.
     if task_id in _terminated_task_ids and not is_idempotent_path:
         raise HTTPException(status_code=401, detail="Task is no longer active")
+    if task_id in _terminated_task_ids and is_warm_idempotent_path:
+        # Cache says terminated AND we're on a warm-VM idempotent path —
+        # apply the freshness window before falling through to the DB check.
+        _enforce_terminal_freshness()
     # On idempotent paths with terminated task we fall through to the DB
     # check so we can compare token_vm against task.vm_instance_id (the
     # cache alone doesn't carry that field).
@@ -172,6 +243,11 @@ async def verify_agent_token(
                 # VM (or any non-idempotent path) fails fast.
                 if not is_idempotent_path:
                     raise HTTPException(status_code=401, detail="Task is no longer active")
+                # Issue M3: warm-VM idempotent paths additionally require a
+                # fresh JWT (iat within _TERMINAL_IDEMPOTENT_FRESHNESS_SECS)
+                # so a leaked terminal-task token can't be replayed hours
+                # later to spam-keepalive a phantom VM identity.
+                _enforce_terminal_freshness()
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — fail open on DB errors so agents aren't blocked by transient DB issues
@@ -595,6 +671,11 @@ async def claim_task(
     token: dict = Depends(verify_agent_token)
 ):
     vm_id = token.get("vm_instance_id")
+    # Phase 2c Race A mitigation: a successful claim is a strong liveness
+    # signal — we wouldn't be here without an authenticated VM. Recording
+    # this widens the warm-VM continuity liveness window beyond just the
+    # /vm-heartbeat and /next-role endpoints.
+    _shared_state.record_vm_heartbeat(vm_id)
     stmt = select(Task).where(
         Task.vm_instance_id == vm_id,
         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
@@ -1963,6 +2044,13 @@ async def agent_heartbeat(
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
 
+    # Phase 2c Race A mitigation: every backend contact from a VM is a
+    # liveness signal. Without this, the orchestrator's skip-provision
+    # branch could clear a freshly-written warm pin before the agent's
+    # first /vm-heartbeat call lands (~200-700 ms after spawn). Source the
+    # vm_instance_id from the trusted JWT, never from the request body.
+    _shared_state.record_vm_heartbeat(token.get("vm_instance_id"))
+
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking
     # would starve the heartbeat (agent's 30s HTTP timeout fires before the
@@ -2044,6 +2132,198 @@ async def agent_heartbeat(
 
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+# Phase 2 (warm-VM continuity): /next-role + /vm-heartbeat
+# ---------------------------------------------------------------------------
+
+
+class NextRoleRequest(BaseModel):
+    """Body for POST /api/agent/next-role.
+
+    The agent on a warm VM polls this endpoint after a role completes to
+    discover whether another QUEUED task has been pinned to the same VM.
+    The JWT proves the agent owns the prior task; the body re-asserts the
+    VM identity (defence in depth — JWT + body cross-check) and the prior
+    PR number so the orchestrator can scope the lookup.
+    """
+    model_config = ConfigDict(extra="ignore")
+    vm_instance_id: str = Field(..., min_length=1)
+    prior_task_id: uuid.UUID
+    prior_pr_number: int | None = None
+
+
+class VmHeartbeatRequest(BaseModel):
+    """Body for POST /api/agent/vm-heartbeat — VM-scoped liveness."""
+    model_config = ConfigDict(extra="ignore")
+    vm_instance_id: str = Field(..., min_length=1)
+
+
+@router.post("/vm-heartbeat", status_code=204)
+@limiter.limit("600/minute")
+async def vm_heartbeat(
+    request: Request,
+    req: VmHeartbeatRequest,
+    token: dict = Depends(verify_agent_token),
+):
+    """VM-scoped heartbeat used by warm VMs while polling /next-role.
+
+    The reaper kills VMs whose task hasn't heartbeated, but during the
+    next-role poll the prior task is already terminal, so the agent
+    needs a separate liveness signal that targets the VM identity, not
+    the task identity. The orchestrator's provisioning loop consults
+    `_shared_state.vm_last_heartbeat` to decide whether to skip
+    cold-provisioning a fresh VM.
+    """
+    if req.vm_instance_id != token.get("vm_instance_id"):
+        raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+    _shared_state.record_vm_heartbeat(req.vm_instance_id)
+    return JSONResponse(status_code=204, content=None)
+
+
+@router.post("/next-role")
+@limiter.limit("600/minute")
+async def next_role(
+    request: Request,
+    req: NextRoleRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Look up a warm-pinned QUEUED task for this VM and claim it.
+
+    Phase 2b. Returns one of:
+      - 200 ``{"action": "claim", "task_id": ..., "warm_start": True}`` —
+        a QUEUED task whose context.warm_target_vm_id matches this VM
+        was found and atomically transitioned to IN_PROGRESS.
+      - 200 ``{"action": "exit", "reason": "another_vm_owns_this_pr"}`` —
+        an IN_PROGRESS task for the same PR is pinned to a different
+        VM; the agent should exit cleanly.
+      - 204 — no warm-pinned task for this VM right now; the agent
+        should keep polling until ``next_role_poll_timeout_secs``.
+
+    JWT cross-check: the body's ``vm_instance_id`` MUST equal the JWT's
+    ``vm_instance_id`` claim. Any mismatch is rejected 403.
+    """
+    if req.vm_instance_id != token.get("vm_instance_id"):
+        raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+
+    # Liveness signal: receiving the request itself proves the VM is alive.
+    _shared_state.record_vm_heartbeat(req.vm_instance_id)
+
+    # Look up a QUEUED task pinned to this VM. JSONB context query uses
+    # `as_string()` to match the project's existing pattern (see
+    # autonomous_research.py / direction_lifecycle.py for prior art).
+    # Optional prior_pr_number filter narrows the lookup so a stray
+    # pin from an unrelated chain doesn't get claimed.
+    stmt = select(Task).where(
+        Task.status == TaskStatus.QUEUED,
+        Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id,
+    )
+    if req.prior_pr_number is not None:
+        stmt = stmt.where(
+            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
+        )
+    stmt = stmt.with_for_update(skip_locked=True)
+
+    task = (await session.execute(stmt)).scalars().first()
+
+    if task is not None:
+        task.vm_instance_id = req.vm_instance_id
+        task.status = TaskStatus.IN_PROGRESS
+        task.last_heartbeat = _utcnow()
+        # vm_provisioned_at marks when the VM was made available to the
+        # task. For warm-start we set it to "now" so existing
+        # claim_latency / reaper logic operates on a fresh window.
+        task.vm_provisioned_at = _utcnow()
+        if task.started_at is None:
+            task.started_at = _utcnow()
+        # Carry warm-start signal forward into context._timing so the
+        # status-update path can add the agent-side setup_secs to the
+        # same record on completion.
+        #
+        # Issue H3 (warm-VM rev, deferred): the agent's status update is the
+        # authoritative source for warm_start (task_lifecycle._process_post_commit
+        # runs existing.update(_timing_payload), so an explicit False from the
+        # agent would correctly overwrite a stale True written here). Use
+        # setdefault so this server-side write is idempotent — preserving any
+        # prior value if a warm-claim already happened — and add a sibling
+        # warm_claim_origin marker so post-mortem inspection can distinguish
+        # server-side seeded values from agent-reported ones.
+        ctx = dict(task.context or {})
+        existing_timing = dict(ctx.get("_timing") or {})
+        existing_timing.setdefault("warm_start", True)
+        existing_timing["warm_claim_origin"] = "next_role_endpoint"
+        existing_timing["prior_role_vm_id"] = req.vm_instance_id
+        ctx["_timing"] = existing_timing
+        task.context = ctx
+        flag_modified(task, "context")
+        # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If
+        # mint raises, the rollback below restores the task to QUEUED so a
+        # retry can succeed instead of leaving it stuck IN_PROGRESS with no
+        # live agent (Phase 2 issue #5).
+        task_type = ""
+        try:
+            payloads = task.payloads or []
+            if payloads and isinstance(payloads[0], dict):
+                task_type = str(payloads[0].get("type") or "")
+        except Exception:  # noqa: BLE001 — task_type is best-effort metadata
+            task_type = ""
+        try:
+            agent_token = create_agent_token(
+                task_id=str(task.id),
+                vm_instance_id=req.vm_instance_id,
+                task_type=task_type,
+                project_id=str(task.project_id) if task.project_id else "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
+            raise HTTPException(status_code=500, detail="token_mint_failed") from exc
+
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        # Broadcast status change to frontend so the UI doesn't lag until
+        # the next status update (Phase 2 issue #10). Placed AFTER the
+        # commit so a rollback path doesn't fire a spurious event.
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+        )
+        logger.info(
+            f"[NEXT-ROLE] Warm-start claim: task={task.id} vm={req.vm_instance_id} "
+            f"prior_task={req.prior_task_id} prior_pr={req.prior_pr_number}"
+        )
+        return {
+            "action": "claim",
+            "task_id": str(task.id),
+            "warm_start": True,
+            "agent_token": agent_token,
+        }
+
+    # No matching warm-pinned task. Check whether another VM owns an
+    # IN_PROGRESS task for this PR — if so, the warm chain has already
+    # forked and this VM should exit cleanly.
+    if req.prior_pr_number is not None:
+        other_stmt = select(Task).where(
+            Task.status == TaskStatus.IN_PROGRESS,
+            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number),
+            Task.vm_instance_id.is_not(None),
+            Task.vm_instance_id != req.vm_instance_id,
+        )
+        other = (await session.execute(other_stmt)).scalars().first()
+        if other is not None:
+            return {
+                "action": "exit",
+                "reason": "another_vm_owns_this_pr",
+            }
+
+    # Nothing to claim. Tell the agent to keep polling.
+    return JSONResponse(status_code=204, content=None)
+
+
 @router.post("/spawn")
 @limiter.limit("150/minute")
 async def spawn_subtask(
@@ -2084,6 +2364,22 @@ async def spawn_subtask(
     if (req.context or {}).get("agent_spawned"):
         return {"message": "Plan children deferred to post-branch-creation", "task_ids": [], "requires_approval": False}
 
+    # Strip orchestrator-internal keys before merging into the new task's
+    # context. An agent JWT-holder MUST NOT be able to forge a warm-VM pin
+    # that hijacks another VM's chain. Log a warning when this happens so
+    # we can spot the attack pattern in production.
+    raw_context = req.context or {}
+    forbidden_present = [k for k in raw_context.keys() if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS]
+    if forbidden_present:
+        logger.warning(
+            "[SPAWN] Stripped forbidden context keys from agent spawn: parent_task=%s keys=%s",
+            parent_task.id, forbidden_present,
+        )
+    sanitized_context = {
+        k: v for k, v in raw_context.items()
+        if k not in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS
+    }
+
     new_tasks = []
     for payload in req.payloads:
         try:
@@ -2101,7 +2397,7 @@ async def spawn_subtask(
             title=payload.get("title", f"Subtask of {parent_task.title}"),
             description=payload.get("description", ""),
             payloads=[payload],
-            context={**(req.context or {}), "spawn_depth": spawn_depth + 1, "parent_context": parent_context},
+            context={**sanitized_context, "spawn_depth": spawn_depth + 1, "parent_context": parent_context},
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by=f"AGENT_{parent_task.id}",

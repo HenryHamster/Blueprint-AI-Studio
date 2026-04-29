@@ -45,6 +45,17 @@ vi.mock('child_process', () => ({
   }),
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
   execSync: vi.fn().mockReturnValue(''),
+  // reset.ts (now imported transitively via index.ts) wraps execFile with
+  // promisify; supply the (cmd, args, opts, callback) shape so reset's
+  // own dependency surface doesn't break unrelated index tests.
+  execFile: (
+    _cmd: string,
+    _args: string[],
+    _opts: unknown,
+    cb: (err: Error | null, stdout: string, stderr: string) => void,
+  ) => {
+    Promise.resolve().then(() => cb(null, '', ''));
+  },
 }));
 
 vi.mock('ws', () => ({
@@ -58,7 +69,8 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _getWarmStartForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _getHandlerDurationForTesting, getAgentHeaders, type FailureCategory } from './index.js';
+import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -1844,5 +1856,729 @@ describe('flushLogBuffer', () => {
     flushLogBuffer(ws);
     const remaining = snapshotLogBuffer();
     expect(remaining.map(e => e.content)).toEqual(['b', 'c']);
+  });
+});
+
+// ── Phase 0 telemetry — setup_secs / warm_start / prior_role_vm_id ───────────
+describe('persistAndPostStatus telemetry enrichment', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    _resetTelemetryForTesting();
+    _setRoleClaimTimestampForTesting(null);
+    _setHandlerDurationForTesting(null);
+    fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+      text: () => Promise.resolve(''),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _resetTelemetryForTesting();
+    _setRoleClaimTimestampForTesting(null);
+    _setHandlerDurationForTesting(null);
+  });
+
+  it('computes setup_secs from claim → first tool use gap', async () => {
+    const claimAt = 1_000_000;
+    _setRoleClaimTimestampForTesting(claimAt);
+    // Simulate the SDK message loop calling recordToolUse 12.5s after claim.
+    const dateNowSpy = vi.spyOn(Date, 'now').mockReturnValue(claimAt + 12_500);
+    try {
+      recordToolUse('Read', { file_path: '/x' });
+      expect(_getFirstToolUseAtForTesting()).toBe(claimAt + 12_500);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
+
+    await persistAndPostStatus('task-X', { task_id: 'task-X', status: 'COMPLETED' });
+    expect(fetchMock).toHaveBeenCalled();
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+    ) as { setup_secs?: number; warm_start?: boolean; prior_role_vm_id?: string | null };
+    expect(body.setup_secs).toBe(12.5);
+  });
+
+  it('warm_start defaults to false on initial role; null prior_role_vm_id', async () => {
+    _setRoleClaimTimestampForTesting(2_000_000);
+    await persistAndPostStatus('task-cold', { task_id: 'task-cold', status: 'COMPLETED' });
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+    ) as { warm_start?: boolean; prior_role_vm_id?: string | null };
+    expect(body.warm_start).toBe(false);
+    expect(body.prior_role_vm_id).toBeNull();
+  });
+
+  it('warm_start=true emits prior_role_vm_id from VM_INSTANCE_ID', async () => {
+    const orig = process.env.VM_INSTANCE_ID;
+    process.env.VM_INSTANCE_ID = 'agent-vm-warm-7';
+    try {
+      _setRoleClaimTimestampForTesting(3_000_000);
+      _setWarmStartForTesting(true);
+      await persistAndPostStatus('task-warm', { task_id: 'task-warm', status: 'COMPLETED' });
+      const body = JSON.parse(
+        (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+      ) as { warm_start?: boolean; prior_role_vm_id?: string | null };
+      expect(body.warm_start).toBe(true);
+      expect(body.prior_role_vm_id).toBe('agent-vm-warm-7');
+    } finally {
+      if (orig === undefined) delete process.env.VM_INSTANCE_ID;
+      else process.env.VM_INSTANCE_ID = orig;
+    }
+  });
+
+  it('omits setup_secs when no tool use was recorded', async () => {
+    _setRoleClaimTimestampForTesting(4_000_000);
+    // No recordToolUse call — firstToolUseAt stays null.
+    await persistAndPostStatus('task-quiet', { task_id: 'task-quiet', status: 'COMPLETED' });
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+    ) as { setup_secs?: number };
+    expect(body.setup_secs).toBeUndefined();
+  });
+
+  it('enrichStatusPayload includes handler_duration_secs after the simulated handler-complete capture', async () => {
+    // Mirrors what runRoleOnce does on the success path: capture
+    // (Date.now() - roleClaimTimestamp)/1000 after the handler returns.
+    // We seed the mutable directly via the test helper instead of running
+    // the full role-loop.
+    _setHandlerDurationForTesting(87.3);
+    await persistAndPostStatus('task-h', { task_id: 'task-h', status: 'COMPLETED' });
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+    ) as { handler_duration_secs?: number };
+    expect(body.handler_duration_secs).toBe(87.3);
+  });
+
+  it('omits handler_duration_secs when null (e.g. failure paths or pre-handler statuses)', async () => {
+    // Default state — _setHandlerDurationForTesting(null) in beforeEach.
+    await persistAndPostStatus('task-q', { task_id: 'task-q', status: 'COMPLETED' });
+    const body = JSON.parse(
+      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+    ) as { handler_duration_secs?: number };
+    expect(body.handler_duration_secs).toBeUndefined();
+  });
+});
+
+// ── pollForNextRole ──────────────────────────────────────────────────────────
+describe('pollForNextRole', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  // Spy on the global clearInterval; widening to any is the simplest path
+  // around vi.spyOn's strict object/keyof typing for ambient globals.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let clearIntervalSpy: ReturnType<typeof vi.spyOn<any, any>>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    clearIntervalSpy = vi.spyOn(globalThis as any, 'clearInterval');
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearIntervalSpy.mockRestore();
+  });
+
+  it('returns exit with poll_timeout when 204 forever', async () => {
+    fetchMock.mockResolvedValue({ status: 204, json: () => Promise.resolve({}) });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-1',
+      priorTaskId: 't-1',
+      priorPrNumber: 42,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-tok',
+      pollIntervalMs: 30,
+      timeoutMs: 100,
+      heartbeatIntervalMs: 50,
+    });
+    expect(result.action).toBe('exit');
+    expect(result.reason).toBe('poll_timeout');
+    // vm-heartbeat must have fired at least once (initial).
+    const heartbeatCalls = fetchMock.mock.calls.filter(c => String(c[0]).endsWith('/api/agent/vm-heartbeat'));
+    expect(heartbeatCalls.length).toBeGreaterThanOrEqual(1);
+    // Authorization header must be the X-Agent-Token (matches existing apiPost).
+    const headers = (heartbeatCalls[0][1] as { headers?: Record<string, string> } | undefined)?.headers ?? {};
+    expect(headers['X-Agent-Token']).toBe('jwt-tok');
+    expect(clearIntervalSpy).toHaveBeenCalled();
+  });
+
+  it('returns claim with taskId on action=claim', async () => {
+    let call = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      call += 1;
+      if (call === 1) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({
+          action: 'claim',
+          task_id: 'next-X',
+          warm_start: true,
+          agent_token: 'rotated-jwt-for-next-X',
+        }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-2',
+      priorTaskId: 't-2',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt2',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 200,
+    });
+    // The freshly-minted JWT is forwarded so the role-loop can rotate
+    // AGENT_TOKEN before the next /api/agent/claim call.
+    expect(result).toEqual({
+      action: 'claim',
+      taskId: 'next-X',
+      agentToken: 'rotated-jwt-for-next-X',
+    });
+    expect(clearIntervalSpy).toHaveBeenCalled();
+  });
+
+  it('returns claim with undefined agentToken when backend omits it (deploy mismatch)', async () => {
+    let call = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      call += 1;
+      if (call === 1) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      // Old-shape claim response — no agent_token.
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'claim', task_id: 'next-Y', warm_start: true }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-2',
+      priorTaskId: 't-2',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt2',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 200,
+    });
+    // pollForNextRole exposes the missing-token case to the caller (the
+    // role-loop) which raises reset_failed rather than silently
+    // continuing with a stale prior-task JWT.
+    expect(result).toEqual({ action: 'claim', taskId: 'next-Y' });
+    expect(result.agentToken).toBeUndefined();
+    expect(clearIntervalSpy).toHaveBeenCalled();
+  });
+
+  it('returns exit with reason on action=exit', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'another_vm_owns_this_pr' }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-3',
+      priorTaskId: 't-3',
+      priorPrNumber: 7,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt3',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 200,
+    });
+    expect(result).toEqual({ action: 'exit', reason: 'another_vm_owns_this_pr' });
+    expect(clearIntervalSpy).toHaveBeenCalled();
+  });
+
+  it('clears heartbeat interval on every return path', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
+      });
+    });
+    const before = clearIntervalSpy.mock.calls.length;
+    await pollForNextRole({
+      vmInstanceId: 'vm-4',
+      priorTaskId: 't-4',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt4',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 200,
+    });
+    expect(clearIntervalSpy.mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it('treats non-204 non-200 responses as transient and keeps polling until timeout', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({ status: 503, json: () => Promise.resolve({}) });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-5',
+      priorTaskId: 't-5',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt5',
+      pollIntervalMs: 20,
+      timeoutMs: 80,
+      heartbeatIntervalMs: 200,
+    });
+    expect(result.action).toBe('exit');
+    expect(result.reason).toBe('poll_timeout');
+  });
+
+  it('handles fetch network errors without crashing', async () => {
+    let attempts = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      attempts += 1;
+      if (attempts === 1) return Promise.reject(new Error('network failure'));
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'recovered' }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-6',
+      priorTaskId: 't-6',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt6',
+      pollIntervalMs: 10,
+      timeoutMs: 500,
+      heartbeatIntervalMs: 200,
+    });
+    expect(result).toEqual({ action: 'exit', reason: 'recovered' });
+  });
+});
+
+// ── child-PID registration in runProviderAgent / execFileAsync ───────────────
+describe('child PID registration', () => {
+  beforeEach(() => {
+    clearPidRegistry();
+  });
+
+  afterEach(() => {
+    clearPidRegistry();
+  });
+
+  it('execFileAsync registers PID at spawn and unregisters on close', async () => {
+    type ChildHandlers = { close?: (code: number, signal: NodeJS.Signals | null) => void; error?: (err: Error) => void };
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid: 9999,
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null,
+      signalCode: null,
+    };
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const promise = execFileAsync('echo', ['ok'], { timeoutMs: 100_000 });
+    // Right after spawn, before close — PID should be registered.
+    expect(_getRegisteredPids()).toContain(9999);
+
+    // Simulate clean exit so the close handler runs.
+    childHandlers.close?.(0, null);
+    await promise;
+    expect(_getRegisteredPids()).not.toContain(9999);
+  });
+
+  it('execFileAsync unregisters PID on error event', async () => {
+    type ChildHandlers = { close?: (code: number | null, signal: NodeJS.Signals | null) => void; error?: (err: Error) => void };
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid: 8888,
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null,
+      signalCode: null,
+    };
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const promise = execFileAsync('echo', ['ok'], { timeoutMs: 100_000 });
+    expect(_getRegisteredPids()).toContain(8888);
+    childHandlers.error?.(new Error('spawn failed'));
+    await promise.catch(() => undefined);
+    expect(_getRegisteredPids()).not.toContain(8888);
+  });
+
+  it('skips registration when child has no pid (spawn failure)', async () => {
+    type ChildHandlers = { close?: (code: number | null, signal: NodeJS.Signals | null) => void; error?: (err: Error) => void };
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid: undefined,
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null,
+      signalCode: null,
+    };
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const promise = execFileAsync('echo', ['ok'], { timeoutMs: 100_000 });
+    expect(_getRegisteredPids().length).toBe(0);
+    childHandlers.close?.(0, null);
+    await promise;
+    expect(_getRegisteredPids().length).toBe(0);
+  });
+});
+
+// ── runProviderAgent PID register/unregister ─────────────────────────────────
+// Issue 9 (partial): runProviderAgent uses spawn() under the hood; the close
+// AND error event paths must each unregister so the reset routine doesn't
+// chase a dead PID. Mirrors the execFileAsync coverage above but for the
+// runner-spawn path. We mock fs.existsSync false so the ./note write is
+// skipped (it's a no-op when WORKSPACE doesn't exist in this mock).
+describe('runProviderAgent PID register/unregister', () => {
+  beforeEach(() => {
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    clearPidRegistry();
+  });
+
+  it('registers PID at spawn and unregisters on close', async () => {
+    type ChildHandlers = {
+      close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+      error?: (err: Error) => void;
+    };
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid: 4242,
+      stdin: { end: vi.fn() },
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null,
+      signalCode: null,
+    };
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    // Drain microtasks so the synchronous spawn-time registerChildPid runs.
+    await Promise.resolve();
+    expect(_getRegisteredPids()).toContain(4242);
+
+    childHandlers.close?.(0, null);
+    await promise.catch(() => undefined);
+    expect(_getRegisteredPids()).not.toContain(4242);
+  });
+
+  it('unregisters PID on error event before close fires', async () => {
+    type ChildHandlers = {
+      close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+      error?: (err: Error) => void;
+    };
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid: 5252,
+      stdin: { end: vi.fn() },
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null,
+      signalCode: null,
+    };
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+    expect(_getRegisteredPids()).toContain(5252);
+
+    childHandlers.error?.(new Error('spawn failed'));
+    await promise.catch(() => undefined);
+    expect(_getRegisteredPids()).not.toContain(5252);
+  });
+});
+
+// ── clearToolTrace — Issue 2 cross-role leak guard ───────────────────────────
+describe('clearToolTrace', () => {
+  it('drains the ring buffer so subsequent snapshotToolTrace returns []', () => {
+    recordToolUse('Read', { file_path: '/tmp/a' });
+    recordToolUse('Edit', { file_path: '/tmp/b' });
+    expect(snapshotToolTrace().length).toBeGreaterThanOrEqual(2);
+
+    clearToolTrace();
+
+    expect(snapshotToolTrace()).toEqual([]);
+    expect(extractInvestigatedFiles(snapshotToolTrace())).toEqual([]);
+  });
+
+  it('survives being called when the buffer is already empty', () => {
+    clearToolTrace();
+    clearToolTrace();
+    expect(snapshotToolTrace()).toEqual([]);
+  });
+
+  it('after clear, new tool uses populate from a clean slate', () => {
+    recordToolUse('Read', { file_path: '/before/file.ts' });
+    clearToolTrace();
+    recordToolUse('Read', { file_path: '/after/file.ts' });
+    const files = extractInvestigatedFiles(snapshotToolTrace());
+    expect(files).toEqual(['/after/file.ts']);
+    expect(files).not.toContain('/before/file.ts');
+  });
+});
+
+// ── pollForNextRole 401/403 handling — Issue 14 ──────────────────────────────
+describe('pollForNextRole auth-revoked', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('exits with reason=auth_revoked when next-role returns 401', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({ status: 401, json: () => Promise.resolve({}) });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-401',
+      priorTaskId: 't-401',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'expired-jwt',
+      pollIntervalMs: 10,
+      timeoutMs: 5000,
+      heartbeatIntervalMs: 10000,
+    });
+    expect(result).toEqual({ action: 'exit', reason: 'auth_revoked' });
+  });
+
+  it('exits with reason=auth_revoked when next-role returns 403', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({ status: 403, json: () => Promise.resolve({}) });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-403',
+      priorTaskId: 't-403',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'forbidden-jwt',
+      pollIntervalMs: 10,
+      timeoutMs: 5000,
+      heartbeatIntervalMs: 10000,
+    });
+    expect(result).toEqual({ action: 'exit', reason: 'auth_revoked' });
+  });
+
+  it('exits with reason=auth_revoked when only the vm-heartbeat returns 401', async () => {
+    // next-role keeps returning 204 forever; the heartbeat path detects
+    // the 401 and the loop exits at the next iteration check. We use a
+    // long timeout so we know exit comes from the auth flag, not poll_timeout.
+    let heartbeatCount = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        heartbeatCount += 1;
+        // First heartbeat returns 401 — flips the authRevoked flag.
+        return Promise.resolve({ status: 401, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-hb-401',
+      priorTaskId: 't-hb',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'expired-jwt',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 10000,
+    });
+    expect(result).toEqual({ action: 'exit', reason: 'auth_revoked' });
+    // Sanity: heartbeat was attempted at least once (the initial fire).
+    expect(heartbeatCount).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ── getAgentHeaders — Issue 3 ───────────────────────────────────────────────
+describe('getAgentHeaders', () => {
+  it('returns headers with Content-Type and X-Agent-Token reflecting the live AGENT_TOKEN', () => {
+    const headers = getAgentHeaders();
+    expect(headers['Content-Type']).toBe('application/json');
+    // The exact AGENT_TOKEN value depends on how the test harness was started
+    // (process.env.AGENT_SECRET_TOKEN). The contract is just that the field
+    // is present with a string value — token rotation is exercised by the
+    // production tryRefreshToken path which reads back the same module-level
+    // AGENT_TOKEN variable that getAgentHeaders reads.
+    expect(typeof headers['X-Agent-Token']).toBe('string');
+    expect(Object.keys(headers).sort()).toEqual(['Content-Type', 'X-Agent-Token']);
+  });
+
+  it('returns a fresh object each call (no shared mutable reference)', () => {
+    // Callers shouldn't be able to mutate one returned headers object and
+    // affect a subsequent call's headers. Object identity must differ.
+    const h1 = getAgentHeaders();
+    const h2 = getAgentHeaders();
+    expect(h1).not.toBe(h2);
+  });
+});
+
+// ── pollForNextRole heartbeat firing pattern — Issue 4 ──────────────────────
+// Existing tests verify "heartbeat fired at least once". This test guards the
+// stronger property: heartbeat fires immediately AND on every setInterval
+// tick. A regression that drops the immediate fire (only triggers after
+// heartbeatIntervalMs) would still satisfy ">= 1" but would be wrong.
+describe('pollForNextRole vm-heartbeat timing', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('fires once immediately and then on each heartbeat interval tick', async () => {
+    let heartbeatCount = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      // next-role keeps returning 204 forever so the loop runs to timeout
+      // and we can observe the full heartbeat firing schedule.
+      return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+    });
+
+    // Real timers + a generous wall-clock window. Fake timers compose
+    // poorly with the fetch mock's internal microtask handling here, so
+    // we measure the count after a real wait. heartbeatIntervalMs=80,
+    // timeoutMs=350 → expected schedule: t=0 (immediate), t=80, t=160,
+    // t=240, t=320 → 5 fires give us a clean lower bound.
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-rev-u',
+      priorTaskId: 't-rev-u',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-rev-u',
+      pollIntervalMs: 25,
+      timeoutMs: 350,
+      heartbeatIntervalMs: 80,
+    });
+    expect(result.action).toBe('exit');
+    expect(result.reason).toBe('poll_timeout');
+
+    // The immediate fire alone gives us 1. Each setInterval tick at 80ms
+    // adds another. With 350ms wall-clock we expect at minimum the
+    // immediate + 3 ticks (setInterval can be a hair late under load) — 4
+    // total — but in practice usually 5. Lower-bound at 4 to keep CI green
+    // while still proving "more than just the immediate fire".
+    expect(heartbeatCount).toBeGreaterThanOrEqual(4);
+  });
+
+  it('immediate vm-heartbeat fires synchronously before the first poll tick', async () => {
+    // Structural property: the IIFE that does the immediate fire is called
+    // on the synchronous portion of pollForNextRole's setup, so by the time
+    // the first poll-tick await yields, fetchMock should already have one
+    // heartbeat call in its queue. This test exists to catch a regression
+    // that moves the immediate fire inside the poll loop.
+    let heartbeatCount = 0;
+    let nextRoleCount = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      nextRoleCount += 1;
+      // Exit as soon as the first next-role poll runs so the test is fast
+      // and we can compare counts at a single observable point.
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
+      });
+    });
+
+    await pollForNextRole({
+      vmInstanceId: 'vm-imm',
+      priorTaskId: 't-imm',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-imm',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      // Make the interval-fire path practically inactive so any heartbeat
+      // observed must have come from the immediate-fire IIFE.
+      heartbeatIntervalMs: 60_000,
+    });
+
+    expect(nextRoleCount).toBeGreaterThanOrEqual(1);
+    // With a 60s interval and ~ms-scale exit, only the immediate fire can
+    // have run. Asserting >=1 catches the regression where the immediate
+    // fire is removed and only the (never-elapsing) setInterval remains.
+    expect(heartbeatCount).toBeGreaterThanOrEqual(1);
   });
 });

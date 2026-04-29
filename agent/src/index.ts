@@ -5,6 +5,8 @@ import fs from 'fs';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
+import { registerChildPid, unregisterChildPid } from './processTracking.js';
+import { resetForNextRole } from './reset.js';
 import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
@@ -19,7 +21,7 @@ import {
 } from './constants.js';
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed';
 type ProviderName = 'anthropic' | 'openai' | 'gemini';
 type AuthMode = 'oauth' | 'api_key' | 'service_account';
 type OutputMode = 'claude-stream-json' | 'text';
@@ -251,6 +253,12 @@ export const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
 
 /** Get the current agent token (may have been refreshed since startup). */
 export function getAgentToken(): string { return AGENT_TOKEN; }
+
+/** Get the current API headers (Content-Type + X-Agent-Token). Always reads
+ *  the live AGENT_TOKEN, so callers don't need to guard against rotation. */
+export function getAgentHeaders(): Record<string, string> {
+  return { 'Content-Type': 'application/json', 'X-Agent-Token': AGENT_TOKEN };
+}
 
 const apiHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
@@ -518,13 +526,76 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
   return result;
 }
 
+// Phase 0 telemetry — start-of-role timestamp captured by main() after a
+// successful claim and reset at the start of each warm role. Used by
+// enrichStatusPayload to derive setup_secs from firstToolUseAt.
+let roleClaimTimestamp: number | null = null;
+
+// Phase 0 telemetry — claim → handler-complete elapsed seconds. Captured at
+// the success path of runRoleOnce() right after the handler returns; rides on
+// the next status payload via enrichStatusPayload. Reset to null between
+// roles in the role-loop telemetry-reset block. Stays null on failure paths
+// so the backend doesn't conflate fatal-error duration with completion time.
+let handlerDurationSecsForPayload: number | null = null;
+
+/** Test-only: seed the role-claim timestamp so a test can simulate
+ *  timing without going through main(). */
+export function _setRoleClaimTimestampForTesting(value: number | null): void {
+  roleClaimTimestamp = value;
+}
+
+/** Test-only: read the role-claim timestamp. */
+export function _getRoleClaimTimestampForTesting(): number | null {
+  return roleClaimTimestamp;
+}
+
+/** Test-only: seed the handler-duration value so a test can simulate the
+ *  post-handler capture without invoking the full role-loop. */
+export function _setHandlerDurationForTesting(value: number | null): void {
+  handlerDurationSecsForPayload = value;
+}
+
+/** Test-only: read the handler-duration value. */
+export function _getHandlerDurationForTesting(): number | null {
+  return handlerDurationSecsForPayload;
+}
+
+function computeSetupSecs(): number | null {
+  if (roleClaimTimestamp === null || firstToolUseAt === null) return null;
+  const diff = (firstToolUseAt - roleClaimTimestamp) / 1000;
+  // Defensive: never report negative setup_secs (clock skew, mis-ordered timestamps).
+  return diff >= 0 ? diff : null;
+}
+
 function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): Record<string, unknown> {
+  // Phase 0 telemetry: setup_secs (claim → first tool use), warm_start, and
+  // prior_role_vm_id ride along on every status payload. The backend's
+  // task_lifecycle.py persists them under task.context["_timing"] when
+  // present and ignores them otherwise. Compute eagerly so the shape is
+  // stable across cold/warm/failed roles.
+  const telemetry: Record<string, unknown> = {};
+  const setupSecs = computeSetupSecs();
+  if (setupSecs !== null) telemetry.setup_secs = setupSecs;
+  // handler_duration_secs is captured by runRoleOnce after the handler returns
+  // successfully; null on failure paths so a fatal-error duration doesn't get
+  // logged as completion time.
+  if (handlerDurationSecsForPayload !== null) {
+    telemetry.handler_duration_secs = handlerDurationSecsForPayload;
+  }
+  // warm_start is a meaningful boolean even when false (cold roles); always
+  // emit so the backend can distinguish "missing" from "explicitly false".
+  telemetry.warm_start = isWarmStart;
+  // prior_role_vm_id is the VM that ran the prior role. On a warm VM that's
+  // ourselves (the same VM ran the prior role and is now running this one).
+  // On cold roles there is no prior, so we send null.
+  telemetry.prior_role_vm_id = isWarmStart ? (process.env.VM_INSTANCE_ID || null) : null;
   return {
     provider: PROVIDER,
     auth_mode: AUTH_MODE,
     model: process.env.LLM_MODEL || undefined,
     execution_mode: LLM_EXECUTION_MODE,
     task_id: taskId,
+    ...telemetry,
     ...payload,
     ...statusFlagsForTask(taskId),
   };
@@ -567,6 +638,181 @@ export function log(msg: string) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+// ── Warm-VM continuity polling (Phase 2a) ───────────────────────────────────
+// pollForNextRole is the agent-side counterpart to the backend's
+// /api/agent/next-role + /api/agent/vm-heartbeat endpoints. After a role
+// finishes successfully, the agent calls this function instead of exiting.
+// It polls the orchestrator for a warm-pinned QUEUED task targeting our VM,
+// firing vm-heartbeat keepalives in parallel so the reaper doesn't kill us
+// during the poll window. Returns either a claim (next task to run) or an
+// exit (no more roles in this chain).
+//
+// The agent reads neither warm_continuity_enabled nor next_role_poll_timeout_secs
+// — the backend gates the feature; the agent just calls the endpoints and
+// honours whatever response shape comes back. The only knob agents see is
+// the poll timeout default (180s), which matches the backend default.
+
+export interface PollResult {
+  action: 'claim' | 'exit';
+  taskId?: string;
+  reason?: string;
+  // On a warm-start claim the backend mints a fresh JWT scoped to the new
+  // task. The agent must rotate AGENT_TOKEN to this value before any
+  // subsequent task-scoped call (status updates, github proxy, claim
+  // idempotent-replay), since the prior task's JWT is terminal and only
+  // authenticates the idempotent next-role/vm-heartbeat paths.
+  agentToken?: string;
+}
+
+export interface PollForNextRoleOptions {
+  vmInstanceId: string;
+  priorTaskId: string;
+  priorPrNumber: number | null;
+  apiBase: string;
+  agentJwt: string;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  heartbeatIntervalMs?: number;
+}
+
+export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<PollResult> {
+  const {
+    vmInstanceId,
+    priorTaskId,
+    priorPrNumber,
+    apiBase,
+    agentJwt,
+    pollIntervalMs = 5000,
+    timeoutMs = 180_000,
+    heartbeatIntervalMs = 30_000,
+  } = opts;
+
+  const start = Date.now();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Agent-Token': agentJwt,
+  };
+
+  // Shared revoke flag — set by either heartbeat path or next-role path on
+  // an explicit 401/403 from the backend. Polling without a valid JWT just
+  // burns the timeout, so we exit fast and let the orchestrator cold-
+  // provision a fresh VM with a freshly minted token.
+  // Wrapper object: type-narrowing in TypeScript can't see through async
+  // closures that mutate a let-bound boolean, so the unnecessary-condition
+  // rule fires false-positively. A field-on-object dodges that limitation.
+  const authState: { revoked: boolean } = { revoked: false };
+
+  // VM-heartbeat keepalive — runs in parallel with the poll loop so the
+  // reaper sees this VM as alive even though the task heartbeat stopped
+  // when the prior role completed. setInterval, NOT setTimeout-recursion,
+  // so a slow heartbeat call doesn't accumulate latency into the poll.
+  const heartbeatTimer = setInterval(() => {
+    void (async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ vm_instance_id: vmInstanceId }),
+        });
+        if (res.status === 401 || res.status === 403) {
+          log(`pollForNextRole vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
+          authState.revoked = true;
+        }
+      } catch (e) {
+        log(`pollForNextRole vm-heartbeat error: ${String(e)}`);
+      }
+    })();
+  }, heartbeatIntervalMs);
+
+  // Single fire-and-forget initial heartbeat so we don't wait
+  // heartbeatIntervalMs for the first liveness signal — the next-role poll
+  // itself records liveness backend-side, but explicit heartbeat is the
+  // documented contract.
+  void (async () => {
+    try {
+      const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ vm_instance_id: vmInstanceId }),
+      });
+      if (res.status === 401 || res.status === 403) {
+        log(`pollForNextRole initial vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
+        authState.revoked = true;
+      }
+    } catch (e) {
+      log(`pollForNextRole initial vm-heartbeat error: ${String(e)}`);
+    }
+  })();
+
+  try {
+    while (Date.now() - start < timeoutMs) {
+      if (authState.revoked) {
+        return { action: 'exit', reason: 'auth_revoked' };
+      }
+      try {
+        const res = await fetch(`${apiBase}/api/agent/next-role`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            vm_instance_id: vmInstanceId,
+            prior_task_id: priorTaskId,
+            prior_pr_number: priorPrNumber,
+          }),
+        });
+        // 401/403 — JWT revoked or otherwise rejected. Polling further is
+        // hopeless; exit so the orchestrator can cold-provision with fresh
+        // creds. We treat this as terminal even on the first iteration.
+        if (res.status === 401 || res.status === 403) {
+          log(`pollForNextRole next-role got ${String(res.status)} — auth revoked, exiting`);
+          return { action: 'exit', reason: 'auth_revoked' };
+        }
+        // 204 No Content — keep polling.
+        if (res.status === 204) {
+          await new Promise(r => setTimeout(r, pollIntervalMs));
+          continue;
+        }
+        // 200 OK with a JSON body that selects claim or exit.
+        if (res.status === 200) {
+          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string } = {};
+          try {
+            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string };
+          } catch (e) {
+            log(`pollForNextRole: 200 with unparseable body: ${String(e)}`);
+            await new Promise(r => setTimeout(r, pollIntervalMs));
+            continue;
+          }
+          if (body.action === 'claim' && typeof body.task_id === 'string') {
+            return {
+              action: 'claim',
+              taskId: body.task_id,
+              agentToken: typeof body.agent_token === 'string' ? body.agent_token : undefined,
+            };
+          }
+          if (body.action === 'exit') {
+            return { action: 'exit', reason: body.reason };
+          }
+          log(`pollForNextRole: 200 with unrecognised action=${String(body.action)}`);
+          await new Promise(r => setTimeout(r, pollIntervalMs));
+          continue;
+        }
+        // Other non-2xx — treat as transient, log and keep polling.
+        log(`pollForNextRole: HTTP ${String(res.status)} — continuing to poll`);
+        await new Promise(r => setTimeout(r, pollIntervalMs));
+      } catch (e) {
+        // Network error, JSON error etc. Don't crash the agent — keep polling.
+        log(`pollForNextRole fetch error: ${String(e)}`);
+        await new Promise(r => setTimeout(r, pollIntervalMs));
+      }
+    }
+    if (authState.revoked) {
+      return { action: 'exit', reason: 'auth_revoked' };
+    }
+    return { action: 'exit', reason: 'poll_timeout' };
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
+}
+
 // ── Tool-use ring buffer ────────────────────────────────────────────────────
 // Captures the most recent tool invocations so a post-mortem on AGENT_TIMEOUT
 // reap can see what the agent was doing in the seconds before the heartbeat
@@ -577,7 +823,22 @@ type ToolTraceEntry = { t: string; tool: string; input_preview: string };
 const _toolTrace: ToolTraceEntry[] = [];
 const TOOL_TRACE_MAX = 20;
 
+// Phase 0 telemetry — first-tool-use timestamp per role. Captured by
+// recordToolUse on its first call after a fresh role starts. Reset to null
+// at the start of main() and at the start of each warm role so the next
+// role gets its own setup_secs measurement. Module-level mutable so the
+// SDK message loop (which records tool uses) doesn't need a handle to
+// per-role state.
+let firstToolUseAt: number | null = null;
+
+// Phase 0 telemetry — true when the current role was started via
+// pollForNextRole on a warm VM, false on the initial cold-start role.
+let isWarmStart = false;
+
 export function recordToolUse(toolName: string, input: unknown): void {
+  if (firstToolUseAt === null) {
+    firstToolUseAt = Date.now();
+  }
   let preview: string;
   try {
     preview = typeof input === 'string' ? input : JSON.stringify(input);
@@ -592,8 +853,41 @@ export function recordToolUse(toolName: string, input: unknown): void {
   if (_toolTrace.length > TOOL_TRACE_MAX) _toolTrace.shift();
 }
 
+/** Test-only: read the first-tool-use timestamp captured this role. */
+export function _getFirstToolUseAtForTesting(): number | null {
+  return firstToolUseAt;
+}
+
+/** Test-only: reset per-role telemetry state between cases. */
+export function _resetTelemetryForTesting(): void {
+  firstToolUseAt = null;
+  isWarmStart = false;
+}
+
+/** Test-only: set the warm-start flag (mirrors what the role loop does). */
+export function _setWarmStartForTesting(value: boolean): void {
+  isWarmStart = value;
+}
+
+/** Test-only: read the warm-start flag. */
+export function _getWarmStartForTesting(): boolean {
+  return isWarmStart;
+}
+
 export function snapshotToolTrace(): ToolTraceEntry[] {
   return _toolTrace.slice();
+}
+
+/**
+ * Clear the tool-trace ring buffer.
+ *
+ * Called between warm roles by the role-loop reset block so the next role's
+ * extractInvestigatedFiles() / heartbeat snapshot doesn't mix prior-role tool
+ * uses with current-role ones. (Without this, a fix agent's tool trace would
+ * carry over the reviewer's reads — biasing the next role's fingerprint.)
+ */
+export function clearToolTrace(): void {
+  _toolTrace.length = 0;
 }
 
 // Extract repo-relative file paths the agent looked at during a task. Used to
@@ -922,6 +1216,13 @@ export function execFileAsync(
     // spawn mock's call arguments. The actual timeout logic is handled by the
     // termTimer setInterval below.
     const proc = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true, timeout: timeoutMs } as Parameters<typeof spawn>[2]);
+    // Phase 1: register the child's PID so a reset between roles can SIGKILL
+    // a stuck test runner. Long-running by design (timeoutMs default 180s);
+    // short utility execFile calls (git log, etc.) go through execFileSync
+    // and are not tracked here.
+    if (typeof proc.pid === 'number') {
+      registerChildPid(proc.pid);
+    }
     proc.stdout!.on('data', (d: Buffer) => stdoutChunks.push(d));
     proc.stderr!.on('data', (d: Buffer) => stderrChunks.push(d));
     let timedOut = false;
@@ -947,6 +1248,9 @@ export function execFileAsync(
       const closeSignal = signal ?? null;
       clearTimeout(termTimer);
       if (killTimer) clearTimeout(killTimer);
+      if (typeof originalPid === 'number') {
+        unregisterChildPid(originalPid);
+      }
       const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
       const stderr = Buffer.concat(stderrChunks).toString('utf-8');
       if (code === 0 && closeSignal === null && !timedOut) {
@@ -972,7 +1276,14 @@ export function execFileAsync(
       }
       reject(err);
     });
-    proc.on('error', (e) => { clearTimeout(termTimer); if (killTimer) clearTimeout(killTimer); reject(e); });
+    proc.on('error', (e) => {
+      clearTimeout(termTimer);
+      if (killTimer) clearTimeout(killTimer);
+      if (typeof originalPid === 'number') {
+        unregisterChildPid(originalPid);
+      }
+      reject(e);
+    });
   });
 }
 
@@ -2450,6 +2761,13 @@ echo ""
       detached: true,
       stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],
     });
+    // Phase 1: register the child's PID so the reset routine can SIGKILL
+    // it between roles if it lingers. Unregistered on close. We track the
+    // leader PID; the timeout path already kills the whole process group
+    // via process.kill(-pid).
+    if (typeof child.pid === 'number') {
+      registerChildPid(child.pid);
+    }
     if (promptFd !== undefined) fs.closeSync(promptFd);
     if (runCommand.promptInput === 'stdin') {
       try {
@@ -2554,6 +2872,9 @@ echo ""
     child.on('error', (err) => {
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (typeof originalPid === 'number') {
+        unregisterChildPid(originalPid);
+      }
       sendLog(ws, `[error] ${err.message}\n`);
       resolve(1);
     });
@@ -2561,6 +2882,11 @@ echo ""
       const closeSignal = signal ?? null;
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      // Phase 1: unregister now that we know the child exited; reset routine
+      // doesn't need to chase a dead PID.
+      if (typeof originalPid === 'number') {
+        unregisterChildPid(originalPid);
+      }
       if (closeSignal === 'SIGKILL' && !timedOut) {
         providerKilledByOOM = true;
         const oomLine = `EOOM: ${runCommand.displayName} process received external SIGKILL before agent timeout; likely cgroup OOM\n`;
@@ -2605,6 +2931,17 @@ async function main() {
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
   log(`Agent source: ${import.meta.url}`);
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
+
+  // Cold start — ensure prepareWorkspaceForRole takes the fresh-clone path on
+  // role 1. The flag is set later by the role-loop AFTER resetForNextRole
+  // succeeds; on first boot the workspace is empty and we always cold-clone.
+  delete process.env.BLUEPRINT_WARM_HANDOFF;
+
+  // Per-role telemetry reset on cold-start. Mirrors the role-loop's warm
+  // handoff reset so a stale value from a previous process incarnation
+  // (shouldn't happen, but defensive) cannot leak into the first role's
+  // status payload.
+  handlerDurationSecsForPayload = null;
 
   // TASK_ID is baked into /etc/agent.env by the orchestrator's startup script
   // so we can post pre-claim failure heartbeats. The JWT also binds sub=task_id,
@@ -2699,9 +3036,151 @@ async function main() {
     log(`WARNING: Stale result scan failed: ${String(e)}`);
   }
 
-  // Claim task. Wrap in try/catch so a claim failure (network, 4xx, 5xx) is
-  // reported via pre-claim heartbeat rather than dying silently. Without this
-  // the task stays in PROVISIONING until the reaper times out with no evidence.
+  // ── Role loop ────────────────────────────────────────────────────────────
+  // The first iteration is a cold start — claim via /api/agent/claim and
+  // dispatch the handler. Subsequent iterations are warm: pollForNextRole
+  // returned a claim, we ran resetForNextRole, and we re-enter the loop
+  // body to claim the new task data. The PR_NUMBER threaded through the
+  // poll lets the backend scope the lookup so a stray pin doesn't claim
+  // the wrong VM.
+  let lastTaskId = '';
+  let lastPrNumber: number | null = null;
+  let lastBaseBranch: string | null = null;
+
+  // Top-level lifecycle catch — runRoleOnce throws on unrecoverable errors
+  // (claim failure, OAuth rotation failure, fatal handler exception). The
+  // outer catch reports via the existing global crash handlers which fire
+  // on the rejected promise from main().
+  try {
+    for (;;) {
+      const claimResult = await runRoleOnce({ reportPreClaimFailure });
+      lastTaskId = claimResult.taskId;
+      lastPrNumber = claimResult.prNumber;
+      lastBaseBranch = claimResult.baseBranch;
+
+      // After a successful role completion, decide whether to poll for a
+      // warm next role. process.env.VM_INSTANCE_ID is set by the orchestrator's
+      // startup script and is what the backend keys warm pinning on. Local
+      // dev and tests where it's absent skip the loop and exit normally.
+      const vmInstanceId = process.env.VM_INSTANCE_ID;
+      if (!vmInstanceId) break;
+
+      let pollResult: PollResult;
+      try {
+        pollResult = await pollForNextRole({
+          vmInstanceId,
+          priorTaskId: lastTaskId,
+          priorPrNumber: lastPrNumber,
+          apiBase: ORCHESTRATOR_URL,
+          agentJwt: AGENT_TOKEN,
+        });
+      } catch (pollErr) {
+        // Defensive — pollForNextRole has its own internal try/catch, but
+        // if a programmer error escapes it we don't want to crash the
+        // VM. Treat as exit and let the orchestrator cold-provision next.
+        log(`pollForNextRole threw: ${String(pollErr)} — exiting`);
+        break;
+      }
+      if (pollResult.action === 'exit') {
+        log(`pollForNextRole returned exit (reason=${pollResult.reason ?? 'unspecified'})`);
+        break;
+      }
+      // claim — rotate the agent token, reset, then re-enter the loop.
+      log(`Warm-claimed next role: task ${pollResult.taskId ?? ''}`);
+      // The backend mints a fresh JWT scoped to the new task as part of
+      // the next-role response. Rotate AGENT_TOKEN immediately so the
+      // upcoming runRoleOnce → /api/agent/claim idempotent-replay (and
+      // every subsequent task-scoped call) authenticates against the new
+      // task. Without rotation the prior task's terminal JWT is rejected
+      // by verify_agent_token outside the idempotent-path allowlist.
+      if (pollResult.agentToken) {
+        AGENT_TOKEN = pollResult.agentToken;
+        apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+      } else {
+        // Backend always mints one for warm claims; missing it indicates
+        // a deploy mismatch (old backend, new agent). Treat as fatal so
+        // we don't silently keep using the stale prior-task JWT.
+        const err = new Error('reset_failed: warm-claim missing agent_token in next-role response') as Error & { failureCategory?: FailureCategory };
+        err.failureCategory = 'reset_failed';
+        throw err;
+      }
+      // Pre-set TASK_ID BEFORE resetForNextRole so any crash inside reset
+      // (or this block) crash-reports against the new task, not the prior
+      // terminal one. Without this, the global crash handler reads
+      // process.env.TASK_ID == lastTaskId and the orchestrator attributes
+      // the failure to the wrong (already-completed) task.
+      if (pollResult.taskId) {
+        process.env.TASK_ID = pollResult.taskId;
+      }
+      try {
+        await resetForNextRole({
+          workspace: WORKSPACE,
+          priorTaskId: lastTaskId,
+          baseBranch: lastBaseBranch ?? undefined,
+        });
+      } catch (resetErr) {
+        const resetMsg = resetErr instanceof Error ? resetErr.message : String(resetErr);
+        log(`resetForNextRole failed: ${resetMsg}`);
+        // Surface as a typed failure so the outer catch / global crash
+        // handler tags this as reset_failed and the orchestrator knows
+        // to cold-provision rather than retry warm.
+        const err = new Error(`reset_failed: ${resetMsg}`) as Error & { failureCategory?: FailureCategory };
+        err.failureCategory = 'reset_failed';
+        throw err;
+      }
+      // Reset succeeded — flip the warm-handoff flag so handlers'
+      // prepareWorkspaceForRole reuses the workspace (preserving caches)
+      // instead of wiping + re-cloning.
+      process.env.BLUEPRINT_WARM_HANDOFF = '1';
+      // Per-role telemetry reset. The next loop iteration's runRoleOnce
+      // will set roleClaimTimestamp after a successful re-claim.
+      isWarmStart = true;
+      firstToolUseAt = null;
+      roleClaimTimestamp = null;
+      handlerDurationSecsForPayload = null;
+      // Drain the tool-trace ring buffer so the next role's
+      // extractInvestigatedFiles() and heartbeat-attached trace start clean
+      // — without this, the next agent's heartbeat surfaces prior-role tool
+      // uses and the reaper's death-trace conflates two roles' work.
+      clearToolTrace();
+    }
+  } finally {
+    // Workspace teardown happens once at process exit, not per-role —
+    // warm continuity DEPENDS on the workspace surviving across roles.
+    try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
+    log('Agent shutdown complete.');
+  }
+}
+
+// ── Per-role lifecycle (extracted so warm roles re-enter cleanly) ────────────
+//
+// Encapsulates one role end-to-end: claim → setup heartbeat + WS → fetch GH
+// creds → dispatch handler → success/failure status post → teardown
+// heartbeat + WS + per-role /tmp scratch. `main()` calls this once for the
+// initial cold role and again for each warm role discovered via
+// pollForNextRole. Returns the claimed task's id + PR number so the role
+// loop can thread them into the next /api/agent/next-role call.
+
+interface RunRoleOnceOptions {
+  reportPreClaimFailure: (reason: string) => void;
+}
+
+interface RunRoleOnceResult {
+  taskId: string;
+  prNumber: number | null;
+  /**
+   * The base branch of the just-completed task. Threaded through to the
+   * role-loop so resetForNextRole's optional fetch+rebase step (step 5) can
+   * actually run. Without this, baseBranch was always undefined and step 5
+   * was dead code in production.
+   */
+  baseBranch: string | null;
+}
+
+async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult> {
+  const { reportPreClaimFailure } = opts;
+  const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
+
   if (PRE_CLAIM_TASK_ID) {
     sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_CLAIMING: requesting task payload');
   }
@@ -2713,6 +3192,9 @@ async function main() {
     reportPreClaimFailure(`claim failed: ${errMsg}`);
     throw claimErr;
   }
+  // Phase 0 telemetry: tClaim = now. firstToolUseAt is filled in by the
+  // first recordToolUse() call after this point. setup_secs = the gap.
+  roleClaimTimestamp = Date.now();
   const taskId = strVal(task.task_id);
   process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
@@ -2723,8 +3205,30 @@ async function main() {
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
   const buildConfig = (projectMetadata?.build_config ?? {}) as Record<string, unknown>;
   // Attach buildConfig to the task object so handlers can access it via task.build_config
-  (task as Record<string, unknown>).build_config = buildConfig;
+  task.build_config = buildConfig;
   log(`Claimed task ${taskId} (type: ${taskType}): "${strVal(task.title)}"`);
+
+  // Capture pr_number for the warm-VM next-role poll. Different handlers
+  // store it under different keys (review/fix use payload.pr_number,
+  // research-plan derives it later); we read whatever is present at claim
+  // time and accept null otherwise.
+  let prNumber: number | null = null;
+  const rawPr = payload.pr_number;
+  if (typeof rawPr === 'number' && Number.isFinite(rawPr)) {
+    prNumber = rawPr;
+  } else if (typeof rawPr === 'string' && rawPr.trim() && Number.isFinite(Number(rawPr))) {
+    prNumber = Number(rawPr);
+  }
+
+  // Capture the task's base_branch so the role-loop can pass it to
+  // resetForNextRole(...) and the optional fetch+rebase step actually runs
+  // between warm roles. Default to 'main' when unspecified — matches the
+  // handlers' own strVal(payload.base_branch, 'main') fallback.
+  const rawBaseBranch = payload.base_branch;
+  const baseBranchForReset =
+    typeof rawBaseBranch === 'string' && rawBaseBranch.trim()
+      ? rawBaseBranch.trim()
+      : 'main';
 
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };
@@ -2759,6 +3263,14 @@ async function main() {
     }
     const handler = knownHandler;
     await handler(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+    // Phase 0 telemetry: t_handler_complete. Captured only on the success
+    // path so failures don't pollute the completion-duration histogram.
+    // enrichStatusPayload picks this up on the very next status post and
+    // resets between roles in the role-loop's per-role telemetry block.
+    // roleClaimTimestamp was set unconditionally above (line ~3197); the
+    // Math.max guards against any clock skew producing a negative delta.
+    const handlerDurationSecs = (Date.now() - roleClaimTimestamp) / 1000;
+    handlerDurationSecsForPayload = Math.max(0, handlerDurationSecs);
     sendLog(ws, '\nTask completed.\n');
 
   } catch (error) {
@@ -2799,18 +3311,21 @@ async function main() {
         if (attempt < 2) await new Promise(r => setTimeout(r, 10_000 * (attempt + 1)));
       }
     }
+    // Re-throw so the role loop terminates — failures don't get warm
+    // continuity; the orchestrator cold-provisions for the next role.
+    throw error;
   } finally {
     stopHeartbeat();
     if (ws) ws.close();
-    // Clean up workspace to avoid leaking tokens in git config
-    try { execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8', timeout: 30_000 }); } catch { /* ignore */ }
-    // Clean up /tmp files written by Claude Code handlers (task-specific paths)
+    // Per-role /tmp scratch cleanup. Workspace teardown happens at process
+    // exit (in main()'s outer finally) so warm continuity preserves it.
     try { fs.unlinkSync(`/tmp/agent_prompt_${taskId}.txt`); } catch { /* ignore */ }
     for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
-    log('Agent shutdown complete.');
   }
+
+  return { taskId, prNumber, baseBranch: baseBranchForReset };
 }
 
 // Global crash handlers — report errors via heartbeat before dying.

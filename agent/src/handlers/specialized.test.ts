@@ -26,6 +26,10 @@ vi.mock('../index.js', () => ({
   listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
 }));
 
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../prompt.js', () => ({
   TASK_TYPE_HINTS: {},
   getTaskTypeHints: vi.fn().mockReturnValue({}),
