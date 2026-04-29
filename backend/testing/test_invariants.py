@@ -907,6 +907,12 @@ class TestFrontendSizeGuardrails:
     def test_system_maturity_card(self):
         self._check_frontend("components/SystemMaturityCard.tsx")
 
+    def test_provider_model_breakdown_panel(self):
+        self._check_frontend("components/ProviderModelBreakdownPanel.tsx")
+
+    def test_task_duration_widget(self):
+        self._check_frontend("components/TaskDurationWidget.tsx")
+
 # ── Failure Classification Taxonomy ────────────────────────────────────────
 
 

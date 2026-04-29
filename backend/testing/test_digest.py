@@ -6452,3 +6452,128 @@ async def test_digest_active_tasks_ordered_oldest_first(client: AsyncClient, db_
     active = response.json()["active_tasks"]
     ids = [t["task_id"] for t in active]
     assert ids.index(str(older.id)) < ids.index(str(newer.id))
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_legacy_autonomous_sum(client: AsyncClient, db_session):
+    """Multiple legacy research_history entries (prs_merged only, no autonomous_prs_merged)
+    within the window: autonomous_prs_merged equals the sum of all prs_merged values."""
+    recent_ts1 = (_utcnow() - timedelta(hours=2)).isoformat()
+    recent_ts2 = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-legacy-sum",
+                "text": "Legacy sum direction",
+                "status": "active",
+                "research_history": [
+                    {"timestamp": recent_ts1, "prs_merged": 3},
+                    {"timestamp": recent_ts2, "prs_merged": 5},
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-legacy-sum"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    # Both entries lack autonomous_prs_merged → fallback sums prs_merged values (3 + 5 = 8)
+    assert dp["autonomous_prs_merged"] == 8
+    assert dp["assisted_prs_merged"] == 0
+    assert dp["prs_merged"] == 8
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_empty_history_sane_defaults(client: AsyncClient, db_session):
+    """Direction with a task created in the window but empty research_history appears in
+    direction_progress with autonomous_prs_merged=0 and cost_per_merged_pr=None."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-empty",
+                "text": "Empty history direction",
+                "status": "active",
+                "research_history": [],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Create task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"direction_id": "dir-empty"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp_list = response.json()["direction_progress"]
+    assert len(dp_list) == 1
+    dp = dp_list[0]
+    assert dp["autonomous_prs_merged"] == 0
+    assert dp["cost_per_merged_pr"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
+    client: AsyncClient, db_session
+):
+    """When autonomous_prs_merged=0 but operator_action_count>0, cost_per_merged_pr is None
+    (not zero, not infinity — division is guarded on autonomous_prs_merged)."""
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-op",
+                "text": "Operator-assisted direction",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 0,
+                        "autonomous_prs_merged": 0,
+                        "assisted_prs_merged": 2,
+                        "operator_action_count": 3,
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Research task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-op"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["autonomous_prs_merged"] == 0
+    assert dp["operator_action_count"] == 3
+    assert dp["cost_per_merged_pr"] is None
