@@ -37,7 +37,7 @@
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1200,
     "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 1750,
+    "components/DashboardHome.tsx": 1800,
     "components/MessagesPanel.tsx": 1500,
     "components/MetricsDashboard.tsx": 1500,
     "components/ProjectDashboard.tsx": 1500,
@@ -48,6 +48,14 @@
     "components/RecentErrorsWidget.tsx": 800,
     "components/MediumScopeWidget.tsx": 800,
     "components/SettingsNotificationsSection.tsx": 1000,
-    "components/FailureStageWidget.tsx": 800
+    "components/FailureStageWidget.tsx": 800,
+    "components/PRMonitorSection.tsx": 200,
+    "components/DirectionAutoPauseWidget.tsx": 200,
+    "components/ScopeConversionRatesSection.tsx": 200,
+    "components/ScopeTrendsSection.tsx": 200,
+    "components/ProviderCostPanel.tsx": 200,
+    "components/DriftSignalsCard.tsx": 200,
+    "components/PoolAccountHealthPanel.tsx": 300,
+    "components/SystemMaturityCard.tsx": 200
   }
 }

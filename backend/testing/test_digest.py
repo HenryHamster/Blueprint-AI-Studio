@@ -37,6 +37,7 @@ async def test_digest_empty_window(client: AsyncClient):
     assert response.status_code == 200
     data = response.json()
     assert data["window_hours"] == 24
+    assert data["tasks_truncated"] == False  # no tasks → well below the 5000-row cap
     assert data["completed_count"] == 0
     assert data["failed_count"] == 0
     assert data["pending_approval_count"] == 0
@@ -6049,3 +6050,84 @@ async def test_digest_calibration_fields_null_without_project(client: AsyncClien
     assert data["prediction_calibration_factor"] is None
     assert data["prediction_calibration_note"] is None
     assert data["prediction_calibration_sample_count"] is None
+
+
+# ---------------------------------------------------------------------------
+# Schema contract / ordering tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_top_level_schema_keys(client: AsyncClient):
+    """All dashboard-facing top-level keys are present; tasks_truncated is a boolean."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+    required = {
+        "window_hours", "tasks_truncated", "completed_count", "failed_count",
+        "pending_approval_count", "research_cycles", "prs_opened",
+        "active_count", "running_count", "queued_count",
+        "active_tasks", "needs_attention", "recent_failures", "recent_completions",
+        "success_rate", "trend", "narrative_summary", "total_estimated_cost_usd",
+        "migration_health", "failure_groups", "recurring_error_clusters",
+        "recurring_patterns", "direction_progress", "retry_waste_by_direction",
+        "provision_waste_cost_usd", "provision_waste_by_direction",
+        "cost_by_failure_class", "analysis_overflow_summary",
+        "total_merge_retries_saved", "merge_early_exit_count",
+        "prediction_calibration_factor", "prediction_calibration_note",
+        "prediction_calibration_sample_count",
+    }
+    missing = required - data.keys()
+    assert not missing, f"Missing dashboard keys: {missing}"
+    assert isinstance(data["tasks_truncated"], bool)
+
+
+@pytest.mark.asyncio
+async def test_digest_needs_attention_approval_before_failed(client: AsyncClient, db_session):
+    """approval_required items precede failed items in needs_attention."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id, title="Failed Task", status=TaskStatus.FAILED,
+    ))
+    db_session.add(make_task(
+        project_id=project.id, title="Approval Task", status=TaskStatus.IN_PROGRESS,
+        requires_approval=True,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    items = response.json()["needs_attention"]
+    assert len(items) == 2
+    assert items[0]["reason"] == "approval_required"
+    assert items[1]["reason"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_digest_active_tasks_ordered_oldest_first(client: AsyncClient, db_session):
+    """active_tasks are ordered oldest started_at first."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    older = make_task(
+        project_id=project.id, title="Older Task", status=TaskStatus.IN_PROGRESS,
+        started_at=_utcnow() - timedelta(hours=3),
+    )
+    newer = make_task(
+        project_id=project.id, title="Newer Task", status=TaskStatus.IN_PROGRESS,
+        started_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add_all([older, newer])
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    active = response.json()["active_tasks"]
+    ids = [t["task_id"] for t in active]
+    assert ids.index(str(older.id)) < ids.index(str(newer.id))

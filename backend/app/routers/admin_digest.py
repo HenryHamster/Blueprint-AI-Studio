@@ -1445,6 +1445,7 @@ async def _compute_digest(
         task_filters.append(Task.project_id == project_id)
 
     _DIGEST_TASK_ROW_CAP = 5000
+    _ACTIVE_TASKS_DISPLAY_LIMIT = 5
     # Project payloads[0] and status_log[-1]->>'t' SQL-side on PostgreSQL.
     # Loading the full JSONB arrays for 5000 rows blew a Cloud Run instance
     # past its 4 GiB limit under concurrent polling; with projection each
@@ -1508,7 +1509,8 @@ async def _compute_digest(
             .limit(_DIGEST_TASK_ROW_CAP)
         )
         all_tasks = list(tasks_result.scalars().all())
-    if len(all_tasks) == _DIGEST_TASK_ROW_CAP:
+    tasks_capped = len(all_tasks) == _DIGEST_TASK_ROW_CAP
+    if tasks_capped:
         logger.warning(
             "admin_digest task query hit %d-row safety cap (window=%dh, project_id=%s); digest metrics may be truncated",
             _DIGEST_TASK_ROW_CAP, hours, project_id,
@@ -2330,11 +2332,11 @@ async def _compute_digest(
             "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0),
         })
 
-    # --- active_tasks list (up to 5, oldest started first) ---
+    # --- active_tasks list (oldest started first, capped at _ACTIVE_TASKS_DISPLAY_LIMIT) ---
     _now_active = _utcnow()
     from app.review_pipeline import _max_review_iterations
     active_tasks_list = []
-    for t in active_tasks_all[:5]:
+    for t in active_tasks_all[:_ACTIVE_TASKS_DISPLAY_LIMIT]:
         at_dir_id = (t.context or {}).get("direction_id")
         at_dir_text = dir_id_to_text.get(str(at_dir_id)) if at_dir_id else None
         if t.vm_provisioned_at:
@@ -3591,6 +3593,7 @@ async def _compute_digest(
 
     return {
         "window_hours": hours,
+        "tasks_truncated": tasks_capped,
         "total_merge_retries_saved": total_merge_retries_saved,
         "first_attempt_success_rate": _first_attempt_success_rate,
         "first_review_approval_rate": _first_review_approval_rate,

@@ -879,6 +879,30 @@ class TestFrontendSizeGuardrails:
     def test_failure_stage_widget(self):
         self._check_frontend("components/FailureStageWidget.tsx")
 
+    def test_pr_monitor_section(self):
+        self._check_frontend("components/PRMonitorSection.tsx")
+
+    def test_direction_auto_pause_widget(self):
+        self._check_frontend("components/DirectionAutoPauseWidget.tsx")
+
+    def test_scope_conversion_rates_section(self):
+        self._check_frontend("components/ScopeConversionRatesSection.tsx")
+
+    def test_scope_trends_section(self):
+        self._check_frontend("components/ScopeTrendsSection.tsx")
+
+    def test_provider_cost_panel(self):
+        self._check_frontend("components/ProviderCostPanel.tsx")
+
+    def test_drift_signals_card(self):
+        self._check_frontend("components/DriftSignalsCard.tsx")
+
+    def test_pool_account_health_panel(self):
+        self._check_frontend("components/PoolAccountHealthPanel.tsx")
+
+    def test_system_maturity_card(self):
+        self._check_frontend("components/SystemMaturityCard.tsx")
+
 # ── Failure Classification Taxonomy ────────────────────────────────────────
 
 

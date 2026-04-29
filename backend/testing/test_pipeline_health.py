@@ -466,6 +466,79 @@ async def test_dominant_dropout_stage_none_when_all_zeros():
     )
 
 
+@pytest.mark.asyncio
+async def test_direction_stats_sorted_by_cycles_descending():
+    """direction_stats are ordered highest-cycles first so dashboard shows busiest directions at top."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    dir_a = str(uuid.uuid4())
+    dir_b = str(uuid.uuid4())
+
+    project = make_project(directions=[
+        {
+            "id": dir_a, "status": "active",
+            "research_history": [{"timestamp": (now - timedelta(hours=3)).isoformat(), "prs_merged": 1, "tasks_created": 3}],
+        },
+        {
+            "id": dir_b, "status": "active",
+            "research_history": [{"timestamp": (now - timedelta(hours=3)).isoformat(), "prs_merged": 0, "tasks_created": 1}],
+        },
+    ])
+    tasks = [
+        # dir_a: 3 completed research cycles
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
+                  context={"direction_id": dir_a}, created_at=now - timedelta(hours=2)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
+                  context={"direction_id": dir_a}, created_at=now - timedelta(hours=4)),
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
+                  context={"direction_id": dir_a}, created_at=now - timedelta(hours=6)),
+        # dir_b: 1 completed research cycle
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
+                  context={"direction_id": dir_b}, created_at=now - timedelta(hours=5)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 2
+    assert stats[0]["direction_id"] == dir_a, "Direction with more cycles should be first"
+    assert stats[0]["cycles"] == 3
+    assert stats[1]["direction_id"] == dir_b
+    assert stats[1]["cycles"] == 1
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_entry_shape_pinned():
+    """Each direction_stats entry exposes all dashboard-facing keys."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    project = make_project(directions=[{
+        "id": direction_id, "status": "active",
+        "possibly_saturated": True, "possibly_complete": False,
+        "completion_criteria": "done", "category": "reliability",
+        "research_history": [{"timestamp": (now - timedelta(hours=2)).isoformat(), "prs_merged": 1, "tasks_created": 2, "prs_rejected": 1}],
+    }])
+    tasks = [
+        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
+                  context={"direction_id": direction_id}, created_at=now - timedelta(hours=1)),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    entry = result["direction_stats"][0]
+    expected_keys = {
+        "direction_id", "cycles", "possibly_saturated", "conversion_rate",
+        "dominant_dropout_stage", "completion_criteria", "possibly_complete",
+        "category", "acceptance_rate",
+    }
+    missing = expected_keys - entry.keys()
+    assert not missing, f"direction_stats entry missing keys: {missing}"
+
+
 # ── First-review approval rate ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -530,6 +603,23 @@ async def test_first_review_approval_rate_none_when_no_eligible_tasks():
     fra = result["first_review_approval_rate"]
     assert fra["overall"] is None
     assert fra["sample_size"] == 0
+
+
+@pytest.mark.asyncio
+async def test_first_review_approval_rate_shape_pinned():
+    """first_review_approval_rate always exposes all dashboard-facing sub-keys."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    fra = result["first_review_approval_rate"]
+    expected_keys = {
+        "overall", "sample_size", "by_type", "by_scope",
+        "with_playbook", "without_playbook",
+        "with_measurements", "without_measurements",
+    }
+    missing = expected_keys - fra.keys()
+    assert not missing, f"first_review_approval_rate missing keys: {missing}"
 
 
 # ── Return structure ──────────────────────────────────────────────────────────
