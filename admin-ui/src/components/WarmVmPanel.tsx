@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
-import { API_BASE_URL, authGet } from '../api';
+import { API_BASE_URL, apiFetch, authGet } from '../api';
 import type { WarmVmStateResponse, WarmVmRow } from '../types/warmVm';
 
 const POLL_INTERVAL_MS = 10_000;
@@ -41,33 +41,65 @@ export function WarmVmPanel({ onViewTask }: Props) {
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(STORAGE_KEY) === 'true');
   const [data, setData] = useState<WarmVmStateResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [flipping, setFlipping] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/warm-vm-state`);
+      if (!res.ok) {
+        setError(`HTTP ${res.status}`);
+        return;
+      }
+      setData(await res.json() as WarmVmStateResponse);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await authGet(`${API_BASE_URL}/api/admin/warm-vm-state`);
-        if (cancelled) return;
-        if (!res.ok) {
-          setError(`HTTP ${res.status}`);
-          return;
-        }
-        setData(await res.json() as WarmVmStateResponse);
-        setError(null);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      }
-    };
-    void load();
-    const id = setInterval(load, POLL_INTERVAL_MS);
+    const wrapped = async () => { if (!cancelled) await load(); };
+    void wrapped();
+    const id = setInterval(wrapped, POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(id); };
-  }, []);
+  }, [load]);
 
   const toggle = () => {
     const next = !collapsed;
     setCollapsed(next);
     localStorage.setItem(STORAGE_KEY, String(next));
   };
+
+  const flipFlag = useCallback(async (currentValue: boolean) => {
+    const target = !currentValue;
+    const verb = target ? 'ENABLE' : 'DISABLE';
+    const ok = window.confirm(
+      `${verb} warm-VM continuity globally?\n\n` +
+      `Current: ${currentValue ? 'enabled' : 'disabled'}\n` +
+      `New:     ${target ? 'enabled' : 'disabled'}\n\n` +
+      `Effect propagates within ~15s via runtime-config sync. ` +
+      `Existing roles finish on whichever path they started.`
+    );
+    if (!ok) return;
+    setFlipping(true);
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/settings`, {
+        method: 'PATCH',
+        body: JSON.stringify({ warm_continuity_enabled: target }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '');
+        setError(`Toggle failed: HTTP ${res.status} ${detail.slice(0, 200)}`);
+      } else {
+        await load();
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlipping(false);
+    }
+  }, [load]);
 
   const vmCount = data?.active_vms.length ?? 0;
   const warmChains = data?.warm_pin_metrics.active_warm_chains ?? 0;
@@ -78,7 +110,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
 
   return (
     <div className="mb-3 shrink-0">
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <button
           onClick={toggle}
           className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
@@ -86,24 +118,41 @@ export function WarmVmPanel({ onViewTask }: Props) {
           {collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
           <Server className="w-3 h-3" />
           VM Fleet
-          <span
-            className={
-              flagOn
-                ? 'ml-1 bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 text-[10px] font-bold px-1.5 py-0.5 rounded leading-none'
-                : 'ml-1 bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 text-[10px] font-bold px-1.5 py-0.5 rounded leading-none'
-            }
-            title={flagOn ? 'warm_continuity_enabled = true' : 'warm_continuity_enabled = false (cold-only)'}
-          >
-            {flagOn ? 'WARM' : 'COLD'}
-          </span>
+        </button>
+        <button
+          onClick={() => { void flipFlag(flagOn); }}
+          disabled={flipping || !data}
+          className={
+            (flagOn
+              ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30'
+              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+            ) +
+            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
+            (!data ? ' opacity-50 cursor-not-allowed' : '')
+          }
+          title={
+            flipping
+              ? 'flipping…'
+              : (flagOn
+                  ? 'Click to DISABLE warm-VM continuity (will be cold-only)'
+                  : 'Click to ENABLE warm-VM continuity globally')
+          }
+        >
+          {flipping ? '…' : (flagOn ? 'WARM' : 'COLD')}
+        </button>
+        <button
+          onClick={toggle}
+          className="flex items-center gap-2 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+        >
           {warmChains > 0 && (
-            <span className="ml-1 bg-orange-500/20 border border-orange-500/40 text-orange-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
+            <span className="bg-orange-500/20 border border-orange-500/40 text-orange-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
               <Flame className="w-2.5 h-2.5" />
               {warmChains} chain{warmChains !== 1 ? 's' : ''}
             </span>
           )}
           {overThreshold && (
-            <span className="ml-1 bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
+            <span className="bg-red-500/20 border border-red-500/40 text-red-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
               <AlertTriangle className="w-2.5 h-2.5" />
               {clearsHour} clears/hr
             </span>

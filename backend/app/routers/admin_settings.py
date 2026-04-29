@@ -122,6 +122,8 @@ async def get_settings(
         "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
         "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
         "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
+        "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
+        "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
         "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
         "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
@@ -288,6 +290,19 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 720):
             raise HTTPException(status_code=400, detail="residual_remediation_cooldown_hours must be between 1 and 720")
         _runtime_config["residual_remediation_cooldown_hours"] = val
+    if "warm_continuity_enabled" in payload:
+        val = payload["warm_continuity_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(status_code=400, detail="warm_continuity_enabled must be a boolean")
+        _runtime_config["warm_continuity_enabled"] = val
+    if "next_role_poll_timeout_secs" in payload:
+        try:
+            val = int(payload["next_role_poll_timeout_secs"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="next_role_poll_timeout_secs must be a number")
+        if not (30 <= val <= 600):
+            raise HTTPException(status_code=400, detail="next_role_poll_timeout_secs must be between 30 and 600")
+        _runtime_config["next_role_poll_timeout_secs"] = val
     if "provider_tier_model_map" in payload:
         val = payload["provider_tier_model_map"]
         if not isinstance(val, dict):
@@ -794,6 +809,8 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
                     "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
                     "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
+                    "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
+                    "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "RESIDUAL_FIX_ESCALATED"],

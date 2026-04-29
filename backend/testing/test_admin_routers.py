@@ -1145,6 +1145,40 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_warm_continuity_enabled(self, client: AsyncClient):
+        """warm_continuity_enabled accepts booleans and rejects non-booleans; round-trips on GET."""
+        resp = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": True})
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["warm_continuity_enabled"] is True
+
+        resp = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": False})
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["warm_continuity_enabled"] is False
+
+        # Reject non-booleans (truthy strings/ints must NOT silently flip the flag).
+        bad = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": "true"})
+        assert bad.status_code == 400
+        bad2 = await client.patch("/api/admin/settings", json={"warm_continuity_enabled": 1})
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_next_role_poll_timeout_secs(self, client: AsyncClient):
+        """next_role_poll_timeout_secs accepts ints in [30,600] and rejects out-of-range / non-numeric."""
+        resp = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": 240})
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["next_role_poll_timeout_secs"] == 240
+
+        bad_low = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": 29})
+        assert bad_low.status_code == 400
+        bad_high = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": 601})
+        assert bad_high.status_code == 400
+        bad_str = await client.patch("/api/admin/settings", json={"next_role_poll_timeout_secs": "x"})
+        assert bad_str.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_valid_notification_config(self, client: AsyncClient):
         """PATCH with a valid notification_config is accepted."""
         resp = await client.patch("/api/admin/settings", json={
