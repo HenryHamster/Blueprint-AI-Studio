@@ -387,6 +387,25 @@ class Task(SQLModel, table=True):
             postgresql_where=text("archived = false"),
             sqlite_where=text("archived = false"),
         ),
+        # Composite indexes for reaper + claim hot paths (audit 2026-04-29
+        # Phase E1 / findings M-P2, M-P3). Both partial on Postgres so the
+        # index pages stay small (terminal/top-level rows excluded). The
+        # alembic 0064 migration creates them CONCURRENTLY on Postgres;
+        # the metadata Index entries here register the names + column
+        # references for the test_model_indexes_covered_by_migrations
+        # invariant.
+        Index(
+            "ix_task_status_last_heartbeat",
+            "status",
+            "last_heartbeat",
+            postgresql_where=text("status IN ('IN_PROGRESS', 'PROVISIONING')"),
+        ),
+        Index(
+            "ix_task_parent_task_id_status",
+            "parent_task_id",
+            "status",
+            postgresql_where=text("parent_task_id IS NOT NULL"),
+        ),
         # Defense-in-depth size cap on payloads JSONB (audit 2026-04-29 D4 /
         # finding M-S5). The Python layer's ``pack_under_budget`` already caps
         # strategic-spawn payloads at 120 KB, but a future code path could

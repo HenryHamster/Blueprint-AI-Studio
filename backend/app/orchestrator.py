@@ -491,69 +491,141 @@ async def _persist_zone_health():
         logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
-async def _persist_anomaly_state():
-    """Snapshot anomaly detection state to DB so occurrence counts survive restarts."""
+def _serialize_anomaly_snapshot() -> dict:
+    """Build the anomaly-state snapshot from in-memory shared_state."""
+    serializable_anomalies: dict = {}
+    for proj_id, proj_anomalies in _shared_state.persistent_anomalies.items():
+        serializable_anomalies[proj_id] = {}
+        for k, v in proj_anomalies.items():
+            serializable_anomalies[proj_id][k] = {
+                fk: fv.isoformat() if isinstance(fv, datetime) else fv
+                for fk, fv in v.items()
+            }
+    return {
+        "persistent_anomalies": serializable_anomalies,
+        "anomaly_adjustments": dict(_shared_state.anomaly_adjustments),
+    }
+
+
+def _serialize_direction_streaks_snapshot() -> dict:
+    """Build the direction-streak snapshot from in-memory shared_state."""
+    return {
+        direction_id: {
+            k: v.isoformat() if isinstance(v, datetime) else v
+            for k, v in streak.items()
+        }
+        for direction_id, streak in _shared_state.direction_failure_streaks.items()
+    }
+
+
+def _serialize_pipeline_events_snapshot() -> dict:
+    """Build the pipeline-events snapshot from in-memory shared_state."""
+    events_list = [
+        {k: v.isoformat() if isinstance(v, datetime) else v for k, v in e.items()}
+        for e in _shared_state.deploy_monitoring["pipeline_events"]
+    ]
+    return {"events": events_list}
+
+
+async def _persist_anomaly_state(session: AsyncSession | None = None):
+    """Snapshot anomaly detection state to DB so occurrence counts survive restarts.
+
+    If ``session`` is provided, mutates ``DeploymentState`` on that session and
+    leaves the commit to the caller (lets the orchestrator coalesce multiple
+    persist calls into one round-trip — see M-P6). When called without a
+    session, opens its own session and commits, preserving the legacy
+    fire-and-forget contract used by tests.
+    """
     from app.deploy_health import _get_deploy_state_for_update
     try:
-        serializable_anomalies = {}
-        for proj_id, proj_anomalies in _shared_state.persistent_anomalies.items():
-            serializable_anomalies[proj_id] = {}
-            for k, v in proj_anomalies.items():
-                serializable_anomalies[proj_id][k] = {
-                    fk: fv.isoformat() if isinstance(fv, datetime) else fv
-                    for fk, fv in v.items()
-                }
-        adjustments = dict(_shared_state.anomaly_adjustments)
-        snapshot = {
-            "persistent_anomalies": serializable_anomalies,
-            "anomaly_adjustments": adjustments,
-        }
-        async with AsyncSessionLocal() as session:
+        snapshot = _serialize_anomaly_snapshot()
+        if session is not None:
             state = await _get_deploy_state_for_update(session)
             if state:
                 state.persistent_anomaly_state = snapshot
                 session.add(state)
-                await session.commit()
+            return
+        async with AsyncSessionLocal() as new_session:
+            state = await _get_deploy_state_for_update(new_session)
+            if state:
+                state.persistent_anomaly_state = snapshot
+                new_session.add(state)
+                await new_session.commit()
     except Exception as e:
         logger.warning(f"[ANOMALY STATE] Failed to persist: {e}", exc_info=True)
 
 
-async def _persist_direction_streaks():
-    """Snapshot direction failure streaks to DB so holds survive restarts."""
+async def _persist_direction_streaks(session: AsyncSession | None = None):
+    """Snapshot direction failure streaks to DB so holds survive restarts.
+
+    See :func:`_persist_anomaly_state` for the optional-session contract.
+    """
     from app.deploy_health import _get_deploy_state_for_update
     try:
-        serializable = {}
-        for direction_id, streak in _shared_state.direction_failure_streaks.items():
-            serializable[direction_id] = {
-                k: v.isoformat() if isinstance(v, datetime) else v
-                for k, v in streak.items()
-            }
-        async with AsyncSessionLocal() as session:
+        serializable = _serialize_direction_streaks_snapshot()
+        if session is not None:
             state = await _get_deploy_state_for_update(session)
             if state:
                 state.direction_streak_state = serializable
                 session.add(state)
-                await session.commit()
+            return
+        async with AsyncSessionLocal() as new_session:
+            state = await _get_deploy_state_for_update(new_session)
+            if state:
+                state.direction_streak_state = serializable
+                new_session.add(state)
+                await new_session.commit()
     except Exception as e:
         logger.warning(f"[DIRECTION STREAKS] Failed to persist: {e}", exc_info=True)
 
 
-async def _persist_pipeline_events():
-    """Snapshot pipeline events ring buffer to DB so alert windows survive restarts."""
+async def _persist_pipeline_events(session: AsyncSession | None = None):
+    """Snapshot pipeline events ring buffer to DB so alert windows survive restarts.
+
+    See :func:`_persist_anomaly_state` for the optional-session contract.
+    """
     from app.deploy_health import _get_deploy_state_for_update
     try:
-        events_list = [
-            {k: v.isoformat() if isinstance(v, datetime) else v for k, v in e.items()}
-            for e in _shared_state.deploy_monitoring["pipeline_events"]
-        ]
+        snapshot = _serialize_pipeline_events_snapshot()
+        if session is not None:
+            state = await _get_deploy_state_for_update(session)
+            if state:
+                state.pipeline_events_state = snapshot
+                session.add(state)
+            return
+        async with AsyncSessionLocal() as new_session:
+            state = await _get_deploy_state_for_update(new_session)
+            if state:
+                state.pipeline_events_state = snapshot
+                new_session.add(state)
+                await new_session.commit()
+    except Exception as e:
+        logger.warning(f"[PIPELINE EVENTS] Failed to persist: {e}", exc_info=True)
+
+
+async def _persist_self_healing_state_bundle():
+    """Coalesced 60s snapshot of anomaly + direction-streak + pipeline-events state.
+
+    All three live on the same ``DeploymentState`` row, so we open one session,
+    take the row lock once via ``_get_deploy_state_for_update``, mutate the
+    three columns, and commit once. Replaces three separate session/commit
+    cycles per orchestrator tick (M-P6).
+    """
+    from app.deploy_health import _get_deploy_state_for_update
+    try:
+        anomaly_snapshot = _serialize_anomaly_snapshot()
+        direction_snapshot = _serialize_direction_streaks_snapshot()
+        events_snapshot = _serialize_pipeline_events_snapshot()
         async with AsyncSessionLocal() as session:
             state = await _get_deploy_state_for_update(session)
             if state:
-                state.pipeline_events_state = {"events": events_list}
+                state.persistent_anomaly_state = anomaly_snapshot
+                state.direction_streak_state = direction_snapshot
+                state.pipeline_events_state = events_snapshot
                 session.add(state)
                 await session.commit()
     except Exception as e:
-        logger.warning(f"[PIPELINE EVENTS] Failed to persist: {e}", exc_info=True)
+        logger.warning(f"[SELF-HEALING STATE] Failed to persist bundle: {e}", exc_info=True)
 
 
 _CRITICAL_EXTERNAL_DEPS = ("github_api", "dispatch_api", "gcp")
@@ -809,12 +881,12 @@ async def orchestrator_worker():
                 await _persist_zone_health()
                 _last_zone_health_persist = _utcnow()
 
-            # Periodic self-healing state persist — anomaly counts, direction holds, pipeline events
+            # Periodic self-healing state persist — anomaly counts, direction holds, pipeline events.
+            # All three live on the same DeploymentState row, so coalesce into a
+            # single session/commit (M-P6) instead of three round-trips.
             global _last_anomaly_state_persist
             if (_utcnow() - _last_anomaly_state_persist).total_seconds() >= 60:
-                await _persist_anomaly_state()
-                await _persist_direction_streaks()
-                await _persist_pipeline_events()
+                await _persist_self_healing_state_bundle()
                 _last_anomaly_state_persist = _utcnow()
 
             # Independent anomaly maintenance — expires stale entries and restores

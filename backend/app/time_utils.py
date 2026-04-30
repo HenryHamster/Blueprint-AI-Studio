@@ -15,6 +15,22 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Strip tzinfo from a datetime, converting to UTC first if it was aware.
+
+    Phase D2 (alembic 0061) migrated several columns to ``DateTime(timezone=True)``
+    so reads from those columns now return tz-aware datetimes. The rest of the
+    codebase still uses naive UTC (``_utcnow()``). Use this at comparison /
+    arithmetic boundaries where one side is loaded-from-DB (potentially aware)
+    and the other is constructed Python-side (naive).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def set_retry_after(task_or_ctx, minutes: float) -> str:
     """Clamp `minutes` to [0, 30], write retry_after on the task or context.
 

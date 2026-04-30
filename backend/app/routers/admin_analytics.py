@@ -24,24 +24,31 @@ logger = logging.getLogger(__name__)
 def _derive_completed_at(t: "Task") -> datetime:
     """Return the completion timestamp from the last status_log entry, or task.created_at.
 
+    Always returns a naive UTC datetime — `task.created_at` may be TIMESTAMPTZ
+    (migration 0061) and the JSON `t` strings are written without tz, so callers
+    of this function must not mix the two without normalization.
+
     If the caller projected `status_log[-1]->>'t'` SQL-side and stashed it on
     `t._projected_completed_at_ts` (see admin_digest.py), use that instead of
     materializing the heavy `status_log` JSONB column.
     """
+    def _strip_tz(d: datetime) -> datetime:
+        return d.replace(tzinfo=None) if d.tzinfo is not None else d
+
     if hasattr(t, "_projected_completed_at_ts"):
         cached_ts = t._projected_completed_at_ts
         if cached_ts:
             try:
-                return datetime.fromisoformat(cached_ts)
+                return _strip_tz(datetime.fromisoformat(cached_ts))
             except (TypeError, ValueError):
                 pass
-        return t.created_at
+        return _strip_tz(t.created_at)
     if t.status_log:
         try:
-            return datetime.fromisoformat(t.status_log[-1]["t"])
+            return _strip_tz(datetime.fromisoformat(t.status_log[-1]["t"]))
         except (KeyError, ValueError):
             pass
-    return t.created_at
+    return _strip_tz(t.created_at)
 
 
 ON_DEMAND_RATE = 0.067 / 3600  # $/sec

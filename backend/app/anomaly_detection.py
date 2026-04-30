@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from sqlalchemy import cast, or_
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -1148,12 +1150,16 @@ async def _count_active_proactive_investigations(session: AsyncSession) -> int:
         TaskStatus.QUEUED, TaskStatus.PROVISIONING,
         TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
     )
+    # Phase E (M-P5): use JSONB containment so ``ix_task_context_gin`` is
+    # usable. The previous ``.as_string().in_(...)`` text-cast bypassed the
+    # GIN index and forced a sequential scan of all active tasks each call.
     rows = (await session.execute(
         select(Task.id).where(
             Task.status.in_(active_statuses),
             Task.payloads[0]["type"].as_string() == "investigate",
-            Task.context["diagnosis_trigger"].as_string().in_(
-                ("proactive_pattern_detection", "proactive_intra_direction")
+            or_(
+                Task.context.op("@>")(cast({"diagnosis_trigger": "proactive_pattern_detection"}, JSONB)),
+                Task.context.op("@>")(cast({"diagnosis_trigger": "proactive_intra_direction"}, JSONB)),
             ),
         )
     )).all()

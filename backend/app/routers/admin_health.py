@@ -10,6 +10,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session
+from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
     Task, TaskStatus, Project, DeploymentState, DeploymentStatus, _utcnow,
 )
@@ -35,8 +36,34 @@ async def get_health_overview(
     lookback_hours: int = Query(24, ge=1, le=720),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
-    """Return a unified health overview with top actionable issues."""
+    """Return a unified health overview with top actionable issues.
+
+    Wraps the compute path in a TTL cache with in-flight dedup so that a
+    stampede of concurrent admin UI polls (DashboardHome refreshes every
+    30s) doesn't re-execute the multi-thousand-row JSONB scan for each
+    request. Cache key is (project_id, lookback_hours) — the response does
+    not vary per user. Default TTL 15s; tune in digest_cache.
+    """
+    cache_key = ("health-overview", str(project_id) if project_id else None, lookback_hours)
+    return await cache.get_or_compute(
+        cache_key,
+        lambda: _compute_health_overview(
+            project_id=project_id,
+            lookback_hours=lookback_hours,
+            session=session,
+        ),
+    )
+
+
+async def _compute_health_overview(
+    *,
+    project_id: uuid.UUID | None,
+    lookback_hours: int,
+    session: AsyncSession,
+) -> Dict[str, Any]:
+    """Compute the unified health overview payload (cached by caller)."""
     now = _utcnow()
     actionable_issues: List[Dict[str, Any]] = []
 

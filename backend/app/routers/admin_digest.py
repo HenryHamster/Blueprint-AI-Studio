@@ -17,6 +17,7 @@ from app.notification_dispatch import dispatch_external_notification
 
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
+from app.time_utils import _to_naive_utc
 from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
     MaxPlanAccount,
@@ -1483,11 +1484,13 @@ async def _compute_digest(
         if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
     ]
     # Approval tasks use created_at (they haven't completed yet)
+    # _to_naive_utc strips tz from t.created_at (TIMESTAMPTZ since 0061) for
+    # comparison with naive window_start. See time_utils._to_naive_utc.
     approval_tasks = [
         t for t in all_tasks
         if t.requires_approval
         and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-        and t.created_at >= window_start
+        and _to_naive_utc(t.created_at) >= window_start
     ]
 
     # --- Query active tasks (not filtered by window — they may have started before it) ---
@@ -1583,7 +1586,7 @@ async def _compute_digest(
                 )
                 tasks_created_in_window = sum(
                     1 for t in tasks_for_dir
-                    if t.created_at >= window_start
+                    if _to_naive_utc(t.created_at) >= window_start
                 )
 
                 # Single pass over research_history: aggregate PR/scope/product/type/taxonomy
@@ -3061,7 +3064,8 @@ async def _compute_digest(
             continue
         completed_at = _derive_completed_at(r)
         if completed_at and inv.created_at:
-            delta = (completed_at - inv.created_at).total_seconds() / 3600.0
+            inv_created = inv.created_at.replace(tzinfo=None) if inv.created_at.tzinfo is not None else inv.created_at
+            delta = (completed_at - inv_created).total_seconds() / 3600.0
             if delta >= 0:
                 _ttr_values.append(delta)
     avg_time_to_remediation_hours = (
@@ -3156,7 +3160,7 @@ async def _compute_digest(
             continue
         elapsed_hours = None
         if t.created_at:
-            elapsed_hours = round((_now - t.created_at).total_seconds() / 3600.0, 2)
+            elapsed_hours = round((_now - _to_naive_utc(t.created_at)).total_seconds() / 3600.0, 2)
         active_investigations_detail.append({
             "task_id": str(t.id),
             "direction_id": (t.context or {}).get("direction_id"),

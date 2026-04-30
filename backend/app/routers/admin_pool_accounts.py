@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from app.auth import get_current_user
 from app.database import get_session
+from app.digest_cache import DigestCache, get_digest_cache
 from app.models import Alert, AlertSeverity, LLMAuthMode, LLMProviderName, MaxPlanAccount, Task, TaskStatus, _utcnow
 from app.providers.registry import get_provider
 from app.shared_state import limiter
@@ -195,16 +196,38 @@ _FAILURE_CLASS_BUCKET_GROUPS: dict[str, list[str]] = {
 async def get_account_health_summary(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    cache: DigestCache = Depends(get_digest_cache),
 ):
     """Per-account health summary: state, 24h completions/RL events, health score,
     7d success rate, rate-limited models with cooldown, and per-failure-class
-    task counts."""
+    task counts.
+
+    Wraps the compute path in a TTL cache with in-flight dedup so that
+    concurrent admin UI polls don't each re-execute the per-account failed-task
+    scan. Cache key is the user_id — the response varies per user because
+    summaries are filtered to the user's accounts. Default TTL 15s.
+    """
+    user_id = current_user["user_id"]
+    cache_key = ("max-plan-accounts-health", user_id)
+    return await cache.get_or_compute(
+        cache_key,
+        lambda: _compute_account_health_summary(
+            user_id=user_id, session=session,
+        ),
+    )
+
+
+async def _compute_account_health_summary(
+    *,
+    user_id: str,
+    session: AsyncSession,
+) -> Dict[str, Any]:
+    """Compute the per-account health summary payload (cached by caller)."""
     from datetime import timedelta
 
     from app.failure_classification import classify_failure
     from app.max_plan_pool import get_all_account_health_summaries
 
-    user_id = current_user["user_id"]
     now = _utcnow()
     cutoff = now - timedelta(hours=24)
 
