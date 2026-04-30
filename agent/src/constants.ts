@@ -6,6 +6,22 @@
 export const API_TIMEOUT = 30_000;
 export const API_MAX_RETRIES = 5;
 export const LOGS_MAX_LENGTH = 450_000;
+// Cap on per-attempt exponential backoff inside apiRequest.
+export const API_RETRY_BACKOFF_MAX_MS = 30_000;
+
+// Stale-result envelope (POST /api/agent/status retry persisted to disk
+// when a POST fails — file survives VM kill, replayed on next startup).
+export const STALE_RESULT_RETRY_BASE_MS = 30_000;
+export const STALE_RESULT_RETRY_MAX_MS = 30 * 60_000;
+export const STALE_RESULT_MAX_ATTEMPTS = 10;
+export const STALE_RESULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const STDERR_TAIL_BYTES = 50_000;
+
+// Subprocess lifecycle: grace window between SIGTERM and SIGKILL escalation.
+export const PROCESS_KILL_GRACE_MS = 5_000;
+
+// Log/error message tail length used in status reports.
+export const LOG_TAIL_BYTES = 5_000;
 
 // Heartbeat
 export const HEARTBEAT_INTERVAL = 30_000;

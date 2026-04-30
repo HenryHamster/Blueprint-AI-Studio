@@ -8,7 +8,10 @@ import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole } from './reset.js';
 import {
-  API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH,
+  API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
+  STALE_RESULT_RETRY_BASE_MS, STALE_RESULT_RETRY_MAX_MS,
+  STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
+  PROCESS_KILL_GRACE_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -270,11 +273,6 @@ export function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
-const STDERR_TAIL_BYTES = 50_000;
-const STALE_RESULT_RETRY_BASE_MS = 30_000;
-const STALE_RESULT_RETRY_MAX_MS = 30 * 60_000;
-const STALE_RESULT_MAX_ATTEMPTS = 10;
-const STALE_RESULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function appendBoundedTail(current: string, chunk: string, maxBytes: number): string {
   const combined = current + chunk;
@@ -316,39 +314,52 @@ async function tryRefreshToken(): Promise<boolean> {
   return false;
 }
 
-export async function apiPost(path: string, body: Record<string, unknown> = {}, retries = API_MAX_RETRIES, timeoutMs = API_TIMEOUT) {
-  // Cap logs field to avoid 422 from backend's max_length=500000 validation.
-  // A 422 is a 4xx = no retry = agent dies silently.
-  if (body.logs && typeof body.logs === 'string' && body.logs.length > LOGS_MAX_LENGTH) {
-    body = { ...body, logs: body.logs.slice(0, LOGS_MAX_LENGTH) + '\n...(truncated)' };
-  }
+/**
+ * Shared retry/auth/backoff core for orchestrator HTTP calls.
+ *
+ * Owns: per-attempt AbortController/timeout, 401 token-refresh-once retry,
+ * 429 Retry-After honoring, 4xx fail-fast, 5xx exponential backoff, and the
+ * final "failed after N retries" surface.
+ *
+ * `init()` is invoked fresh per attempt so apiHeaders mutations from a
+ * token refresh land on the next request without re-plumbing.
+ *
+ * `responseInterceptor` lets POST inject the "/api/agent/status 401 → task
+ * already terminal" success short-circuit that GET has no equivalent for.
+ * Returning a non-undefined value short-circuits with that value; throwing
+ * propagates through the outer catch where 4xx errors bail out of the loop.
+ */
+type ResponseInterceptor = (status: number, text: string) => unknown;
+
+export async function apiRequest(
+  method: string,
+  path: string,
+  init: () => RequestInit,
+  retries = API_MAX_RETRIES,
+  timeoutMs = API_TIMEOUT,
+  responseInterceptor?: ResponseInterceptor,
+): Promise<unknown> {
   let tokenRefreshed = false;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
-      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
-        method: 'POST', headers: apiHeaders, body: JSON.stringify(body), signal: controller.signal,
-      });
+      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { ...init(), signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) return await res.json() as unknown;
       const text = await res.text();
-      // 401 with "no longer active": task completed/failed — our previous POST worked.
-      // This happens when a status COMPLETED POST succeeded but the response was lost,
-      // so the agent retries and hits JWT revocation. Treat as success.
-      if (res.status === 401 && text.includes('no longer active')) {
-        if (path === '/api/agent/status') {
-          log(`POST ${path} got 401 (task terminated) — previous POST likely succeeded`);
-          return { status: 'already_terminal', task_id: body.task_id };
-        }
-        throw new Error(`POST ${path} failed (401): ${text}`);
+
+      if (responseInterceptor) {
+        const intercepted = responseInterceptor(res.status, text);
+        if (intercepted !== undefined) return intercepted;
       }
+
       // 401: attempt token refresh at most once, then retry
       if (res.status === 401) {
-        if (tokenRefreshed) throw new Error(`POST ${path} failed (401): ${text}`);
-        log(`POST ${path} got 401 — attempting token refresh`);
+        if (tokenRefreshed) throw new Error(`${method} ${path} failed (401): ${text}`);
+        log(`${method} ${path} got 401 — attempting token refresh`);
         const refreshed = await tryRefreshToken();
-        if (!refreshed) throw new Error(`POST ${path} failed (401): ${text}`);
+        if (!refreshed) throw new Error(`${method} ${path} failed (401): ${text}`);
         tokenRefreshed = true;
         continue;
       }
@@ -358,21 +369,21 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
       // 5xx handling without tripping Cloud Run ContainerError classification.
       if (res.status === 429) {
         if (attempt === retries - 1) {
-          throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+          throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
         }
         const retryAfterSec = parseInt(res.headers.get('Retry-After') || '5', 10);
-        const delayMs = Math.max(1000, Math.min(retryAfterSec * 1000, 30000));
-        log(`POST ${path} got 429 (rate-limited/locked), retrying in ${delayMs}ms`);
+        const delayMs = Math.max(1000, Math.min(retryAfterSec * 1000, API_RETRY_BACKOFF_MAX_MS));
+        log(`${method} ${path} got 429 (rate-limited/locked), retrying in ${delayMs}ms`);
         await new Promise(r => setTimeout(r, delayMs));
         continue;
       }
       // Other 4xx errors are not transient — fail immediately
       if (res.status < 500) {
-        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+        throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
       }
       // 5xx: retry if we have attempts left
       if (attempt === retries - 1) {
-        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+        throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
       }
     } catch (e) {
       // Re-throw 4xx errors and final-attempt errors immediately. 429 is
@@ -380,9 +391,36 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
       // above, which uses `continue` before this catch runs.
       if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
     }
-    await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 30000)));
+    await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, API_RETRY_BACKOFF_MAX_MS)));
   }
-  throw new Error(`POST ${path} failed after ${retries} retries`);
+  throw new Error(`${method} ${path} failed after ${retries} retries`);
+}
+
+export async function apiPost(path: string, body: Record<string, unknown> = {}, retries = API_MAX_RETRIES, timeoutMs = API_TIMEOUT) {
+  // Cap logs field to avoid 422 from backend's max_length=500000 validation.
+  // A 422 is a 4xx = no retry = agent dies silently.
+  if (body.logs && typeof body.logs === 'string' && body.logs.length > LOGS_MAX_LENGTH) {
+    body = { ...body, logs: body.logs.slice(0, LOGS_MAX_LENGTH) + '\n...(truncated)' };
+  }
+  return apiRequest(
+    'POST', path,
+    () => ({ method: 'POST', headers: apiHeaders, body: JSON.stringify(body) }),
+    retries, timeoutMs,
+    (status, text) => {
+      // 401 with "no longer active": task completed/failed — our previous POST worked.
+      // This happens when a status COMPLETED POST succeeded but the response was lost,
+      // so the agent retries and hits JWT revocation. Treat as success for status path,
+      // hard-fail (no retry) for everything else.
+      if (status === 401 && text.includes('no longer active')) {
+        if (path === '/api/agent/status') {
+          log(`POST ${path} got 401 (task terminated) — previous POST likely succeeded`);
+          return { status: 'already_terminal', task_id: body.task_id };
+        }
+        throw new Error(`POST ${path} failed (401): ${text}`);
+      }
+      return undefined;
+    },
+  );
 }
 
 /** Persist result payload to disk before POSTing status, then clean up on success.
@@ -602,36 +640,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
 }
 
 export async function apiGet(path: string, retries = API_MAX_RETRIES) {
-  let tokenRefreshed = false;
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
-      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, { headers: apiHeaders, signal: controller.signal });
-      clearTimeout(timeout);
-      if (res.ok) return await res.json() as unknown;
-      const text = await res.text();
-      // 401: attempt token refresh at most once, then retry
-      if (res.status === 401) {
-        if (tokenRefreshed) throw new Error(`GET ${path} failed (401): ${text}`);
-        log(`GET ${path} got 401 — attempting token refresh`);
-        const refreshed = await tryRefreshToken();
-        if (!refreshed) throw new Error(`GET ${path} failed (401): ${text}`);
-        tokenRefreshed = true;
-        continue;
-      }
-      if (res.status < 500) {
-        throw new Error(`GET ${path} failed (${res.status}): ${text}`);
-      }
-      if (attempt === retries - 1) {
-        throw new Error(`GET ${path} failed (${res.status}): ${text}`);
-      }
-    } catch (e) {
-      if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
-    }
-    await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, 30000)));
-  }
-  throw new Error(`GET ${path} failed after ${retries} retries`);
+  return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, API_TIMEOUT);
 }
 
 export function log(msg: string) {
@@ -1241,7 +1250,7 @@ export function execFileAsync(
         killTimer = setTimeout(() => {
           if (!processGroupStillOwned()) return;
           try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ }
-        }, 5000);
+        }, PROCESS_KILL_GRACE_MS);
       }
     }, timeoutMs);
     proc.on('close', (code, signal) => {
@@ -2320,7 +2329,7 @@ export async function testFixLoop(
     prevFingerprint = fingerprint;
     if (attempt < maxFixAttempts) {
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
-      sendLog(ws, `${phasePrefix}Tests failed (attempt ${attempt + 1}/${totalAttempts})${preExistingHint}:\n${combinedFailures.slice(-5000)}\nClaude will attempt to fix...\n`);
+      sendLog(ws, `${phasePrefix}Tests failed (attempt ${attempt + 1}/${totalAttempts})${preExistingHint}:\n${combinedFailures.slice(-LOG_TAIL_BYTES)}\nClaude will attempt to fix...\n`);
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';
       const analysisPrefix = analysisSections ? `## Module Analysis\n\n${analysisSections}\n\n` : '';
       // Broader, investigation-first prompt. The previous "These tests
@@ -2357,8 +2366,8 @@ export async function testFixLoop(
       // enough to carry a diagnostic traceback or a handful of failed
       // assertions without drowning the agent in noise.
       const fixPrompt = baselineFailures
-        ? `${analysisPrefix}${guidance}\n\nFailures to fix:\n\n${combinedFailures.slice(-5000)}${preExistingNote.slice(-1500)}`
-        : `${analysisPrefix}${guidance}\n\nAll test failures (baseline skipped — pre-existing failures are also fair game on this task):\n\n${combinedFailures.slice(-5000)}`;
+        ? `${analysisPrefix}${guidance}\n\nFailures to fix:\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}${preExistingNote.slice(-1500)}`
+        : `${analysisPrefix}${guidance}\n\nAll test failures (baseline skipped — pre-existing failures are also fair game on this task):\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}`;
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     } else {
@@ -2796,7 +2805,7 @@ echo ""
         forceKillTimer = setTimeout(() => {
           if (!processGroupStillOwned()) return;
           try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-        }, 5000);
+        }, PROCESS_KILL_GRACE_MS);
       }
     }, timeoutMs);
 
@@ -2914,7 +2923,7 @@ echo ""
   }
 
   if (exitCode !== 0) {
-    const combined = stderrBuffer + allOutput.slice(-5000);
+    const combined = stderrBuffer + allOutput.slice(-LOG_TAIL_BYTES);
     if (matchesRateLimit(combined, runner.provider, runner.authMode)) {
       const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
       throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);

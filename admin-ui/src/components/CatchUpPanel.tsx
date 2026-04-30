@@ -7,6 +7,7 @@ import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from
 import type { TaskType } from './TaskCard';
 import { DirectionProgressSection } from './DirectionProgressSection';
 import type { DirectionProgress } from './DirectionProgressSection';
+import { ErrorBoundary } from './ErrorBoundary';
 import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
 import {
   TIMEOUT_SUBTYPE_LABELS,
@@ -1091,7 +1092,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
 
               {/* Direction progress */}
               {digest!.direction_progress && digest!.direction_progress.length > 0 && (
-                <DirectionProgressSection directions={digest!.direction_progress} medianCostPerMergedPr={digest!.median_cost_per_merged_pr} />
+                <ErrorBoundary level="widget">
+                  <DirectionProgressSection directions={digest!.direction_progress} medianCostPerMergedPr={digest!.median_cost_per_merged_pr} />
+                </ErrorBoundary>
               )}
 
               {/* Needs attention */}
@@ -1594,8 +1597,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   </div>
                   {digest!.rejection_pattern_summary.top_notes.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {digest!.rejection_pattern_summary.top_notes.map((n, i) => (
-                        <span key={i} className="text-[10px] text-neutral-500 truncate">
+                      {digest!.rejection_pattern_summary.top_notes.map((n) => (
+                        <span key={n.snippet} className="text-[10px] text-neutral-500 truncate">
                           · {n.snippet.slice(0, 100)}{n.snippet.length > 100 ? '…' : ''}{' '}
                           <span className="text-purple-400">×{n.count}</span>
                         </span>
@@ -1654,8 +1657,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               {dirCount > 1 && (
                                 <span className="text-amber-400">across {dirCount} directions</span>
                               )}
-                              {dirLabels.slice(0, 2).map((label, i) => (
-                                <span key={i} className="text-[9px] text-neutral-500 truncate max-w-[180px]">
+                              {dirLabels.slice(0, 2).map((label) => (
+                                <span key={label} className="text-[9px] text-neutral-500 truncate max-w-[180px]">
                                   · {label}
                                 </span>
                               ))}
@@ -1930,8 +1933,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   </div>
                   {digest!.retry_pattern_summary.top_patterns.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {digest!.retry_pattern_summary.top_patterns.slice(0, 3).map((p, i) => (
-                        <span key={i} className="text-[10px] text-neutral-500 truncate font-mono">
+                      {digest!.retry_pattern_summary.top_patterns.slice(0, 3).map((p) => (
+                        <span key={p.sequence} className="text-[10px] text-neutral-500 truncate font-mono">
                           · {p.sequence}{' '}
                           <span className="text-amber-400">×{p.count}</span>
                         </span>

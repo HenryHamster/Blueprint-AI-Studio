@@ -258,8 +258,8 @@ function SpawnGuardDiagnostics({ guards }: { guards: BlockingGuard[] }) {
         Why autonomy isn't spawning
       </p>
       <ul className="space-y-1">
-        {errorGuards.map((g, i) => (
-          <li key={i} className="flex items-start gap-1.5">
+        {errorGuards.map((g) => (
+          <li key={g.guard} className="flex items-start gap-1.5">
             <span className="mt-px"><GuardIcon guard={g.guard} /></span>
             <span className={`text-[11px] leading-tight ${guardColor(g.guard)}`}>
               {guardLabel(g)}
@@ -479,8 +479,8 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
         <div className="rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
           <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">Why strategic is blocked</p>
           <ul className="space-y-1">
-            {strategic.blocking_guards.map((g, i) => (
-              <li key={i} className="flex items-start gap-1.5">
+            {strategic.blocking_guards.map((g) => (
+              <li key={g.guard} className="flex items-start gap-1.5">
                 <AlertTriangle className="w-3 h-3 shrink-0 text-red-400 mt-px" />
                 <span className="text-[11px] leading-tight text-red-300">{StrategicGuardLabel(g)}</span>
               </li>

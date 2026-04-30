@@ -23,8 +23,16 @@ import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
+import { ErrorBoundary } from './ErrorBoundary';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
+
+// Wraps a sub-widget in an ErrorBoundary so a single bad render (malformed
+// API payload, divide-by-zero, etc.) collapses just that widget instead of
+// the entire dashboard panel.
+const Widget = ({ children }: { children: React.ReactNode }) => (
+  <ErrorBoundary level="widget">{children}</ErrorBoundary>
+);
 
 // ---------- local types ----------
 
@@ -860,7 +868,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
       <SystemStatusCard digest={digest} loading={loading} />
 
       {/* Orchestrator Errors widget: high-visibility observability for prod errors */}
-      <RecentErrorsWidget />
+      <Widget><RecentErrorsWidget /></Widget>
 
       {/* Main grid: 2-col on large screens */}
       <div className="lg:grid lg:grid-cols-3 lg:gap-4 space-y-4 lg:space-y-0">
@@ -936,7 +944,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           )}
 
           {/* Section 1d: Failure Stage Distribution */}
-          {!loading && <FailureStageWidget distribution={digest?.failure_stage_distribution} />}
+          {!loading && <Widget><FailureStageWidget distribution={digest?.failure_stage_distribution} /></Widget>}
 
           {/* Section 1d2: Review Rejection Reason Breakdown */}
           {!loading && (() => {
@@ -1096,12 +1104,14 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Section 1f: Remediation Funnel */}
           {selectedProjectId && (
-            <RemediationFunnelSection
-              funnel={digest?.remediation_funnel ?? null}
-              conversion={digest?.investigation_conversion ?? null}
-              loading={loading}
-              projectId={selectedProjectId}
-            />
+            <Widget>
+              <RemediationFunnelSection
+                funnel={digest?.remediation_funnel ?? null}
+                conversion={digest?.investigation_conversion ?? null}
+                loading={loading}
+                projectId={selectedProjectId}
+              />
+            </Widget>
           )}
           {!loading && (() => {
             const groups = digest?.remediation_funnel?.residual_remediation_funnel?.open_cases_by_error_class ?? [];
@@ -1205,9 +1215,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   Human Rejection Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {rps.total_rejected} rejected</span>
                 </h2>
                 <div className="flex flex-col gap-1">
-                  {rps.top_notes.map((note, i) => (
+                  {rps.top_notes.map((note) => (
                     <div
-                      key={i}
+                      key={note.snippet}
                       className="flex items-start gap-2 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
                     >
                       <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 tabular-nums">
@@ -1340,8 +1350,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
                         {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
                           <ul className="mt-1 space-y-0.5">
-                            {d.recent_failure_titles.slice(0, 3).map((t, i) => (
-                              <li key={i} className="text-[10px] text-red-300/80 truncate" title={t}>• {t}</li>
+                            {d.recent_failure_titles.slice(0, 3).map((t) => (
+                              <li key={t} className="text-[10px] text-red-300/80 truncate" title={t}>• {t}</li>
                             ))}
                           </ul>
                         )}
@@ -1355,26 +1365,30 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Section 2b: Scope Conversion Rates */}
           {!!selectedProjectId && (
-            <ScopeConversionRatesSection
-              scopeRates={digest?.scope_conversion_rates}
-              prevScopeRates={digest?.prev_scope_conversion_rates}
-              loading={loading}
-            />
+            <Widget>
+              <ScopeConversionRatesSection
+                scopeRates={digest?.scope_conversion_rates}
+                prevScopeRates={digest?.prev_scope_conversion_rates}
+                loading={loading}
+              />
+            </Widget>
           )}
 
           {/* Section 2b2: Scope Trends */}
           {!!selectedProjectId && (
-            <ScopeTrendsSection
-              data={scopeBaselines}
-              loading={loading}
-              open={scopeTrendsOpen}
-              onToggle={() => setScopeTrendsOpen(v => !v)}
-            />
+            <Widget>
+              <ScopeTrendsSection
+                data={scopeBaselines}
+                loading={loading}
+                open={scopeTrendsOpen}
+                onToggle={() => setScopeTrendsOpen(v => !v)}
+              />
+            </Widget>
           )}
 
           {/* Section 2c: Medium Scope Measurement */}
           {!!selectedProjectId && (
-            <MediumScopeWidget data={measurementData} loading={loading} />
+            <Widget><MediumScopeWidget data={measurementData} loading={loading} /></Widget>
           )}
 
           {/* Section 2d: Provider Account Health */}
@@ -1386,7 +1400,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
 
           {/* Drift Signals */}
-          {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
+          {!!selectedProjectId && <Widget><DriftSignalsCard projectId={selectedProjectId} /></Widget>}
 
           {/* Section 3: Top Actionable Issues */}
           <section>
@@ -1400,8 +1414,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </div>
             ) : (
               <div className="space-y-1.5">
-                {visibleIssues.map((issue, i) => (
-                  <IssueRow key={i} {...issue} />
+                {visibleIssues.map((issue) => (
+                  <IssueRow key={`${issue.category}-${issue.title}`} {...issue} />
                 ))}
                 {issues.length > 3 && (
                   <button
@@ -1461,19 +1475,21 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Direction auto-pause/recovery observability */}
           <div className="mt-4">
-            <DirectionAutoPauseWidget selectedProjectId={selectedProjectId} />
+            <Widget><DirectionAutoPauseWidget selectedProjectId={selectedProjectId} /></Widget>
           </div>
 
           {/* Section 5: PR Monitor */}
-          <PRMonitorSection
-            openPRs={openPRs}
-            loading={loading}
-            refreshing={openPRsRefreshing}
-            onRefresh={fetchOpenPRs}
-            hasProject={!!selectedProjectId}
-            tasks={tasks}
-            onViewTask={onViewTask}
-          />
+          <Widget>
+            <PRMonitorSection
+              openPRs={openPRs}
+              loading={loading}
+              refreshing={openPRsRefreshing}
+              onRefresh={fetchOpenPRs}
+              hasProject={!!selectedProjectId}
+              tasks={tasks}
+              onViewTask={onViewTask}
+            />
+          </Widget>
         </div>
       </div>
     </div>
@@ -1848,10 +1864,10 @@ function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[] | nul
                 </div>
                 {isExpanded && hasIssues && (
                   <div className="mt-2 space-y-0.5 pt-2 border-t border-neutral-800/50">
-                    {row.top_issues.map((issue, i) => {
+                    {row.top_issues.map((issue) => {
                       const desc = (issue.description as string | undefined) ?? JSON.stringify(issue);
                       return (
-                        <div key={i} className="text-[10px] text-neutral-400 flex items-start gap-1.5">
+                        <div key={desc} className="text-[10px] text-neutral-400 flex items-start gap-1.5">
                           <span className="shrink-0 text-neutral-600">•</span>
                           <span>{desc}</span>
                         </div>

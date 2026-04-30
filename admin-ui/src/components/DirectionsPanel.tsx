@@ -5,6 +5,7 @@ import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
 import RunningUpdatePanel from './RunningUpdatePanel';
 import { DirectionCard } from './DirectionCard';
+import { ErrorBoundary } from './ErrorBoundary';
 import { AutonomousConfigSection } from './AutonomousConfigSection';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useAutonomousConfig } from '../hooks/useAutonomousConfig';
@@ -918,8 +919,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                     {!isCollapsed && (
                       <div className="space-y-2">
                         {items.map(d => (
+                          <ErrorBoundary key={d.id} level="widget">
                           <DirectionCard
-                            key={d.id}
                             direction={d}
                             statusKey={key}
                             activeItems={activeItems}
@@ -965,6 +966,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                             onViewFindings={onViewFindings}
                             onNavigateToTask={onNavigateToTask}
                           />
+                          </ErrorBoundary>
                         ))}
                       </div>
                     )}
