@@ -185,8 +185,26 @@ resource "google_monitoring_alert_policy" "cloudsql_up" {
 resource "google_logging_metric" "cloud_sql_backup_failure" {
   count       = local.alerting_enabled ? 1 : 0
   name        = "cloud_sql_backup_failure"
-  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3)."
-  filter      = "resource.type=\"cloudsql_database\" AND protoPayload.methodName=~\"cloudsql.instances.backup.*\" AND severity=ERROR"
+  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3, R3-W4 M6)."
+  # R3-W4 M6 (audit 2026-04-30): broadened from the original
+  # `cloudsql.instances.backup.*` regex, which missed the actual method
+  # names Cloud SQL emits in audit logs. Real method names include:
+  #   - cloudsql.instances.createBackup   (on-demand backup)
+  #   - cloudsql.backupRuns.insert        (scheduled backup runs)
+  #   - cloudsql.backupRuns.create        (alternate scheduled path)
+  # `cloudsql.instances.export` is intentionally excluded (export is a
+  # separate concern, not a backup). The escaped backslashes below are
+  # required because Cloud Logging filter syntax interprets `.` as
+  # any-character; we want literal `.` matches between method-name
+  # segments.
+  filter = <<-EOT
+    resource.type="cloudsql_database"
+    AND (
+      protoPayload.methodName=~"cloudsql\.instances\.(create)?[Bb]ackup.*"
+      OR protoPayload.methodName=~"cloudsql\.backupRuns\.(insert|create)"
+    )
+    AND severity=ERROR
+  EOT
   metric_descriptor {
     metric_kind = "DELTA"
     value_type  = "INT64"
@@ -231,9 +249,18 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
 # enabled — but during the cutover window both stacks are live and AlloyDB
 # is still the authoritative DB until the runbook flips DATABASE_URL.
 # Keeping the alert armed during cutover catches any AlloyDB CPU spike that
-# would mask a botched migration. Once `alloydb.tf` is removed post-cutover,
-# this resource block becomes inert (the `google_alloydb_instance` reference
-# disappears and Terraform deletes the alert) and can be pruned.
+# would mask a botched migration.
+#
+# R3-W4 M5 (audit 2026-04-30): the previous comment claimed this alert
+# auto-deletes when alloydb.tf is removed. That is WRONG — the filter is
+# a literal Cloud Monitoring resource.type string
+# (`alloydb.googleapis.com/Instance`), not a Terraform
+# google_alloydb_instance reference, so Terraform has no dependency edge
+# to drive deletion. After alloydb.tf is removed, this alert resource
+# will persist as a no-op (zero series matched, no notifications fire).
+# The cutover commit MUST also remove this alert block alongside
+# alloydb.tf, or the policy stays in the project's monitoring console
+# forever as cosmetic noise.
 # ------------------------------------------------------------------------------
 resource "google_monitoring_alert_policy" "alloydb_cpu" {
   count        = local.alerting_enabled ? 1 : 0

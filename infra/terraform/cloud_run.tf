@@ -92,17 +92,23 @@ resource "google_cloud_run_v2_service" "orchestrator" {
   }
 
   # Ignore image changes so Terraform doesn't revert CI/CD deployments.
-  # Wave F4 M5: env vars REMOVED from ignore_changes — env should reflect
-  # Terraform state. The env-var rotation/setup flow is owned by Terraform
-  # + cloudbuild.yaml's --set-env-vars list, both of which are visible in
-  # source control. Ignoring env masked drift between Terraform and the
-  # actual revision YAML; the operator could not see when a rogue
-  # `gcloud run services update --update-env-vars` had landed an out-of-band
-  # variable. Image-only ignore preserves the CI/CD-pushes-image flow
-  # without hiding env drift.
+  # R3-W4 C2 (audit 2026-04-30): env reverted onto ignore_changes after
+  # Round 2's M5 narrowing caused a regression. cloudbuild.yaml's
+  # --set-env-vars is the source of truth and declaratively replaces the
+  # full env list with 11 vars (ALLOWED_ORIGINS, LOCAL_MODE,
+  # MAX_CONCURRENT_VMS, INITIAL_ADMIN_EMAIL, plus 7 others); this file
+  # only declares 7. Without ignore_changes on env, the next
+  # `terraform apply` planned to delete the 4 cloudbuild-only variables
+  # — taking ALLOWED_ORIGINS with them and triggering a CORS outage.
+  # Ownership split: Terraform tracks the *structure* of the resource
+  # (containers, volumes, scaling, vpc_access); CI tracks the env-var
+  # *content*. Drift between cloudbuild.yaml and this file is reviewable
+  # in source control because both are checked in.
   lifecycle {
     ignore_changes = [
       template[0].containers[0].image,
+      template[0].containers[0].env, # CI deploys via cloudbuild.yaml own the env-var set;
+      # Terraform tracks structure, CI tracks content. See R3-W4 (audit 2026-04-30).
     ]
   }
 }

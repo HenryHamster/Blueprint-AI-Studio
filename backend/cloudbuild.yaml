@@ -5,6 +5,17 @@ substitutions:
   # Wave F4 M6: previously hardcoded `lihuanshen123@gmail.com`. Pass via
   # --substitutions=_INITIAL_ADMIN_EMAIL=<your-email> at deploy time
   # (setup.sh wires this up automatically).
+  #
+  # R3-W4 H8 (audit 2026-04-30): when this substitution is left empty,
+  # the deploy below sets `INITIAL_ADMIN_EMAIL=` literally on the Cloud
+  # Run revision. That visible empty string is intentional — backend
+  # `lifecycle.py:_seed_initial_admin` treats an empty value as
+  # "not configured: do NOT seed; use the existing AllowedUser table."
+  # gcloud's `--set-env-vars` has no "omit if empty" syntax and
+  # splitting into a conditional `--update-env-vars` call would require
+  # bash logic the cloudbuild step can't run cleanly. Operators who see
+  # the empty env var on a revision should read it as "first-admin
+  # seeding disabled," not as "misconfigured."
   _INITIAL_ADMIN_EMAIL: ''
 
 steps:

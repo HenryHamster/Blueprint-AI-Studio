@@ -289,7 +289,10 @@ echo
 step "6. Update DATABASE_URL secret"
 # URL-encode the password for defense-in-depth even though override_special is now URL-safe.
 # Append ?ssl=require for asyncpg TLS hint (server-side enforced via ssl_mode=ENCRYPTED_ONLY).
-ENCODED_PW=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$CLOUDSQL_PASSWORD")
+# R3-W4 M7 (audit 2026-04-30): pipe via stdin instead of argv to keep the
+# cleartext password out of /proc/<pid>/cmdline for the python process
+# lifetime. `rstrip("\n")` strips the trailing newline that bash <<< adds.
+ENCODED_PW=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.stdin.read().rstrip("\n"),safe=""))' <<< "$CLOUDSQL_PASSWORD")
 NEW_URL="postgresql+asyncpg://postgres:${ENCODED_PW}@${CLOUDSQL_IP}:5432/postgres?ssl=require"
 # Clear plaintext password — must not be re-used after URL build.
 CLOUDSQL_PASSWORD=""

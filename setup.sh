@@ -279,7 +279,12 @@ fi
 info "Setting up secrets in Secret Manager..."
 
 urlencode() {
-  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+  # R3-W4 M7 (audit 2026-04-30): pipe via stdin instead of argv. The
+  # cleartext password used to appear in /proc/<pid>/cmdline for the
+  # python process lifetime, visible to any local user with /proc read
+  # access. Reading from stdin keeps the secret off argv entirely.
+  # `rstrip("\n")` strips the trailing newline that bash <<< adds.
+  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().rstrip("\n"), safe=""))' <<< "$1"
 }
 
 DB_PASSWORD=$(gcloud secrets versions access latest --secret="$DB_PW_SECRET" --project="$PROJECT_ID")
