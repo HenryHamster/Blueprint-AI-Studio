@@ -304,10 +304,55 @@ ADMIN_API_KEY=$(gcloud secrets versions access latest --secret="ADMIN_API_KEY" -
 
 ok "Core secrets ready"
 
-# Create placeholder GitHub secrets so Cloud Run deploy doesn't fail
-for PLACEHOLDER_SECRET in GITHUB_APP_ID GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET GITHUB_PRIVATE_KEY GITHUB_WEBHOOK_SECRET; do
-  create_secret_if_missing "$PLACEHOLDER_SECRET" "placeholder"
-done
+# GitHub secrets — prompt for real values or skip (Cloud Run boot-path that
+# reads these will fail loudly rather than silently use a literal "placeholder"
+# value, which used to mask config bugs as "GitHub feature broken").
+#
+# If the secret already exists (re-run), we leave it alone — Phase 2 is the
+# canonical path for setting real values, and we don't want to clobber a real
+# value the operator already entered.
+prompt_secret_or_skip() {
+  local name="$1"
+  local description="$2"
+  local masked="${3:-false}"  # true = no echo (for client secrets / private keys)
+  if gcloud secrets describe "$name" --project="$PROJECT_ID" &>/dev/null; then
+    echo "  $name already exists, skipping"
+    gcloud secrets add-iam-policy-binding "$name" \
+      --member="serviceAccount:$ORCHESTRATOR_SA" \
+      --role="roles/secretmanager.secretAccessor" \
+      --project="$PROJECT_ID" --quiet 2>/dev/null || true
+    return 0
+  fi
+  echo
+  echo -e "  ${DIM}$description${NC}"
+  local value=""
+  if [[ "$masked" == "true" ]]; then
+    read -r -s -p "  $name (or Enter to skip): " value
+    echo
+  else
+    read -r -p "  $name (or Enter to skip): " value
+  fi
+  if [[ -z "$value" ]]; then
+    echo -e "  ${YELLOW}Skipped: $name not created. Cloud Run boot will fail loudly when GitHub features are exercised.${NC}"
+    echo -e "  ${DIM}Re-run './setup.sh --phase2' to populate all GitHub secrets at once.${NC}"
+    return 0
+  fi
+  echo -n "$value" | gcloud secrets create "$name" --data-file=- --project="$PROJECT_ID" --quiet
+  echo "  $name created"
+  gcloud secrets add-iam-policy-binding "$name" \
+    --member="serviceAccount:$ORCHESTRATOR_SA" \
+    --role="roles/secretmanager.secretAccessor" \
+    --project="$PROJECT_ID" --quiet 2>/dev/null || true
+}
+
+echo
+echo -e "${DIM}── GitHub secrets (optional now; required before GitHub features work) ──${NC}"
+echo -e "${DIM}Press Enter at any prompt to skip; Phase 2 (./setup.sh --phase2) sets them all.${NC}"
+prompt_secret_or_skip "GITHUB_APP_ID"         "GitHub App numeric ID (top of app settings page)"
+prompt_secret_or_skip "GITHUB_CLIENT_ID"      "GitHub OAuth client ID (from App About section)"
+prompt_secret_or_skip "GITHUB_CLIENT_SECRET"  "GitHub OAuth client secret (Generate a client secret)" "true"
+prompt_secret_or_skip "GITHUB_PRIVATE_KEY"    "GitHub App private key (paste full PEM contents)" "true"
+prompt_secret_or_skip "GITHUB_WEBHOOK_SECRET" "GitHub webhook secret (the value you set on the App)" "true"
 
 # ─── Build & Deploy Backend ─────────────────────────────────────────────────
 

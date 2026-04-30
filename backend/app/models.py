@@ -89,7 +89,9 @@ class AllowedUser(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     email: str = Field(index=True, unique=True)
     firebase_uid: Optional[str] = Field(default=None, index=True)
-    role: str = Field(default="user")  # "admin" or "user"
+    # Allowed values: 'admin' | 'user'. Enforced server-side by
+    # ``chk_alloweduser_role`` (alembic 0065 / audit L-S1, Postgres-only).
+    role: str = Field(default="user")
     display_name: Optional[str] = None
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5):
     # default_factory is retained as an additive Python-side guard so ORM
@@ -131,6 +133,14 @@ class UserIntegration(SQLModel, table=True):
 class Project(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
+    # Firebase UID of the project owner. Intentionally NOT a FK to
+    # ``alloweduser.firebase_uid`` (audit 2026-04-29 / L-S2): a Project may
+    # be created via an admin token whose Firebase UID has not yet been
+    # populated on the matching ``alloweduser`` row (firebase_uid is filled
+    # on first login, but project creation can precede first login during
+    # bootstrap / onboarding). A FK here would force a hard ordering
+    # between allowlist seeding and project creation that the bootstrap
+    # flow doesn't otherwise need. Loose-coupled by design.
     user_id: str = Field(index=True)
     status: ProjectStatus = Field(default=ProjectStatus.DRAFT, sa_column=Column(String, default=ProjectStatus.DRAFT))
     github_owner: Optional[str] = None
@@ -205,7 +215,9 @@ class ProjectMember(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
     user_id: str = Field(index=True)
-    role: str = Field(default="member")  # "owner", "member", "viewer"
+    # Allowed values: 'owner' | 'member' | 'viewer'. Enforced server-side by
+    # ``chk_projectmember_role`` (alembic 0065 / audit L-S1, Postgres-only).
+    role: str = Field(default="member")
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -233,7 +245,15 @@ class Task(SQLModel, table=True):
     latest_status_message: Optional[str] = None
     status_log: List[Dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")))
 
-    created_by: str = Field(default="USER") # "USER", "ORCHESTRATOR", "AGENT_{ID}"
+    # Task provenance. Allowed canonical values:
+    #   'USER' | 'ORCHESTRATOR' | 'STRATEGIC_AGENT' |
+    #   'SYSTEM_AUTO_REMEDIATION' | 'SYSTEM_AUTO_REVIEW' |
+    #   'SYSTEM_ISSUE_IMPLEMENTATION'
+    # Test fixtures additionally use 'TEST' / 'test-user' / 'user' / 'user1'
+    # — these are accepted by the CHECK constraint but should not be
+    # introduced in production code paths. Enforced server-side by
+    # ``chk_task_created_by`` (alembic 0065 / audit L-S1, Postgres-only).
+    created_by: str = Field(default="USER")
     launched_by_user_id: Optional[str] = Field(default=None)  # Firebase UID of the user who launched this task (for launcher-pays billing)
     idempotency_key: Optional[str] = Field(default=None, sa_column=Column(String(255), nullable=True))
     requires_approval: bool = Field(default=False)
@@ -583,7 +603,10 @@ class ProjectMessage(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
     message_type: MessageType = Field(default=MessageType.NOTE, sa_column=Column(String, default=MessageType.NOTE))
-    from_type: str = Field(default="user")  # "user" | "agent" | "strategic"
+    # Allowed values: 'user' | 'agent' | 'strategic' | 'system'. Enforced
+    # server-side by ``chk_projectmessage_from_type`` (alembic 0065 /
+    # audit L-S1, Postgres-only).
+    from_type: str = Field(default="user")
     from_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
     content: str = Field(default="")
     context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))

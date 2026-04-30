@@ -68,6 +68,17 @@ confirm() {
 
 cleanup_on_exit() {
   local rc=$?
+  # On abort (non-zero exit) with the orchestrator drained, restore Cloud Run
+  # scaling so the operator isn't left with a 0-instance service. The success
+  # path handles this in step 7b; the trap covers every other exit path.
+  if [[ $rc -ne 0 && "${ORCHESTRATOR_DRAINED:-false}" == "true" ]]; then
+    echo
+    echo "=== Restoring Cloud Run scaling (abort path) ==="
+    gcloud run services update blueprint-orchestrator \
+      --region="$REGION" --max-instances=5 --min-instances=1 \
+      --project="$PROJECT_ID" || \
+      echo "WARNING: failed to restore scaling; run manually: gcloud run services update blueprint-orchestrator --region=$REGION --max-instances=5 --min-instances=1"
+  fi
   if [[ "$MIGRATOR_VM_PROVISIONED" == "true" ]]; then
     echo
     echo "=== Cleanup ==="
@@ -127,9 +138,14 @@ if gcloud compute instances describe "$MIGRATOR_VM" --zone="$ZONE" >/dev/null 2>
   MIGRATOR_VM_PROVISIONED="true"
 else
   # --service-account points at the dedicated migrator-sa (provisioned by Wave F4
-  # terraform). Although --scopes=cloud-platform is broad, the SA's IAM bindings
-  # only grant secretAccessor on the two DB password secrets, so effective
-  # capabilities remain minimal.
+  # terraform). Defense-in-depth scopes:
+  #   - cloud-platform.read-only: lets `gcloud secrets versions access` use
+  #     instance metadata for ADC (the read-only scope is sufficient because
+  #     accessing a secret VERSION is a "read" — adding/creating versions
+  #     would require the broader scope and we never do that here).
+  #   - userinfo.email: required by gcloud for OS Login and audit attribution.
+  # The migrator-sa's IAM bindings further narrow effective capability to
+  # secretAccessor on only the two DB password secrets.
   gcloud compute instances create "$MIGRATOR_VM" \
     --zone="$ZONE" \
     --machine-type=e2-small \
@@ -139,7 +155,7 @@ else
     --image-family=debian-12 \
     --image-project=debian-cloud \
     --service-account="migrator-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --scopes=cloud-platform \
+    --scopes=https://www.googleapis.com/auth/cloud-platform.read-only,https://www.googleapis.com/auth/userinfo.email \
     --metadata=enable-oslogin=TRUE \
     --project="$PROJECT_ID"
   MIGRATOR_VM_PROVISIONED="true"
@@ -264,11 +280,26 @@ gcloud secrets versions list DATABASE_URL --project="$PROJECT_ID" --limit=3
 
 step "7. Force Cloud Run to pick up the new secret"
 # Cloud Run pulls --set-secrets values at instance startup; we need a new revision.
-# Updating an env value forces a redeploy without changing the image.
+# Re-deploy by pinning the current image — this forces a new revision without
+# leaving any persistent migration-only env vars in the revision YAML
+# (mutating env vars would survive in `gcloud run revisions describe` forever).
+CURRENT_IMAGE="$(gcloud run services describe blueprint-orchestrator \
+  --region="$REGION" --project="$PROJECT_ID" \
+  --format='value(spec.template.spec.containers[0].image)')"
+if [[ -z "$CURRENT_IMAGE" ]]; then
+  echo "ERROR: could not read current Cloud Run image; aborting redeploy." >&2
+  exit 1
+fi
 gcloud run services update blueprint-orchestrator \
   --region="$REGION" \
-  --update-env-vars="MIGRATION_REDEPLOY_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)" \
+  --image="$CURRENT_IMAGE" \
   --project="$PROJECT_ID"
+# Defensive cleanup: if a prior run of this script (pre-fix) left the env var
+# behind, strip it now. Safe no-op if the var is absent.
+gcloud run services update blueprint-orchestrator \
+  --region="$REGION" \
+  --remove-env-vars=MIGRATION_REDEPLOY_TIMESTAMP \
+  --project="$PROJECT_ID" 2>/dev/null || true
 
 if [[ "${ORCHESTRATOR_DRAINED:-false}" == "true" ]]; then
   step "7b. Restore Cloud Run scaling"
