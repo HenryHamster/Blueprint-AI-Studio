@@ -21,6 +21,7 @@ from app.models import (
     Project, Task, TaskStatus, TaskHistory, Artifact, ArtifactType,
     UserIntegration, _on_task_terminal_callbacks, _utcnow,
 )
+from app.time_utils import _to_naive_utc
 from app.schemas import (
     UploadUrlRequest, HeartbeatRequest, SpawnTaskRequest,
     GitHubCommitStatusRequest, GitHubPRCommentRequest,
@@ -1142,7 +1143,9 @@ async def claim_task(
                 cutoff_14d = _utcnow() - timedelta(days=14)
                 combined_review_history = []
                 for ht in high_iter_rows:
-                    if ht.created_at and ht.created_at < cutoff_14d:
+                    # Task.created_at is TIMESTAMPTZ since 0061; cutoff_14d is naive.
+                    ht_created = _to_naive_utc(ht.created_at)
+                    if ht_created and ht_created < cutoff_14d:
                         continue
                     review_loop = (ht.context or {}).get("review_loop", {})
                     rev_hist = review_loop.get("review_history", []) if review_loop else []

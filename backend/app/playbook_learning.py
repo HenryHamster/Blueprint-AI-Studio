@@ -774,8 +774,11 @@ def compute_recurring_first_review_descriptions(
     desc_to_cat: dict = {}
     desc_task_ids: dict = {}
     filtered_task_count = 0
+    from app.time_utils import _to_naive_utc
+    cutoff_naive = _to_naive_utc(cutoff)
     for ht in rows:
-        if ht.created_at and ht.created_at < cutoff:
+        ht_created = _to_naive_utc(ht.created_at)
+        if ht_created and cutoff_naive and ht_created < cutoff_naive:
             continue
         if task_filter and not task_filter(ht):
             continue
