@@ -1415,7 +1415,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             ) : (
               <div className="space-y-1.5">
                 {visibleIssues.map((issue) => (
-                  <IssueRow key={`${issue.category}-${issue.title}`} {...issue} />
+                  <IssueRow key={`${issue.severity}-${issue.title}`} {...issue} />
                 ))}
                 {issues.length > 3 && (
                   <button
