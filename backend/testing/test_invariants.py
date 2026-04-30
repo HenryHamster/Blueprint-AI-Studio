@@ -298,7 +298,13 @@ class TestSchemaRevisionSync:
                 return "INTEGER"
             if n in {"UUID", "GUID"}:
                 return "UUID"
-            if n in {"DATETIME", "TIMESTAMP"}:
+            # ``NAIVEUTCDATETIME`` is the round-2 audit TypeDecorator
+            # (``app.models.NaiveUTCDateTime``) whose ``impl`` is
+            # ``DateTime(timezone=True)`` — the DB column is still TIMESTAMPTZ;
+            # the decorator only strips tz on read in Python. The migration
+            # files emit ``sa.DateTime(timezone=True)`` directly, so the
+            # families must alias.
+            if n in {"DATETIME", "TIMESTAMP", "NAIVEUTCDATETIME"}:
                 return "DATETIME"
             if n in {"NUMERIC", "DECIMAL"}:
                 return "NUMERIC"

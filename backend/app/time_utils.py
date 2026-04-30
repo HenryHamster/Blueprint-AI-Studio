@@ -15,20 +15,35 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """Strip tzinfo from a datetime, converting to UTC first if it was aware.
+def _strip_tz_assume_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Strip tzinfo. Asserts input is either naive or aware-UTC.
 
-    Phase D2 (alembic 0061) migrated several columns to ``DateTime(timezone=True)``
-    so reads from those columns now return tz-aware datetimes. The rest of the
-    codebase still uses naive UTC (``_utcnow()``). Use this at comparison /
-    arithmetic boundaries where one side is loaded-from-DB (potentially aware)
-    and the other is constructed Python-side (naive).
+    After F1's NaiveUTCDateTime TypeDecorator landed, ORM-loaded datetimes
+    are already naive — this function is now mostly redundant. Existing
+    callsites are no-ops; new code shouldn't need it.
+
+    Round 2 audit (M12) renamed from the older ``_to_naive_utc`` so the
+    UTC-only assumption is explicit at every callsite. Non-UTC tz-aware
+    inputs raise ``ValueError`` rather than silently losing wall-clock
+    information; the previous implementation would have converted them
+    to UTC and stripped the tz, which masked tz bugs.
     """
     if dt is None:
         return None
     if dt.tzinfo is None:
         return dt
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    if dt.tzinfo.utcoffset(dt) != timedelta(0):
+        # Don't silently lose information from non-UTC tz-aware datetimes.
+        raise ValueError(f"Expected UTC or naive datetime, got tz={dt.tzinfo}")
+    return dt.replace(tzinfo=None)
+
+
+# Backwards-compat alias kept so existing imports keep working without a
+# codebase-wide sweep. Marked deprecated; new code should call
+# ``_strip_tz_assume_utc`` directly. After F1's TypeDecorator lands ORM
+# reads are naive so all current callsites are no-ops anyway — they're
+# scheduled for removal in a Phase G cleanup.
+_to_naive_utc = _strip_tz_assume_utc  # deprecated alias
 
 
 def set_retry_after(task_or_ctx, minutes: float) -> str:

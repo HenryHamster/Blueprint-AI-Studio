@@ -4,10 +4,35 @@ from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, String, Integer, Float, Index, Text, UniqueConstraint, ForeignKey, text, event, func, Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import TypeDecorator
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from app.time_utils import _utcnow
+
+
+class NaiveUTCDateTime(TypeDecorator):
+    """TIMESTAMPTZ in DB, naive UTC datetime in Python.
+
+    Phase D2 (alembic 0061) migrated several columns to TIMESTAMPTZ for
+    server-default support and clock-skew safety, but the rest of the codebase
+    uses naive UTC throughout (_utcnow() returns naive). Rather than sweep
+    every comparison site to handle aware datetimes, strip tz on read.
+    Writes pass through unchanged — asyncpg sends naive datetimes to
+    TIMESTAMPTZ columns and Postgres interprets them as UTC.
+
+    Pairs with the F1 helper rename _to_naive_utc -> _strip_tz_assume_utc;
+    after this decorator lands, ORM-loaded datetimes are already naive and
+    callsite strips become no-ops (audit 2026-04-29 round 2 / C3 + H1).
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +124,7 @@ class AllowedUser(SQLModel, table=True):
     # server_default protects raw-SQL INSERT paths that bypass the ORM.
     created_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
     last_login_at: Optional[datetime] = None
 
@@ -146,9 +171,10 @@ class Project(SQLModel, table=True):
     github_owner: Optional[str] = None
     github_repo: Optional[str] = None
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
     # Autonomous improvement: user-defined high-level directions for research agents
@@ -293,9 +319,10 @@ class Task(SQLModel, table=True):
 
     attempt_count: int = Field(default=0)
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
     started_at: Optional[datetime] = Field(default=None)
     # Auto-populated on INSERT (default_factory + server_default) and UPDATE
@@ -306,7 +333,7 @@ class Task(SQLModel, table=True):
     updated_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(
-            DateTime(timezone=True),
+            NaiveUTCDateTime,
             nullable=False,
             server_default=func.now(),
             onupdate=_utcnow,
@@ -340,11 +367,14 @@ class Task(SQLModel, table=True):
     estimated_cost_usd: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
 
     # Optimistic-concurrency version (audit 2026-04-29 Phase C4 / finding M-C4):
-    # SQLAlchemy enforces version-mismatch on UPDATE via ``__mapper_args__``
-    # below. Concurrent stale writes raise ``sqlalchemy.exc.StaleDataError`` so
-    # callers can detect lost-write hazards without holding row locks across
-    # long post-commit cycles. Mirrors the ``DeploymentState.version`` idiom
-    # but wired through ``version_id_col`` for automatic enforcement.
+    # Round 2 audit (C4 + C5) dropped the ``__mapper_args__["version_id_col"]``
+    # enforcement: bulk Core UPDATEs (``update(Task).where(...).values(...)``)
+    # bypass the mapper entirely and there were zero ``StaleDataError`` handlers
+    # in the codebase, so every ORM commit could surface a 500 on concurrent
+    # stale writes. The column is retained as a forensic counter — bulk archive
+    # paths bump it explicitly via ``.values(version=Task.version + 1)`` in F4
+    # so concurrent-write detection stays meaningful (e.g. for
+    # ``_release_parent_lock`` snapshot validation).
     #
     # Default 1 (not 0) so freshly-constructed rows match what the server
     # default emits on raw INSERTs that bypass the ORM (e.g. backfill SQL).
@@ -437,12 +467,12 @@ class Task(SQLModel, table=True):
         # See alembic 0063 / memory ``reference_strategic_payload_bloat.md``.
     )
 
-    # Optimistic concurrency: SQLAlchemy bumps ``version`` and adds
-    # ``WHERE version = :v`` to every UPDATE. A concurrent write whose
-    # ``version`` no longer matches raises ``sqlalchemy.exc.StaleDataError``
-    # without the caller having to hold a row lock for the whole post-commit
-    # cycle (audit 2026-04-29 Phase C4 / finding M-C4).
-    __mapper_args__ = {"version_id_col": _TASK_VERSION_COL}
+    # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in
+    # round 2 audit (C4 + C5) — see the comment on the ``version`` Field
+    # above. Bulk Core UPDATEs bypassed it and no ``StaleDataError``
+    # handlers existed, so ORM commits leaked 500s on concurrent stale
+    # writes. The column itself is retained as a forensic counter; bulk
+    # archive paths bump it explicitly in F4.
 
     project: Project = Relationship(back_populates="tasks")
     artifacts: List["Artifact"] = Relationship(
@@ -511,9 +541,10 @@ class Alert(SQLModel, table=True):
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
     dismissed_at: Optional[datetime] = None
 
@@ -614,9 +645,10 @@ class ProjectMessage(SQLModel, table=True):
     resolution: Optional[str] = None
     resolved_at: Optional[datetime] = None
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
+    # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
     __table_args__ = (
