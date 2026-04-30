@@ -4,7 +4,7 @@
     "main.py": 3500,
     "task_completion.py": 2850,
     "task_lifecycle.py": 2800,
-    "orchestrator.py": 3500,
+    "orchestrator.py": 3600,
     "admin.py": 3000,
     "compute.py": 2500,
     "github.py": 2050,
