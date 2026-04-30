@@ -11,7 +11,7 @@ import re
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import Integer, cast
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -1001,6 +1001,31 @@ async def _spawn_pipeline_task(
     # ``load_only`` keeps the row narrow — we only need status/context/payloads
     # for the post-filter; status_log and other JSONB columns stay deferred.
     from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
+    # Dialect-conditional WHERE for the per-PR cap query (audit 2026-04-29
+    # round 2 / finding C2). Postgres requires byte-exact expression match
+    # for ``ix_task_payloads_pr_number`` (built on
+    # ``(payloads -> 0 ->> 'pr_number')`` per alembic 0057). The
+    # ``.as_string() == str(pr_number)`` form compiles to
+    # ``CAST(((payloads -> 0) ->> 'pr_number') AS VARCHAR) = '55'``; the
+    # planner is smart enough to drop the redundant CAST AS VARCHAR (text
+    # already) and matches the index — verified via EXPLAIN.
+    #
+    # SQLite test path: ``.as_string()`` compiles to
+    # ``JSON_EXTRACT(JSON_QUOTE(JSON_EXTRACT(payloads, '$[0]')), ...)``
+    # which double-quotes the int and never matches. ``func.json_extract``
+    # reads the value as a primitive (typeof = 'integer' for an int
+    # payload) — that's the form that works on SQLite. SQLite has no
+    # expression index here (the migration creates a regular B-tree on
+    # ``payloads`` for the SQLite branch), so seq-scan is acceptable for
+    # tests. Postgres production path is the source of truth and gets the
+    # index acceleration.
+    dialect_name = session.bind.dialect.name if session.bind else 'postgresql'
+    if dialect_name == 'sqlite':
+        pr_number_match = func.json_extract(Task.payloads, '$[0].pr_number') == pr_number
+        type_match = func.json_extract(Task.payloads, '$[0].type').in_(("review", "fix"))
+    else:
+        pr_number_match = Task.payloads[0]["pr_number"].as_string() == str(pr_number)
+        type_match = Task.payloads[0]["type"].as_string().in_(("review", "fix"))
     pr_pipeline_tasks = (await session.execute(
         select(Task)
         .options(load_only(
@@ -1016,13 +1041,8 @@ async def _spawn_pipeline_task(
             Task.project_id == source_task.project_id,
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.archived.is_(False),
-            # cast(..., Integer) is dialect-agnostic — Postgres uses the
-            # ix_task_payloads_pr_number expression index, SQLite extracts via
-            # json_extract. Comparing the raw JSON value as text differs
-            # between dialects (quoted-string on SQLite vs unquoted on
-            # Postgres ->>), so cast both sides to Integer for safety.
-            cast(Task.payloads[0]["pr_number"], Integer) == pr_number,
-            Task.payloads[0]["type"].as_string().in_(("review", "fix")),
+            pr_number_match,
+            type_match,
         )
     )).scalars().all()
 

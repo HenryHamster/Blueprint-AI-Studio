@@ -2172,10 +2172,13 @@ async def agent_heartbeat(
             )
     if req.metrics or req.tool_trace is not None:
         # Phase B2 (audit 2026-04-29 / finding C3): hot fields (last_metrics,
-        # last_tool_use_at) are now dedicated columns — cheap in-place column
-        # UPDATEs, no whole-blob TOAST page rewrites every 30s/VM. The JSONB
-        # mirror writes continue (dual-write) so unmigrated readers still see
-        # the values; mirror writes are retired in Phase F.
+        # last_tool_use_at) are dedicated columns — cheap in-place column
+        # UPDATEs, no whole-blob TOAST page rewrites every 30s/VM. JSONB
+        # mirror writes for these two fields were retired in Phase F (audit
+        # 2026-04-29 round 2 / finding H8) so the column writes are now the
+        # sole source of truth. Frontend (TaskDetailDrawerMeta) must read
+        # the columns directly — reading task.context.last_metrics will go
+        # stale.
         #
         # Audit-trail fields (metrics_history ring buffer, _tool_trace death-
         # trace window) are post-mortem-only, so we persist them every 5th
@@ -2206,20 +2209,21 @@ async def agent_heartbeat(
         if latest_tool_use_at is not None:
             task.last_tool_use_at = latest_tool_use_at
 
-        # Every-5th-heartbeat gate for the audit-trail ring buffers. Use
-        # second-of-epoch on last_heartbeat (just stamped above) mod 5 — at
-        # 30s cadence this fires roughly every 2.5 min, evenly distributed.
-        hb_seconds = int(task.last_heartbeat.timestamp()) if task.last_heartbeat else 0
-        persist_audit_trail = (hb_seconds % 5 == 0)
-
-        # Dual-write: keep the JSONB mirror so unmigrated readers still see
-        # the values. Phase F will drop these once readers migrate. Always
-        # mirror hot fields; ring buffers only on the every-5th cycle.
+        # Every-5th-heartbeat gate for the audit-trail ring buffers. Use a
+        # Python-side counter persisted in context (``_heartbeat_count``).
+        # Round-1 used ``int(last_heartbeat.timestamp()) % 5`` which was a
+        # per-VM lottery: at 30s cadence consecutive heartbeats from the same
+        # VM hit the same modulo bucket (delta=30s, 30%5==0), so ~20% of VMs
+        # always persisted and ~80% never persisted (audit C1).
+        # ``attempt_count`` was the suggested replacement but it only
+        # increments on retry/failure paths, never on heartbeats — so it
+        # would also produce nothing useful here. A dedicated context key
+        # incremented Python-side every heartbeat is the correct counter.
         ctx = dict(task.context or {})
-        if metrics_dump is not None:
-            ctx['last_metrics'] = metrics_dump
-        if latest_tool_use_at is not None:
-            ctx['last_tool_use_at'] = latest_tool_use_at.isoformat()
+        hb_count = int(ctx.get('_heartbeat_count', 0)) + 1
+        ctx['_heartbeat_count'] = hb_count
+        persist_audit_trail = (hb_count % 5 == 0)
+
         if persist_audit_trail:
             if metrics_dump is not None:
                 history = list(ctx.get('metrics_history', []))
