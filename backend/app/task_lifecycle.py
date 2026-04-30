@@ -1086,18 +1086,68 @@ async def _process_post_commit(
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
+        # Round 3 C3 + C4: strategic tasks (design_doc_update, strategic_review)
+        # have a downstream completion chain that needs both the Project and
+        # the Task locked. The canonical order is **Project before Task,
+        # always** (docs/concurrency.md). Locking Task first then Project
+        # second reintroduces the cross-table deadlock vector C5 originally
+        # closed, so we peek at the task type via a non-locking read and use
+        # the canonical pair-locker for strategic types. Non-strategic types
+        # use the existing task-only lock pattern.
+        _peek_row = (await session.execute(
+            select(Task.payloads, Task.project_id).where(Task.id == task_id)
+        )).first()
+        if _peek_row is None:
+            return {"status": "accepted"}
+        _peek_payload_list = _peek_row[0] or []
+        _peek_first = _peek_payload_list[0] if _peek_payload_list else {}
+        _peek_type = _peek_first.get("type") if isinstance(_peek_first, dict) else None
+        _peek_project_id = _peek_row[1]
+        _is_strategic_type = _peek_type in ("design_doc_update", "strategic_review")
+
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
         # concurrent post-commit for the same task). A plain FOR UPDATE would
         # queue behind GitHub API calls (15-120s) and hit the Postgres
         # lock_timeout as LockNotAvailableError, which tears down the session.
         task = None
+        # Round 3 C3 + C4: ``locked_project`` is set ONLY when the post-commit
+        # is processing a strategic task and the canonical pair-lock succeeded.
+        # The strategic-completion chain handlers below receive this via
+        # ``project=`` so they skip their own (legacy) re-acquisition.
+        locked_project: Project | None = None
         for _attempt in range(3):
-            task = (await session.execute(
-                select(Task).where(Task.id == task_id).with_for_update(skip_locked=True)
-            )).scalars().first()
-            if task is not None:
-                break
+            if _is_strategic_type and _peek_project_id is not None:
+                # Canonical Project → Task ordering for strategic tasks. The
+                # helper acquires Project first; if the task row is held it
+                # yields ``(project, None)`` and we retry. If the project is
+                # held it yields ``(None, None)`` and we retry as well.
+                from app.task_locking import lock_project_then_task  # noqa: PLC0415
+                async with lock_project_then_task(
+                    session, _peek_project_id, task_id, skip_locked=True,
+                ) as (_p, _t):
+                    if _t is not None:
+                        # Both locks acquired. Capture references and break.
+                        # SQLAlchemy session-level FOR UPDATE locks persist
+                        # past the contextmanager exit; the surrounding
+                        # ``async with factory() as session`` commit/rollback
+                        # at the end of post-commit releases both row locks.
+                        task = _t
+                        locked_project = _p
+                        break
+                    # Half-pair acquired (project but not task) or no pair
+                    # (project also held). Release any held lock before
+                    # retrying so we don't accumulate session-level locks
+                    # across retry iterations and don't hold a project lock
+                    # while a peer attempts the same task lock.
+                    if _p is not None:
+                        await session.rollback()
+            else:
+                task = (await session.execute(
+                    select(Task).where(Task.id == task_id).with_for_update(skip_locked=True)
+                )).scalars().first()
+                if task is not None:
+                    break
             # Confirm the row still exists before retrying — if it's gone the
             # peer holder is irrelevant.
             exists = (await session.execute(
@@ -1166,17 +1216,16 @@ async def _process_post_commit(
             # Record strategic task failures for the circuit breaker and cycle history
             if task.first_payload.get("type") in ("design_doc_update", "strategic_review"):
                 try:
-                    # Phase C3: acquire the project lock once at the top of
-                    # the strategic-completion chain and pass it down rather
-                    # than letting _record_strategic_task_failure (and any
-                    # follow-on chain) re-acquire. Canonical order is
-                    # Project before Task (see docs/concurrency.md). The
-                    # helper returns None on contention or missing — we
-                    # fall back to the legacy unlocked path so we still
-                    # record the failure (better than silently dropping it).
-                    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
-                    _strat_project = await lock_project_for_strategic_transition(session, task.project_id)
-                    await _record_strategic_task_failure(task, session, project=_strat_project)
+                    # Round 3 C3 + C4: the canonical pair-lock acquired at the
+                    # top of _process_post_commit (Project before Task, see
+                    # docs/concurrency.md) is passed down here as
+                    # ``locked_project``. _record_strategic_task_failure skips
+                    # its own re-acquisition when ``project=`` is provided.
+                    # Falls back to None for legacy callers / non-strategic
+                    # types (the helper does an unlocked session.get(Project)
+                    # in that case — the failure-record path doesn't strictly
+                    # require the project lock).
+                    await _record_strategic_task_failure(task, session, project=locked_project)
                 except Exception as _strat_exc:
                     logger.error(f"[STRATEGIC] Failed to record strategic failure for {task.id}: {_strat_exc!r}", exc_info=True)
 
@@ -2605,23 +2654,24 @@ async def _process_post_commit(
 
                 elif task_type == "design_doc_update":
                     doc_logs = payload.logs or task.latest_status_message or ""
-                    # Phase C3: acquire the project lock ONCE at the top of
-                    # the strategic-completion chain and pass it down; the
-                    # handler skips its own re-acquisition when given a
-                    # locked Project. None propagates the legacy bounded-
-                    # retry path inside the handler (also surfaces the
-                    # contended-deferral alert). Canonical order is
-                    # Project before Task — see docs/concurrency.md.
-                    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
-                    _doc_project = await lock_project_for_strategic_transition(session, task.project_id)
-                    await _handle_design_doc_completion(task, doc_logs, session, project=_doc_project)
+                    # Round 3 C3 + C4: ``locked_project`` was acquired in
+                    # canonical Project → Task order at the top of
+                    # _process_post_commit via ``lock_project_then_task``.
+                    # The handler skips its own re-acquisition when given
+                    # a pre-locked Project. None propagates the legacy
+                    # bounded-retry path inside the handler (defensive
+                    # only — the canonical pair-lock should have produced
+                    # a non-None project for design_doc_update tasks).
+                    # Canonical order is Project before Task — see
+                    # docs/concurrency.md.
+                    await _handle_design_doc_completion(task, doc_logs, session, project=locked_project)
 
                 elif task_type == "strategic_review":
                     review_logs = payload.logs or task.latest_status_message or ""
-                    # Phase C3: see _handle_design_doc_completion above.
-                    from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
-                    _strat_project = await lock_project_for_strategic_transition(session, task.project_id)
-                    await _handle_strategic_completion(task, review_logs, session, project=_strat_project)
+                    # Round 3 C3 + C4: see _handle_design_doc_completion above.
+                    # ``locked_project`` was acquired in canonical
+                    # Project → Task order at the top of _process_post_commit.
+                    await _handle_strategic_completion(task, review_logs, session, project=locked_project)
 
                 elif task_type == "research":
                     research_logs = payload.logs or task.latest_status_message or ""

@@ -1539,9 +1539,40 @@ async def _ensure_branch(
     """Create a branch, or verify it already exists.
 
     Returns True on success, False on failure (task set to FAILED).
+
+    Round 3 H5 (lock-window break): callers (_handle_plan_completion,
+    _handle_research_completion) run inside _process_post_commit while
+    the task is FOR UPDATE-locked. The retry loop below sleeps 10-40s
+    (with jitter, up to ~150s combined across 5 attempts) and makes
+    GitHub API calls that can hang for tens of seconds during rate-limit.
+    Holding the task lock across that window starves concurrent
+    heartbeats and false-orphans the row. We mirror the
+    rollup_management.py ``_release_parent_lock`` / ``_relock_parent``
+    pattern: capture ``updated_at`` snapshot, commit-release before the
+    loop, run GitHub calls + sleeps without the lock, then re-acquire
+    with snapshot validation only on the failure path (where we mutate
+    the task to FAILED). Success path returns without re-acquiring —
+    the caller's next mutation re-locks naturally.
     """
     # Deferred import to avoid circular dependency
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+
+    # Round 3 H5: snapshot identifiers BEFORE releasing, snapshot
+    # ``updated_at`` AFTER releasing. ``parent_id_local`` mirrors the
+    # snapshot-stale convention from rollup_management.py — between
+    # release and re-acquire, the in-memory ``task`` is detached and
+    # only stable ids are safe to read. ``updated_at`` must be captured
+    # AFTER commit because the lock-release commit itself bumps the
+    # timestamp via ``onupdate=_utcnow``; capturing pre-commit would
+    # always trigger a false "peer mutated" path on re-acquire.
+    # Mirrors the pattern in rollup_management._release_parent_lock.
+    parent_id_local = task.id
+    parent_task_type = task.first_payload.get("type", "")
+    parent_auto_remediation = task.auto_remediation
+    parent_context_snapshot = dict(task.context or {})
+    session.add(task)
+    await session.commit()  # release task FOR UPDATE lock
+    pre_branch_updated_at = task.updated_at
 
     max_retries = 5
     gh_token = owner = repo = None
@@ -1549,7 +1580,7 @@ async def _ensure_branch(
     for _attempt in range(max_retries):
         try:
             gh_token, owner, repo = await get_github_token_for_task(
-                task.id, session, force_refresh=(_attempt > 0))
+                parent_id_local, session, force_refresh=(_attempt > 0))
             sha = await get_branch_sha(gh_token, owner, repo, source_branch)
             await create_branch(gh_token, owner, repo, branch_name, sha)
             logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
@@ -1581,13 +1612,35 @@ async def _ensure_branch(
                 else:
                     logger.exception(f"[{label}] Cannot create branch — GitHub token unavailable")
     e = last_err
+
+    # Round 3 H5: re-acquire with snapshot validation before applying the
+    # FAILED mutation. If a peer mutated the row during our retry window,
+    # defer (don't overwrite) and let the next sweep handle the failure
+    # via _process_post_commit's normal entry path.
+    fresh = (await session.execute(
+        select(Task).where(Task.id == parent_id_local).with_for_update(skip_locked=True)
+    )).scalars().first()
+    if fresh is None:
+        logger.info(
+            f"[{label}] Task {parent_id_local} held by peer after branch retries — "
+            f"deferring failure mutation to next sweep"
+        )
+        return False
+    if pre_branch_updated_at is not None and fresh.updated_at != pre_branch_updated_at:
+        logger.info(
+            f"[{label}] Task {parent_id_local} mutated during branch-retry window "
+            f"(expected updated_at={pre_branch_updated_at}, found {fresh.updated_at}) — "
+            f"deferring failure mutation to next sweep"
+        )
+        return False
+    task = fresh
     task.status = TaskStatus.FAILED
     task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
     from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
     _fc = classify_failure(task)
     persist_failure_category(task, _fc)
-    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=task.first_payload.get("type", ""), task_context=dict(task.context or {}), auto_remediation=task.auto_remediation)
+    record_task_result(success=False, failure_class=_fc, task_id=str(task.id), task_type=parent_task_type, task_context=parent_context_snapshot, auto_remediation=parent_auto_remediation)
     session.add(task)
     await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
     await session.commit()
@@ -2691,12 +2744,15 @@ async def _handle_design_doc_completion(
     Chain and status are committed together so a failed Phase 2 spawn doesn't leave
     the task marked COMPLETED with no follow-up.
 
-    Phase C3 (HIGH H-C4): callers in the post-commit chain pre-acquire the
-    project lock once at the top via ``lock_project_for_strategic_transition``
-    and pass it as ``project=`` so this handler does NOT re-acquire. When
-    ``project=None`` (legacy / direct callers), we fall back to acquiring
-    the lock here ourselves with the same bounded-retry semantics. The
-    canonical order is Project before Task — see ``docs/concurrency.md``.
+    Phase C3 / Round 3 C3 + C4: callers in the post-commit chain pre-acquire
+    the project lock at the top of ``_process_post_commit`` via the
+    canonical pair-locker ``lock_project_then_task`` (Project before Task)
+    and pass the locked Project as ``project=`` so this handler does NOT
+    re-acquire. When ``project=None`` (legacy / direct callers), we fall
+    back to acquiring the lock here ourselves via
+    ``lock_project_for_strategic_transition`` with the same bounded-retry
+    semantics. The canonical order is Project before Task — see
+    ``docs/concurrency.md``.
     """
     # Deferred imports to avoid circular dependency
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415

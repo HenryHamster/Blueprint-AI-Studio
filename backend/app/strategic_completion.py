@@ -567,13 +567,15 @@ async def _handle_strategic_completion(
     during agent execution. This handler just records final status and checks for issues.
     Falls back to log parsing for backward compatibility if the agent used the old approach.
 
-    Phase C3 (HIGH H-C4): callers in the post-commit chain pre-acquire the
-    project lock once at the top via ``lock_project_for_strategic_transition``
-    and pass it here as ``project=``. The legacy fallback path below
-    (parseable-JSON branch) historically also acquired its own lock — that
-    inner acquisition is preserved as a defensive no-op when the caller
-    already holds the row (FOR UPDATE SKIP LOCKED returns the row to the
-    holding transaction, so the same-session re-lock is a cheap re-read).
+    Phase C3 / Round 3 C3 + C4: callers in the post-commit chain pre-acquire
+    the project lock once at the top of ``_process_post_commit`` via the
+    canonical pair-locker ``lock_project_then_task`` (Project before Task)
+    and pass the locked Project here as ``project=``. The legacy fallback
+    path below (parseable-JSON branch) historically also acquired its own
+    lock — that inner acquisition is preserved as a defensive no-op when
+    the caller already holds the row (FOR UPDATE SKIP LOCKED returns the
+    row to the holding transaction, so the same-session re-lock is a
+    cheap re-read).
     """
     # Deferred imports to avoid circular dependency
     from app.main import _create_strategic_alert
