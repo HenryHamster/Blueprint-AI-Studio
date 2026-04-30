@@ -62,6 +62,7 @@ _TASK_CREATED_BY_VALUES = (
     "USER",
     "ORCHESTRATOR",
     "STRATEGIC_AGENT",
+    "AGENT",  # spawn-by-running-agent path (routers/agent.py /spawn endpoint)
     "SYSTEM_AUTO_REMEDIATION",
     "SYSTEM_AUTO_REVIEW",
     "SYSTEM_ISSUE_IMPLEMENTATION",

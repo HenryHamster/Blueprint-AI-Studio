@@ -2512,7 +2512,11 @@ async def spawn_subtask(
             context={**sanitized_context, "spawn_depth": spawn_depth + 1, "parent_context": parent_context},
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
-            created_by=f"AGENT_{parent_task.id}",
+            # Fixed value — parent linkage lives on parent_task_id, no need
+            # to encode parent UUID into the created_by string. The CHECK
+            # constraint chk_task_created_by (alembic 0065) only allows the
+            # canonical set, of which "AGENT" is the spawn-by-running-agent member.
+            created_by="AGENT",
             requires_approval=req.requires_approval,
             parent_task_id=parent_task.id,
             **({"priority": req.priority} if req.priority is not None else {}),

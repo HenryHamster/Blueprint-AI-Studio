@@ -2278,9 +2278,12 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
     service-start block and the success-heartbeat curl.
     """
     import inspect
-    from app import compute
+    # The bash startup script body was moved out of compute._provision_gcp
+    # into compute_startup_script.build_agent_startup_script (commit 55156451).
+    # Read source from the new home.
+    from app import compute_startup_script
 
-    source = inspect.getsource(compute._provision_gcp)
+    source = inspect.getsource(compute_startup_script.build_agent_startup_script)
 
     # Locate the success-heartbeat region by its unique status_message.
     success_msg = "Startup script completed, agent service started"
