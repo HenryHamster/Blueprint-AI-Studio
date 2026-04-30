@@ -473,17 +473,20 @@ async def _build_recent_interventions(
         "of the work that landed or failed in this window, what fraction
         succeeded?" — the number they actually want to read.
         """
+        from app.time_utils import _to_naive_utc
+        since_naive = _to_naive_utc(since)
         merged = 0
         finished = 0
         spawned = 0  # retained for throughput visibility
         for t in tasks:
-            created_at = t.created_at
-            if created_at and created_at >= since:
+            # Task.created_at and updated_at are TIMESTAMPTZ since 0061; since is naive.
+            created_at = _to_naive_utc(t.created_at)
+            if created_at and since_naive and created_at >= since_naive:
                 spawned += 1
             if t.status not in _TERMINAL:
                 continue
-            updated_at = t.updated_at or created_at
-            if not updated_at or updated_at < since:
+            updated_at = _to_naive_utc(t.updated_at) or created_at
+            if not updated_at or (since_naive and updated_at < since_naive):
                 continue
             finished += 1
             if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
