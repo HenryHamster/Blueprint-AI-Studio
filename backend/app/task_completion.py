@@ -2745,7 +2745,12 @@ async def _handle_design_doc_completion(
     cycle_id = (task.context or {}).get("strategic_cycle_id")
     spawned = None
     try:
-        await session.refresh(project)
+        # Wave F4 H9: removed `await session.refresh(project)`. The caller
+        # (post-commit chain via task_lifecycle._process_post_commit) already
+        # holds the project lock acquired via lock_project_for_strategic_transition;
+        # the row is fresh-read at lock time, so a refresh here is a redundant
+        # round-trip that defeats the lock-share optimization between
+        # strategic-completion handlers.
         spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
         if spawned:
             task.latest_status_message = f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"

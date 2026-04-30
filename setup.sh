@@ -31,6 +31,7 @@ USE_CLOUD_SQL=${USE_CLOUD_SQL:-false}
 DB_IP=$DB_IP
 DB_PW_SECRET=$DB_PW_SECRET
 ADMIN_API_KEY=$ADMIN_API_KEY
+ADMIN_EMAIL=${ADMIN_EMAIL:-}
 EOF
 }
 
@@ -52,8 +53,10 @@ if [ "${1:-}" = "-f" ]; then
   load_config || fail "No previous config found. Run ./setup.sh first."
   info "Force rebuilding and deploying backend..."
   cd backend
+  # Wave F4 M6: pass _INITIAL_ADMIN_EMAIL through to cloudbuild.yaml
+  # so the operator email is no longer hardcoded.
   gcloud builds submit --config=cloudbuild.yaml \
-    --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL" \
+    --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
     --project="$PROJECT_ID"
   cd ..
   ok "Backend redeployed to $ORCHESTRATOR_URL"
@@ -94,10 +97,12 @@ run_phase2() {
     else
       echo -n "$value" | gcloud secrets create "$name" --data-file=- --project="$PROJECT_ID" --quiet
     fi
-    gcloud secrets add-iam-policy-binding "$name" \
-      --member="serviceAccount:$ORCHESTRATOR_SA" \
-      --role="roles/secretmanager.secretAccessor" \
-      --project="$PROJECT_ID" --quiet 2>/dev/null || true
+    # Wave F4 M2: per-secret IAM binding for orchestrator-sa removed.
+    # iam.tf already grants `roles/secretmanager.admin` (and
+    # `roles/secretmanager.secretAccessor`) project-wide on
+    # orchestrator-sa, so per-secret secretAccessor bindings are
+    # redundant. Migrator-sa still has per-secret bindings (see
+    # iam.tf migrator_*_password_access) — those stay scoped.
   }
 
   set_secret "GITHUB_APP_ID" "$GITHUB_APP_ID"
@@ -110,8 +115,9 @@ run_phase2() {
   # Re-deploy backend so it picks up the new secrets
   info "Re-deploying backend with GitHub secrets..."
   cd backend
+  # Wave F4 M6: pass _INITIAL_ADMIN_EMAIL through to cloudbuild.yaml.
   gcloud builds submit --config=cloudbuild.yaml \
-    --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL" \
+    --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
     --project="$PROJECT_ID" --quiet
   cd ..
   ok "Backend re-deployed"
@@ -205,6 +211,13 @@ if [ -z "$SKIP_TERRAFORM" ]; then
   ZONE="${REGION}-a"
   GITHUB_REPO="skip"
 
+  # Wave F4 M6: INITIAL_ADMIN_EMAIL is read from operator input rather than
+  # hardcoded in cloudbuild.yaml. The orchestrator uses this value to seed
+  # the first AllowedUser row at boot so the operator can sign into the
+  # admin UI without an existing admin to grant access.
+  read -p "Admin email (will be seeded as first project admin) [optional, can skip]: " ADMIN_EMAIL
+  ADMIN_EMAIL=${ADMIN_EMAIL:-}
+
   echo ""
   info "Setting GCP project to $PROJECT_ID..."
   gcloud config set project "$PROJECT_ID" --quiet
@@ -289,10 +302,9 @@ create_secret_if_missing() {
     echo -n "$value" | gcloud secrets create "$name" --data-file=- --project="$PROJECT_ID" --quiet
     echo "  $name created"
   fi
-  gcloud secrets add-iam-policy-binding "$name" \
-    --member="serviceAccount:$ORCHESTRATOR_SA" \
-    --role="roles/secretmanager.secretAccessor" \
-    --project="$PROJECT_ID" --quiet 2>/dev/null || true
+  # Wave F4 M2: per-secret IAM binding for orchestrator-sa removed.
+  # See `set_secret` above and iam.tf's project-wide grants — orchestrator-sa
+  # already has secretmanager.admin + secretAccessor at the project level.
 }
 
 create_secret_if_missing "DATABASE_URL" "$DATABASE_URL"
@@ -317,10 +329,7 @@ prompt_secret_or_skip() {
   local masked="${3:-false}"  # true = no echo (for client secrets / private keys)
   if gcloud secrets describe "$name" --project="$PROJECT_ID" &>/dev/null; then
     echo "  $name already exists, skipping"
-    gcloud secrets add-iam-policy-binding "$name" \
-      --member="serviceAccount:$ORCHESTRATOR_SA" \
-      --role="roles/secretmanager.secretAccessor" \
-      --project="$PROJECT_ID" --quiet 2>/dev/null || true
+    # Wave F4 M2: per-secret IAM binding removed (project-wide grant covers).
     return 0
   fi
   echo
@@ -339,10 +348,7 @@ prompt_secret_or_skip() {
   fi
   echo -n "$value" | gcloud secrets create "$name" --data-file=- --project="$PROJECT_ID" --quiet
   echo "  $name created"
-  gcloud secrets add-iam-policy-binding "$name" \
-    --member="serviceAccount:$ORCHESTRATOR_SA" \
-    --role="roles/secretmanager.secretAccessor" \
-    --project="$PROJECT_ID" --quiet 2>/dev/null || true
+  # Wave F4 M2: per-secret IAM binding removed (project-wide grant covers).
 }
 
 echo
@@ -358,8 +364,11 @@ prompt_secret_or_skip "GITHUB_WEBHOOK_SECRET" "GitHub webhook secret (the value 
 
 info "Building and deploying backend to Cloud Run..."
 cd backend
+# Wave F4 M6: pass _INITIAL_ADMIN_EMAIL through to cloudbuild.yaml so
+# orchestrator boot-seed code reads the operator email instead of a
+# hardcoded value.
 gcloud builds submit --config=cloudbuild.yaml \
-  --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL" \
+  --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
   --project="$PROJECT_ID" --quiet
 cd ..
 ok "Backend deployed"

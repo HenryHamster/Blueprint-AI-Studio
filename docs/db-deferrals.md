@@ -190,6 +190,42 @@ or risk hard-fail on the rotation date).
   has fired and the corresponding item is still open, escalate to the next
   planning cycle.
 
+## Bulk-action orphan sweep
+
+**Why deferred.** `admin.bulk_action_tasks` runs in two phases: Phase 1
+validates task IDs and resolves project membership in a short shared-session
+transaction; Phase 2 iterates tasks one at a time, each in its own scoped
+session (for retry) or with per-task commits (for approve/cancel). If Cloud
+Run mid-iterates and the instance is killed (deploy, OOM, scale-down) between
+Phase 1's claim and Phase 2's mutation for some task, that task stays in its
+pre-bulk state with no sweep to retry it. The operator notices because the
+admin UI still shows the task in its old status and can re-issue the bulk
+action. For a solo-dev deployment with Cloud Run rolling deploys roughly
+weekly and OOMs ~zero, the operational cost of the orphan-sweep machinery
+(state table + reconciliation loop + idempotency guards) outweighs the
+recovery cost.
+
+**Trigger to revisit.** Cloud Run mid-iteration crashes are observed at
+**>1 per month**, OR a paying user is impacted by a stuck bulk-action
+(visible as: bulk-approve clicked, only some tasks moved to COMPLETED, the
+rest still stuck in EVALUATING). Either signal warrants an explicit sweep.
+
+**What's in place today.** Per-task commits in Phase 2 ensure partial
+progress is durable; `_terminated_task_ids` cache invalidation runs on every
+mutated task; the operator can re-issue the same bulk action and it
+short-circuits on already-mutated tasks (idempotent for approve/cancel,
+re-runs for retry which generates a fresh `vm_instance_id`). The
+`bulk_action_tasks` docstring + comment block (added in Wave F4) document
+this contract for future maintainers.
+
+**Estimated cost when triggered.** ~2 dev-days. Add a `bulk_action_session`
+table (id, action, task_ids JSONB, created_at, completed_at) keyed by a
+fresh UUID at Phase 1 entry, mark each task complete as Phase 2 mutates it,
+and add a reconciliation loop in `services.py` that re-fires the action for
+sessions older than ~5 minutes with un-mutated tasks. Test plan: kill
+Cloud Run mid-iteration via SIGKILL on a `pytest` simulation, assert sweep
+re-fires the missed tasks within one reconciliation tick.
+
 ## Done
 
 (Empty — items move here when addressed, with date and PR/commit reference.)

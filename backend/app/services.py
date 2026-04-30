@@ -671,8 +671,15 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
             ids = (await session.execute(select_stmt)).scalars().all()
             if not ids:
                 break
+            # Wave F4 C4: bulk Core UPDATEs bypass `version_id_col`. Even though
+            # F1 dropped the mapper-level enforcement, we keep the version
+            # column as a forensic counter — bumping it here preserves
+            # "concurrent writes can be detected by version drift" semantics.
             await session.execute(
-                update(Task).where(Task.id.in_(ids)).values(archived=True)
+                update(Task).where(Task.id.in_(ids)).values(
+                    archived=True,
+                    version=Task.version + 1,
+                )
             )
             await session.commit()
             age_total += len(ids)
@@ -726,8 +733,14 @@ async def _run_auto_archive_cycle() -> Dict[str, int]:
                 )).scalars().all()
                 if not lockable:
                     continue
+                # Wave F4 C4: see Pass 1 note — bump `version` so forensic
+                # counter reflects this bulk archive even though the mapper
+                # `version_id_col` enforcement was dropped in F1.
                 await session.execute(
-                    update(Task).where(Task.id.in_(lockable)).values(archived=True)
+                    update(Task).where(Task.id.in_(lockable)).values(
+                        archived=True,
+                        version=Task.version + 1,
+                    )
                 )
                 await session.commit()
                 count_total += len(lockable)

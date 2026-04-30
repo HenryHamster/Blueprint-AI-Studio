@@ -11,11 +11,14 @@
 # in terraform.tfvars or via -var="alert_email=foo@bar.com" to enable.
 #
 # Coverage during the AlloyDB → Cloud SQL migration window:
-#   - Cloud SQL CPU / disk / connections / backup health (count = use_cloud_sql)
-#   - AlloyDB CPU mirror so the same dashboards work pre-cutover (count = !use_cloud_sql)
+#   - Cloud SQL CPU / disk / connections / availability (count = use_cloud_sql)
+#   - Cloud SQL backup failure (log-based metric, count = alerting_enabled — Wave F4 M3)
+#   - AlloyDB CPU mirror so the same dashboards work pre-cutover (count =
+#     alerting_enabled — Wave F4 M4 changed the gate from `!use_cloud_sql`
+#     so the alert stays armed during cutover when both stacks are live)
 # Once alloydb.tf is removed post-cutover, the AlloyDB policy block becomes
-# inert (count = 0 by way of the missing resource reference) and can be
-# pruned.
+# inert (the missing resource reference triggers Terraform deletion) and can
+# be pruned.
 #
 # Documentation links target docs/db-migration-plan.md (Operational continuity
 # section) which carries the runbook for each incident type.
@@ -171,14 +174,69 @@ resource "google_monitoring_alert_policy" "cloudsql_up" {
 }
 
 # ------------------------------------------------------------------------------
+# Cloud SQL — backup failure (log-based metric + alert)
+#
+# Wave F4 M3: complements `cloudsql_up` (which catches instance-availability
+# flapping) with a direct signal on backup operations failing. Cloud SQL
+# emits audit-log events under method names matching `cloudsql.instances.backup`
+# at severity=ERROR when a backup attempt fails — we count those into a
+# log-based metric and fire on any non-zero count over 5 minutes.
+# ------------------------------------------------------------------------------
+resource "google_logging_metric" "cloud_sql_backup_failure" {
+  count       = local.alerting_enabled ? 1 : 0
+  name        = "cloud_sql_backup_failure"
+  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3)."
+  filter      = "resource.type=\"cloudsql_database\" AND protoPayload.methodName=~\"cloudsql.instances.backup.*\" AND severity=ERROR"
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
+  count        = local.alerting_enabled ? 1 : 0
+  display_name = "Cloud SQL: backup failure"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "Any backup-failure event in 5 min"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.cloud_sql_backup_failure[0].name}\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_DELTA"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  documentation {
+    content   = "Cloud SQL emitted a backup-failure event. The 7-day retention of `cloudsql_backups` means a single failure is recoverable, but two consecutive failures shrink the recoverable window. Runbook: docs/db-operations.md (Restore procedure) — verify the instance is healthy and re-trigger via `gcloud sql backups create --instance=<name>`."
+    mime_type = "text/markdown"
+  }
+}
+
+# ------------------------------------------------------------------------------
 # AlloyDB — CPU > 80% (mirror of Cloud SQL CPU policy)
 #
-# Active during the migration window so the same alert coverage applies before
-# cutover. Once alloydb.tf is removed, change the count to 0 (or delete this
-# block) to avoid Terraform errors on the missing resource reference.
+# Active for the duration that AlloyDB resources still exist in the Terraform
+# state (regardless of `use_cloud_sql`). Wave F4 M4: previously gated on
+# `!var.use_cloud_sql` so the alert went silent the moment Cloud SQL was
+# enabled — but during the cutover window both stacks are live and AlloyDB
+# is still the authoritative DB until the runbook flips DATABASE_URL.
+# Keeping the alert armed during cutover catches any AlloyDB CPU spike that
+# would mask a botched migration. Once `alloydb.tf` is removed post-cutover,
+# this resource block becomes inert (the `google_alloydb_instance` reference
+# disappears and Terraform deletes the alert) and can be pruned.
 # ------------------------------------------------------------------------------
 resource "google_monitoring_alert_policy" "alloydb_cpu" {
-  count        = local.alerting_enabled && !var.use_cloud_sql ? 1 : 0
+  count        = local.alerting_enabled ? 1 : 0
   display_name = "AlloyDB CPU > 80% (5 min)"
   combiner     = "OR"
   enabled      = true

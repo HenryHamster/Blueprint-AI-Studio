@@ -63,6 +63,22 @@ resource "google_cloud_run_v2_service" "orchestrator" {
         name  = "ORCHESTRATOR_URL"
         value = var.orchestrator_url
       }
+
+      # /health returns 503 when the orchestrator background loop hasn't
+      # ticked in 60s (see backend/app/main.py /health). Without this probe
+      # a hung instance keeps port 8080 open and never gets replaced —
+      # GFE then returns 503 with no CORS headers and the admin UI surfaces
+      # it as a CORS error. ~150s to replacement (60s delay + 3 × 30s).
+      liveness_probe {
+        http_get {
+          path = "/health"
+          port = 8080
+        }
+        initial_delay_seconds = 60
+        period_seconds        = 30
+        timeout_seconds       = 10
+        failure_threshold     = 3
+      }
     }
 
     # Connect Cloud Run to the VPC so it can reach the private AlloyDB instance
@@ -74,12 +90,19 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       egress = "ALL_TRAFFIC"
     }
   }
-  
-  # Ignore image changes so Terraform doesn't revert CI/CD deployments
+
+  # Ignore image changes so Terraform doesn't revert CI/CD deployments.
+  # Wave F4 M5: env vars REMOVED from ignore_changes — env should reflect
+  # Terraform state. The env-var rotation/setup flow is owned by Terraform
+  # + cloudbuild.yaml's --set-env-vars list, both of which are visible in
+  # source control. Ignoring env masked drift between Terraform and the
+  # actual revision YAML; the operator could not see when a rogue
+  # `gcloud run services update --update-env-vars` had landed an out-of-band
+  # variable. Image-only ignore preserves the CI/CD-pushes-image flow
+  # without hiding env drift.
   lifecycle {
     ignore_changes = [
       template[0].containers[0].image,
-      template[0].containers[0].env, # Ignore env changes if CI/CD injects secrets
     ]
   }
 }

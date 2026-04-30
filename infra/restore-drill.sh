@@ -117,10 +117,23 @@ else
     exit 1
   fi
   # Cloud SQL requires the destination instance to exist before restoring into it.
-  # Create a minimal db-g1-small clone of the live instance shape.
+  # Wave F4 M8: read the live instance's tier dynamically rather than
+  # hardcoding `db-g1-small`. After a tier upgrade on the live instance,
+  # a hardcoded smaller tier silently shrinks the test instance — a backup
+  # restore that succeeds at the smaller tier proves nothing about the live
+  # tier's capacity to absorb the same workload. Falling back to db-g1-small
+  # only if the describe fails (e.g. live instance not yet provisioned).
+  LIVE_TIER="$(gcloud sql instances describe "$LIVE_INSTANCE" \
+    --project="$PROJECT_ID" \
+    --format='value(settings.tier)' 2>/dev/null || echo '')"
+  if [[ -z "$LIVE_TIER" ]]; then
+    echo "WARN: could not read live tier from $LIVE_INSTANCE; falling back to db-g1-small." >&2
+    LIVE_TIER="db-g1-small"
+  fi
+  echo "Using tier=$LIVE_TIER for $RESTORE_INSTANCE (matches live instance)."
   gcloud sql instances create "$RESTORE_INSTANCE" \
     --database-version=POSTGRES_15 \
-    --tier=db-g1-small \
+    --tier="$LIVE_TIER" \
     --region="$REGION" \
     --availability-type=ZONAL \
     --no-backup \
@@ -154,8 +167,44 @@ echo "Expected outcome: 'No new upgrade operations detected.'"
 if confirm "Did 'alembic check' pass with no pending migrations?"; then
   ALEMBIC_RESULT="pass"
 else
+  # Wave F4 M7: a failed alembic check means the restored DB cannot serve
+  # production traffic — the migration history is broken. Continuing the
+  # drill silently and recording "fail" in the log files away the failure
+  # without alerting the operator that the documented RTO has been
+  # invalidated. Fail loudly: append the outcome to the log first (so the
+  # audit trail is complete), THEN exit non-zero.
   ALEMBIC_RESULT="fail"
   ANOMALIES="${ANOMALIES}alembic check failed; "
+  DRILL_END_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ ! -f "$DRILL_LOG" ]]; then
+    cat > "$DRILL_LOG" <<'HEADER'
+# Database restore-drill log
+
+Append-only log of quarterly restore drills run via `infra/restore-drill.sh`.
+Each entry captures: drill date, backup id used, alembic check outcome, row
+counts, anomalies, and total wall time. The log is the audit trail proving
+the RTO/RPO targets in `docs/db-operations.md` are real, not aspirational.
+
+HEADER
+  fi
+  {
+    echo "## Drill ${DRILL_START_TS}"
+    echo
+    echo "- Operator project: ${PROJECT_ID}"
+    echo "- Live instance: ${LIVE_INSTANCE}"
+    echo "- Restore-test instance: ${RESTORE_INSTANCE}"
+    echo "- Backup id: ${BACKUP_ID}"
+    echo "- Started: ${DRILL_START_TS}"
+    echo "- Finished: ${DRILL_END_TS}"
+    echo "- Alembic check: ${ALEMBIC_RESULT}"
+    echo "- Row counts: (skipped — alembic failed)"
+    echo "- Anomalies: ${ANOMALIES}"
+    echo
+  } >> "$DRILL_LOG"
+  echo "ERROR: alembic check failed against the restored DB." >&2
+  echo "       The documented RTO/RPO targets in docs/db-operations.md are NOT achievable" >&2
+  echo "       until the migration history is fixed. Drill outcome appended to $DRILL_LOG." >&2
+  exit 1
 fi
 
 step "5. Sample row counts on key tables"

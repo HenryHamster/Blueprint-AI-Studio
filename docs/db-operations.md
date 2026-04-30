@@ -198,23 +198,30 @@ DATABASE_URL=DATABASE_URL:latest`. There is no scheduled rotation.
 
 ### Rotation procedure
 
-To rotate the password:
+Run the rotation script — it does the full chain (taint → apply → re-build
+DATABASE_URL → secret-add → Cloud Run revision bump → readiness poll) in one
+shot. Bare `terraform taint` alone leaves Cloud Run reading a STALE
+`DATABASE_URL` constructed against the prior password; the script closes that
+gap (Wave F4 H6).
+
+```bash
+bash infra/rotate-db-password.sh
+```
+
+The script is interactive (`confirm()` prompts before each destructive step)
+and idempotent — safe to re-run after a partial failure.
+
+If you must run the steps manually (e.g. the script is unavailable in your
+environment), the equivalent sequence is:
 
 ```bash
 cd infra/terraform
 terraform taint random_password.cloud_sql_db_password
-terraform apply
+terraform apply -var="use_cloud_sql=true"
+# Then read the new password, URL-encode, build the URL, add a new
+# DATABASE_URL secret version, and force a new Cloud Run revision —
+# see infra/rotate-db-password.sh for the exact gcloud commands.
 ```
-
-This regenerates the password, updates `google_sql_user.postgres` (binding the
-new value to the `postgres` role on the running Cloud SQL instance), and
-publishes a new version of `cloud-sql-postgres-password` in Secret Manager.
-
-The `DATABASE_URL` secret references the password-secret value at construction
-time (via the migration script or `setup.sh`); after a rotation, run the
-migration script's "step 6 — update DATABASE_URL secret" portion (or re-run
-`setup.sh`) so the URL secret picks up the new password and Cloud Run cycles to
-a new revision.
 
 ### Rotation cadence
 

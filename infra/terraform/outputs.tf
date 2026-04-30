@@ -33,22 +33,23 @@ output "github_actions_service_account" {
   description = "The Service Account email that GitHub Actions will impersonate"
 }
 
-# NOTE: when alloydb.tf is removed post-cutover (after the Cloud SQL stability
-# window), these two outputs MUST be deleted in the same commit — terraform plan
-# fails to resolve `google_alloydb_instance.primary` / `db_password_secret`
-# otherwise. A ternary like `var.use_cloud_sql ? "" : google_alloydb_*` does not
-# help: HCL still resolves the resource reference in the false branch even when
-# the ternary picks the empty branch, so removal still requires removing these.
-# We deliberately keep them unconditional so the migration runbook (which reads
-# alloydb_ip_address while alloydb.tf is still present) gets the real IP.
+# Wave F4 M9: wrapped in `try()` so when alloydb.tf is removed post-cutover,
+# `terraform plan` does not fail trying to resolve a missing
+# `google_alloydb_instance.primary` / `db_password_secret`. HCL's `try()`
+# short-circuits on a missing-reference error and falls back to the empty
+# string. This lets the migration runbook delete alloydb.tf in one commit
+# without also having to delete these outputs in the same commit (a
+# previous note in this file claimed that was infeasible — `try()` is the
+# fix). Once alloydb.tf is gone these outputs will resolve to "" and can
+# be cleaned up at leisure.
 output "alloydb_ip_address" {
-  value       = google_alloydb_instance.primary.ip_address
-  description = "Private IP of AlloyDB primary (delete this output when removing alloydb.tf)"
+  value       = try(google_alloydb_instance.primary.ip_address, "")
+  description = "Private IP of AlloyDB primary (empty once alloydb.tf is removed)"
 }
 
 output "alloydb_password_secret_id" {
-  value       = google_secret_manager_secret.db_password_secret.secret_id
-  description = "Secret Manager ID of AlloyDB password (delete this output when removing alloydb.tf)"
+  value       = try(google_secret_manager_secret.db_password_secret.secret_id, "")
+  description = "Secret Manager ID of AlloyDB password (empty once alloydb.tf is removed)"
 }
 
 output "cloud_sql_ip_address" {

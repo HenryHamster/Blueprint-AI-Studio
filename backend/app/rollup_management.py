@@ -55,36 +55,49 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 # any pending mutations to release the lock, perform the GitHub call(s)
 # without lock held, then re-acquire and validate `updated_at` to detect
 # whether the staging-state changed during the unlocked window.
-async def _release_parent_lock(parent: Task, session: AsyncSession) -> datetime:
+async def _release_parent_lock(parent: Task, session: AsyncSession) -> tuple[datetime, int]:
     """Commit any pending mutations on parent and release the FOR UPDATE lock.
 
-    Returns the parent's `updated_at` snapshot (the value SQLAlchemy will compare
-    against in the re-acquire step). Caller must reload from DB after the GitHub
-    call via `_relock_parent`.
+    Returns ``(updated_at_snapshot, version_snapshot)`` — both values must be
+    handed to ``_relock_parent`` to detect concurrent mutation during the
+    unlocked window. Caller must reload from DB after the GitHub call via
+    ``_relock_parent``.
+
+    Wave F4 M10: previously returned just the ``updated_at`` snapshot. Bulk
+    Core UPDATEs (e.g. archive sweeps) bump ``version`` without bumping
+    ``updated_at``, so a single-axis check missed those drifts. Returning
+    both axes lets the re-acquire detect either flavor of concurrent write.
     """
     from app.main import _utcnow
     session.add(parent)
     await session.commit()
     # Snapshot updated_at *after* the commit — the onupdate trigger will have
-    # bumped it if any mutation occurred. Return it so the next re-acquire can
-    # compare against this exact value.
-    snapshot = parent.updated_at or _utcnow()
-    return snapshot
+    # bumped it if any mutation occurred. Return both axes so the next
+    # re-acquire can compare against this exact pair.
+    updated_at_snapshot = parent.updated_at or _utcnow()
+    version_snapshot = parent.version or 0
+    return updated_at_snapshot, version_snapshot
 
 
 async def _relock_parent(
     session: AsyncSession,
     parent_id,
-    expected_updated_at,
+    expected_snapshot: tuple[datetime, int] | datetime | None,
 ) -> Task | None:
     """Re-acquire FOR UPDATE on the parent row and validate staging-state.
 
     Returns the freshly-loaded Task if the row is still ours and unchanged,
     or None if:
         - the row is held by another writer (skip_locked yielded nothing), OR
-        - the row's updated_at has advanced past the snapshot (someone wrote
-          to it during the unlocked window — the mutation we were about to
-          apply may now be stale).
+        - the row's ``updated_at`` has advanced past the snapshot, OR
+        - the row's ``version`` has advanced past the snapshot (Wave F4 M10:
+          catches Core UPDATEs that bump version but not updated_at, e.g.
+          bulk archive paths).
+
+    ``expected_snapshot`` accepts either the ``(updated_at, version)`` tuple
+    returned by ``_release_parent_lock`` (preferred) or the legacy bare
+    ``updated_at`` value (back-compat for any test that still passes a single
+    datetime).
 
     Mirrors the early-commit pattern in routers/agent_status.py:1694: release
     the lock around long-running I/O, then resume on a fresh row read.
@@ -98,11 +111,28 @@ async def _relock_parent(
             "deferring to next cycle", parent_id,
         )
         return None
+    # Normalize the snapshot tuple — back-compat with bare-datetime callers.
+    expected_updated_at: datetime | None
+    expected_version: int | None
+    if isinstance(expected_snapshot, tuple):
+        expected_updated_at, expected_version = expected_snapshot
+    else:
+        expected_updated_at = expected_snapshot
+        expected_version = None
     if expected_updated_at is not None and fresh.updated_at != expected_updated_at:
         logger.info(
             "[ROLLUP] Re-lock detected concurrent mutation on parent %s "
             "(expected updated_at=%s, found %s) — deferring to next cycle",
             parent_id, expected_updated_at, fresh.updated_at,
+        )
+        return None
+    if expected_version is not None and (fresh.version or 0) != expected_version:
+        # Wave F4 M10: catches bulk Core UPDATE paths (archive, etc.) that
+        # bumped `version` without triggering the `updated_at` onupdate.
+        logger.info(
+            "[ROLLUP] Re-lock detected version drift on parent %s "
+            "(expected version=%s, found %s) — deferring to next cycle",
+            parent_id, expected_version, fresh.version,
         )
         return None
     return fresh

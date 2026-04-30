@@ -176,6 +176,12 @@ fi
 REMOTE_SCRIPT=$(cat <<REMOTE
 set -euo pipefail
 
+# Wave F4 H7: libpq defaults to sslmode=prefer (downgrade if peer rejects TLS),
+# which on a private VPC link is fine for confidentiality but defeats the
+# server-side ssl_mode=ENCRYPTED_ONLY contract. Force REQUIRE so any psql/
+# pg_dump/pg_restore call below errors out instead of silently downgrading.
+export PGSSLMODE=require
+
 sudo apt-get update -qq
 sudo apt-get install -y -qq postgresql-client
 
@@ -186,7 +192,24 @@ CLOUDSQL_PASSWORD=\$(gcloud secrets versions access latest --secret=cloud-sql-po
 # Use PGPASSFILE — never put passwords in env or argv
 PGPASS_FILE=\$(mktemp)
 chmod 600 "\$PGPASS_FILE"
-trap 'shred -u "\$PGPASS_FILE" 2>/dev/null || rm -f "\$PGPASS_FILE"' EXIT
+
+# Wave F4 M1: single consolidated trap covering both PGPASS_FILE and
+# RESTORE_LOG. Pre-fix this was a chained trap (one set on PGPASS_FILE
+# at this point, then re-set later before pg_restore to also include
+# RESTORE_LOG) which made the cleanup invariant brittle — any new file
+# added in between would also need a third re-set. RESTORE_LOG is
+# created lazily below; cleanup_remote tolerates its absence via the
+# rm -f fallback.
+RESTORE_LOG=""
+cleanup_remote() {
+  if [[ -n "\${PGPASS_FILE:-}" && -f "\$PGPASS_FILE" ]]; then
+    shred -u "\$PGPASS_FILE" 2>/dev/null || rm -f "\$PGPASS_FILE"
+  fi
+  if [[ -n "\${RESTORE_LOG:-}" && -f "\$RESTORE_LOG" ]]; then
+    shred -u "\$RESTORE_LOG" 2>/dev/null || rm -f "\$RESTORE_LOG"
+  fi
+}
+trap cleanup_remote EXIT INT TERM
 
 # Format: hostname:port:database:username:password
 echo "$ALLOYDB_IP:5432:postgres:postgres:\${ALLOYDB_PASSWORD}" >  "\$PGPASS_FILE"
@@ -210,10 +233,11 @@ pg_dump -h "$ALLOYDB_IP" -U postgres -d postgres -Fc --no-owner --no-acl > "$DUM
 mv "$DUMP_TMP" "$DUMP_PATH"
 echo "Dump size: \$(du -h "$DUMP_PATH" | cut -f1)"
 
-# Restore — capture stderr and parse for real errors
+# Restore — capture stderr and parse for real errors.
+# Wave F4 M1: assign RESTORE_LOG to the variable that the consolidated trap
+# already references; no per-call trap re-set needed.
 echo "Restoring to Cloud SQL..."
 RESTORE_LOG=\$(mktemp)
-trap "shred -u \"\$RESTORE_LOG\" 2>/dev/null || rm -f \"\$RESTORE_LOG\"; shred -u \"\$PGPASS_FILE\" 2>/dev/null || rm -f \"\$PGPASS_FILE\"" EXIT
 pg_restore -h "$CLOUDSQL_IP" -U postgres -d postgres \
   --clean --if-exists --no-owner --no-acl \
   "$DUMP_PATH" 2> "\$RESTORE_LOG" || true

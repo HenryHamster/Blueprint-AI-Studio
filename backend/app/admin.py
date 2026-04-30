@@ -424,8 +424,15 @@ async def bulk_archive_tasks(
     lockable_ids = (await session.execute(select_stmt)).scalars().all()
     if not lockable_ids:
         return {"archived_count": 0}
+    # Wave F4 C4: bulk Core UPDATEs bypass mapper-level `version_id_col`. F1
+    # dropped that enforcement but keeps `version` as a forensic counter —
+    # bump it here so concurrent-write detection via version drift remains
+    # available even on archive paths.
     await session.execute(
-        update(Task).where(Task.id.in_(lockable_ids)).values(archived=True)
+        update(Task).where(Task.id.in_(lockable_ids)).values(
+            archived=True,
+            version=Task.version + 1,
+        )
     )
     await session.commit()
     return {"archived_count": len(lockable_ids)}
@@ -529,6 +536,14 @@ async def bulk_action_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user)
 ):
+    # Wave F4 H10 — Accepted operational risk:
+    # The 2-phase split below (Phase 1 claims IDs, Phase 2 mutates per-task)
+    # has no orphan sweep if Cloud Run dies mid-iteration. Tasks claimed in
+    # Phase 1 but not yet mutated in Phase 2 stay in their pre-bulk state;
+    # the operator can re-issue the bulk action manually. This is acceptable
+    # for solo-dev because Cloud Run mid-iteration crashes are rare. See
+    # docs/db-deferrals.md ("Bulk-action orphan sweep") for the trigger to
+    # add an automated sweep (>1 mid-iteration crash/month observed).
     if body.action not in ('approve', 'retry', 'cancel'):
         raise HTTPException(status_code=400, detail="action must be 'approve', 'retry', or 'cancel'")
 
