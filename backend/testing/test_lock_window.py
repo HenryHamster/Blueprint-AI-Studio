@@ -46,13 +46,13 @@ USE_POSTGRES = (
 
 @pytest.mark.asyncio
 async def test_release_parent_lock_returns_updated_at_snapshot(db_session):
-    """`_release_parent_lock` must commit the parent and return an
-    ``(updated_at, version)`` snapshot pair the caller can use to
+    """`_release_parent_lock` must commit the parent and return the
+    ``updated_at`` snapshot the caller hands to ``_relock_parent`` to
     re-validate after I/O.
 
-    Wave F4 M10: returns a tuple now instead of a bare datetime so the
-    re-acquire can also detect Core UPDATE drift that bumps version
-    without bumping updated_at.
+    Round 3 H10: reverted to a bare ``Optional[datetime]`` — the version
+    axis was redundant given ``onupdate=_utcnow`` already advances
+    updated_at on every mutation.
     """
     project = Project(name="B3 release lock", user_id="user-b3")
     db_session.add(project)
@@ -70,11 +70,7 @@ async def test_release_parent_lock_returns_updated_at_snapshot(db_session):
 
     snapshot = await _release_parent_lock(parent, db_session)
     assert snapshot is not None
-    # The returned value should be a (datetime, int) tuple — datetime for the
-    # updated_at axis, int for the version-counter axis.
-    assert isinstance(snapshot, tuple) and len(snapshot) == 2
-    assert isinstance(snapshot[0], datetime)
-    assert isinstance(snapshot[1], int)
+    assert isinstance(snapshot, datetime)
     # Session must no longer hold an open transaction (commit released the lock)
     assert not db_session.in_transaction()
 

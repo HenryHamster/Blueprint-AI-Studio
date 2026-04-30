@@ -18,7 +18,11 @@ class NaiveUTCDateTime(TypeDecorator):
     server-default support and clock-skew safety, but the rest of the codebase
     uses naive UTC throughout (_utcnow() returns naive). Rather than sweep
     every comparison site to handle aware datetimes, strip tz on read.
-    Writes pass through unchanged — asyncpg sends naive datetimes to
+
+    Round 3 audit (M1): symmetric write path. Future tz-aware writers
+    (e.g. anything calling ``datetime.now(timezone.utc)`` instead of
+    ``_utcnow()``) get normalized to naive UTC on the way to the DB so the
+    column stays internally consistent. asyncpg sends naive datetimes to
     TIMESTAMPTZ columns and Postgres interprets them as UTC.
 
     Pairs with the F1 helper rename _to_naive_utc -> _strip_tz_assume_utc;
@@ -28,6 +32,11 @@ class NaiveUTCDateTime(TypeDecorator):
 
     impl = DateTime(timezone=True)
     cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
 
     def process_result_value(self, value, dialect):
         if value is not None and value.tzinfo is not None:
@@ -247,15 +256,6 @@ class ProjectMember(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
-# Module-level Column instance shared between ``Task.version`` (the SQLModel
-# Field) and ``Task.__mapper_args__["version_id_col"]`` (the SQLAlchemy mapper
-# arg). The mapper arg requires an actual ``Column`` object, but SQLModel's
-# ``Field(sa_column=...)`` consumes the same Column for the attribute mapping,
-# so we declare it once here and reference it from both places. (Audit
-# 2026-04-29 Phase C4 / finding M-C4 — optimistic-concurrency on Task.)
-_TASK_VERSION_COL = Column("version", Integer, nullable=False, server_default=text("1"))
-
-
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
@@ -315,6 +315,18 @@ class Task(SQLModel, table=True):
     last_metrics_json: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     last_tool_use_at: Optional[datetime] = Field(default=None)
 
+    # Heartbeat audit-trail gate counter (R3-W1 / Round 3 C1, alembic 0066).
+    # Round 2 F2 stored this in ``task.context['_heartbeat_count']`` to gate
+    # the per-5th-cycle JSONB writes (metrics_history / _tool_trace). But
+    # bumping a JSONB subkey re-serializes the whole blob, defeating B2's
+    # TOAST savings. Promoted to a dedicated column so the heartbeat path
+    # can ``Task.heartbeat_count = Task.heartbeat_count + 1`` in SQL
+    # without dirtying ``context``.
+    heartbeat_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
     priority: int = Field(default=50, sa_column=Column(Integer, nullable=False, server_default=text("50")))
 
     attempt_count: int = Field(default=0)
@@ -372,15 +384,18 @@ class Task(SQLModel, table=True):
     # bypass the mapper entirely and there were zero ``StaleDataError`` handlers
     # in the codebase, so every ORM commit could surface a 500 on concurrent
     # stale writes. The column is retained as a forensic counter — bulk archive
-    # paths bump it explicitly via ``.values(version=Task.version + 1)`` in F4
-    # so concurrent-write detection stays meaningful (e.g. for
-    # ``_release_parent_lock`` snapshot validation).
+    # paths bump it explicitly via ``.values(version=Task.version + 1)`` in F4.
+    #
+    # Round 3 H10 dropped the version-axis check from
+    # ``_release_parent_lock`` / ``_relock_parent`` because the
+    # ``onupdate=_utcnow`` on ``updated_at`` already advances on every
+    # mutation. The version axis remains as a forensic counter only.
     #
     # Default 1 (not 0) so freshly-constructed rows match what the server
     # default emits on raw INSERTs that bypass the ORM (e.g. backfill SQL).
     version: int = Field(
         default=1,
-        sa_column=_TASK_VERSION_COL,
+        sa_column=Column(Integer, nullable=False, server_default=text("1")),
     )
 
     @property
@@ -942,7 +957,14 @@ class SystemMaturity(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
     )
 
-    last_audited_at: datetime = Field(default_factory=_utcnow)
+    # TIMESTAMPTZ + NaiveUTCDateTime (alembic 0052 made these tz-aware;
+    # round 3 audit H9 routes them through the type decorator so loads
+    # return naive UTC consistent with the rest of the codebase, and
+    # tz-aware writes get normalized via process_bind_param).
+    last_audited_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
 
     source_task_id: Optional[uuid.UUID] = Field(
         default=None,
@@ -953,10 +975,18 @@ class SystemMaturity(SQLModel, table=True):
         ),
     )
 
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
     updated_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column_kwargs={"onupdate": _utcnow},
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
     )
 
     __table_args__ = (

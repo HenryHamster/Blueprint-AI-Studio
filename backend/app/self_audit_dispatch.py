@@ -161,9 +161,9 @@ async def _should_dispatch_self_audit(
         if row is None:
             candidate_systems.append(sid)
             continue
+        # Round 3 H9: SystemMaturity.last_audited_at routes through
+        # NaiveUTCDateTime now, so the ORM-loaded value is already naive UTC.
         last_audited = row.last_audited_at
-        if last_audited is not None and last_audited.tzinfo is not None:
-            last_audited = last_audited.replace(tzinfo=None)
         if last_audited is None or last_audited < staleness_cutoff:
             candidate_systems.append(sid)
             continue
