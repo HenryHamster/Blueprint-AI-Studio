@@ -10,6 +10,7 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -772,6 +773,10 @@ async def claim_task(
         # Active tasks (IN_PROGRESS or EVALUATING) in the same project.
         # Phase B4 (H-P6): load_only drops status_log/plan_output JSONB.
         # Reads below: id, title, first_payload (payloads), status, context.
+        # Audit R3-W2 (H6): cap fetch at 50 rows. The downstream loop
+        # consumes these as a bounded set (rendered into the agent's
+        # related-tasks payload), so unbounded fetch on a busy project
+        # could pull 500 MB before truncating in Python.
         active_stmt = (
             select(Task)
             .options(load_only(
@@ -783,6 +788,8 @@ async def claim_task(
                 Task.id != task.id,
                 Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
             )
+            .order_by(Task.created_at.desc())
+            .limit(50)
         )
         active_tasks_rows = (await session.execute(active_stmt)).scalars().all()
         active_tasks = []
@@ -799,6 +806,7 @@ async def claim_task(
             })
 
         # Queued tasks in the same project. Same projection as active_stmt.
+        # Audit R3-W2 (H6): cap fetch at 50 rows (same rationale as above).
         queued_stmt = (
             select(Task)
             .options(load_only(
@@ -810,6 +818,8 @@ async def claim_task(
                 Task.id != task.id,
                 Task.status == TaskStatus.QUEUED
             )
+            .order_by(Task.created_at.desc())
+            .limit(50)
         )
         queued_tasks_rows = (await session.execute(queued_stmt)).scalars().all()
         queued_tasks = []
@@ -2209,22 +2219,32 @@ async def agent_heartbeat(
         if latest_tool_use_at is not None:
             task.last_tool_use_at = latest_tool_use_at
 
-        # Every-5th-heartbeat gate for the audit-trail ring buffers. Use a
-        # Python-side counter persisted in context (``_heartbeat_count``).
-        # Round-1 used ``int(last_heartbeat.timestamp()) % 5`` which was a
-        # per-VM lottery: at 30s cadence consecutive heartbeats from the same
-        # VM hit the same modulo bucket (delta=30s, 30%5==0), so ~20% of VMs
+        # Every-5th-heartbeat gate for the audit-trail ring buffers. Round-1
+        # used ``int(last_heartbeat.timestamp()) % 5`` which was a per-VM
+        # lottery: at 30s cadence consecutive heartbeats from the same VM
+        # hit the same modulo bucket (delta=30s, 30%5==0), so ~20% of VMs
         # always persisted and ~80% never persisted (audit C1).
         # ``attempt_count`` was the suggested replacement but it only
         # increments on retry/failure paths, never on heartbeats — so it
-        # would also produce nothing useful here. A dedicated context key
-        # incremented Python-side every heartbeat is the correct counter.
-        ctx = dict(task.context or {})
-        hb_count = int(ctx.get('_heartbeat_count', 0)) + 1
-        ctx['_heartbeat_count'] = hb_count
+        # would also produce nothing useful here.
+        # Round 2 F2 stored the counter in ``task.context['_heartbeat_count']``
+        # but bumping a JSONB subkey re-serializes the whole blob every
+        # heartbeat, defeating B2's TOAST-savings (Round 3 C1). The counter
+        # now lives in a dedicated ``Task.heartbeat_count`` Integer column
+        # (alembic 0066). Atomic SQL increment so two-pod racing heartbeats
+        # don't collide on a stale-read cycle. The locked row already gives
+        # a fresh read; ``task.heartbeat_count + 1`` is the value the SQL
+        # increment just wrote.
+        await session.execute(
+            sql_update(Task)
+            .where(Task.id == task.id)
+            .values(heartbeat_count=Task.heartbeat_count + 1)
+        )
+        hb_count = task.heartbeat_count + 1
         persist_audit_trail = (hb_count % 5 == 0)
 
         if persist_audit_trail:
+            ctx = dict(task.context or {})
             if metrics_dump is not None:
                 history = list(ctx.get('metrics_history', []))
                 entry: dict = {'t': _utcnow().isoformat()}
@@ -2241,7 +2261,10 @@ async def agent_heartbeat(
                 # recent-tool-calls window. Last-successful value is the
                 # death trace after reap.
                 ctx['_tool_trace'] = [t.model_dump() for t in req.tool_trace]
-        task.context = ctx
+            # Only assign on the 5th-cycle write — assigning on every
+            # heartbeat would re-serialize the whole JSONB blob and defeat
+            # the column-counter optimisation we just made.
+            task.context = ctx
 
     session.add(task)
     await session.commit()

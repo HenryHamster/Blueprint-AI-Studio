@@ -14,10 +14,21 @@ export async function authGet(url: string) {
   return fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
 }
 
+// In-flight dedup for idempotent reads: when several panels poll the same
+// endpoint within the same render tick (DashboardHome + CatchUpPanel both
+// hitting /api/admin/digest, etc.), we collapse them onto one underlying
+// fetch and clone the Response per caller. Map entries auto-delete when the
+// shared promise settles, so the map cannot grow without bound.
+const inFlightRequests = new Map<string, Promise<Response>>();
+
 /**
  * Fetch wrapper with auth headers and retry for transient Cloud Run errors.
  * Cloud Run 502/503 responses bypass FastAPI middleware and lack CORS headers,
  * causing the browser to report CORS errors. Retrying handles this gracefully.
+ *
+ * Concurrent calls to the same idempotent endpoint share a single underlying
+ * fetch; each caller receives an independent Response.clone() so .json()/
+ * .text() consumption stays isolated.
  */
 export async function apiFetch(
   url: string,
@@ -34,6 +45,18 @@ export async function apiFetch(
   const safeToRetry = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
   const maxAttempts = safeToRetry ? retries : 0;
 
+  // Only dedup idempotent reads. POST/PUT/DELETE are intentionally separate
+  // requests even when fired in parallel — the body's identity is too
+  // expensive to hash reliably and the semantics rarely overlap.
+  const dedupKey = safeToRetry ? `${method} ${fullUrl}` : null;
+  if (dedupKey) {
+    const existing = inFlightRequests.get(dedupKey);
+    if (existing) {
+      const shared = await existing;
+      return shared.clone();
+    }
+  }
+
   const attemptFetch = async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -48,16 +71,35 @@ export async function apiFetch(
     }
   };
 
-  for (let i = 0; i <= maxAttempts; i++) {
-    try {
-      const res = await attemptFetch();
-      if (res.ok || res.status < 500) return res;
-    } catch (e) {
-      if (i === maxAttempts) throw e;
+  const run = (async () => {
+    for (let i = 0; i <= maxAttempts; i++) {
+      try {
+        const res = await attemptFetch();
+        if (res.ok || res.status < 500) return res;
+      } catch (e) {
+        if (i === maxAttempts) throw e;
+      }
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     }
-    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    return attemptFetch();
+  })();
+
+  if (dedupKey) {
+    inFlightRequests.set(dedupKey, run);
+    run.finally(() => {
+      // Only delete if this exact promise is still the one cached — guards
+      // against a racy fast-follow request that already replaced it.
+      if (inFlightRequests.get(dedupKey) === run) {
+        inFlightRequests.delete(dedupKey);
+      }
+    });
   }
-  return attemptFetch();
+
+  const res = await run;
+  // Clone for the first caller too so the in-flight Response can still
+  // be cloned by late joiners that arrive between resolution and the
+  // .finally() cleanup.
+  return dedupKey ? res.clone() : res;
 }
 
 export async function fetchTask(taskId: string): Promise<import('./components/TaskCard').Task> {

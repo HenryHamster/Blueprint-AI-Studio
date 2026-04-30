@@ -234,10 +234,11 @@ async def get_all_tasks(
             | (Task.latest_status_message.ilike(search_pattern, escape="\\"))
         )
     if created_after:
-        # Task.created_at is TIMESTAMP WITHOUT TIME ZONE — strip tzinfo if the
-        # query param arrived as tz-aware (e.g. `...Z` or `...+00:00`) so the
-        # asyncpg comparison doesn't raise "can't subtract offset-naive and
-        # offset-aware datetimes".
+        # Task.created_at is TIMESTAMPTZ (alembic 0061) but the
+        # NaiveUTCDateTime ORM TypeDecorator returns naive UTC; this strip
+        # is now redundant but kept as defense-in-depth in case a future
+        # query param arrives tz-aware (e.g. `...Z` or `...+00:00`) before
+        # passing through the TypeDecorator's read path.
         if created_after.tzinfo is not None:
             created_after = created_after.astimezone(timezone.utc).replace(tzinfo=None)
         filters.append(Task.created_at >= created_after)
@@ -350,6 +351,10 @@ async def get_all_tasks(
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "started_at": t.started_at.isoformat() if t.started_at else None,
             "last_heartbeat": t.last_heartbeat.isoformat() if t.last_heartbeat else None,
+            # Audit R3-W2 (H1): expose heartbeat-hot columns directly so the
+            # admin-ui System Metrics panel reads from the column source-of-truth.
+            "last_metrics_json": t.last_metrics_json,
+            "last_tool_use_at": t.last_tool_use_at.isoformat() if t.last_tool_use_at else None,
             "attempt_count": t.attempt_count,
             "payloads": t.payloads,
             "context": {k: v for k, v in (t.context or {}).items() if not k.startswith("max_plan_")},
@@ -604,6 +609,18 @@ async def bulk_action_tasks(
                     ctx = task.context or {}
                     rollup_pr_number = ctx.get("rollup_pr_number")
 
+                    # Round 3 M10 — operator-response latency contract:
+                    # The rollup-PR approval branch performs external GitHub
+                    # API calls (merge_pull_request, create_pr_comment, and
+                    # later _cleanup_branches) BEFORE per-task commit. The
+                    # bulk endpoint's HTTP response therefore includes the
+                    # full GitHub round-trip latency for each approved task
+                    # (typically 2-5s, up to 30s+ during rate-limit). For N
+                    # tasks the response time scales O(N) — operators should
+                    # not assume sub-second latency on bulk approve. This is
+                    # intentional: holding the merge external until commit
+                    # would risk an inconsistency where the DB shows
+                    # COMPLETED but the GitHub PR is still open.
                     if rollup_pr_number:
                         # Rollup PR approval: merge the rollup PR directly
                         try:
@@ -882,6 +899,12 @@ async def get_task(
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "last_heartbeat": task.last_heartbeat.isoformat() if task.last_heartbeat else None,
+        # Audit R3-W2 (H1): expose the heartbeat-hot columns directly so the
+        # admin-ui System Metrics panel reads from the column source-of-truth.
+        # Round 2 F retired the ctx.last_metrics JSONB mirror; this endpoint
+        # was the missing piece that left the frontend silently stale.
+        "last_metrics_json": task.last_metrics_json,
+        "last_tool_use_at": task.last_tool_use_at.isoformat() if task.last_tool_use_at else None,
         "attempt_count": task.attempt_count,
         "payloads": task.payloads,
         "context": {k: v for k, v in (task.context or {}).items() if not k.startswith("max_plan_")},

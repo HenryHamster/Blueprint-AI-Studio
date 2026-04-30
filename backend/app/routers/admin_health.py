@@ -445,9 +445,21 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         if t.vm_instance_id and t.vm_instance_id not in inprogress_by_vm:
             inprogress_by_vm[t.vm_instance_id] = t
 
+    # Audit R3-W2 (M8): push the warm_target_vm_id existence filter into SQL
+    # so we don't pull 1000-row pages of QUEUED tasks just to Python-filter
+    # to a handful of warm-pinned ones. ``context['warm_target_vm_id']``
+    # compiles to ``context -> 'warm_target_vm_id'`` (Postgres JSONB) /
+    # ``json_extract(context, '$.warm_target_vm_id')`` (SQLite); both
+    # return NULL when the key is absent, so the IS NOT NULL predicate is
+    # dialect-agnostic. SQLite has no GIN — the index_safe variant matters
+    # only on Postgres but the predicate evaluates correctly either way.
+    pinned_where = [
+        Task.status == TaskStatus.QUEUED,
+        Task.context["warm_target_vm_id"].as_string().is_not(None),
+    ]
     pinned_stmt = (
         select(Task)
-        .where(Task.status == TaskStatus.QUEUED)
+        .where(*pinned_where)
         .options(load_only(
             Task.id, Task.context, Task.payloads, Task.project_id,
             Task.status_log,

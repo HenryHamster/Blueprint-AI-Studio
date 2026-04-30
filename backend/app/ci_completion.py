@@ -24,6 +24,11 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
+
+from app.models import Task, TaskStatus, _utcnow
+
+logger = logging.getLogger(__name__)
 
 
 def _pr_number_match(session, pr_number: int):
@@ -39,11 +44,6 @@ def _pr_number_match(session, pr_number: int):
     if dialect_name == 'sqlite':
         return func.json_extract(Task.payloads, '$[0].pr_number') == pr_number
     return Task.payloads[0]["pr_number"].as_string() == str(pr_number)
-from sqlmodel import select
-
-from app.models import Task, TaskStatus, _utcnow
-
-logger = logging.getLogger(__name__)
 
 # Hard cap on merge retries — scope-aware. Small-scope PRs (single-file tweaks)
 # have fewer legitimate reasons for transient merge failures, so cap sooner.
@@ -171,6 +171,15 @@ async def _attempt_merge_with_retry_and_escalation(
 
     Handles the existing retry / rule-block escalation / merge-failure path that
     used to live inline inside handle_ci_completion. Returns True iff merged.
+
+    Round 3 H4 (lock-window break): caller (process_ci_completion) holds the
+    task FOR UPDATE lock since line 762. The merge_pull_request call and its
+    retry loop (5 + 15 + 45 = 65s combined) hold that lock across long-running
+    GitHub I/O, starving concurrent heartbeats on the same row. We mirror the
+    rollup_management ``_release_parent_lock`` / ``_relock_parent`` pattern:
+    capture ``updated_at`` snapshot, commit-release, run the merge calls
+    without lock, then re-acquire with snapshot validation. If a peer mutated
+    the row during the unlocked window, the re-acquire fails and we defer.
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.main import _maybe_create_failure_alert
@@ -182,6 +191,22 @@ async def _attempt_merge_with_retry_and_escalation(
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
     ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
 
+    # Round 3 H4: capture snapshot + release lock around the merge calls.
+    # ``parent_id_local`` mirrors the snapshot-stale convention from
+    # rollup_management.py: the in-memory ``task`` is stale after release;
+    # only stable identifiers (id, project_id) are safe to read between
+    # release and re-acquire.
+    #
+    # IMPORTANT: snapshot updated_at AFTER the commit. Any ORM-tracked
+    # mutation that lands in this commit advances ``updated_at`` via
+    # ``onupdate=_utcnow``, so capturing pre-commit would always trigger
+    # a false "peer mutated" path on re-acquire. Mirrors the pattern in
+    # rollup_management._release_parent_lock.
+    parent_id_local = task.id
+    session.add(task)
+    await session.commit()  # release task FOR UPDATE lock
+    pre_merge_updated_at = task.updated_at
+
     merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
     if not merge_result.get("merged") and not merge_result.get("conflict") and source != "webhook":
         # Retry with backoff (skip in webhook context — would timeout delivery).
@@ -191,6 +216,31 @@ async def _attempt_merge_with_retry_and_escalation(
             merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
             if merge_result.get("merged") or merge_result.get("conflict"):
                 break
+
+    # Re-acquire with snapshot validation. If a peer mutated during our
+    # unlocked window, defer to next sweep. The merge call may have already
+    # succeeded externally; the next sweep observes pr_state.merged=True via
+    # get_pull_request below.
+    fresh_task = (await session.execute(
+        select(Task).where(Task.id == parent_id_local).with_for_update(skip_locked=True)
+    )).scalars().first()
+    if fresh_task is None:
+        logger.info(
+            f"[CI] Task {parent_id_local} held by peer after merge call — "
+            f"deferring to next sweep ({source})"
+        )
+        return bool(merge_result.get("merged"))
+    if pre_merge_updated_at is not None and fresh_task.updated_at != pre_merge_updated_at:
+        logger.info(
+            f"[CI] Task {parent_id_local} mutated during merge window "
+            f"(expected updated_at={pre_merge_updated_at}, found {fresh_task.updated_at}) — "
+            f"deferring to next sweep ({source})"
+        )
+        return bool(merge_result.get("merged"))
+    # Re-bind ``task`` to the fresh row so mutations below operate on the
+    # currently-locked instance (the original ``task`` is detached / stale).
+    task = fresh_task
+    ci_loop = (task.context or {}).get("review_loop", {})
 
     if merge_result.get("merged"):
         await create_pr_comment(gh_token, owner, repo, ci_pr_number,
@@ -332,6 +382,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 .where(
                     Task.project_id == task.project_id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                    Task.archived.is_(False),
                     _pr_number_match(session, ci_pr_number),
                 )
             )).scalars().all()
@@ -422,6 +473,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 .where(
                     Task.project_id == task.project_id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                    Task.archived.is_(False),
                     _pr_number_match(session, ci_pr_number),
                 )
             )).scalars().all()
@@ -595,6 +647,7 @@ async def _attempt_merge_with_retry_and_escalation(
                     .where(
                         Task.project_id == task.project_id,
                         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                        Task.archived.is_(False),
                         _pr_number_match(session, ci_pr_number),
                     )
                 )).scalars().all()
@@ -820,6 +873,7 @@ async def handle_ci_completion(
             .where(
                 Task.project_id == task.project_id,
                 Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                Task.archived.is_(False),
                 _pr_number_match(session, ci_pr_number),
             )
         )).scalars().all()

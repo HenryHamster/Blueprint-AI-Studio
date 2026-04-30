@@ -559,22 +559,31 @@ async def _maybe_auto_playbook(
     # containment so Postgres can use ``ix_task_context_gin`` instead of
     # seq-scanning every FAILED/CANCELLED task in the window and filtering in
     # Python. ``context @> {"_failure_signature": signature}`` is index-safe
-    # on Postgres; on SQLite the GIN index doesn't exist but the predicate is
-    # still evaluated correctly via the SQLAlchemy JSON ops shim. ``load_only``
-    # drops heavy JSONBs we don't read here (payloads, plan_output) but keeps
-    # ``status_log`` to avoid MissingGreenlet from the Task event listeners
-    # (models.py ~360) under async sessions. Limit caps the per-project scan;
-    # a project that hit the cap had >200 same-signature failures in window
-    # and the playbook entry already triggers well below that threshold.
+    # on Postgres; on SQLite the JSONB op doesn't compile cleanly so we omit
+    # the SQL-side filter and rely on the Python re-check below (audit
+    # R3-W2 / H3). ``load_only`` drops heavy JSONBs we don't read here
+    # (payloads, plan_output) but keeps ``status_log`` to avoid
+    # MissingGreenlet from the Task event listeners (models.py ~360) under
+    # async sessions. Limit caps the per-project scan; a project that hit
+    # the cap had >200 same-signature failures in window and the playbook
+    # entry already triggers well below that threshold.
+    dialect_name = session.bind.dialect.name if session.bind else 'postgresql'
+    where_clauses = [
+        Task.project_id == task.project_id,
+        Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+        Task.created_at >= window_start,
+        Task.id != task.id,
+    ]
+    if dialect_name != 'sqlite':
+        # Postgres path: GIN containment via ``ix_task_context_gin``.
+        where_clauses.append(
+            Task.context.op("@>")(cast({"_failure_signature": signature}, JSONB))
+        )
+    # SQLite path: no SQL-side filter; Python re-check below filters the
+    # candidate set. The 200-row limit caps the seq-scan worst case.
     result = await session.execute(
         select(Task)
-        .where(
-            Task.project_id == task.project_id,
-            Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
-            Task.created_at >= window_start,
-            Task.id != task.id,
-            Task.context.op("@>")(cast({"_failure_signature": signature}, JSONB)),
-        )
+        .where(*where_clauses)
         .options(load_only(
             Task.id, Task.status, Task.context, Task.created_at, Task.status_log,
         ))
@@ -582,8 +591,9 @@ async def _maybe_auto_playbook(
     )
     recent_tasks = result.scalars().all()
 
-    # Containment guarantees signature match; Python re-check is redundant
-    # but cheap and defends against any dialect oddity (SQLite JSON ops).
+    # Containment guarantees signature match on Postgres; on SQLite this is
+    # the actual filter. Either way the Python re-check is the source of
+    # truth for ``matching``.
     matching = [
         t for t in recent_tasks
         if (t.context or {}).get("_failure_signature") == signature

@@ -312,7 +312,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
 
       {(() => {
-        const metrics = task.context?.last_metrics as { rss_mb?: number; heap_used_mb?: number; disk_free_mb?: number; disk_total_mb?: number; cgroup_mb?: number; cgroup_limit_mb?: number } | undefined;
+        // R3-W2 (H1): read the dedicated column first; fall back to the
+        // legacy ctx.last_metrics mirror only for old in-flight tasks
+        // pre-deploy. Drop the fallback after one deploy cycle once no
+        // in-flight tasks pre-date the column write.
+        const metrics = (task.last_metrics_json ?? task.context?.last_metrics) as { rss_mb?: number; heap_used_mb?: number; disk_free_mb?: number; disk_total_mb?: number; cgroup_mb?: number; cgroup_limit_mb?: number } | undefined;
         const history = (task.context?.metrics_history ?? []) as MetricsSnapshot[];
         if (!metrics) return null;
         const useSparklines = history.length >= 2;

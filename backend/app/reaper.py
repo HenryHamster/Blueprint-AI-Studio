@@ -33,6 +33,13 @@ _TRANSIENT_5XX_PATTERNS = frozenset({
 })
 
 
+# Audit R3-W2 (H7): per-tick fetch cap for unbounded reaper scans. A project
+# with a flood of stuck tasks would otherwise pull megabytes per tick. The
+# constant is intentionally generous (5000) — any tick that hits the cap
+# emits a WARNING so operators can chunk-paginate as a follow-up.
+_BATCH = 5000
+
+
 _ANALYSIS_ARTIFACT_KEYS = (
     ("_pr_diff_summary", "_previous_diff_summary"),
     ("_test_failure_summary", "_previous_test_failure_summary"),
@@ -293,6 +300,7 @@ async def reaper_service():
                 # via task.first_payload (L-P2). The reaper mutates status,
                 # latest_status_message, vm_instance_id, last_heartbeat, started_at,
                 # context, payloads, attempt_count downstream.
+                # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
                 stmt = (
                     select(Task)
                     .options(load_only(
@@ -308,8 +316,14 @@ async def reaper_service():
                     .where(
                         Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
                     )
+                    .limit(_BATCH)
                 )
                 active_tasks = (await session.execute(stmt)).scalars().all()
+                if len(active_tasks) >= _BATCH:
+                    logger.warning(
+                        "[REAPER] active sweep hit cap=%d rows — result truncated; "
+                        "follow-up: chunk-paginate", _BATCH,
+                    )
 
                 now = _utcnow()
                 ten_minutes_ago = now - timedelta(minutes=10)
@@ -1546,10 +1560,18 @@ async def reaper_service():
                 # A far-future or unparseable value permanently blocks dispatch
                 # (orchestrator skips tasks where retry_after > now).
                 try:
+                    # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
                     _retry_cutoff = now + timedelta(minutes=RETRY_AFTER_MAX_MINUTES)
                     _queued_with_retry = (await session.execute(
-                        select(Task).where(Task.status == TaskStatus.QUEUED)
+                        select(Task)
+                        .where(Task.status == TaskStatus.QUEUED)
+                        .limit(_BATCH)
                     )).scalars().all()
+                    if len(_queued_with_retry) >= _BATCH:
+                        logger.warning(
+                            "[REAPER] retry_after sweep hit cap=%d rows — result truncated; "
+                            "follow-up: chunk-paginate", _BATCH,
+                        )
                     _cleared = 0
                     for _qt in _queued_with_retry:
                         # Audit W1: retry_after_until is a column now.
@@ -1588,12 +1610,19 @@ async def reaper_service():
                     import app.shared_state as _shared_state  # noqa: PLC0415
                     _queued_threshold_hours = _runtime_config.get("queued_age_alert_hours", 2)
                     _queued_cutoff = now - timedelta(hours=_queued_threshold_hours)
+                    # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
                     _stale_queued = (await session.execute(
                         select(Task).where(
                             Task.status == TaskStatus.QUEUED,
                             Task.created_at <= _queued_cutoff,
                         )
+                        .limit(_BATCH)
                     )).scalars().all()
+                    if len(_stale_queued) >= _BATCH:
+                        logger.warning(
+                            "[REAPER] stale-queued sweep hit cap=%d rows — result truncated; "
+                            "follow-up: chunk-paginate", _BATCH,
+                        )
 
                     _tier_specs = [
                         (1, _queued_threshold_hours, AlertSeverity.INFO, "INFO"),
