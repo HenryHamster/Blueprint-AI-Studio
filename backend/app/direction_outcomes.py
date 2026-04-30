@@ -291,9 +291,11 @@ async def _update_direction_research_outcomes(
         1 for ct in child_tasks_rows
         if (ct.context or {}).get("user_caught_issues")
     )
-    # avg_time_to_merge_hours: mean of (vm_stopped_at - created_at) for merged tasks
+    # avg_time_to_merge_hours: mean of (vm_stopped_at - created_at) for merged tasks.
+    # created_at is TIMESTAMPTZ since 0061; vm_stopped_at is naive — normalize both.
+    from app.time_utils import _to_naive_utc
     merge_durations = [
-        (ct.vm_stopped_at - ct.created_at).total_seconds() / 3600
+        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds() / 3600
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and (ct.context or {}).get("pr_merged")
@@ -306,7 +308,7 @@ async def _update_direction_research_outcomes(
     # just merged ones. Pairs with avg_review_hours below to split
     # avg_time_to_merge_hours into implementation vs review-pipeline time.
     impl_durations = [
-        (ct.vm_stopped_at - ct.created_at).total_seconds() / 3600
+        (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds() / 3600
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and ct.vm_stopped_at is not None
@@ -341,8 +343,10 @@ async def _update_direction_research_outcomes(
         end_ts = review_end_by_pr.get(pr_num) if pr_num is not None else None
         if end_ts is None:
             end_ts = ct.updated_at
-        if end_ts is not None and end_ts >= ct.vm_stopped_at:
-            review_durations.append((end_ts - ct.vm_stopped_at).total_seconds() / 3600)
+        end_ts_n = _to_naive_utc(end_ts)
+        vm_stop_n = _to_naive_utc(ct.vm_stopped_at)
+        if end_ts_n is not None and vm_stop_n is not None and end_ts_n >= vm_stop_n:
+            review_durations.append((end_ts_n - vm_stop_n).total_seconds() / 3600)
     entry["avg_review_hours"] = round(sum(review_durations) / len(review_durations), 2) if review_durations else None
     # Review iteration counts per child task — lets research agents see
     # prompt-quality outcomes (fewer iterations = clearer prompt).
