@@ -173,10 +173,12 @@ async def _build_stuck_tasks(
     evaluating_timeout_secs = 2 * 3600  # 2 hours
 
     # Pre-fetch all dependency statuses and titles in a single batch query to avoid N+1
+    from app.time_utils import _to_naive_utc
     all_dep_uuids: set[uuid.UUID] = set()
     for task in tasks:
         if task.status == TaskStatus.QUEUED:
-            created_age = (now - task.created_at).total_seconds()
+            # task.created_at is TIMESTAMPTZ since 0061; now is naive _utcnow().
+            created_age = (now - _to_naive_utc(task.created_at)).total_seconds()
             if (task.depends_on or []) and created_age > stuck_deps_secs:
                 for d in task.depends_on:
                     try:
@@ -232,15 +234,16 @@ async def _build_stuck_tasks(
 
         elif task.status == TaskStatus.IN_PROGRESS and task.last_heartbeat is not None:
             hb_cutoff = _heartbeat_stale_cutoff(task, now)
-            if task.last_heartbeat < hb_cutoff:
-                heartbeat_age = (now - task.last_heartbeat).total_seconds()
+            last_hb = _to_naive_utc(task.last_heartbeat)
+            if last_hb and last_hb < hb_cutoff:
+                heartbeat_age = (now - last_hb).total_seconds()
                 threshold_secs = (now - hb_cutoff).total_seconds()
                 stuck_reason = "no_heartbeat"
                 stuck_for_seconds = int(heartbeat_age - threshold_secs)
                 remediation_hint = f"No heartbeat for {_fmt_duration(heartbeat_age)} — VM may have crashed, reaper will clean up"
 
         elif task.status == TaskStatus.QUEUED:
-            created_age = (now - task.created_at).total_seconds()
+            created_age = (now - _to_naive_utc(task.created_at)).total_seconds()
             dep_ids = task.depends_on or []
 
             if dep_ids and created_age > stuck_deps_secs:

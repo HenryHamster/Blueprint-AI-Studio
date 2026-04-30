@@ -301,10 +301,13 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     momentum_buckets = [0, 0, 0]  # [72-48h, 48-24h, 24-0h] failures
     total_buckets = [0, 0, 0]     # same windows, all-status totals
     momentum_dirs: set[str] = set()
+    from app.time_utils import _to_naive_utc
     for t in terminal_tasks:
-        if not t.created_at or t.created_at < momentum_window_start:
+        # Task.created_at TIMESTAMPTZ since 0061; momentum_window_start + now are naive.
+        t_created = _to_naive_utc(t.created_at)
+        if not t_created or t_created < momentum_window_start:
             continue
-        hours_ago = (now - t.created_at).total_seconds() / 3600
+        hours_ago = (now - t_created).total_seconds() / 3600
         if hours_ago < 24:
             momentum_buckets[2] += 1
         elif hours_ago < 48:
@@ -315,9 +318,10 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         if did:
             momentum_dirs.add(did)
     for t in all_tasks_72h:
-        if not t.created_at:
+        t_created = _to_naive_utc(t.created_at)
+        if not t_created:
             continue
-        hours_ago = (now - t.created_at).total_seconds() / 3600
+        hours_ago = (now - t_created).total_seconds() / 3600
         if hours_ago < 24:
             total_buckets[2] += 1
         elif hours_ago < 48:
