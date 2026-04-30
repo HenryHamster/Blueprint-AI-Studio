@@ -385,23 +385,61 @@ async def _compute_health_overview(
 async def get_warm_vm_state(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
+    cache: DigestCache = Depends(get_digest_cache),
 ) -> Dict[str, Any]:
-    """Snapshot of active VMs and warm-pin chain state for the admin UI."""
+    """Snapshot of active VMs and warm-pin chain state for the admin UI.
+
+    Wraps the compute path in a TTL cache with in-flight dedup so that a
+    stampede of concurrent admin UI polls (the warm-VM panel refreshes every
+    5-30s) doesn't re-execute the IN_PROGRESS+QUEUED+terminal scans for each
+    request. Cache key is system-wide (no project filter); response is the
+    same for every admin caller. Default TTL 15s; tune in digest_cache.
+    """
+    cache_key = ("warm-vm-state",)
+    return await cache.get_or_compute(
+        cache_key,
+        lambda: _compute_warm_vm_state(session=session),
+    )
+
+
+# Phase F3 (H2): hard cap on each warm-vm-state scan. The endpoint is admin-
+# polled every 5-30s and previously had no LIMIT — at scale the IN_PROGRESS
+# scan alone could fan out to thousands of rows under burst load. Truncating
+# to 1000 keeps the response bounded; we log a warning if the cap is hit so
+# operators can extend the cap or narrow the query rather than silently
+# missing VMs.
+_WARM_VM_SCAN_LIMIT = 1000
+
+
+async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
+    """Compute the warm-VM state payload (cached by caller)."""
     now = _utcnow()
 
     # Build the "set of VMs we care about": union of (a) IDs heartbeating, (b)
     # IDs running an IN_PROGRESS task, (c) IDs targeted by a QUEUED warm-pin.
     heartbeat_vms = set(_shared_state.vm_last_heartbeat.keys())
 
+    # Phase F3 (H2): include status_log in load_only — even for read-only sites,
+    # the Task event listeners (models.py ~360) read it on every status mutation
+    # under async sessions, and an unloaded status_log triggers MissingGreenlet
+    # if any downstream code touches Task.status. Safer to always include it.
     in_progress_stmt = (
         select(Task)
         .where(Task.status == TaskStatus.IN_PROGRESS, Task.vm_instance_id.is_not(None))
         .options(load_only(
             Task.id, Task.vm_instance_id, Task.title, Task.payloads,
             Task.status, Task.context, Task.started_at, Task.project_id,
+            Task.status_log,
         ))
+        .limit(_WARM_VM_SCAN_LIMIT)
     )
     in_progress_tasks = (await session.execute(in_progress_stmt)).scalars().all()
+    if len(in_progress_tasks) >= _WARM_VM_SCAN_LIMIT:
+        logger.warning(
+            "[WARM-VM-STATE] in_progress scan hit cap=%d rows — result truncated; "
+            "warm-VM panel may miss VMs",
+            _WARM_VM_SCAN_LIMIT,
+        )
     inprogress_by_vm: Dict[str, Task] = {}
     for t in in_progress_tasks:
         if t.vm_instance_id and t.vm_instance_id not in inprogress_by_vm:
@@ -410,9 +448,18 @@ async def get_warm_vm_state(
     pinned_stmt = (
         select(Task)
         .where(Task.status == TaskStatus.QUEUED)
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.project_id))
+        .options(load_only(
+            Task.id, Task.context, Task.payloads, Task.project_id,
+            Task.status_log,
+        ))
+        .limit(_WARM_VM_SCAN_LIMIT)
     )
     pinned_tasks = (await session.execute(pinned_stmt)).scalars().all()
+    if len(pinned_tasks) >= _WARM_VM_SCAN_LIMIT:
+        logger.warning(
+            "[WARM-VM-STATE] pinned QUEUED scan hit cap=%d rows — result truncated",
+            _WARM_VM_SCAN_LIMIT,
+        )
     pinned_by_vm: Dict[str, List[Task]] = {}
     for t in pinned_tasks:
         ctx = t.context or {}
@@ -429,12 +476,17 @@ async def get_warm_vm_state(
         )
         .options(load_only(
             Task.id, Task.vm_instance_id, Task.payloads, Task.last_heartbeat,
-            Task.status, Task.title,
+            Task.status, Task.title, Task.status_log,
         ))
         .order_by(Task.last_heartbeat.desc())
-        .limit(200)
+        .limit(_WARM_VM_SCAN_LIMIT)
     )
     completed_tasks = (await session.execute(completed_stmt)).scalars().all()
+    if len(completed_tasks) >= _WARM_VM_SCAN_LIMIT:
+        logger.warning(
+            "[WARM-VM-STATE] recent completion scan hit cap=%d rows — "
+            "result truncated", _WARM_VM_SCAN_LIMIT,
+        )
     completed_by_vm: Dict[str, List[Task]] = {}
     for t in completed_tasks:
         if t.vm_instance_id:

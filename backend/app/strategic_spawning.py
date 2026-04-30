@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app import strategic_cycle
@@ -435,13 +436,36 @@ async def _build_recent_interventions(
     now = _utcnow()
     cutoff = now - timedelta(days=lookback_days)
 
+    # Phase F3 (H3): bound the per-project lookback scan. With a 14-day default
+    # window and 20-40 tasks/day, a busy project hits 280-560 rows; the cap at
+    # 500 keeps the working set bounded for projects that burst higher. Order
+    # newest-first so a truncated result still reflects the most recent rolling
+    # windows (last_24h, last_3d, last_7d, since_last_strategic) — those rolling
+    # buckets are the load-bearing outputs of this function. Drop heavy JSONBs
+    # we don't read here (plan_output) via load_only, but keep status_log so
+    # the Task event listeners (models.py ~360) don't trip MissingGreenlet under
+    # async sessions even on read-only access.
     tasks_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project.id,
             Task.created_at >= cutoff,
         )
+        .options(load_only(
+            Task.id, Task.status, Task.created_at, Task.updated_at,
+            Task.context, Task.payloads, Task.parent_task_id, Task.status_log,
+        ))
+        .order_by(Task.created_at.desc())
+        .limit(500)
     )
     tasks_in_window = list(tasks_result.scalars().all())
+    if len(tasks_in_window) >= 500:
+        logger.warning(
+            "[STRATEGIC] creation_velocity truncated to 500 rows for project=%s "
+            "(lookback=%dd) — extend lookback OR add LIMIT-aware logic if the "
+            "rolling rates need to span a busier window",
+            project.id, lookback_days,
+        )
 
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {

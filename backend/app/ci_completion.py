@@ -20,9 +20,25 @@ import logging
 import re
 import uuid
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
+
+
+def _pr_number_match(session, pr_number: int):
+    """Dialect-conditional WHERE clause for payloads[0].pr_number filter.
+
+    Postgres: matches the ``ix_task_payloads_pr_number`` expression index
+    (alembic 0057) via ``.as_string()`` which compiles to ``-> 0 ->> 'pr_number'``.
+    SQLite: uses ``func.json_extract`` because the .as_string() form
+    JSON_QUOTE-double-quotes ints on SQLite and never matches.
+    See review_pipeline.py:_spawn_pipeline_task for the canonical pattern.
+    """
+    dialect_name = session.bind.dialect.name if session.bind else 'postgresql'
+    if dialect_name == 'sqlite':
+        return func.json_extract(Task.payloads, '$[0].pr_number') == pr_number
+    return Task.payloads[0]["pr_number"].as_string() == str(pr_number)
 from sqlmodel import select
 
 from app.models import Task, TaskStatus, _utcnow
@@ -296,21 +312,33 @@ async def _attempt_merge_with_retry_and_escalation(
             # update_branch failures exceeded dynamic threshold — escalate to fix task with rebase.
             from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
             from app.rollup_state import _is_rollup_parent_awaiting_merge  # noqa: PLC0415
-            # Phase B4 (H-P6): Python-side filter on first_payload.type/pr_number.
-            # Drop status_log/plan_output/context — only id + payloads needed.
+            # Phase F3 (H5): push the per-PR filter into SQL using
+            # cast(..., Integer) so the ``ix_task_payloads_pr_number`` partial
+            # expression index (alembic 0057) can serve the predicate on
+            # Postgres. SQLite seq-scans (test path); Postgres uses the index.
+            # Matches the ``cast(Task.payloads[0]["pr_number"], Integer)`` form
+            # used in review_pipeline.py:_spawn_pipeline_task to keep both call
+            # sites dialect-symmetric. Include ``status_log`` in load_only:
+            # the Task event listeners (models.py ~360) read it on every
+            # status assignment under async sessions, and an unloaded value
+            # triggers MissingGreenlet on downstream mutations even if this
+            # site only filters the result set. Drop heavy plan_output JSONB.
             active_tasks = (await session.execute(
                 select(Task)
-                .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+                .options(load_only(
+                    Task.id, Task.status, Task.context, Task.payloads,
+                    Task.project_id, Task.status_log,
+                ))
                 .where(
                     Task.project_id == task.project_id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                    _pr_number_match(session, ci_pr_number),
                 )
             )).scalars().all()
             existing_fix = next(
                 (t for t in active_tasks
                  if t.id != task.id
-                 and t.first_payload.get("type") == "fix"
-                 and t.first_payload.get("pr_number") == ci_pr_number),
+                 and t.first_payload.get("type") == "fix"),
                 None,
             )
             if existing_fix:
@@ -380,21 +408,27 @@ async def _attempt_merge_with_retry_and_escalation(
             # Dedup guard: if a fix task for this PR is already active, don't spawn another.
             # Mirrors the CI-failure path in handle_ci_completion to prevent duplicate fixes
             # contending on the same PR.
-            # Phase B4 (H-P6): Python-side filter on first_payload.type/pr_number.
-            # Drop status_log/plan_output/context — only id + payloads needed.
+            # Phase F3 (H5): push pr_number filter into SQL via cast(..., Integer)
+            # so ``ix_task_payloads_pr_number`` (alembic 0057) is usable on
+            # Postgres. Same dialect-symmetric approach as review_pipeline.py.
+            # status_log included to satisfy the Task event listeners under
+            # async sessions; plan_output dropped via load_only.
             active_tasks = (await session.execute(
                 select(Task)
-                .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+                .options(load_only(
+                    Task.id, Task.status, Task.context, Task.payloads,
+                    Task.project_id, Task.status_log,
+                ))
                 .where(
                     Task.project_id == task.project_id,
                     Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                    _pr_number_match(session, ci_pr_number),
                 )
             )).scalars().all()
             existing_fix = next(
                 (t for t in active_tasks
                  if t.id != task.id
-                 and t.first_payload.get("type") == "fix"
-                 and t.first_payload.get("pr_number") == ci_pr_number),
+                 and t.first_payload.get("type") == "fix"),
                 None,
             )
             if existing_fix:
@@ -548,19 +582,25 @@ async def _attempt_merge_with_retry_and_escalation(
             # cleanly without spawning.
             if not (_deterministic or _repeated_identical or _merge_failures >= _hard_cap):
                 from app.review_pipeline import _spawn_pipeline_task
-                # Phase B4 (H-P6): drop status_log/plan_output/context.
+                # Phase F3 (H5): push pr_number filter into SQL via cast(..., Integer)
+                # so ``ix_task_payloads_pr_number`` (alembic 0057) is usable on
+                # Postgres. status_log included for the Task event listeners
+                # under async sessions; plan_output dropped via load_only.
                 active_tasks = (await session.execute(
                     select(Task)
-                    .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+                    .options(load_only(
+                        Task.id, Task.status, Task.context, Task.payloads,
+                        Task.project_id, Task.status_log,
+                    ))
                     .where(
                         Task.project_id == task.project_id,
                         Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                        _pr_number_match(session, ci_pr_number),
                     )
                 )).scalars().all()
                 already_fixing = any(
                     t.id != task.id
                     and t.first_payload.get("type") == "fix"
-                    and t.first_payload.get("pr_number") == ci_pr_number
                     for t in active_tasks
                 )
                 if not already_fixing:
@@ -767,20 +807,26 @@ async def handle_ci_completion(
         )
     else:
         # CI failed — spawn fix task
-        # Phase B4 (H-P6): drop status_log/plan_output/context.
+        # Phase F3 (H5): push pr_number filter into SQL via cast(..., Integer)
+        # so ``ix_task_payloads_pr_number`` (alembic 0057) is usable on
+        # Postgres. status_log included for the Task event listeners under
+        # async sessions; plan_output dropped via load_only.
         active_tasks = (await session.execute(
             select(Task)
-            .options(load_only(Task.id, Task.status, Task.payloads, Task.project_id))
+            .options(load_only(
+                Task.id, Task.status, Task.context, Task.payloads,
+                Task.project_id, Task.status_log,
+            ))
             .where(
                 Task.project_id == task.project_id,
                 Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
+                _pr_number_match(session, ci_pr_number),
             )
         )).scalars().all()
         existing_fix = next(
             (t for t in active_tasks
              if t.id != task.id
-             and t.first_payload.get("type") == "fix"
-             and t.first_payload.get("pr_number") == ci_pr_number),
+             and t.first_payload.get("type") == "fix"),
             None
         )
         if existing_fix:
