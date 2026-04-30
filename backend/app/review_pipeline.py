@@ -11,6 +11,7 @@ import re
 import uuid
 from datetime import timedelta
 
+from sqlalchemy import Integer, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -1015,7 +1016,12 @@ async def _spawn_pipeline_task(
             Task.project_id == source_task.project_id,
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.archived.is_(False),
-            Task.payloads[0]["pr_number"].as_string() == str(pr_number),
+            # cast(..., Integer) is dialect-agnostic — Postgres uses the
+            # ix_task_payloads_pr_number expression index, SQLite extracts via
+            # json_extract. Comparing the raw JSON value as text differs
+            # between dialects (quoted-string on SQLite vs unquoted on
+            # Postgres ->>), so cast both sides to Integer for safety.
+            cast(Task.payloads[0]["pr_number"], Integer) == pr_number,
             Task.payloads[0]["type"].as_string().in_(("review", "fix")),
         )
     )).scalars().all()
