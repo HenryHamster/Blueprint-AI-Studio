@@ -185,11 +185,11 @@ resource "google_monitoring_alert_policy" "cloudsql_up" {
 resource "google_logging_metric" "cloud_sql_backup_failure" {
   count       = local.alerting_enabled ? 1 : 0
   name        = "cloud_sql_backup_failure"
-  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3, R3-W4 M6, R4-W4 M8)."
+  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3, R3-W4 M6, R4-W4 M8, R5-W3-C)."
   # R3-W4 M6 (audit 2026-04-30): broadened from the original
   # `cloudsql.instances.backup.*` regex, which missed the actual method
   # names Cloud SQL emits in audit logs. Real method names include:
-  #   - cloudsql.instances.createBackup   (on-demand backup)
+  #   - cloudsql.instances.createBackup   (operator-initiated on-demand)
   #   - cloudsql.backupRuns.insert        (scheduled backup runs)
   #   - cloudsql.backupRuns.create        (alternate scheduled path)
   # `cloudsql.instances.export` is intentionally excluded (export is a
@@ -198,27 +198,33 @@ resource "google_logging_metric" "cloud_sql_backup_failure" {
   # any-character; we want literal `.` matches between method-name
   # segments.
   #
-  # R4-W4 M8 (audit 2026-04-29): severity widened from `ERROR` to
-  # `(ERROR OR WARNING)`. Cloud SQL emits backup-termination events at
-  # severity=WARNING for transient causes (e.g. temporary IO contention,
-  # maintenance-window collision) that still leave the recovery window
-  # unhealthy. With ERROR-only filtering, those incidents went unnoticed
-  # and were only caught when the next-day backup also failed and the
-  # operator hit the 7-day retention floor. The false-positive cost
-  # (alert pings for a transient WARNING that self-recovers) is
-  # acceptable — the alert documentation directs the operator to verify
-  # via `gcloud sql backups list`, which surfaces the actual recovery
-  # window in seconds. A real-failed-backup test in the next restore
-  # drill should validate the regex captures both severity bands; if
-  # WARNING-only events are too noisy, narrow back to ERROR with a note
-  # that transient WARNING-only failures will be missed.
+  # R5-W3-C (audit 2026-04-30): two changes from R4-W4 M8:
+  #
+  # 1. Narrow regex: drop `cloudsql.instances.createBackup` from the
+  #    match. That method is operator-initiated (e.g. an audit, a manual
+  #    pre-deploy snapshot, or scripted `gcloud sql backups create`) and
+  #    its failure is a known-state to whoever triggered it — paging the
+  #    on-call here generates noise that drowns out the actual signal we
+  #    care about (scheduled backups failing). Keep only
+  #    `cloudsql.backupRuns.(insert|create)`, which is the scheduled
+  #    backup path emitted by Cloud SQL's automatic backup engine.
+  #
+  # 2. Revert severity to ERROR-only. The R4-W4 widening to
+  #    `(ERROR OR WARNING)` was based on an unverified assumption that
+  #    Cloud SQL emits WARNING-severity events for failed backups. We
+  #    haven't been able to verify this against actual logs (the most
+  #    reliable confirmation would be a real-failed-backup test in the
+  #    next restore drill, which hasn't run yet). The conservative
+  #    choice is ERROR-only: WARNING-severity backup events that aren't
+  #    actually failures (e.g. routine IO contention, maintenance-window
+  #    collisions, on-demand `createBackup` audits) were the audit-D M1
+  #    noise source. If the next restore drill confirms WARNINGs are
+  #    real backup-failure signals, we can re-broaden — paired with the
+  #    `alert_strategy` rate-limit below so a WARNING burst can't spam.
   filter = <<-EOT
     resource.type="cloudsql_database"
-    AND (
-      protoPayload.methodName=~"cloudsql\.instances\.(create)?[Bb]ackup.*"
-      OR protoPayload.methodName=~"cloudsql\.backupRuns\.(insert|create)"
-    )
-    AND (severity=ERROR OR severity=WARNING)
+    AND protoPayload.methodName=~"cloudsql\.backupRuns\.(insert|create)"
+    AND severity=ERROR
   EOT
   metric_descriptor {
     metric_kind = "DELTA"
@@ -249,8 +255,23 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
 
   notification_channels = [google_monitoring_notification_channel.email[0].id]
 
+  # R5-W3-C (audit 2026-04-30, audit-D M1): defense-in-depth against
+  # alert-burst spam. Even with the narrowed ERROR-only filter, a
+  # transient backup engine outage can emit several failure events in
+  # quick succession; without rate-limiting, each one re-pages the
+  # on-call. `auto_close` (30 min) ensures stale incidents close
+  # automatically once the metric stops firing, so re-firing represents
+  # a NEW incident. `notification_rate_limit` (5 min) caps re-pages to
+  # one per 5-minute window per incident.
+  alert_strategy {
+    auto_close = "1800s"
+    notification_rate_limit {
+      period = "300s"
+    }
+  }
+
   documentation {
-    content   = "Cloud SQL emitted a backup-failure event (severity=ERROR or WARNING). The 7-day retention of `cloudsql_backups` means a single failure is recoverable, but two consecutive failures shrink the recoverable window. R4-W4 M8 (audit 2026-04-29): severity was widened to include WARNING, so this alert may fire on transient backup terminations that self-recover — verify the actual recovery window via `gcloud sql backups list --instance=<name>` before declaring an outage. Runbook: docs/db-operations.md (Restore procedure) — verify the instance is healthy and re-trigger via `gcloud sql backups create --instance=<name>`."
+    content   = "Cloud SQL emitted a scheduled-backup failure event (severity=ERROR on cloudsql.backupRuns.insert/create). The 7-day retention of `cloudsql_backups` means a single failure is recoverable, but two consecutive failures shrink the recoverable window. R5-W3-C narrowed this filter to scheduled backups only and severity=ERROR only — operator-initiated `createBackup` failures and WARNING-severity routine events no longer fire this alert. Runbook: docs/db-operations.md (Restore procedure) — verify the instance is healthy via `gcloud sql backups list --instance=<name>` and re-trigger via `gcloud sql backups create --instance=<name>` if needed."
     mime_type = "text/markdown"
   }
 }
