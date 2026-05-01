@@ -42,12 +42,40 @@ async def _record_strategic_task_failure(
     Called from _process_post_commit when a design_doc_update or strategic_review
     task terminates with FAILED status (VM crash, timeout, etc.).
 
-    Phase C3 (HIGH H-C4): the post-commit chain pre-acquires the project
-    lock via ``lock_project_for_strategic_transition`` and passes the
-    locked Project here as ``project=``. Direct callers can omit it; the
-    fallback path acquires the lock here (Round 4 W1, audit M1).
+    Commit semantics (R5-W5 audit MED-1):
+    -----------------------------------
+    This function does NOT commit. It mutates ``project.vision`` and (when a
+    cycle id is present) the StrategicCycle row, then ``session.add(project)``.
+    The caller is expected to commit. ``_process_post_commit`` in
+    ``task_lifecycle.py`` batches several mutations from a single terminal
+    transition (dependent unblock, strategic-failure increment, research-failure
+    increment, investigation-spawn) into one commit at the end of the post-
+    commit chain — that's the design intent.
 
-    Round 4 W1 (audit M1): the fallback used to call
+    Trade-off: if a later mutation in the same chain raises, the strategic-
+    failure increment rolls back too. That's the chosen behavior — partial
+    state is worse than a re-tried whole. The next FAILED-terminal transition
+    on this task will re-enter the chain (it's idempotent: the increment is
+    a write of ``failures = old + 1`` against the freshly loaded vision).
+    Direct callers (currently only the test suite) that want immediate
+    persistence must commit themselves.
+
+    ``project=None`` fallback (R5-W5 audit MED-2):
+    ---------------------------------------------
+    Production callers always pass ``locked_project`` because
+    ``task_lifecycle.py:1126`` pair-locks Project before Task for strategic
+    types via ``lock_project_then_task`` (canonical Project-before-Task order
+    per docs/concurrency.md). The fallback path below — acquiring the project
+    via FOR UPDATE SKIP LOCKED — is therefore only exercised by direct test
+    callers (see ``testing/test_strategic_completion.py::TestRecordStrategicTaskFailure``).
+    It's preserved so the function remains independently testable without
+    test fixtures having to wire up the canonical pair-lock.
+
+    Phase C3 (HIGH H-C4): post-commit chain pre-acquires the project lock via
+    ``lock_project_for_strategic_transition`` and passes the locked Project
+    here as ``project=``.
+
+    Round 4 W1 (audit M1): historically the fallback called
     ``session.get(Project, ...)`` with no lock, allowing simultaneous
     strategic_review and design_doc_update failures to read the same
     in-memory ``_strategic_failures`` baseline and write back the same
