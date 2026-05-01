@@ -529,6 +529,23 @@ class Task(SQLModel, table=True):
             "payloads",
             postgresql_where=text("status IN ('PROVISIONING', 'IN_PROGRESS')"),
         ),
+        # Partial index on retry_after_until so the reaper's stale
+        # retry_after sweep (reaper.py: status=QUEUED AND
+        # retry_after_until IS NOT NULL) doesn't degrade to linear scan
+        # of the QUEUED queue at 1k users. Postgres-only via alembic 0069
+        # CONCURRENTLY DDL; the metadata Index registers the name +
+        # column for ``test_model_indexes_covered_by_migrations``.
+        # See R5-W2-C.
+        Index(
+            "ix_task_retry_after_active",
+            "retry_after_until",
+            postgresql_where=text(
+                "status = 'QUEUED' AND retry_after_until IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status = 'QUEUED' AND retry_after_until IS NOT NULL"
+            ),
+        ),
         # Defense-in-depth size cap on payloads JSONB (audit 2026-04-29 D4 /
         # finding M-S5). The Python layer's ``pack_under_budget`` already caps
         # strategic-spawn payloads at 120 KB, but a future code path could
