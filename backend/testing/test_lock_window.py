@@ -730,3 +730,126 @@ async def test_lock_task_for_mutation_no_expected_means_no_validation(db_session
     )
     assert locked is not None
     await db_session.rollback()
+
+
+# ── R5-W3-B context_dirty regression (R6 audit) ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_release_parent_lock_persists_context_when_dirty_flag_set(db_session):
+    """R5-W3-B / R6 audit: when a caller mutates ``parent.context``
+    in-place before releasing, it MUST pass ``context_dirty=True`` so
+    ``flag_modified`` fires and SQLA actually emits an UPDATE for the
+    JSONB column.
+
+    Mirror the canonical pattern from ``rollup_management.py``: write a
+    new key into ``parent.context``, release with ``context_dirty=True``,
+    then re-read the row in a fresh transaction and confirm the mutation
+    landed.
+
+    Without ``context_dirty=True``, SQLA's mutation tracking misses
+    in-place dict edits on the JSONB column (mutable type with
+    ``copy_on_set=False``-style semantics under SQLModel + JSONB) — the
+    UPDATE is suppressed and the change silently disappears on the next
+    ``populate_existing`` re-read. This test pins the contract that
+    callers can rely on the flag.
+    """
+    project = Project(name="ctxdirty persist", user_id="user-ctxdirty")
+    db_session.add(project)
+    await db_session.commit()
+
+    parent = Task(
+        project_id=project.id,
+        title="parent",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research"}],
+        context={"original": "value"},
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    parent_id = parent.id
+
+    # Caller-driven: mutate context in-place, then release with the flag.
+    parent.context["new_key"] = "new_value"
+    snapshot = await _release_parent_lock(parent, db_session, context_dirty=True)
+    assert snapshot is not None
+
+    # Re-read with populate_existing to bypass the identity-map cache.
+    fresh = (await db_session.execute(
+        select(Task)
+        .where(Task.id == parent_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+    assert fresh.context.get("new_key") == "new_value", (
+        "context_dirty=True did not persist the in-place mutation — "
+        "flag_modified is no longer firing on context. R5-W3-B contract broken."
+    )
+    assert fresh.context.get("original") == "value"
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "Silent-loss demonstration depends on JSONB mutation-tracking semantics; "
+        "SQLite's JSON column type behaves differently and would mask the "
+        "footgun. The contract holds in production (Postgres)."
+    ),
+)
+@pytest.mark.asyncio
+async def test_release_parent_lock_silently_drops_context_when_dirty_flag_omitted(db_session):
+    """R5-W3-B FOOTGUN documentation: if a caller forgets
+    ``context_dirty=True`` after mutating ``parent.context`` in-place,
+    SQLA's mutation tracking misses the change and the UPDATE is
+    suppressed.
+
+    This test pins the FOOTGUN behavior so a future change that fixes
+    the silent loss (e.g. by re-enabling unconditional flag_modified, or
+    switching to a MutableDict TypeDecorator) is intentional and the
+    test gets updated, not accidentally papered-over. Mirrors the
+    pattern of pinning ``--noconftest`` invariants in test_invariants.py.
+
+    Documented contract: callers that mutate ``parent.context`` MUST
+    pass ``context_dirty=True``. Read-only release sites omit it and
+    pay no JSONB-write cost (R5-W3-B benefit).
+    """
+    project = Project(name="ctxdirty footgun", user_id="user-ctxdirty-fg")
+    db_session.add(project)
+    await db_session.commit()
+
+    parent = Task(
+        project_id=project.id,
+        title="parent",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research"}],
+        context={"original": "value"},
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    parent_id = parent.id
+
+    # FOOTGUN: in-place mutation WITHOUT context_dirty=True.
+    parent.context["forgotten_key"] = "lost_value"
+    await _release_parent_lock(parent, db_session)  # no context_dirty kw
+
+    # Re-read in a fresh session connection to bypass any in-memory state.
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with Session() as fresh_session:
+        fresh = (await fresh_session.execute(
+            select(Task).where(Task.id == parent_id)
+        )).scalar_one()
+        # Document the silent-loss contract. If this assertion ever
+        # changes (i.e. the mutation persists without context_dirty), it
+        # means a future commit fixed the footgun — update the test
+        # message + the docstring of _release_parent_lock to match.
+        assert "forgotten_key" not in (fresh.context or {}), (
+            "Silent-loss contract changed: in-place context mutation now persists "
+            "WITHOUT context_dirty=True. If this is intentional (e.g. you switched "
+            "to MutableDict), remove this test and update the _release_parent_lock "
+            "docstring. Otherwise, the footgun guard regressed."
+        )

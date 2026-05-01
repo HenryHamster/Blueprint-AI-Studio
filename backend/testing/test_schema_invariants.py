@@ -42,6 +42,21 @@ Coverage:
   rows), and reference the JSON expression (a column-only B-tree on
   ``payloads`` would be ignored by the planner). Postgres-only — SQLite
   test path uses a different fallback index per 0067's branch.
+
+- **ix_task_retry_after_active partial index** (R6 audit / R5-W2-C):
+  alembic 0069 creates a partial index on ``retry_after_until`` WHERE
+  ``status = 'QUEUED' AND retry_after_until IS NOT NULL`` so the
+  reaper's stale ``retry_after`` sweep doesn't degrade to a linear scan
+  of the QUEUED queue at 1k users. Same shape of test as the
+  payloads_type_active pair (existence + partial-WHERE + EXPLAIN).
+
+- **NaiveUTCDateTime symmetric writes through R5-W4 columns** (R6
+  audit): R5-W4 routed 22 additional datetime columns through
+  ``NaiveUTCDateTime``. The existing tests cover Project.created_at and
+  SystemMaturity.last_audited_at; this section spot-checks the
+  heartbeat path (Task.last_heartbeat) and the auto-disable path
+  (MaxPlanAccount.disabled_at) so a misconfigured ``sa_column`` on
+  either column fails the suite.
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -50,7 +65,7 @@ import pytest
 from sqlalchemy import text, update
 from sqlmodel import select
 
-from app.models import Project, SystemMaturity, Task, TaskStatus
+from app.models import MaxPlanAccount, Project, SystemMaturity, Task, TaskStatus
 
 
 USE_POSTGRES = (
@@ -71,9 +86,13 @@ async def test_naive_utc_datetime_strips_aware_writes(db_session):
     tz-aware values would land in a column whose Python loads strip tz, so
     callers would see different values than they wrote.
 
-    Tests against ``Task.created_at`` because it uses ``NaiveUTCDateTime`` (the
-    columns that exercise the symmetric write path); ``last_heartbeat`` is a
-    plain DateTime and would not exercise the decorator.
+    Tests against ``Project.created_at`` because it uses ``NaiveUTCDateTime``
+    (the columns that exercise the symmetric write path).
+
+    Note: ``Task.last_heartbeat`` was migrated to ``NaiveUTCDateTime`` in
+    R5-W4 (it was previously plain DateTime); see
+    ``test_task_last_heartbeat_strips_aware_writes`` below for the
+    Task-side equivalent.
     """
     project = Project(name="naive-aware-write", user_id="user-naive-write")
     db_session.add(project)
@@ -553,3 +572,182 @@ async def test_pipeline_budget_query_uses_payloads_type_index(db_session):
         f"loop will SeqScan every 5s. Re-check alembic 0067 and the filter "
         f"shape at orchestrator.py:~1771."
     )
+
+
+# ── ix_task_retry_after_active index shape (R6 audit / R5-W2-C) ────────────
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="partial expression index is Postgres-only")
+@pytest.mark.asyncio
+async def test_ix_task_retry_after_active_exists_and_is_partial(db_session):
+    """The reaper's retry_after sweep index must be a partial index on
+    ``retry_after_until`` filtered to QUEUED rows whose retry hold is set.
+
+    R5-W2-C / alembic 0069: the reaper sweeps every cycle with
+    ``status == QUEUED AND retry_after_until IS NOT NULL`` and the
+    composite indexes don't match that exact partial predicate. Without
+    this index the LIMIT-5000 sweep degrades to linear-scan cost at 1k
+    users.
+
+    Mirror of test_ix_task_payloads_type_active_exists_and_is_partial —
+    same three checks (exists / partial / WHERE clause).
+    """
+    rows = (await db_session.execute(
+        text(
+            """
+            SELECT indexdef
+              FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND tablename = 'task'
+               AND indexname = 'ix_task_retry_after_active'
+            """
+        )
+    )).all()
+
+    assert rows, (
+        "ix_task_retry_after_active not found in pg_indexes — "
+        "alembic 0069 either didn't run or was reverted; the reaper's "
+        "stale retry_after sweep will linear-scan the QUEUED queue every cycle."
+    )
+
+    indexdef = rows[0][0]
+    indexdef_lower = indexdef.lower()
+
+    assert "retry_after_until" in indexdef_lower, (
+        f"ix_task_retry_after_active no longer references retry_after_until — "
+        f"got indexdef={indexdef!r}."
+    )
+    assert "where" in indexdef_lower, (
+        f"ix_task_retry_after_active is no longer a partial index — "
+        f"got indexdef={indexdef!r}. A non-partial would still satisfy the "
+        f"planner but waste index pages on rows the reaper sweep never touches."
+    )
+    assert "queued" in indexdef_lower, (
+        f"partial WHERE clause should restrict to QUEUED status; got {indexdef!r}"
+    )
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="EXPLAIN plan inspection is Postgres-only")
+@pytest.mark.asyncio
+async def test_reaper_retry_after_query_uses_retry_index(db_session):
+    """The reaper's retry_after sweep query plan must use the index.
+
+    Mirror of test_pipeline_budget_query_uses_payloads_type_index — even
+    when the index exists, the planner can ignore it if the predicate
+    shape doesn't match. EXPLAIN catches that.
+    """
+    project = Project(name="reaper-retry-explain", user_id="user-rrx")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Mix of QUEUED-with-retry-hold, QUEUED-without, and other statuses
+    # so the planner has reason to consider the partial index.
+    now = datetime.utcnow()
+    tasks = []
+    for i in range(20):
+        status = TaskStatus.QUEUED if i % 2 == 0 else TaskStatus.IN_PROGRESS
+        retry_after = now + timedelta(seconds=30) if (i % 4 == 0) else None
+        tasks.append(Task(
+            project_id=project.id,
+            title=f"retry-{i}",
+            payloads=[{"type": "research"}],
+            status=status,
+            retry_after_until=retry_after,
+        ))
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    await db_session.execute(text("ANALYZE task"))
+    await db_session.execute(text("SET LOCAL enable_seqscan = off"))
+    await db_session.execute(text("SET LOCAL enable_bitmapscan = off"))
+
+    try:
+        explain_rows = (await db_session.execute(
+            text(
+                """
+                EXPLAIN (FORMAT TEXT)
+                SELECT id FROM task
+                 WHERE status = 'QUEUED'
+                   AND retry_after_until IS NOT NULL
+                 LIMIT 5000
+                """
+            )
+        )).all()
+        plan = "\n".join(row[0] for row in explain_rows)
+    finally:
+        await db_session.execute(text("RESET enable_seqscan"))
+        await db_session.execute(text("RESET enable_bitmapscan"))
+
+    assert "ix_task_retry_after_active" in plan, (
+        f"reaper retry_after sweep query plan does not use "
+        f"ix_task_retry_after_active — got plan:\n{plan}\n"
+        f"This means the index either doesn't match the predicate or was dropped. "
+        f"The reaper sweep will linear-scan the QUEUED queue every cycle. "
+        f"Re-check alembic 0069 and reaper.py."
+    )
+
+
+# ── NaiveUTCDateTime coverage on R5-W4 columns (R6 audit) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_last_heartbeat_strips_aware_writes(db_session):
+    """R5-W4 routed Task.last_heartbeat from plain DateTime → NaiveUTCDateTime.
+
+    Tz-aware writes must be normalized to naive UTC, mirroring the
+    contract pinned for Project.created_at and SystemMaturity.last_audited_at.
+    Without this, the reaper's ``task.last_heartbeat < cutoff_naive`` check
+    raises TypeError on tz-aware values from any caller using
+    ``datetime.now(timezone.utc)``.
+    """
+    project = Project(name="last-heartbeat-aware", user_id="user-lh")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="last_heartbeat tz test",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    aware_input = datetime(2026, 1, 1, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+    task.last_heartbeat = aware_input
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.last_heartbeat is not None
+    assert task.last_heartbeat.tzinfo is None, (
+        f"expected naive datetime, got tzinfo={task.last_heartbeat.tzinfo!r} — "
+        "Task.last_heartbeat sa_column is no longer wired through NaiveUTCDateTime"
+    )
+    assert task.last_heartbeat == datetime(2026, 1, 1, 4, 0)
+
+
+@pytest.mark.asyncio
+async def test_max_plan_account_disabled_at_strips_aware_writes(db_session):
+    """R5-W4 routed MaxPlanAccount.disabled_at to NaiveUTCDateTime.
+
+    The auto-disable / recheck-disabled-accounts path compares
+    ``disabled_at + cooldown < _utcnow()`` on every reaper tick. A
+    tz-aware write here would raise TypeError on every comparison.
+    """
+    aware_input = datetime(2026, 1, 1, 12, 0, tzinfo=timezone(timedelta(hours=8)))
+    account = MaxPlanAccount(
+        user_id="user-disabled-test",
+        name="test-disabled-account",
+        disabled_at=aware_input,
+    )
+    db_session.add(account)
+    await db_session.commit()
+    await db_session.refresh(account)
+
+    assert account.disabled_at is not None
+    assert account.disabled_at.tzinfo is None, (
+        f"expected naive datetime, got tzinfo={account.disabled_at.tzinfo!r} — "
+        "MaxPlanAccount.disabled_at sa_column is no longer wired through NaiveUTCDateTime"
+    )
+    assert account.disabled_at == datetime(2026, 1, 1, 4, 0)
