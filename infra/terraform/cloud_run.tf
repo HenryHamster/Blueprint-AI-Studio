@@ -94,7 +94,7 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       }
     }
 
-    # Connect Cloud Run to the VPC so it can reach the private AlloyDB instance
+    # Connect Cloud Run to the VPC so it can reach the private Cloud SQL instance
     vpc_access {
       network_interfaces {
         network    = google_compute_network.agent_vpc.name
