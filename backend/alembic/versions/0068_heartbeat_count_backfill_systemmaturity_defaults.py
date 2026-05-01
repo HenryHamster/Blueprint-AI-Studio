@@ -41,6 +41,16 @@ def upgrade() -> None:
     # legacy in-flight rows to migrate. The ``= 0`` filter ensures we only
     # touch rows still at the column-default; rows already incremented by
     # the new ORM-mutation path are left untouched.
+    #
+    # R5 audit MEDIUM-B: the cast ``(context->>'_heartbeat_count')::int``
+    # aborts the whole migration mid-table if any row holds a non-numeric
+    # value at that subkey (e.g. ``"abc"``, an array, or ``null``). Guard
+    # the cast with ``jsonb_typeof(...) = 'number'`` so non-numeric
+    # garbage is silently skipped (those rows stay at heartbeat_count=0,
+    # which matches the prior R2 behavior on first heartbeat).
+    # In-place fix safe per ``reference_migration_patterns.md``: 0068 was
+    # added in commit 16afe63e (today) and has never been applied to a
+    # production DB — only ever exercised in the Docker-based test path.
     if bind.dialect.name == "postgresql":
         op.execute(
             """
@@ -48,6 +58,7 @@ def upgrade() -> None:
             SET heartbeat_count = COALESCE((context->>'_heartbeat_count')::int, 0)
             WHERE jsonb_typeof(context) = 'object'
               AND context ? '_heartbeat_count'
+              AND jsonb_typeof(context->'_heartbeat_count') = 'number'
               AND heartbeat_count = 0
             """
         )
