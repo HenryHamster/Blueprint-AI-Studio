@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
 import { apiFetch } from '../api';
-import { timeAgo } from '../utils/time';
+import { timeAgo, parseTimestamp } from '../utils/time';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { TaskType } from './TaskCard';
 import { DirectionProgressSection } from './DirectionProgressSection';
@@ -757,7 +757,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           const rate = p.success_rate ?? 0;
                           const color = rate >= 0.8 ? 'bg-emerald-400' : rate >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
                           const dateLabel = (() => {
-                            const d = new Date(p.period_end);
+                            const d = parseTimestamp(p.period_end);
                             return isNaN(d.getTime()) ? p.period_end : d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
                           })();
                           const ratePart = p.success_rate == null ? 'no data' : `${Math.round(p.success_rate * 100)}%`;

@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch } from '../api';
-import { timeAgo, formatDurationSec } from '../utils/time';
+import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
@@ -633,7 +633,7 @@ function buildIssues(
     const zoneDetails = diagnostics.zone_health.exhausted.map(zone => {
       const expiresAt = cooldownRecovery[zone];
       if (expiresAt) {
-        const minsLeft = Math.ceil((new Date(expiresAt).getTime() - now) / 60000);
+        const minsLeft = Math.ceil((parseTimestamp(expiresAt).getTime() - now) / 60000);
         return minsLeft > 0 ? `${zone} — recovering in ${minsLeft}min` : zone;
       }
       return zone;

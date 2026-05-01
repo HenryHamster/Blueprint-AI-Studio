@@ -506,7 +506,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
 
         function renderRetryEta(retryAfter: string | undefined) {
           if (!retryAfter) return null;
-          const retryTime = new Date(retryAfter).getTime();
+          const retryTime = parseTimestamp(retryAfter).getTime();
           const ms = retryTime - Date.now();
           if (ms > 0) {
             const mins = Math.ceil(ms / 60000);

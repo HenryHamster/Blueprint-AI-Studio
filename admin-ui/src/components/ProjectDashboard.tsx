@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings } from 'lucide-react';
 import type { Task } from './TaskCard';
+import { parseTimestamp } from '../utils/time';
 
 export type { Project } from '../types/project';
 import type { Project } from '../types/project';
@@ -21,7 +22,7 @@ interface ProjectDashboardProps {
  *  and has no completed tasks yet. */
 function isNewProject(project: Project, completedCount: number): boolean {
   if (!project.created_at) return false;
-  const createdMs = new Date(project.created_at).getTime();
+  const createdMs = parseTimestamp(project.created_at).getTime();
   const oneHourAgo = Date.now() - 60 * 60 * 1000;
   return createdMs > oneHourAgo && completedCount === 0;
 }

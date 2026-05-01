@@ -660,7 +660,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           {(() => {
             const retryAfter = task.context?.retry_after as string | undefined;
             if (!retryAfter) return null;
-            const retryTime = new Date(retryAfter).getTime();
+            const retryTime = parseTimestamp(retryAfter).getTime();
             const isFuture = retryTime > now30;
             if (isFuture) {
               const mins = Math.ceil((retryTime - now30) / 60000);

@@ -6,6 +6,18 @@
  * treats that as **local** time, which silently shifts every displayed
  * timestamp.  `parseTimestamp` normalises the input so all downstream
  * formatting is correct.
+ *
+ * CONVENTION: All code that turns a backend-sourced ISO string into a Date
+ * MUST go through `parseTimestamp` (or a helper from this file that calls
+ * it). Direct `new Date(isoString)` is forbidden when the string came from
+ * an API response — it produces silent timezone-shifted Dates that look
+ * "almost right" and cause invisible bugs (countdowns stuck at 0, "isNew"
+ * flags stuck on, age strings off by hours).
+ *
+ * Allowed without parseTimestamp: `new Date()` (current time),
+ * `new Date(epochMs)` (numeric arg), `new Date(year, month, day, ...)`
+ * (multi-arg), `new Date(otherDate.getTime() + delta)`. Forbidden:
+ * `new Date(apiResponseField)` of any kind.
  */
 
 /** Parse an API timestamp (ISO string, epoch-ms, or Date) into a Date. */

@@ -2,6 +2,7 @@ import { useState, useRef } from 'react';
 import type { Task } from '../types/task';
 import { API_BASE_URL, authGet } from '../api';
 import { usePersistedState } from './usePersistedState';
+import { parseTimestamp } from '../utils/time';
 
 export function useArchive(addToast: (msg: string, type: 'success' | 'error') => void) {
   const [showArchive, setShowArchiveState] = useState(false);
@@ -72,7 +73,7 @@ export function useArchive(addToast: (msg: string, type: 'success' | 'error') =>
         let tasks: Task[] = data.tasks || [];
         // Frontend fallback sort in case the backend ignores the sort_order param
         tasks = [...tasks].sort((a, b) => {
-          const diff = new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+          const diff = parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime();
           return sortOrder === 'asc' ? -diff : diff;
         });
         setArchiveTasks(tasks);

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { apiFetch } from '../api';
+import { parseTimestamp } from '../utils/time';
 
 interface RecentInvestigation {
   task_id: string;
@@ -163,7 +164,7 @@ function confidenceBadge(conf?: string | null): string {
 
 function relativeTime(iso?: string | null): string {
   if (!iso) return '';
-  const then = new Date(iso).getTime();
+  const then = parseTimestamp(iso).getTime();
   if (Number.isNaN(then)) return '';
   const diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
   if (diffSec < 60) return `${diffSec}s ago`;

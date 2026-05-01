@@ -38,6 +38,7 @@ import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
 import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
+import { parseTimestamp } from './utils/time';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -224,7 +225,7 @@ export default function App() {
       const query = s.searchQuery.toLowerCase();
       const searchMatch = !query || t.id.toLowerCase().includes(query) || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query)) || (t.latest_status_message?.toLowerCase().includes(query));
       const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
-      const dateMatch = cutoff === null || new Date(t.created_at).getTime() >= cutoff;
+      const dateMatch = cutoff === null || parseTimestamp(t.created_at).getTime() >= cutoff;
       const blockedMatch = !s.blockedFilter || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
       const approvalMatch = !s.requiresApproval || t.requires_approval;
       const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);

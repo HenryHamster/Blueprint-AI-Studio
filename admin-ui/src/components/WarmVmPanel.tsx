@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet } from '../api';
+import { parseTimestamp } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow } from '../types/warmVm';
 
 const POLL_INTERVAL_MS = 10_000;
@@ -9,12 +10,9 @@ const STORAGE_KEY = 'blueprint-admin:warmVmPanelCollapsed';
 function ageSecs(iso: string | null): number | null {
   if (!iso) return null;
   // Backend emits naive UTC datetimes (project-wide convention — see
-  // project_timestamptz_migration). `new Date(naiveIso)` interprets as
-  // local time, so a heartbeat from a UTC backend appears N hours in the
-  // future for any non-UTC client and clamps to 0. Append 'Z' if the
-  // string has no explicit timezone marker.
-  const hasTz = /[zZ]|[+-]\d{2}:?\d{2}$/.test(iso);
-  const t = new Date(hasTz ? iso : iso + 'Z').getTime();
+  // project_timestamptz_migration). parseTimestamp() appends 'Z' so the
+  // value is interpreted as UTC, not local time.
+  const t = parseTimestamp(iso).getTime();
   if (Number.isNaN(t)) return null;
   return Math.max(0, Math.round((Date.now() - t) / 1000));
 }
