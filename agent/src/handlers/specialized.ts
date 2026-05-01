@@ -799,7 +799,21 @@ export async function handleSelfAudit(
     ? `Audit ONLY these systems (use these exact system_id values in output): ${JSON.stringify(focusSystems)}\n\n`
     : `No focus_systems provided. Pick up to ${maxSystems} systems to audit by reading the project design_doc and direction system_id values (round-robin across systems not recently audited). Use the discovered system_id verbatim in output.\n\n`;
 
-  const selfAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${focusSection}You are a self-audit agent. You have full read access to this repository. Your job is to score the maturity of one or more systems on four objective signals and output a structured findings report.
+  const taskCtx = task.context && typeof task.context === 'object' ? task.context as Record<string, unknown> : {};
+  const driftCtxRaw = taskCtx.drift_context;
+  let driftSection = '';
+  if (driftCtxRaw && typeof driftCtxRaw === 'object') {
+    const entries = Object.entries(driftCtxRaw as Record<string, unknown>);
+    if (entries.length > 0) {
+      const lines = entries.map(([sid, sig]) => {
+        const s = sig as Record<string, unknown>;
+        return `  - ${sid}: claimed=${s.claimed_changes_count ?? '?'}, merged=${s.actually_merged_prs ?? '?'}, consistency=${s.claim_shipped_consistency ?? '?'}, over_claim=${s.over_claim_flag ?? false}, stalled=${s.stalled_despite_churn_flag ?? false}`;
+      });
+      driftSection = `## Drift Scanner Findings\nThe following systems were flagged by the drift scanner before this audit was dispatched. For each, reconcile what the pipeline *claimed* to ship vs what was *actually merged*:\n${lines.join('\n')}\n\n`;
+    }
+  }
+
+  const selfAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${driftSection}${focusSection}You are a self-audit agent. You have full read access to this repository. Your job is to score the maturity of one or more systems on four objective signals and output a structured findings report.
 
 For each system, score four components (each 0-100, where 100 is healthy and 0 is broken):
 

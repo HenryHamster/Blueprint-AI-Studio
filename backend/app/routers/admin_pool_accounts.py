@@ -322,6 +322,30 @@ async def _compute_account_health_summary(
     return {"accounts": accounts}
 
 
+@router.get("/max-plan-accounts/provider-model-breakdown")
+async def get_provider_model_breakdown(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+    expand_accounts: bool = Query(False),
+):
+    """Rolling 7-day per-(provider, model) success-rate breakdown with optional per-account drill-in."""
+    from app.account_model_regression import compute_provider_model_breakdown
+
+    user_acct_ids = (
+        await session.execute(
+            select(MaxPlanAccount.id).where(MaxPlanAccount.user_id == current_user["user_id"])
+        )
+    ).scalars().all()
+    user_acct_id_strs = [str(aid) for aid in user_acct_ids]
+    if not user_acct_id_strs:
+        return {"rows": []}
+
+    rows = await compute_provider_model_breakdown(
+        session, user_acct_id_strs, expand_accounts=expand_accounts
+    )
+    return {"rows": rows}
+
+
 @router.post("/max-plan-accounts")
 @limiter.limit("10/minute")
 async def add_max_plan_account(
@@ -759,6 +783,63 @@ async def reset_account_rate_limits(
 
     logger.info(f"[POOL] Rate-limit state reset for account {db_account.name} ({account_id}) by user {current_user['user_id']}")
     return {"message": f"Rate-limit state cleared for account {db_account.name}"}
+
+
+@router.post("/max-plan-accounts/{account_id}/regression-quarantine/clear")
+async def clear_account_model_regression_quarantine(
+    account_id: str,
+    provider: str = Query(..., description="provider name (e.g. anthropic)"),
+    model: str = Query(..., description="exact model name (e.g. claude-opus-4-7)"),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Manual override: clear a kind='regression' disabled_models entry for
+    (account, model). Only regression entries are touched — rate_limit /
+    quota_exhausted / quarantine entries have their own recovery semantics
+    (cooldown timers + probe-on-success) and must be reset via dedicated
+    paths.
+
+    The 6h time-based reprobe is the automatic recovery; this endpoint is
+    for operators who want to re-enable a (provider, model) before the
+    cooldown elapses.
+    """
+    from app.max_plan_pool import clear_account_model_regression
+
+    try:
+        acct_uuid = uuid.UUID(account_id)
+    except ValueError as exc:
+        raise _bad_request("Invalid account ID") from exc
+
+    db_account = await session.get(MaxPlanAccount, acct_uuid)
+    if not db_account or db_account.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    if not provider.strip() or not model.strip():
+        raise _bad_request("provider and model are required")
+
+    cleared = await clear_account_model_regression(account_id, model.strip(), provider.strip())
+    if not cleared:
+        # No-op when (a) the entry doesn't exist or (b) it exists but isn't
+        # regression-kind — surface a 404 so callers know the override was
+        # rejected rather than silently succeed.
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No regression-quarantine entry found for {provider}/{model} on this account "
+                "(either none exists or the disable kind is not 'regression')"
+            ),
+        )
+
+    logger.info(
+        f"[POOL] Regression-quarantine cleared for account {db_account.name} "
+        f"({account_id}) {provider}/{model} by user {current_user['user_id']}"
+    )
+    return {
+        "id": account_id,
+        "provider": provider,
+        "model": model,
+        "cleared": True,
+    }
 
 
 @router.post("/max-plan-accounts/{account_id}/refresh-models")

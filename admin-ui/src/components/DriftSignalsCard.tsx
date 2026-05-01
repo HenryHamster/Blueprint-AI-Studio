@@ -2,28 +2,39 @@ import { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
 
-interface DriftDirection {
-  direction_id: string;
-  direction_text: string;
+interface DriftSignal {
   over_claim_flag: boolean;
   stalled_despite_churn_flag: boolean;
   claimed_changes_count: number;
   actually_merged_prs: number;
-  claim_shipped_consistency: number;
+  claim_shipped_consistency?: number;
+}
+
+interface DriftDirection extends DriftSignal {
+  direction_id: string;
+  direction_text: string;
 }
 
 export interface DriftSnapshot {
   flagged_directions: DriftDirection[];
   flagged_count: number;
   total_directions: number;
-  any_system_flagged: boolean;
+  any_system_flagged?: boolean;
+  by_system?: Record<string, DriftSignal>;
   generated_at: string;
   window_days: number;
+}
+
+function scoreBadgeClass(score: number): string {
+  if (score >= 0.6) return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
+  if (score >= 0.3) return 'bg-amber-500/10 text-amber-500 border-amber-500/20';
+  return 'bg-red-500/10 text-red-400 border-red-500/20';
 }
 
 export function DriftSignalsCard({ projectId }: { projectId: string }) {
   const [snapshot, setSnapshot] = useState<DriftSnapshot | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [systemsExpanded, setSystemsExpanded] = useState(false);
 
   const fetchSnapshot = useCallback(async () => {
     try {
@@ -42,6 +53,10 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
   if (!snapshot || snapshot.flagged_count === 0) return null;
 
   const { flagged_directions, flagged_count } = snapshot;
+  const flaggedSystems = Object.entries(snapshot.by_system ?? {}).filter(
+    ([, signal]) => signal.over_claim_flag || signal.stalled_despite_churn_flag,
+  );
+  const showSystemSummary = snapshot.any_system_flagged === true && flaggedSystems.length > 0;
 
   return (
     <section>
@@ -80,12 +95,51 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
                     stalled
                   </span>
                 )}
+                {typeof d.claim_shipped_consistency === 'number' && (
+                  <span
+                    className={`text-[9px] px-1.5 py-0.5 rounded-full border ${scoreBadgeClass(d.claim_shipped_consistency)}`}
+                    title="Claim-vs-shipped consistency"
+                  >
+                    {Math.round(d.claim_shipped_consistency * 100)}% consistent
+                  </span>
+                )}
                 <span className="text-[9px] text-neutral-500 ml-auto">
                   {d.actually_merged_prs}/{d.claimed_changes_count} merged
                 </span>
               </div>
             </div>
           ))}
+          {showSystemSummary && (
+            <div className="bg-neutral-900/40 border border-neutral-800/50 rounded-lg">
+              <button
+                type="button"
+                className="w-full flex items-center gap-2 px-3 py-2 text-left"
+                onClick={() => setSystemsExpanded(v => !v)}
+                aria-expanded={systemsExpanded}
+              >
+                <span className="text-[11px] font-medium text-neutral-300">System drift summary</span>
+                {systemsExpanded
+                  ? <ChevronDown className="w-3.5 h-3.5 text-neutral-500 ml-auto" />
+                  : <ChevronRight className="w-3.5 h-3.5 text-neutral-500 ml-auto" />}
+              </button>
+              {systemsExpanded && (
+                <div className="px-3 pb-2 space-y-1">
+                  {flaggedSystems.map(([systemId, signal]) => (
+                    <div key={systemId} className="flex gap-1.5 flex-wrap items-center text-[10px]">
+                      <span className="text-neutral-300 font-mono">{systemId}</span>
+                      {signal.over_claim_flag && <span className="px-1.5 py-0.5 rounded font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">over-claim</span>}
+                      {signal.stalled_despite_churn_flag && <span className="px-1.5 py-0.5 rounded font-medium bg-red-500/20 text-red-400 border border-red-500/30">stalled</span>}
+                      {typeof signal.claim_shipped_consistency === 'number' && (
+                        <span className={`px-1.5 py-0.5 rounded-full border ${scoreBadgeClass(signal.claim_shipped_consistency)}`}>
+                          {Math.round(signal.claim_shipped_consistency * 100)}% consistent
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </section>

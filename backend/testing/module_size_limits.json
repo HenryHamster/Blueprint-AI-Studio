@@ -48,6 +48,16 @@
     "components/RecentErrorsWidget.tsx": 800,
     "components/MediumScopeWidget.tsx": 800,
     "components/SettingsNotificationsSection.tsx": 1000,
-    "components/FailureStageWidget.tsx": 800
+    "components/FailureStageWidget.tsx": 800,
+    "components/PRMonitorSection.tsx": 200,
+    "components/DirectionAutoPauseWidget.tsx": 200,
+    "components/ScopeConversionRatesSection.tsx": 200,
+    "components/ScopeTrendsSection.tsx": 200,
+    "components/ProviderCostPanel.tsx": 200,
+    "components/DriftSignalsCard.tsx": 200,
+    "components/PoolAccountHealthPanel.tsx": 300,
+    "components/SystemMaturityCard.tsx": 200,
+    "components/ProviderModelBreakdownPanel.tsx": 350,
+    "components/TaskDurationWidget.tsx": 200
   }
 }

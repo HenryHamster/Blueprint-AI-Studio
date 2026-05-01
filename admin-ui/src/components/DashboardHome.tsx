@@ -19,20 +19,18 @@ import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
 import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWidget';
 import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
+import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
+import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
-import { ErrorBoundary } from './ErrorBoundary';
+import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
+import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
+import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
+import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
-
-// Wraps a sub-widget in an ErrorBoundary so a single bad render (malformed
-// API payload, divide-by-zero, etc.) collapses just that widget instead of
-// the entire dashboard panel.
-const Widget = ({ children }: { children: React.ReactNode }) => (
-  <ErrorBoundary level="widget">{children}</ErrorBoundary>
-);
 
 // ---------- local types ----------
 
@@ -42,44 +40,6 @@ interface IssueItem {
   title: string;
   detail?: string;
   onClick?: () => void;
-}
-
-interface DirectionProgress {
-  direction_id: string;
-  direction_text: string;
-  priority: string;
-  cycles_in_window: number;
-  tasks_created: number;
-  prs_merged: number;
-  prs_rejected?: number | null;
-  autonomous_prs_merged?: number | null;
-  assisted_prs_merged?: number | null;
-  possibly_saturated: boolean;
-  auto_paused?: boolean;
-  paused_reason?: string | null;
-  needs_manual_intervention?: boolean;
-  conversion_rate?: number | null;
-  acceptance_rate?: number | null;
-  first_attempt_success_rate?: number | null;
-  first_attempt_sample_size?: number | null;
-  product_ratio?: number | null;
-  estimated_cost_usd?: number | null;
-  cost_budget_usd?: number | null;
-  budget_utilization_pct?: number | null;
-  budget_exceeded?: boolean;
-  cost_per_merged_pr?: number | null;
-  cost_per_merge_exceeds_threshold?: boolean | null;
-  avg_time_to_merge_hours?: number | null;
-  cost_by_scope?: Record<string, number> | null;
-  cost_by_type?: Record<string, number> | null;
-  cost_by_provider_model?: Record<string, number> | null;
-  spot_cost_usd?: number | null;
-  on_demand_cost_usd?: number | null;
-  scope_breakdown?: Record<string, { created: number; merged: number; failed: number; failed_infra?: number; failed_code_error?: number; failed_scope_overflow?: number; calibrated_in?: number; calibrated_out?: number }> | null;
-  taxonomy_summary?: Record<string, number> | null;
-  review_quality?: { reviews_dismissed?: number; reviews_overridden?: number; user_issues_caught?: number } | null;
-  stage_dropout?: Record<string, number> | null;
-  recent_failure_titles?: string[] | null;
 }
 
 interface FailureGroupTask {
@@ -128,14 +88,6 @@ interface LatestCycle {
   directions_retired: number;
   vision_updated: boolean;
   summary_text?: string | null;
-}
-
-interface SystemMaturityRow {
-  system_id: string;
-  score: number;
-  recommended_mode: string | null;
-  top_issues: Array<Record<string, unknown>>;
-  last_audited_at: string;
 }
 
 interface DigestData {
@@ -272,22 +224,26 @@ interface DigestData {
     total_rejected: number;
     top_notes: { snippet: string; count: number }[];
   } | null;
+  tasks_truncated?: boolean;
 }
 
+/**
+ * Type guard for the /api/admin/digest response. Checks the fields the
+ * dashboard requires so any backend rename or removal is caught at fetch
+ * time rather than silently rendering stale or missing data.
+ */
+function assertDigestContract(data: unknown): data is DigestData {
+  if (typeof data !== 'object' || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.failed_count === 'number' &&
+    typeof d.pending_approval_count === 'number' &&
+    Array.isArray(d.direction_progress) &&
+    Array.isArray(d.recent_completions) &&
+    Array.isArray(d.failure_groups)
+  );
+}
 
-const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
-const TAXONOMY_LABELS: Record<string, string> = {
-  scope_related: 'scope',
-  review_quality: 'review',
-  infra_related: 'infra',
-  code_defect: 'code',
-};
-const TAXONOMY_COLORS: Record<string, string> = {
-  scope_related: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
-  review_quality: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
-  infra_related: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  code_defect: 'bg-red-500/20 text-red-400 border-red-500/30',
-};
 const TAXONOMY_STROKE: Record<string, string> = {
   scope_related: '#22d3ee',
   review_quality: '#a855f7',
@@ -309,27 +265,6 @@ interface SparkPoint {
   active: number;
   queued: number;
   failed: number;
-}
-
-interface RateLimitedModel {
-  model: string;
-  cooldown_seconds_remaining: number;
-  cooldown_type: 'rate_limit' | 'quota_exhausted';
-}
-type AccountHealthState = 'healthy' | 'probing' | 'disqualified' | 'disabled';
-export interface AccountHealthEntry {
-  account_id: string;
-  label: string;
-  provider: string;
-  state: AccountHealthState;
-  disabled_reason?: string | null;
-  health_score: number;
-  success_rate_7d?: number | null;
-  completions_24h: number;
-  rl_events_24h: number;
-  rate_limited_models: RateLimitedModel[];
-  failure_class_counts: Partial<Record<string, number>>;
-  failure_class_buckets?: { provider?: number; code?: number; infrastructure?: number };
 }
 
 // ---------- props ----------
@@ -370,14 +305,6 @@ const TASK_TYPE_COLORS: Record<string, string> = {
   refactor: 'bg-cyan-500/20 text-cyan-400',
 };
 
-
-function priorityBadge(p: string) {
-  switch (p) {
-    case 'high': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30';
-    case 'medium': return 'bg-amber-500/20 text-amber-400 border-amber-500/30';
-    default: return 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-  }
-}
 
 // ---------- failure class pill ----------
 
@@ -455,102 +382,6 @@ function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; spa
 }
 
 // ---------- cost breakdown pill ----------
-
-function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const total = d.estimated_cost_usd ?? 0;
-
-  useEffect(() => {
-    if (!open) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open]);
-
-  const byScope = d.cost_by_scope ?? null;
-  const byType = d.cost_by_type ?? null;
-  const spot = d.spot_cost_usd;
-  const onDemand = d.on_demand_cost_usd;
-  const hasBreakdown =
-    (byScope && Object.keys(byScope).length > 0) ||
-    (byType && Object.keys(byType).length > 0) ||
-    (spot != null && onDemand != null && (spot > 0 || onDemand > 0));
-
-  return (
-    <div ref={ref} className="relative inline-block">
-      <button
-        type="button"
-        className="text-neutral-400 hover:text-neutral-200 cursor-pointer"
-        title="Cost breakdown"
-        onClick={e => { e.stopPropagation(); setOpen(v => !v); }}
-      >
-        ${total.toFixed(2)}
-      </button>
-      {open && hasBreakdown && (
-        <div
-          className="absolute z-20 top-full mt-1 left-0 w-56 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg text-[10px] text-neutral-300 space-y-1.5"
-          onClick={e => e.stopPropagation()}
-        >
-          {byScope && Object.keys(byScope).length > 0 && (
-            <div>
-              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By scope</p>
-              {(['small', 'medium', 'large'] as const).map(s => byScope[s] != null ? (
-                <div key={s} className="flex justify-between"><span>{s}</span><span className="font-mono">${byScope[s].toFixed(2)}</span></div>
-              ) : null)}
-            </div>
-          )}
-          {byType && Object.keys(byType).length > 0 && (
-            <div>
-              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By type</p>
-              {Object.entries(byType).sort((a, b) => b[1] - a[1]).map(([t, v]) => (
-                <div key={t} className="flex justify-between"><span>{t}</span><span className="font-mono">${v.toFixed(2)}</span></div>
-              ))}
-            </div>
-          )}
-          {spot != null && onDemand != null && (spot > 0 || onDemand > 0) && (
-            <div>
-              <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">VM type</p>
-              <div className="flex justify-between"><span>spot</span><span className="font-mono">${spot.toFixed(2)}</span></div>
-              <div className="flex justify-between"><span>on-demand</span><span className="font-mono">${onDemand.toFixed(2)}</span></div>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---------- calibration chip ----------
-
-function CalibrationChip({ factor, note, sampleCount }: { factor: number | null | undefined; note: string | null | undefined; sampleCount: number | null | undefined }) {
-  if (factor == null || sampleCount == null || sampleCount < 3) return null;
-  const diff = factor - 1.0;
-  let label: string;
-  let colorClass: string;
-  if (Math.abs(diff) < 0.05) {
-    label = 'Predictions: well-calibrated';
-    colorClass = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
-  } else if (diff < 0) {
-    const pct = Math.round((1.0 - factor) * 100);
-    label = `Predictions: ~${pct}% optimistic`;
-    colorClass = 'bg-amber-500/15 text-amber-400 border-amber-500/30';
-  } else {
-    const pct = Math.round((factor - 1.0) * 100);
-    label = `Predictions: ~${pct}% pessimistic`;
-    colorClass = 'bg-blue-500/15 text-blue-400 border-blue-500/30';
-  }
-  return (
-    <span
-      className={`text-[9px] font-medium px-1.5 py-0.5 rounded border ${colorClass} cursor-default`}
-      title={note ?? undefined}
-    >
-      {label}
-    </span>
-  );
-}
 
 // ---------- issue row ----------
 
@@ -693,6 +524,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
+  const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
@@ -730,8 +562,21 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             ? `/api/admin/digest?hours=${windowHours}&project_id=${encodeURIComponent(selectedProjectId)}`
             : `/api/admin/digest?hours=${windowHours}`;
           const res = await apiFetch(url);
-          if (res.ok) { setDigest(await res.json()); digestOk = true; }
-        } catch { /* silent */ }
+          if (res.ok) {
+            const data = await res.json();
+            if (assertDigestContract(data)) {
+              setDigest(data);
+              digestOk = true;
+            } else {
+              setDigest(null);
+            }
+          } else {
+            setDigest(null);
+          }
+        } catch {
+          setDigest(null);
+          /* silent */
+        }
       })(),
     );
 
@@ -789,6 +634,18 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
       );
     }
 
+    fetches.push(
+      (async () => {
+        try {
+          const url = selectedProjectId
+            ? `/api/admin/task-duration-stats?project_id=${encodeURIComponent(selectedProjectId)}`
+            : `/api/admin/task-duration-stats`;
+          const res = await apiFetch(url);
+          if (res.ok) setTaskDurationStats(await res.json());
+        } catch { /* silent */ }
+      })(),
+    );
+
     await Promise.allSettled(fetches);
     setLoading(false);
 
@@ -837,6 +694,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const hasAttribution = directions.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
   const totalAutonomousPRs = hasAttribution ? directions.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
   const totalAssistedPRs = hasAttribution ? directions.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
+  const selfSufficientCount = directions.filter(d => {
+    const history = d.research_history ?? [];
+    const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
+    const lifetimeAutonomous = histHasAttrib
+      ? history.reduce((s, e) => s + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
+      : null;
+    const operatorActions = (d.history_aggregate?.total_operator_actions as number | null) ?? null;
+    return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
+  }).length;
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   return (
@@ -868,7 +734,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
       <SystemStatusCard digest={digest} loading={loading} />
 
       {/* Orchestrator Errors widget: high-visibility observability for prod errors */}
-      <Widget><RecentErrorsWidget /></Widget>
+      <RecentErrorsWidget />
 
       {/* Main grid: 2-col on large screens */}
       <div className="lg:grid lg:grid-cols-3 lg:gap-4 space-y-4 lg:space-y-0">
@@ -944,7 +810,10 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           )}
 
           {/* Section 1d: Failure Stage Distribution */}
-          {!loading && <Widget><FailureStageWidget distribution={digest?.failure_stage_distribution} /></Widget>}
+          {!loading && <FailureStageWidget distribution={digest?.failure_stage_distribution} />}
+
+          {/* Section 1d3: Task Duration Percentiles */}
+          {!loading && <TaskDurationWidget data={taskDurationStats} />}
 
           {/* Section 1d2: Review Rejection Reason Breakdown */}
           {!loading && (() => {
@@ -1104,14 +973,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Section 1f: Remediation Funnel */}
           {selectedProjectId && (
-            <Widget>
-              <RemediationFunnelSection
-                funnel={digest?.remediation_funnel ?? null}
-                conversion={digest?.investigation_conversion ?? null}
-                loading={loading}
-                projectId={selectedProjectId}
-              />
-            </Widget>
+            <RemediationFunnelSection
+              funnel={digest?.remediation_funnel ?? null}
+              conversion={digest?.investigation_conversion ?? null}
+              loading={loading}
+              projectId={selectedProjectId}
+            />
           )}
           {!loading && (() => {
             const groups = digest?.remediation_funnel?.residual_remediation_funnel?.open_cases_by_error_class ?? [];
@@ -1215,9 +1082,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   Human Rejection Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {rps.total_rejected} rejected</span>
                 </h2>
                 <div className="flex flex-col gap-1">
-                  {rps.top_notes.map((note) => (
+                  {rps.top_notes.map((note, i) => (
                     <div
-                      key={note.snippet}
+                      key={i}
                       className="flex items-start gap-2 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
                     >
                       <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 tabular-nums">
@@ -1234,161 +1101,44 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 2: Direction Portfolio Health */}
-          <section>
-            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
-            {loading ? (
-              <Skeleton className="h-28 w-full" />
-            ) : directions.length === 0 ? (
-              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No active directions</div>
-            ) : (
-              <>
-                {/* Summary row */}
-                <div className="flex items-center gap-3 text-xs text-neutral-400 mb-2">
-                  <span>{directions.length} direction{directions.length !== 1 ? 's' : ''}</span>
-                  {productPct != null && (
-                    <>
-                      <span className="text-neutral-600">&middot;</span>
-                      <span className="flex items-center gap-1">
-                        {productPct}% product
-                        <div className="w-16 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
-                          <div className="h-full rounded-full bg-emerald-500" style={{ width: `${productPct}%` }} />
-                        </div>
-                      </span>
-                    </>
-                  )}
-                  <span className="text-neutral-600">&middot;</span>
-                  <span>{totalDirPRs} PR{totalDirPRs !== 1 ? 's' : ''} merged</span>
-                  {hasAttribution && (totalAutonomousPRs != null || totalAssistedPRs != null) && (
-                    <>
-                      <span className="text-neutral-600">&middot;</span>
-                      <span className="text-emerald-400">{totalAutonomousPRs ?? 0} autonomous</span>
-                      <span className="text-neutral-600">·</span>
-                      <span className="text-blue-400">{totalAssistedPRs ?? 0} assisted</span>
-                    </>
-                  )}
-                  <CalibrationChip
-                    factor={digest?.prediction_calibration_factor}
-                    note={digest?.prediction_calibration_note}
-                    sampleCount={digest?.prediction_calibration_sample_count}
-                  />
-                </div>
-
-                {/* Scrollable direction cards */}
-                <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide" style={{ scrollbarWidth: 'none' }}>
-                  {directions.map(d => {
-                    const cvr = d.conversion_rate != null ? Math.round(d.conversion_rate * 100) : null;
-                    const cvrColor = cvr == null ? 'text-neutral-500' : cvr >= 60 ? 'text-emerald-400' : cvr >= 30 ? 'text-amber-400' : 'text-red-400';
-                    const acc = d.acceptance_rate != null ? Math.round(d.acceptance_rate * 100) : null;
-                    const accColor = acc == null ? 'text-neutral-500' : acc >= 60 ? 'text-emerald-400' : acc >= 30 ? 'text-amber-400' : 'text-red-400';
-                    const fas = d.first_attempt_success_rate != null ? Math.round(d.first_attempt_success_rate * 100) : null;
-                    const fasColor = fas == null ? 'text-neutral-500' : fas >= 60 ? 'text-emerald-400' : fas >= 30 ? 'text-amber-400' : 'text-red-400';
-                    return (
-                      <div
-                        key={d.direction_id}
-                        className="min-w-[200px] max-w-[220px] bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 shrink-0 cursor-pointer hover:border-neutral-700 transition-colors"
-                        onClick={() => onDirectionClick?.(d.direction_id)}
-                      >
-                        <div className="flex items-center gap-1.5 mb-1.5">
-                          <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${priorityBadge(d.priority)}`}>{d.priority}</span>
-                          {d.possibly_saturated && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30">Saturated</span>}
-                          {d.needs_manual_intervention && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30">Needs Intervention</span>}
-                          {d.auto_paused && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30" title={d.paused_reason ?? undefined}>Paused</span>}
-                        </div>
-                        <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
-                        <div className="flex items-center gap-2 text-[10px] text-neutral-500">
-                          {cvr != null && <span className={cvrColor}>{cvr}% conversion</span>}
-                          {acc != null && <span className={accColor} title="PRs merged / (merged + rejected)">{acc}% acc</span>}
-                          {fas != null && <span className={fasColor} title={`First-attempt success rate${d.first_attempt_sample_size != null ? ` (n=${d.first_attempt_sample_size})` : ''}`}>{fas}% 1st</span>}
-                          <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}{d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}</span>
-                          {d.product_ratio != null && (
-                            <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
-                          )}
-                          {d.estimated_cost_usd != null && (
-                            <CostBreakdownPill direction={d} />
-                          )}
-                          {d.cost_per_merged_pr != null && (
-                            <span
-                              className={d.cost_per_merge_exceeds_threshold ? 'text-red-400 font-semibold' : 'text-neutral-400'}
-                              title={d.cost_per_merge_exceeds_threshold
-                                ? `Cost per merged PR exceeds threshold${digest?.median_cost_per_merged_pr != null ? ` (project median: $${digest.median_cost_per_merged_pr.toFixed(2)})` : ''}`
-                                : 'Cost per merged PR'}
-                            >
-                              {d.cost_per_merge_exceeds_threshold && <span className="mr-0.5">⚠</span>}${d.cost_per_merged_pr.toFixed(2)}/PR
-                            </span>
-                          )}
-                          {d.avg_time_to_merge_hours != null && (
-                            <span className={d.avg_time_to_merge_hours < 2 ? 'text-emerald-400' : d.avg_time_to_merge_hours <= 6 ? 'text-amber-400' : 'text-red-400'} title="Average time from VM start to PR merge">{d.avg_time_to_merge_hours.toFixed(1)}h avg merge</span>
-                          )}
-                        </div>
-                        {d.cost_budget_usd != null && d.cost_budget_usd > 0 && (() => {
-                          const pct = d.budget_utilization_pct != null
-                            ? d.budget_utilization_pct
-                            : ((d.estimated_cost_usd ?? 0) / d.cost_budget_usd) * 100;
-                          const clamped = Math.min(100, Math.max(0, pct));
-                          const barColor = pct > 80 ? 'bg-red-500' : pct >= 60 ? 'bg-amber-500' : 'bg-emerald-500';
-                          return (
-                            <div className="mt-1.5" title={`$${(d.estimated_cost_usd ?? 0).toFixed(2)} / $${d.cost_budget_usd.toFixed(2)} budget (${Math.round(pct)}%)`}>
-                              <div className="h-1 w-full rounded bg-neutral-800 overflow-hidden">
-                                <div className={`h-full ${barColor}`} style={{ width: `${clamped}%` }} />
-                              </div>
-                              <div className="flex justify-between text-[9px] text-neutral-500 mt-0.5">
-                                <span>Budget</span>
-                                <span className={pct > 80 ? 'text-red-400' : pct >= 60 ? 'text-amber-400' : 'text-emerald-400'}>{Math.round(pct)}%{d.budget_exceeded ? ' · over' : ''}</span>
-                              </div>
-                            </div>
-                          );
-                        })()}
-                        {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
-                        {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']].filter(([v]) => typeof v === 'number' && (v as number) > 0).map(([v, l]) => `${v} ${l}`).join(', '); const subtypeStr = subtypes ? ` (${subtypes})` : ''; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
-                        {d.review_quality && (d.review_quality.reviews_dismissed || d.review_quality.reviews_overridden || d.review_quality.user_issues_caught) ? (
-                          <div className="flex gap-1 mt-1 flex-wrap">
-                            {d.review_quality.reviews_dismissed ? <span title="Automated reviews dismissed by the system" className="text-[9px] leading-none px-1 py-0.5 rounded border border-amber-700 bg-amber-900/40 text-amber-300">{d.review_quality.reviews_dismissed} dismissed</span> : null}
-                            {d.review_quality.reviews_overridden ? <span title="Reviews overridden by an operator" className="text-[9px] leading-none px-1 py-0.5 rounded border border-red-700 bg-red-900/40 text-red-300">{d.review_quality.reviews_overridden} overridden</span> : null}
-                            {d.review_quality.user_issues_caught ? <span title="Real issues caught by review" className="text-[9px] leading-none px-1 py-0.5 rounded border border-emerald-700 bg-emerald-900/40 text-emerald-300">{d.review_quality.user_issues_caught} caught</span> : null}
-                          </div>
-                        ) : null}
-                        {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
-                        {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
-                          <ul className="mt-1 space-y-0.5">
-                            {d.recent_failure_titles.slice(0, 3).map((t) => (
-                              <li key={t} className="text-[10px] text-red-300/80 truncate" title={t}>• {t}</li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
-            )}
-          </section>
+          <DirectionPortfolioSection
+            directions={directions}
+            loading={loading}
+            productPct={productPct}
+            totalDirPRs={totalDirPRs}
+            hasAttribution={hasAttribution}
+            totalAutonomousPRs={totalAutonomousPRs}
+            totalAssistedPRs={totalAssistedPRs}
+            selfSufficientCount={selfSufficientCount}
+            predictionCalibrationFactor={digest?.prediction_calibration_factor}
+            predictionCalibrationNote={digest?.prediction_calibration_note}
+            predictionCalibrationSampleCount={digest?.prediction_calibration_sample_count}
+            medianCostPerMergedPr={digest?.median_cost_per_merged_pr}
+            onDirectionClick={onDirectionClick}
+          />
 
           {/* Section 2b: Scope Conversion Rates */}
           {!!selectedProjectId && (
-            <Widget>
-              <ScopeConversionRatesSection
-                scopeRates={digest?.scope_conversion_rates}
-                prevScopeRates={digest?.prev_scope_conversion_rates}
-                loading={loading}
-              />
-            </Widget>
+            <ScopeConversionRatesSection
+              scopeRates={digest?.scope_conversion_rates}
+              prevScopeRates={digest?.prev_scope_conversion_rates}
+              loading={loading}
+            />
           )}
 
           {/* Section 2b2: Scope Trends */}
           {!!selectedProjectId && (
-            <Widget>
-              <ScopeTrendsSection
-                data={scopeBaselines}
-                loading={loading}
-                open={scopeTrendsOpen}
-                onToggle={() => setScopeTrendsOpen(v => !v)}
-              />
-            </Widget>
+            <ScopeTrendsSection
+              data={scopeBaselines}
+              loading={loading}
+              open={scopeTrendsOpen}
+              onToggle={() => setScopeTrendsOpen(v => !v)}
+            />
           )}
 
           {/* Section 2c: Medium Scope Measurement */}
           {!!selectedProjectId && (
-            <Widget><MediumScopeWidget data={measurementData} loading={loading} /></Widget>
+            <MediumScopeWidget data={measurementData} loading={loading} />
           )}
 
           {/* Section 2d: Provider Account Health */}
@@ -1396,11 +1146,17 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             <PoolAccountHealthPanel accounts={accountHealth} loading={loading} />
           )}
 
-          {/* Section 2e: Provider Cost & Success */}
+          {/* Section 2e: Provider / Model Breakdown */}
+          <ProviderModelBreakdownPanel
+            selectedProjectId={selectedProjectId}
+            accounts={accountHealth}
+          />
+
+          {/* Section 2f: Provider Cost & Success */}
           <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
 
           {/* Drift Signals */}
-          {!!selectedProjectId && <Widget><DriftSignalsCard projectId={selectedProjectId} /></Widget>}
+          {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
 
           {/* Section 3: Top Actionable Issues */}
           <section>
@@ -1414,8 +1170,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               </div>
             ) : (
               <div className="space-y-1.5">
-                {visibleIssues.map((issue) => (
-                  <IssueRow key={`${issue.severity}-${issue.title}`} {...issue} />
+                {visibleIssues.map((issue, i) => (
+                  <IssueRow key={i} {...issue} />
                 ))}
                 {issues.length > 3 && (
                   <button
@@ -1475,21 +1231,19 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Direction auto-pause/recovery observability */}
           <div className="mt-4">
-            <Widget><DirectionAutoPauseWidget selectedProjectId={selectedProjectId} /></Widget>
+            <DirectionAutoPauseWidget selectedProjectId={selectedProjectId} />
           </div>
 
           {/* Section 5: PR Monitor */}
-          <Widget>
-            <PRMonitorSection
-              openPRs={openPRs}
-              loading={loading}
-              refreshing={openPRsRefreshing}
-              onRefresh={fetchOpenPRs}
-              hasProject={!!selectedProjectId}
-              tasks={tasks}
-              onViewTask={onViewTask}
-            />
-          </Widget>
+          <PRMonitorSection
+            openPRs={openPRs}
+            loading={loading}
+            refreshing={openPRsRefreshing}
+            onRefresh={fetchOpenPRs}
+            hasProject={!!selectedProjectId}
+            tasks={tasks}
+            onViewTask={onViewTask}
+          />
         </div>
       </div>
     </div>
@@ -1636,13 +1390,6 @@ const FAILURE_CLASS_SHORT: Record<string, string> = {
   SCOPE_OVERFLOW: 'scope',
 };
 
-const STAGE_DROPOUT_LABELS: Record<string, string> = {
-  tasks_failed_code_error: 'code error',
-  tasks_failed_infra: 'infra',
-  tasks_required_approval: 'approval',
-  tasks_merged_staging_only: 'staging only',
-};
-
 function FailedCard({ value, groups, spark, loading }: {
   value: number; groups?: FailureGroup[]; spark: SparkPoint[]; loading: boolean;
 }) {
@@ -1781,218 +1528,5 @@ function CostCard({ totalCost, trendHistory, loading }: {
         </div>
       )}
     </div>
-  );
-}
-
-// ---------- pool account health panel ----------
-
-const ACCOUNT_STATE_BADGES: Record<AccountHealthState, string> = {
-  healthy: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  probing: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  disqualified: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  disabled: 'bg-red-500/20 text-red-400 border-red-500/30',
-};
-
-const FAILURE_CLASS_BAR_COLORS: Record<string, string> = {
-  CODE_ERROR: 'bg-red-400/70',
-  RATE_LIMIT: 'bg-yellow-400/70',
-  EXTERNAL_API: 'bg-purple-400/70',
-  PROVISION_FAILURE: 'bg-orange-400/70',
-  MIGRATION_ERROR: 'bg-pink-400/70',
-  AGENT_TIMEOUT: 'bg-amber-400/70',
-  SCOPE_OVERFLOW: 'bg-teal-400/70',
-};
-
-// ---------- system maturity card ----------
-
-const MATURITY_MODE_STYLES: Record<string, string> = {
-  audit: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  fundamentals: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  ship: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  pause: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
-};
-
-function SystemMaturityCard({ rows, loading }: { rows: SystemMaturityRow[] | null; loading: boolean }) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  return (
-    <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">System Maturity</h2>
-      {loading || rows === null ? (
-        <Skeleton className="h-16 w-full" />
-      ) : rows.length === 0 ? (
-        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">
-          No audits have run yet
-        </div>
-      ) : (
-        <div className="space-y-1.5">
-          {rows.map(row => {
-            const scoreColor = row.score >= 70 ? 'bg-emerald-500' : row.score >= 40 ? 'bg-amber-500' : 'bg-red-500';
-            const modeStyle = row.recommended_mode
-              ? (MATURITY_MODE_STYLES[row.recommended_mode] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30')
-              : null;
-            const isExpanded = expandedId === row.system_id;
-            const hasIssues = (row.top_issues ?? []).length > 0;
-            return (
-              <div key={row.system_id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1.5">
-                      <span className="text-xs font-medium text-neutral-200 truncate">{row.system_id}</span>
-                      {modeStyle && (
-                        <span className={`shrink-0 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border ${modeStyle}`}>
-                          {row.recommended_mode}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 h-1.5 rounded-full bg-neutral-800 overflow-hidden">
-                        <div className={`h-full rounded-full ${scoreColor}`} style={{ width: `${row.score}%` }} />
-                      </div>
-                      <span className="shrink-0 text-[10px] font-mono text-neutral-400">{row.score}</span>
-                      <span className="shrink-0 text-[10px] text-neutral-500">{timeAgo(row.last_audited_at)}</span>
-                    </div>
-                  </div>
-                  {hasIssues && (
-                    <button
-                      type="button"
-                      className="shrink-0 text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors ml-1"
-                      onClick={() => setExpandedId(isExpanded ? null : row.system_id)}
-                    >
-                      {isExpanded ? 'hide' : `${row.top_issues.length} issues`}
-                    </button>
-                  )}
-                </div>
-                {isExpanded && hasIssues && (
-                  <div className="mt-2 space-y-0.5 pt-2 border-t border-neutral-800/50">
-                    {row.top_issues.map((issue) => {
-                      const desc = (issue.description as string | undefined) ?? JSON.stringify(issue);
-                      return (
-                        <div key={desc} className="text-[10px] text-neutral-400 flex items-start gap-1.5">
-                          <span className="shrink-0 text-neutral-600">•</span>
-                          <span>{desc}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </section>
-  );
-}
-
-export function PoolAccountHealthPanel({ accounts, loading }: {
-  accounts: AccountHealthEntry[] | null;
-  loading: boolean;
-}) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  if (loading) return <Skeleton className="h-16 w-full" />;
-  if (!accounts || accounts.length === 0) return null;
-
-  return (
-    <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Provider Account Health</h2>
-      <div className="space-y-1">
-        {accounts.map(acct => {
-          const expanded = expandedId === acct.account_id;
-          const stateBadge = ACCOUNT_STATE_BADGES[acct.state] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-          const scoreColor = acct.health_score >= 0.7 ? 'text-emerald-400' : acct.health_score >= 0.4 ? 'text-amber-400' : 'text-red-400';
-          const counts = Object.entries(acct.failure_class_counts).filter(([, v]) => (v ?? 0) > 0);
-          const totalFailures = counts.reduce((s, [, v]) => s + (v ?? 0), 0);
-          const dominantEntry = counts.length > 0 ? counts.reduce((a, b) => ((b[1] ?? 0) > (a[1] ?? 0) ? b : a)) : null;
-          const sr7d = acct.success_rate_7d;
-          const sr7dColor = sr7d == null ? '' : sr7d >= 0.7 ? 'text-emerald-400' : sr7d >= 0.4 ? 'text-amber-400' : 'text-red-400';
-          const dimmed = acct.state === 'disabled' || acct.state === 'disqualified';
-          return (
-            <div key={acct.account_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5${dimmed ? ' opacity-50' : ''}`}>
-              <button
-                type="button"
-                className="w-full text-left"
-                onClick={() => setExpandedId(expanded ? null : acct.account_id)}
-              >
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border uppercase ${stateBadge}`}>
-                    {acct.state}
-                  </span>
-                  <span className="text-xs text-neutral-200 font-medium">{acct.label}</span>
-                  <span className="text-[10px] text-neutral-500">{acct.provider}</span>
-                  <span className={`text-[10px] font-mono font-bold ${scoreColor}`} title="Health score">
-                    {Math.round(acct.health_score * 100)}%
-                  </span>
-                  {sr7d != null && (
-                    <span className={`text-[10px] font-mono ${sr7dColor}`} title="7-day success rate">
-                      {Math.round(sr7d * 100)}% 7d
-                    </span>
-                  )}
-                  <span className="text-[10px] text-neutral-400" title="24h completions · rate-limit events">
-                    {acct.completions_24h}c {acct.rl_events_24h}rl
-                  </span>
-                  {totalFailures > 0 && (
-                    <div className="flex flex-col items-end gap-0.5 ml-auto">
-                      {acct.failure_class_buckets && (
-                        <div className="flex items-center gap-1.5 text-[9px]">
-                          <span className="text-yellow-400/80" title="provider: rate-limit + external API">
-                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-yellow-400/70 align-middle mr-0.5" />
-                            {acct.failure_class_buckets.provider ?? 0}p
-                          </span>
-                          <span className="text-red-400/80" title="code: code error + migration">
-                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-red-400/70 align-middle mr-0.5" />
-                            {acct.failure_class_buckets.code ?? 0}c
-                          </span>
-                          <span className="text-orange-400/80" title="infra: provision + timeout + scope">
-                            <span className="inline-block w-1.5 h-1.5 rounded-sm bg-orange-400/70 align-middle mr-0.5" />
-                            {acct.failure_class_buckets.infrastructure ?? 0}i
-                          </span>
-                        </div>
-                      )}
-                      <div className="flex items-center gap-1">
-                        {dominantEntry && (
-                          <span className="text-[9px] text-neutral-400" title="Dominant failure class (24h)">
-                            {FAILURE_CLASS_SHORT[dominantEntry[0]] ?? dominantEntry[0].toLowerCase()}:{dominantEntry[1]}
-                          </span>
-                        )}
-                        <div className="flex items-center gap-0.5">
-                          {counts.sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0)).map(([cls, count]) => (
-                            <div
-                              key={cls}
-                              title={`${FAILURE_CLASS_SHORT[cls] ?? cls}: ${count}`}
-                              className={`h-2 rounded-sm ${FAILURE_CLASS_BAR_COLORS[cls] ?? 'bg-neutral-500'}`}
-                              style={{ width: `${Math.max(4, Math.round(((count ?? 0) / totalFailures) * 32))}px` }}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-                {acct.disabled_reason && (
-                  <p className="text-[10px] text-red-400/80 mt-0.5 truncate">{acct.disabled_reason}</p>
-                )}
-              </button>
-              {expanded && acct.rate_limited_models.length > 0 && (
-                <div className="mt-2 pt-2 border-t border-neutral-800/50 flex flex-wrap gap-1">
-                  {acct.rate_limited_models.map(m => {
-                    const isQuota = m.cooldown_type === 'quota_exhausted';
-                    const badge = isQuota
-                      ? 'bg-red-500/20 text-red-400 border-red-500/30'
-                      : 'bg-amber-500/20 text-amber-400 border-amber-500/30';
-                    const modelLabel = m.model.includes('/') ? m.model.split('/').pop()! : m.model;
-                    const durLabel = isQuota ? '24h quota' : `${Math.ceil(m.cooldown_seconds_remaining / 60)}m`;
-                    return (
-                      <span key={m.model} className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${badge}`}>
-                        {modelLabel} · {durLabel}
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </section>
   );
 }

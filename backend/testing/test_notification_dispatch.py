@@ -8,6 +8,7 @@ import pytest
 import app.notification_dispatch as nd
 from app.notification_dispatch import (
     _PERMANENT_FAILURE_CODES,
+    _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
     _RETRY_DELAYS,
     _RetryEntry,
     _retry_queue,
@@ -19,11 +20,14 @@ from app.notification_dispatch import (
     post_cycle_summary_message,
     post_direction_milestone_message,
     post_event_message,
+    post_account_model_regression_message,
+    post_account_model_regression_recovered_message,
     post_failure_alert_message,
     post_feedback_acknowledgment,
     post_issue_implementation_spawned_message,
     post_pr_merged_message,
     post_remediation_escalation_message,
+    post_residual_fix_audit_deferred_escalation_message,
     post_residual_fix_escalation_message,
     post_residual_fix_result_message,
     post_residual_fix_spawned_message,
@@ -487,6 +491,84 @@ async def test_post_failure_alert_message(db_session):
     assert "Circuit breaker opened" in msg.content
     assert msg.context["event_type"] == "failure_alert"
     assert msg.context["description"] == "Circuit breaker opened"
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_account_model_regression_message(db_session):
+    project_id = uuid.uuid4()
+    msg = await post_account_model_regression_message(
+        db_session, project_id,
+        account_id="acct-123",
+        account_label="ProdKey",
+        provider="anthropic",
+        model="claude-opus-4-7",
+        account_rate=0.10,
+        project_median=0.85,
+        sample_size=20,
+        distinct_accounts=3,
+        started_at="2026-04-29T00:00:00+00:00",
+    )
+    assert msg.project_id == project_id
+    # Summary surfaces the structured detail in plain text.
+    assert "ProdKey" in msg.content
+    assert "anthropic/claude-opus-4-7" in msg.content
+    assert msg.context["event_type"] == "account_model_regression_quarantined"
+    assert msg.context["account_id"] == "acct-123"
+    assert msg.context["account_label"] == "ProdKey"
+    assert msg.context["provider"] == "anthropic"
+    assert msg.context["model"] == "claude-opus-4-7"
+    assert msg.context["account_rate"] == 0.10
+    assert msg.context["project_median"] == 0.85
+    assert msg.context["sample_size"] == 20
+    assert msg.context["distinct_accounts"] == 3
+    assert msg.context["started_at"] == "2026-04-29T00:00:00+00:00"
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_account_model_regression_recovered_message(db_session):
+    project_id = uuid.uuid4()
+    msg = await post_account_model_regression_recovered_message(
+        db_session, project_id,
+        account_id="acct-123",
+        account_label="ProdKey",
+        provider="anthropic",
+        model="claude-opus-4-7",
+        account_rate=0.20,
+        project_median=0.85,
+        sample_size=10,
+    )
+    assert msg.project_id == project_id
+    assert "ProdKey" in msg.content
+    assert "anthropic/claude-opus-4-7" in msg.content
+    assert "restored after probe success" in msg.content
+    assert msg.context["event_type"] == "account_model_regression_recovered"
+    assert msg.context["account_id"] == "acct-123"
+    assert msg.context["account_label"] == "ProdKey"
+    assert msg.context["provider"] == "anthropic"
+    assert msg.context["model"] == "claude-opus-4-7"
+    assert msg.context["account_rate"] == 0.20
+    assert msg.context["project_median"] == 0.85
+    assert msg.context["sample_size"] == 10
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_account_model_regression_recovered_message_no_stats(db_session):
+    project_id = uuid.uuid4()
+    msg = await post_account_model_regression_recovered_message(
+        db_session, project_id,
+        account_id="acct-456",
+        account_label="DevKey",
+        provider="google",
+        model="gemini-pro",
+    )
+    assert "DevKey" in msg.content
+    assert "google/gemini-pro" in msg.content
+    assert msg.context["event_type"] == "account_model_regression_recovered"
+    assert msg.context["account_rate"] is None
+    assert msg.context["sample_size"] is None
     assert msg in db_session
 
 
@@ -1150,6 +1232,37 @@ async def test_post_residual_fix_spawned_null_task_id_in_context(db_session):
     assert msg.context["event_type"] == "residual_fix_spawned"
 
 
+@pytest.mark.asyncio
+async def test_post_residual_fix_spawned_fires_external_webhook(db_session):
+    """post_residual_fix_spawned_message dispatches a RESIDUAL_FIX_SPAWNED
+    external webhook once per spawn, carrying fingerprint, hit_count, and task_id."""
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+    project = Project(name="Spawned Webhook", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    fix_task = Task(
+        project_id=project.id, status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix"}],
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_residual_fix_spawned_message(
+            db_session, project.id, fingerprint="fp-wh",
+            sample_message="AssertionError in test_bar", task_id=fix_task.id,
+        )
+        await db_session.commit()
+
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[1] == "RESIDUAL_FIX_SPAWNED"
+    assert args[2]["fingerprint"] == "fp-wh"
+    assert args[2]["task_id"] == str(fix_task.id)
+    assert "hit_count" in args[2]
+
+
 # ─── RESOLVED transition on PR merge ─────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -1177,3 +1290,121 @@ async def test_close_residual_case_resolved_transitions_to_resolved(db_session):
 
     refreshed = await _load_case(db_session, project.id, "fp-resolved-merge")
     assert refreshed.status == ResidualCaseStatus.RESOLVED
+
+
+# ─── Audit-deferral escalation message ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_audit_deferred_escalation_message_creates_blocker(db_session):
+    """post_residual_fix_audit_deferred_escalation_message emits a BLOCKER
+    ProjectMessage with the expected context keys and the correct threshold."""
+    project = Project(name="Audit Deferred Esc", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    with patch("asyncio.ensure_future"):
+        msg = await post_residual_fix_audit_deferred_escalation_message(
+            db_session,
+            project.id,
+            fingerprint="fp-audit-deferred",
+            defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        )
+    await db_session.commit()
+
+    assert msg.message_type == MessageType.BLOCKER
+    assert msg.from_type == "system"
+    assert msg.context["event_type"] == "residual_fix_audit_deferred"
+    assert msg.context["fingerprint"] == "fp-audit-deferred"
+    assert msg.context["audit_defer_count"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+    assert msg.context["threshold"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+    assert "fp-audit-deferred" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_spawned_resets_audit_defer_fields(db_session):
+    """post_residual_fix_spawned_message resets audit_defer_count to 0 and
+    clears audit_deferred_system_id so a future audit cycle can re-escalate."""
+    project = Project(name="Spawn Resets Defer", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Pre-seed a case with non-zero deferral state.
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint="fp-spawn-reset",
+        status=ResidualCaseStatus.ACTIVE,
+        audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        audit_deferred_system_id="sys-abc",
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await post_residual_fix_spawned_message(
+        db_session, project.id, fingerprint="fp-spawn-reset",
+        sample_message="SomeError in foo",
+    )
+    await db_session.commit()
+
+    refreshed = await _load_case(db_session, project.id, "fp-spawn-reset")
+    assert refreshed.audit_defer_count == 0, "audit_defer_count must be reset to 0 on spawn"
+    assert refreshed.audit_deferred_system_id is None, "audit_deferred_system_id must be cleared on spawn"
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_audit_deferred_escalation_message_fires_webhook(db_session):
+    """post_residual_fix_audit_deferred_escalation_message fires RESIDUAL_FIX_AUDIT_DEFERRED
+    webhook with the correct payload fields so external subscribers can filter and act."""
+    project = Project(name="Audit Defer Webhook", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock):
+        await post_residual_fix_audit_deferred_escalation_message(
+            db_session,
+            project.id,
+            fingerprint="fp-webhook-test",
+            defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        )
+        import asyncio as _asyncio
+        await _asyncio.sleep(0)
+
+    dispatch_mock.assert_called_once()
+    args = dispatch_mock.call_args.args
+    assert args[0] == project.id
+    assert args[1] == "RESIDUAL_FIX_AUDIT_DEFERRED"
+    payload = args[2]
+    assert payload["fingerprint"] == "fp-webhook-test"
+    assert payload["audit_defer_count"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+    assert payload["threshold"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+    assert payload["severity"] == "blocker"
+    assert payload["manual_intervention_required"] is False
+    assert "summary" in payload and payload["summary"]
+
+
+@pytest.mark.asyncio
+async def test_post_residual_fix_audit_deferred_escalation_threshold_from_runtime_config(db_session):
+    """The threshold stored in the webhook payload reflects any runtime_config override,
+    not the hardcoded default, so operators can tune without a deploy."""
+    project = Project(name="Audit Defer Config", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    custom_threshold = 10
+    fake_runtime_config = {"residual_audit_defer_escalation_threshold": custom_threshold}
+
+    dispatch_mock = AsyncMock()
+    with patch("app.notification_dispatch.dispatch_external_notification", new=dispatch_mock), \
+         patch("app.shared_state.runtime_config", fake_runtime_config):
+        msg = await post_residual_fix_audit_deferred_escalation_message(
+            db_session,
+            project.id,
+            fingerprint="fp-config-threshold",
+            defer_count=custom_threshold,
+        )
+        import asyncio as _asyncio
+        await _asyncio.sleep(0)
+
+    assert msg.context["threshold"] == custom_threshold
+    args = dispatch_mock.call_args.args
+    assert args[2]["threshold"] == custom_threshold

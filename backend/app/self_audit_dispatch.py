@@ -179,14 +179,15 @@ async def _should_dispatch_self_audit(
             "[SELF_AUDIT] drift computation failed; skipping drift-driven dispatch",
         )
         drift = {"by_direction": {}, "by_system": {}}
+    drift_by_system: dict[str, dict] = {}
     for did, sig in (drift.get("by_direction") or {}).items():
         if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
             high_drift_directions.append(did)
     for sid, sig in (drift.get("by_system") or {}).items():
-        if (
-            sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag")
-        ) and sid not in candidate_systems:
-            candidate_systems.append(sid)
+        if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
+            drift_by_system[sid] = sig
+            if sid not in candidate_systems:
+                candidate_systems.append(sid)
 
     if not candidate_systems and not high_drift_directions:
         return None
@@ -200,10 +201,60 @@ async def _should_dispatch_self_audit(
     else:
         rotated = []
     focus = rotated[:_SELF_AUDIT_FOCUS_SYSTEMS_CAP]
+    focus_drift = {sid: drift_by_system[sid] for sid in focus if sid in drift_by_system}
     return {
         "focus_systems": focus or None,
         "max_systems": _SELF_AUDIT_FOCUS_SYSTEMS_CAP,
+        "drift_context": focus_drift or None,
     }
+
+
+async def _record_residual_audit_deferral(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    fingerprint: str,
+    system_id: str,
+) -> None:
+    """Stamp a deferral event on the ResidualRemediationCase for *fingerprint*.
+
+    Increments ``audit_defer_count`` and records ``audit_deferred_system_id`` so
+    operators can see via GET /residual-cases why a case is held.
+    The caller (``_spawn_residual_fingerprint_remediation``) commits after return.
+    """
+    from app.models import ResidualRemediationCase
+
+    case = (await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )).scalar_one_or_none()
+    if case is None:
+        return
+    case.audit_defer_count = (case.audit_defer_count or 0) + 1
+    case.audit_deferred_system_id = system_id
+    case.updated_at = _utcnow()
+    session.add(case)
+
+    # One-shot escalation: fire exactly when count first reaches the threshold
+    # (== not >=) so the alert fires once per deferral streak. The streak
+    # resets to 0 in post_residual_fix_spawned_message when a fix is spawned,
+    # allowing re-escalation on a future audit cycle.
+    from app.notification_dispatch import (  # deferred — avoids circular import
+        _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        post_residual_fix_audit_deferred_escalation_message,
+    )
+    threshold = int(_runtime_config.get(
+        'residual_audit_defer_escalation_threshold',
+        _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+    ))
+    if case.audit_defer_count == threshold:
+        await post_residual_fix_audit_deferred_escalation_message(
+            session,
+            project_id,
+            fingerprint=fingerprint,
+            defer_count=case.audit_defer_count,
+        )
 
 
 async def _spawn_self_audit_task(
@@ -273,6 +324,10 @@ async def _spawn_self_audit_task(
             f"[SELF_AUDIT] payload too large for project {project.id}: {e}; skipping"
         )
         return False
+    task_context: dict = {}
+    drift_ctx = audit_payload.get("drift_context")
+    if drift_ctx:
+        task_context["drift_context"] = drift_ctx
     new_task = Task(
         project_id=project.id,
         title=f"Self-audit: {project.name}",
@@ -281,7 +336,7 @@ async def _spawn_self_audit_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={},
+        context=task_context,
     )
     session.add(new_task)
     await session.flush()

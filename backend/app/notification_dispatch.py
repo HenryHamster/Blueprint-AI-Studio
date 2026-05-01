@@ -413,6 +413,92 @@ async def post_failure_alert_message(
     )
 
 
+async def post_account_model_regression_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    account_id: str,
+    account_label: str,
+    provider: str,
+    model: str,
+    account_rate: float,
+    project_median: float,
+    sample_size: int,
+    distinct_accounts: int,
+    started_at: str,
+) -> ProjectMessage:
+    """Post a message when a (provider, model) combination is auto-quarantined
+    on an account due to a success-rate regression vs the project median.
+
+    Mirrors the post_failure_alert_message shape — same NOTE/system surface
+    operators already watch for circuit-breaker events. The richer numeric
+    detail (account_rate, project_median, sample_size) is preserved on
+    ``context`` so the UI can surface a structured drill-in alongside the
+    plain-text summary.
+    """
+    summary = (
+        f"Account model regression-quarantined: {account_label} {provider}/{model} "
+        f"({account_rate:.0%} success vs project median {project_median:.0%} on n={sample_size})"
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="account_model_regression_quarantined",
+        summary=summary,
+        context={
+            "account_id": account_id,
+            "account_label": account_label,
+            "provider": provider,
+            "model": model,
+            "account_rate": account_rate,
+            "project_median": project_median,
+            "sample_size": sample_size,
+            "distinct_accounts": distinct_accounts,
+            "started_at": started_at,
+        },
+    )
+
+
+async def post_account_model_regression_recovered_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    account_id: str,
+    account_label: str,
+    provider: str,
+    model: str,
+    account_rate: float | None = None,
+    project_median: float | None = None,
+    sample_size: int | None = None,
+) -> ProjectMessage:
+    """Post a message when a regression-quarantined (provider, model) auto-recovers
+    after a successful probe task completes post-cooldown."""
+    rate_detail = (
+        f" ({account_rate:.0%} vs median {project_median:.0%} on n={sample_size})"
+        if account_rate is not None and project_median is not None and sample_size is not None
+        else ""
+    )
+    summary = (
+        f"Account model regression-recovered: {account_label} {provider}/{model} "
+        f"restored after probe success{rate_detail}"
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="account_model_regression_recovered",
+        summary=summary,
+        context={
+            "account_id": account_id,
+            "account_label": account_label,
+            "provider": provider,
+            "model": model,
+            "account_rate": account_rate,
+            "project_median": project_median,
+            "sample_size": sample_size,
+        },
+    )
+
+
 async def post_auto_fix_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -436,6 +522,7 @@ async def post_auto_fix_spawned_message(
 
 _AUTO_REMEDIATION_ESCALATION_THRESHOLD = 3
 _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD = 1
+_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD = 5
 
 
 async def post_auto_fix_result_message(
@@ -642,10 +729,13 @@ async def post_residual_fix_spawned_message(
     case.last_spawned_task_id = task_id
     case.last_spawned_at = _utcnow()
     case.updated_at = _utcnow()
+    # Reset audit-deferral streak so a future audit cycle can re-escalate.
+    case.audit_defer_count = 0
+    case.audit_deferred_system_id = None
     session.add(case)
 
     summary = f'Residual auto-fix spawned for fingerprint {fingerprint[:32]}'
-    return await post_event_message(
+    msg = await post_event_message(
         session,
         project_id,
         event_type='residual_fix_spawned',
@@ -657,6 +747,16 @@ async def post_residual_fix_spawned_message(
         },
         task_id=task_id,
     )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_FIX_SPAWNED',
+        {
+            'fingerprint': fingerprint,
+            'hit_count': case.hit_count,
+            'task_id': str(task_id) if task_id else None,
+        },
+    ))
+    return msg
 
 
 async def post_residual_fix_result_message(
@@ -811,7 +911,8 @@ async def post_residual_fix_escalation_message(
     summary = (
         f'Residual auto-fix suspended for fingerprint {fingerprint[:32]} '
         f'after {failure_count} consecutive failures. Manual intervention '
-        f'required. Re-enable by clearing suspended_at on the case row.'
+        f'required. Re-enable via the Unsuspend button in the dashboard '
+        f'or POST /api/admin/residual-cases/{fingerprint}/unsuspend.'
     )
     ctx: dict[str, Any] = {
         'event_type': 'residual_fix_escalated',
@@ -827,6 +928,113 @@ async def post_residual_fix_escalation_message(
         context=ctx,
     )
     session.add(msg)
+    return msg
+
+
+async def post_residual_fix_unsuspend_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a NOTE-severity message when a suspended residual fingerprint is
+    manually unsuspended by an operator. Paired with the BLOCKER escalation
+    message so the message stream shows suspend → unsuspend as a matched pair.
+    Also fires RESIDUAL_FIX_UNSUSPENDED external webhook (opt-in).
+    """
+    recovered_at = datetime.now(timezone.utc).isoformat()
+    summary = (
+        f'Residual auto-fix re-enabled for fingerprint {fingerprint[:32]}. '
+        f'Case manually unsuspended by operator. Spawn will resume after cooldown.'
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type='residual_fix_unsuspended',
+        summary=summary,
+        context={
+            'fingerprint': fingerprint,
+            'recovered_at': recovered_at,
+            'manual_intervention_required': False,
+        },
+        task_id=task_id,
+    )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_FIX_UNSUSPENDED',
+        {
+            'fingerprint': fingerprint,
+            'recovered_at': recovered_at,
+            'manual_intervention_required': False,
+            'summary': summary,
+        },
+    ))
+    return msg
+
+
+async def post_residual_fix_audit_deferred_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    defer_count: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity escalation when a residual case is repeatedly
+    blocked by an in-progress audit.
+
+    Called when audit_defer_count first crosses
+    _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD (default 5, configurable via
+    runtime_config["residual_audit_defer_escalation_threshold"]). The case
+    status stays ACTIVE — the case is legitimately still open, just waiting
+    for the audit to complete.
+
+    Callers are responsible for the idempotency guard: fire only when
+    audit_defer_count == threshold (not >= threshold) so the message fires
+    once per deferral streak. post_residual_fix_spawned_message resets
+    audit_defer_count to 0 when a fix spawns so future audit cycles can
+    re-escalate.
+    """
+    try:
+        from app.shared_state import runtime_config
+        threshold = int(runtime_config.get(
+            'residual_audit_defer_escalation_threshold',
+            _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
+        ))
+    except Exception:
+        threshold = _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
+
+    summary = (
+        f'Residual case for fingerprint {fingerprint[:32]} has been deferred by audit '
+        f'{defer_count} times (threshold: {threshold}). No fix has been spawned yet — '
+        f'the case is blocked pending audit completion.'
+    )
+    ctx: dict[str, Any] = {
+        'event_type': 'residual_fix_audit_deferred',
+        'fingerprint': fingerprint,
+        'audit_defer_count': defer_count,
+        'threshold': threshold,
+    }
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type='system',
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        'RESIDUAL_FIX_AUDIT_DEFERRED',
+        {
+            'fingerprint': fingerprint,
+            'audit_defer_count': defer_count,
+            'threshold': threshold,
+            'severity': 'blocker',
+            'manual_intervention_required': False,
+            'summary': summary,
+        },
+    ))
     return msg
 
 

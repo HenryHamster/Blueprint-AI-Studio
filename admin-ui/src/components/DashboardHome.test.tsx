@@ -5,8 +5,15 @@ import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
-const { apiFetchMock } = vi.hoisted(() => ({
+const { apiFetchMock, capturedProps } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
+  capturedProps: {
+    prMonitor: null as Record<string, unknown> | null,
+    remediationFunnel: null as Record<string, unknown> | null,
+    providerCostPanel: null as Record<string, unknown> | null,
+    scopeTrends: null as Record<string, unknown> | null,
+    directionAutoPause: null as Record<string, unknown> | null,
+  },
 }));
 
 vi.mock('../api', () => ({
@@ -17,12 +24,22 @@ vi.mock('./RecentErrorsWidget', () => ({
   RecentErrorsWidget: () => <div data-testid="recent-errors-widget">RecentErrorsWidget</div>,
 }));
 
+vi.mock('./TaskDurationWidget', () => ({
+  TaskDurationWidget: () => <div data-testid="task-duration-widget">TaskDurationWidget</div>,
+}));
+
 vi.mock('./DirectionAutoPauseWidget', () => ({
-  DirectionAutoPauseWidget: () => <div data-testid="direction-auto-pause-widget">DirectionAutoPauseWidget</div>,
+  DirectionAutoPauseWidget: (props: Record<string, unknown>) => {
+    capturedProps.directionAutoPause = props;
+    return <div data-testid="direction-auto-pause-widget">DirectionAutoPauseWidget</div>;
+  },
 }));
 
 vi.mock('./PRMonitorSection', () => ({
-  PRMonitorSection: () => <div data-testid="pr-monitor-section">PRMonitorSection</div>,
+  PRMonitorSection: (props: Record<string, unknown>) => {
+    capturedProps.prMonitor = props;
+    return <div data-testid="pr-monitor-section">PRMonitorSection</div>;
+  },
 }));
 
 vi.mock('./MediumScopeWidget', () => ({
@@ -30,7 +47,10 @@ vi.mock('./MediumScopeWidget', () => ({
 }));
 
 vi.mock('./RemediationFunnelSection', () => ({
-  RemediationFunnelSection: () => <div data-testid="remediation-funnel-section">RemediationFunnelSection</div>,
+  RemediationFunnelSection: (props: Record<string, unknown>) => {
+    capturedProps.remediationFunnel = props;
+    return <div data-testid="remediation-funnel-section">RemediationFunnelSection</div>;
+  },
 }));
 
 vi.mock('./FailureStageWidget', () => ({
@@ -42,11 +62,17 @@ vi.mock('./ScopeConversionRatesSection', () => ({
 }));
 
 vi.mock('./ScopeTrendsSection', () => ({
-  ScopeTrendsSection: () => <div data-testid="scope-trends-section">ScopeTrendsSection</div>,
+  ScopeTrendsSection: (props: Record<string, unknown>) => {
+    capturedProps.scopeTrends = props;
+    return <div data-testid="scope-trends-section">ScopeTrendsSection</div>;
+  },
 }));
 
 vi.mock('./ProviderCostPanel', () => ({
-  ProviderCostPanel: () => <div data-testid="provider-cost-panel">ProviderCostPanel</div>,
+  ProviderCostPanel: (props: Record<string, unknown>) => {
+    capturedProps.providerCostPanel = props;
+    return <div data-testid="provider-cost-panel">ProviderCostPanel</div>;
+  },
 }));
 
 vi.mock('recharts', () => ({
@@ -547,8 +573,8 @@ describe('DashboardHome', () => {
 
     render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
-    expect(await screen.findByText('System Maturity')).toBeInTheDocument();
-    expect(screen.getByText('ci-pipeline')).toBeInTheDocument();
+    expect(screen.getByText('System Maturity')).toBeInTheDocument();
+    expect(await screen.findByText('ci-pipeline')).toBeInTheDocument();
     expect(screen.getByText('auth-service')).toBeInTheDocument();
     expect(screen.getByText('35')).toBeInTheDocument();
     expect(screen.getByText('82')).toBeInTheDocument();
@@ -565,8 +591,8 @@ describe('DashboardHome', () => {
 
     render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
 
-    expect(await screen.findByText('System Maturity')).toBeInTheDocument();
-    expect(screen.getByText('No audits have run yet')).toBeInTheDocument();
+    expect(screen.getByText('System Maturity')).toBeInTheDocument();
+    expect(await screen.findByText('No audits have run yet')).toBeInTheDocument();
   });
 
   describe('project-level autonomous/assisted split', () => {
@@ -630,5 +656,184 @@ describe('DashboardHome', () => {
       expect(await screen.findByText('7 autonomous')).toBeInTheDocument();
       expect(screen.getByText('0 assisted')).toBeInTheDocument();
     });
+  });
+
+  describe('widget prop wiring', () => {
+    beforeEach(() => {
+      capturedProps.prMonitor = null;
+      capturedProps.remediationFunnel = null;
+      capturedProps.providerCostPanel = null;
+      capturedProps.scopeTrends = null;
+      capturedProps.directionAutoPause = null;
+    });
+
+    const baseDigest = { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] };
+
+    it('passes hasProject=false and tasks/onViewTask to PRMonitorSection when no project selected', async () => {
+      setupApiMocks({ digest: baseDigest });
+      const onViewTask = vi.fn();
+      const tasks = [makeTask({ id: 'task-1' })];
+
+      render(<DashboardHome tasks={tasks} selectedProjectId={null} onViewTask={onViewTask} />);
+
+      await screen.findByText('No active directions');
+      expect(capturedProps.prMonitor).not.toBeNull();
+      const prProps = capturedProps.prMonitor ?? {};
+      expect(prProps.hasProject).toBe(false);
+      expect(prProps.tasks).toBe(tasks);
+      expect(prProps.onViewTask).toBe(onViewTask);
+    });
+
+    it('passes hasProject=true and loading=false to PRMonitorSection when project is set and data loaded', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      const prProps = capturedProps.prMonitor ?? {};
+      expect(prProps.hasProject).toBe(true);
+      expect(prProps.loading).toBe(false);
+    });
+
+    it('passes projectId and loading to RemediationFunnelSection when project selected', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj-abc" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      const rfProps = capturedProps.remediationFunnel ?? {};
+      expect(rfProps.projectId).toBe('proj-abc');
+      expect(rfProps.loading).toBe(false);
+    });
+
+    it('passes selectedProjectId and windowHours=24 (default) to ProviderCostPanel', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      const cpProps = capturedProps.providerCostPanel ?? {};
+      expect(cpProps.selectedProjectId).toBe('proj1');
+      expect(cpProps.windowHours).toBe(24);
+    });
+
+    it('updates ProviderCostPanel windowHours when time-window selector changes', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+      const user = userEvent.setup();
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      await user.selectOptions(screen.getByRole('combobox'), '48');
+
+      const cpProps = capturedProps.providerCostPanel ?? {};
+      expect(cpProps.windowHours).toBe(48);
+    });
+
+    it('passes open=false and onToggle to ScopeTrendsSection', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      const stProps = capturedProps.scopeTrends ?? {};
+      expect(stProps.open).toBe(false);
+      expect(typeof stProps.onToggle).toBe('function');
+    });
+
+    it('passes selectedProjectId to DirectionAutoPauseWidget', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj-xyz" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      const daProps = capturedProps.directionAutoPause ?? {};
+      expect(daProps.selectedProjectId).toBe('proj-xyz');
+    });
+  });
+
+  describe('self-sufficient directions roll-up', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      recent_completions: [],
+    };
+
+    it('shows 0 / N when no directions meet threshold', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            { direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 2, prs_merged: 3, possibly_saturated: false },
+            { direction_id: 'd2', direction_text: 'Dir B', priority: 'low', cycles_in_window: 1, tasks_created: 1, prs_merged: 1, possibly_saturated: false },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Self-sufficient: 0 / 2')).toBeInTheDocument();
+    });
+
+    it('shows correct count when one direction is self-sufficient', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            {
+              direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 2, prs_merged: 12, possibly_saturated: false,
+              research_history: [{ autonomous_prs_merged: 12 }],
+              history_aggregate: { total_autonomous_prs_merged: 0, total_operator_actions: 0 },
+            },
+            { direction_id: 'd2', direction_text: 'Dir B', priority: 'low', cycles_in_window: 1, tasks_created: 1, prs_merged: 2, possibly_saturated: false },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('Self-sufficient: 1 / 2')).toBeInTheDocument();
+    });
+
+    it('treats total_operator_actions undefined as null (not zero) when research_history has no attribution', async () => {
+      setupApiMocks({
+        digest: {
+          ...baseDigest,
+          direction_progress: [
+            {
+              direction_id: 'd1', direction_text: 'Dir A', priority: 'high', cycles_in_window: 1, tasks_created: 2, prs_merged: 12, possibly_saturated: false,
+              research_history: [{ autonomous_prs_merged: 12 }],
+              history_aggregate: { total_autonomous_prs_merged: 0 },
+            },
+          ],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      // total_operator_actions is undefined → null, so operatorActions === 0 is false → not self-sufficient
+      expect(await screen.findByText('Self-sufficient: 0 / 1')).toBeInTheDocument();
+    });
+  });
+
+  it('does not render digest data when backend returns a response that fails the contract check', async () => {
+    setupApiMocks({
+      digest: { unexpected_field: 'bad', totally_wrong: true },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    // Diagnostics loads successfully so the component exits loading state
+    expect(await screen.findByText('All systems healthy')).toBeInTheDocument();
+    // Digest-specific failure pills and success rate must not appear
+    expect(screen.queryByText('CODE ERROR')).not.toBeInTheDocument();
+    expect(screen.queryByText('75%')).not.toBeInTheDocument();
+    expect(screen.queryByText('Pipeline stabilized')).not.toBeInTheDocument();
   });
 });

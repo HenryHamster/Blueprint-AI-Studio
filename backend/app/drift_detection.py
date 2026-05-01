@@ -15,11 +15,13 @@ when drift is high — independent of lifetime merge calibration.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+import uuid
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import Index, delete
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import Field, SQLModel, select
 
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.time_utils import _utcnow
@@ -27,9 +29,46 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
-_OVER_CLAIM_MIN_CLAIMS = 3
-_OVER_CLAIM_CONSISTENCY_THRESHOLD = 0.4
-_STALL_MIN_CLAIMS = 5
+_OVER_CLAIM_MIN_CLAIMS_DEFAULT = 3
+_OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT = 0.4
+_STALL_MIN_CLAIMS_DEFAULT = 5
+# Maximum snapshots retained per (project_id, direction_id) pair.
+_DRIFT_SNAPSHOT_RETENTION = 50
+
+
+def _drift_thresholds() -> tuple[int, float, int]:
+    """Return (over_claim_min_claims, over_claim_consistency_threshold, stall_min_claims)
+    from runtime_config, falling back to defaults when absent.
+    """
+    from app.shared_state import runtime_config as _rc  # lazy import avoids circular
+    return (
+        int(_rc.get("drift_over_claim_min_claims", _OVER_CLAIM_MIN_CLAIMS_DEFAULT)),
+        float(_rc.get("drift_over_claim_consistency_threshold", _OVER_CLAIM_CONSISTENCY_THRESHOLD_DEFAULT)),
+        int(_rc.get("drift_stall_min_claims", _STALL_MIN_CLAIMS_DEFAULT)),
+    )
+
+
+class DirectionDriftSnapshot(SQLModel, table=True):
+    """One drift-signal observation for a single direction at a point in time.
+
+    Written by persist_drift_snapshot() each autonomous cycle so consumers
+    can look back N cycles and distinguish a one-off spike from a sustained
+    breakdown.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(index=True)
+    direction_id: str = Field(index=True)
+    snapshot_at: datetime = Field(default_factory=_utcnow)
+    claimed_changes_count: int = Field(default=0)
+    actually_merged_prs: int = Field(default=0)
+    claim_shipped_consistency: float = Field(default=1.0)
+    over_claim_flag: bool = Field(default=False)
+    stalled_despite_churn_flag: bool = Field(default=False)
+
+    __table_args__ = (
+        Index("ix_dds_project_direction_at", "project_id", "direction_id", "snapshot_at"),
+    )
 
 
 def _neutral_signal() -> dict[str, Any]:
@@ -84,13 +123,25 @@ def _consistency(merged: int, claimed: int) -> float:
     return max(0.0, min(1.0, merged / claimed))
 
 
-def _build_direction_signal(claimed: int, merged: int) -> dict[str, Any]:
+def _build_direction_signal(
+    claimed: int,
+    merged: int,
+    *,
+    over_claim_min: int | None = None,
+    consistency_threshold: float | None = None,
+    stall_min: int | None = None,
+) -> dict[str, Any]:
+    if over_claim_min is None or consistency_threshold is None or stall_min is None:
+        _oc_min, _ct, _st_min = _drift_thresholds()
+        over_claim_min = over_claim_min if over_claim_min is not None else _oc_min
+        consistency_threshold = consistency_threshold if consistency_threshold is not None else _ct
+        stall_min = stall_min if stall_min is not None else _st_min
     consistency = _consistency(merged, claimed)
     over_claim = (
-        claimed >= _OVER_CLAIM_MIN_CLAIMS
-        and consistency < _OVER_CLAIM_CONSISTENCY_THRESHOLD
+        claimed >= over_claim_min
+        and consistency < consistency_threshold
     )
-    stalled = claimed >= _STALL_MIN_CLAIMS and merged == 0
+    stalled = claimed >= stall_min and merged == 0
     return {
         "claimed_changes_count": claimed,
         "actually_merged_prs": merged,
@@ -124,6 +175,7 @@ async def compute_direction_drift(
     signals so callers can rely on a stable shape.
     """
     generated_at = _utcnow().isoformat()
+    over_claim_min, consistency_threshold, stall_min = _drift_thresholds()
     directions = list(project.directions or [])
     by_direction: dict[str, dict[str, Any]] = {}
     by_system_accum: dict[str, dict[str, int]] = {}
@@ -194,7 +246,12 @@ async def compute_direction_drift(
             continue
         claimed = per_direction_claims.get(did, 0)
         merged = per_direction_merged.get(did, 0)
-        signal = _build_direction_signal(claimed, merged)
+        signal = _build_direction_signal(
+            claimed, merged,
+            over_claim_min=over_claim_min,
+            consistency_threshold=consistency_threshold,
+            stall_min=stall_min,
+        )
         by_direction[did] = signal
         sid = d.get("system_id")
         if sid:
@@ -207,7 +264,12 @@ async def compute_direction_drift(
     # neutral signal so consumers can rely on the by_system shape.
     by_system: dict[str, dict[str, Any]] = {}
     for sid, acc in by_system_accum.items():
-        by_system[sid] = _build_direction_signal(acc["claimed"], acc["merged"])
+        by_system[sid] = _build_direction_signal(
+            acc["claimed"], acc["merged"],
+            over_claim_min=over_claim_min,
+            consistency_threshold=consistency_threshold,
+            stall_min=stall_min,
+        )
 
     # Surface systems that exist on directions but had no in-window data —
     # neutral signal lets the strategic prompt still see the system_id.
@@ -224,3 +286,79 @@ async def compute_direction_drift(
         "generated_at": generated_at,
         "window_days": window_days,
     }
+
+
+async def persist_drift_snapshot(
+    session: AsyncSession,
+    project: Project,
+    drift_result: dict[str, Any],
+) -> None:
+    """Write one DirectionDriftSnapshot row per direction and prune excess history.
+
+    Callers (strategic_spawning, self_audit_dispatch) call this after
+    compute_direction_drift() to build the time-series. The session is
+    flushed but NOT committed — the caller owns the transaction boundary.
+
+    Prunes rows beyond _DRIFT_SNAPSHOT_RETENTION newest for each direction.
+    """
+    by_direction = drift_result.get("by_direction", {})
+    if not by_direction:
+        return
+
+    snapshot_at = _utcnow()
+    for direction_id, signal in by_direction.items():
+        session.add(
+            DirectionDriftSnapshot(
+                project_id=project.id,
+                direction_id=direction_id,
+                snapshot_at=snapshot_at,
+                claimed_changes_count=signal.get("claimed_changes_count", 0),
+                actually_merged_prs=signal.get("actually_merged_prs", 0),
+                claim_shipped_consistency=signal.get("claim_shipped_consistency", 1.0),
+                over_claim_flag=bool(signal.get("over_claim_flag", False)),
+                stalled_despite_churn_flag=bool(signal.get("stalled_despite_churn_flag", False)),
+            )
+        )
+
+    await session.flush()
+
+    for direction_id in by_direction:
+        excess = (
+            await session.execute(
+                select(DirectionDriftSnapshot.id)
+                .where(
+                    DirectionDriftSnapshot.project_id == project.id,
+                    DirectionDriftSnapshot.direction_id == direction_id,
+                )
+                .order_by(DirectionDriftSnapshot.snapshot_at.desc())
+                .offset(_DRIFT_SNAPSHOT_RETENTION)
+            )
+        ).all()
+        if excess:
+            await session.execute(
+                delete(DirectionDriftSnapshot).where(
+                    DirectionDriftSnapshot.id.in_([r[0] for r in excess])
+                )
+            )
+
+
+async def last_n_drift_snapshots(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    n: int = 10,
+) -> list[DirectionDriftSnapshot]:
+    """Return the n most-recent drift snapshots for a direction, newest first."""
+    return list(
+        (
+            await session.execute(
+                select(DirectionDriftSnapshot)
+                .where(
+                    DirectionDriftSnapshot.project_id == project_id,
+                    DirectionDriftSnapshot.direction_id == direction_id,
+                )
+                .order_by(DirectionDriftSnapshot.snapshot_at.desc())
+                .limit(n)
+            )
+        ).scalars().all()
+    )

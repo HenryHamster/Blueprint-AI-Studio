@@ -146,6 +146,92 @@ describe('DriftSignalsCard', () => {
     expect(screen.queryByText('over-claim')).not.toBeInTheDocument();
   });
 
+  it('shows a consistency badge and collapsed flagged-system summary', async () => {
+    apiFetchMock.mockResolvedValue(
+      jsonResponse(
+        makeSnapshot({
+          flagged_count: 1,
+          any_system_flagged: true,
+          by_system: {
+            'sys-alpha': {
+              over_claim_flag: true,
+              stalled_despite_churn_flag: false,
+              claimed_changes_count: 5,
+              actually_merged_prs: 1,
+              claim_shipped_consistency: 0.2,
+            },
+            'sys-beta': {
+              over_claim_flag: false,
+              stalled_despite_churn_flag: false,
+              claimed_changes_count: 1,
+              actually_merged_prs: 1,
+              claim_shipped_consistency: 1,
+            },
+          },
+          flagged_directions: [
+            {
+              direction_id: 'd-1',
+              direction_text: 'Stabilize rollout ownership',
+              over_claim_flag: true,
+              stalled_despite_churn_flag: false,
+              claimed_changes_count: 4,
+              actually_merged_prs: 1,
+              claim_shipped_consistency: 0.25,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<DriftSignalsCard projectId="proj-1" />);
+
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Drift Signals/i }));
+
+    expect(screen.getByText('25% consistent')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /System drift summary/i })).toBeInTheDocument();
+    expect(screen.queryByText('sys-alpha')).not.toBeInTheDocument();
+    expect(screen.queryByText('sys-beta')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /System drift summary/i }));
+    expect(screen.getByText('sys-alpha')).toBeInTheDocument();
+    expect(screen.getByText('20% consistent')).toBeInTheDocument();
+    expect(screen.queryByText('sys-beta')).not.toBeInTheDocument();
+  });
+
+  it('gracefully skips newer drift fields when older responses omit them', async () => {
+    apiFetchMock.mockResolvedValue(
+      jsonResponse({
+        flagged_count: 1,
+        flagged_directions: [
+          {
+            direction_id: 'd-legacy',
+            direction_text: 'Legacy payload path',
+            over_claim_flag: true,
+            stalled_despite_churn_flag: false,
+            claimed_changes_count: 3,
+            actually_merged_prs: 0,
+          },
+        ],
+        total_directions: 1,
+        generated_at: '2026-04-28T00:00:00Z',
+        window_days: 7,
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<DriftSignalsCard projectId="proj-1" />);
+
+    await act(async () => {});
+    await user.click(screen.getByRole('button', { name: /Drift Signals/i }));
+
+    expect(screen.getByText('Legacy payload path')).toBeInTheDocument();
+    expect(screen.getByText('0/3 merged')).toBeInTheDocument();
+    expect(screen.queryByText(/consistent/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /System drift summary/i })).not.toBeInTheDocument();
+  });
+
   it('fetches with the correct project_id query param', async () => {
     apiFetchMock.mockResolvedValue(jsonResponse(makeSnapshot()));
 

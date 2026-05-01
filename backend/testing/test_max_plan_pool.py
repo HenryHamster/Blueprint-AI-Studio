@@ -6,7 +6,7 @@ keeping assertions deterministic without fixtures or locks.
 """
 import time
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -1130,3 +1130,375 @@ class TestLatencyAwareSelection:
         result = await select_max_plan_account_balanced(self._USER, [("anthropic", None)])
         assert result is not None
         assert result[0]["id"] == "slow"
+
+
+# ── disable_account_model(kind="regression") + clear_account_model_regression ─
+
+class TestRegressionQuarantine:
+    """Unit tests for the regression-kind disabled_models entry shape."""
+
+    def setup_method(self):
+        from app.failure_classification import _account_failure_log
+        _account_failure_log.clear()
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    def teardown_method(self):
+        from app.failure_classification import _account_failure_log
+        _account_failure_log.clear()
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    async def test_regression_kind_does_not_cascade(self):
+        """Regression on Sonnet must NOT also disable Opus / Haiku."""
+        from app.max_plan_pool import disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, "claude-sonnet-4-5",
+                kind="regression",
+                regression_stats={"account_rate": 0.1, "project_median": 0.9,
+                                  "sample_size": 5, "distinct_accounts": 2,
+                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                provider="anthropic",
+            )
+        dm = acct["disabled_models"]
+        assert "claude-sonnet-4-5" in dm
+        # Opus and Haiku must be untouched — regression does NOT cascade.
+        assert OPUS not in dm
+        assert HAIKU not in dm
+
+    async def test_regression_persists_stats_and_provider(self):
+        from app.max_plan_pool import disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 6,
+                 "distinct_accounts": 3, "started_at": "2026-04-29T00:00:00+00:00"}
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, OPUS,
+                kind="regression",
+                regression_stats=stats,
+                provider="anthropic",
+            )
+        info = acct["disabled_models"][OPUS]
+        assert info["kind"] == "regression"
+        assert info["provider"] == "anthropic"
+        assert info["regression_stats"] == stats
+
+    async def test_regression_cooldown_is_six_hours(self):
+        from app.max_plan_pool import _REGRESSION_COOLDOWN_SECONDS, disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, OPUS, kind="regression",
+                regression_stats={"account_rate": 0.1, "project_median": 0.9,
+                                  "sample_size": 5, "distinct_accounts": 2,
+                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                provider="anthropic",
+            )
+        info = acct["disabled_models"][OPUS]
+        assert _cooldown_seconds_for_info(info) == _REGRESSION_COOLDOWN_SECONDS
+        assert _REGRESSION_COOLDOWN_SECONDS == 6 * 60 * 60
+
+    async def test_regression_does_not_record_rl_event(self):
+        """Regression bookkeeping skips rl_events / outcome_events writes —
+        those are tied to per-event failure signals, not aggregate trends."""
+        from app.max_plan_pool import disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, OPUS, kind="regression",
+                regression_stats={"account_rate": 0.1, "project_median": 0.9,
+                                  "sample_size": 5, "distinct_accounts": 2,
+                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                provider="anthropic",
+            )
+        assert acct.get("rl_events") in (None, [])
+        assert acct.get("outcome_events") in (None, [])
+
+    async def test_regression_kind_serializes_stats_and_provider(self):
+        from app.max_plan_pool import disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 6,
+                 "distinct_accounts": 3, "started_at": "2026-04-29T00:00:00+00:00"}
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, OPUS, kind="regression",
+                regression_stats=stats, provider="anthropic",
+            )
+        serialized = _serialize_disabled_model_info(acct["disabled_models"][OPUS])
+        assert serialized["kind"] == "regression"
+        assert serialized["provider"] == "anthropic"
+        assert serialized["regression_stats"] == stats
+
+    async def test_clear_regression_only_clears_regression_kind(self):
+        """clear_account_model_regression must NOT touch rate_limit / quarantine entries."""
+        from app.max_plan_pool import (
+            clear_account_model_regression,
+            disable_account_model,
+        )
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        # Seed a rate_limit-kind entry on Opus (cascade kept simple — no test fixtures for failure log).
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="rate_limit")
+
+        # clear_account_model_regression must refuse to touch a rate_limit entry.
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            cleared = await clear_account_model_regression(acct_id, OPUS)
+        assert cleared is False
+        assert OPUS in acct["disabled_models"]
+        assert acct["disabled_models"][OPUS].get("kind") != "regression"
+
+    async def test_clear_regression_clears_regression_kind(self):
+        from app.max_plan_pool import (
+            clear_account_model_regression,
+            disable_account_model,
+        )
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, OPUS, kind="regression",
+                regression_stats={"account_rate": 0.1, "project_median": 0.9,
+                                  "sample_size": 5, "distinct_accounts": 2,
+                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                provider="anthropic",
+            )
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            cleared = await clear_account_model_regression(acct_id, OPUS)
+        assert cleared is True
+        # disabled_models is removed entirely when emptied.
+        assert "disabled_models" not in acct
+
+    async def test_regression_quarantine_gates_haiku_dispatch(self):
+        """Regression entry stored under Haiku must be found by
+        _account_state_for_model when Haiku tasks are dispatched.
+
+        disable_account_model(kind='regression') intentionally skips
+        Haiku→Opus normalization (regression is per-model, not per-meter),
+        so the key in disabled_models is the literal Haiku model name.
+        _account_state_for_model normalizes Haiku→Opus before lookup, but
+        must fall back to the un-normalized key to catch regression entries.
+        """
+        from app.max_plan_pool import _account_state_for_model, disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, HAIKU, kind="regression",
+                regression_stats={"account_rate": 0.1, "project_median": 0.9,
+                                  "sample_size": 5, "distinct_accounts": 2,
+                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                provider="anthropic",
+            )
+        # Entry stored under the actual Haiku key (not Opus-normalized).
+        assert HAIKU in acct["disabled_models"]
+        assert OPUS not in acct["disabled_models"]
+        # Gate must see the regression entry and block Haiku dispatch.
+        assert _account_state_for_model(acct, HAIKU) == "unavailable"
+        # Opus must remain healthy — Haiku regression must NOT bleed over.
+        assert _account_state_for_model(acct, OPUS) == "healthy"
+
+    async def test_clear_regression_rejects_provider_mismatch(self):
+        """clear_account_model_regression must return False when the caller
+        passes a provider that doesn't match the stored entry's provider."""
+        from app.max_plan_pool import (
+            clear_account_model_regression,
+            disable_account_model,
+        )
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(
+                acct_id, OPUS, kind="regression",
+                regression_stats={"account_rate": 0.1, "project_median": 0.9,
+                                  "sample_size": 5, "distinct_accounts": 2,
+                                  "started_at": "2026-04-29T00:00:00+00:00"},
+                provider="anthropic",
+            )
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            # Wrong provider — must be rejected.
+            cleared = await clear_account_model_regression(acct_id, OPUS, provider="google")
+        assert cleared is False
+        # Entry must still be present.
+        assert OPUS in acct["disabled_models"]
+
+    async def test_clear_regression_on_success_clears_entry(self):
+        """Successful probe removes the regression entry and returns metadata."""
+        from app.max_plan_pool import clear_regression_on_success, disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id, user_id="u1", name="TestAcct")
+        _account_by_id[acct_id] = acct
+        stats = {"account_rate": 0.2, "project_median": 0.8, "sample_size": 5,
+                 "distinct_accounts": 2, "started_at": "2026-04-29T00:00:00+00:00"}
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="regression",
+                                        regression_stats=stats, provider="anthropic")
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            result = await clear_regression_on_success(acct_id, OPUS)
+        assert result is not None
+        assert result["model"] == OPUS
+        assert result["provider"] == "anthropic"
+        assert result["account_rate"] == 0.2
+        assert result["project_median"] == 0.8
+        assert result["sample_size"] == 5
+        assert result["user_id"] == "u1"
+        assert result["account_label"] == "TestAcct"
+        assert "disabled_models" not in acct
+
+    async def test_clear_regression_on_success_returns_none_without_entry(self):
+        """Returns None when no regression entry exists — also ensures second call is a no-op."""
+        from app.max_plan_pool import clear_regression_on_success
+
+        acct = _acct(id="a")
+        _account_by_id["a"] = acct
+        assert await clear_regression_on_success("a", OPUS) is None
+
+    async def test_clear_regression_on_success_ignores_quota_exhausted(self):
+        """Must not clear a quota_exhausted entry on the same model."""
+        from app.max_plan_pool import clear_regression_on_success, disable_account_model
+
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="quota_exhausted")
+        result = await clear_regression_on_success(acct_id, OPUS)
+        assert result is None
+        assert OPUS in acct["disabled_models"]
+        assert acct["disabled_models"][OPUS]["kind"] == "quota_exhausted"
+
+    async def test_clear_regression_on_success_leaves_quota_exhausted_sibling(self):
+        """Clearing regression on one model must not touch quota_exhausted on another."""
+        from app.max_plan_pool import clear_regression_on_success
+        from datetime import datetime
+
+        acct_id = "a"
+        acct = _acct(id=acct_id, name="A")
+        sonnet = "claude-sonnet-4-5"
+        # Inject directly to avoid cascade interference between model tiers.
+        acct["disabled_models"] = {
+            sonnet: {
+                "kind": "regression", "hits": 1, "at": datetime.utcnow(),
+                "provider": "anthropic",
+                "regression_stats": {"account_rate": 0.1, "project_median": 0.9,
+                                     "sample_size": 5, "distinct_accounts": 2,
+                                     "started_at": "2026-04-29T00:00:00+00:00"},
+            },
+            OPUS: {"kind": "quota_exhausted", "hits": 1, "at": datetime.utcnow()},
+        }
+        _account_by_id[acct_id] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            result = await clear_regression_on_success(acct_id, sonnet)
+        assert result is not None
+        assert result["model"] == sonnet
+        dm = acct.get("disabled_models") or {}
+        assert sonnet not in dm
+        assert OPUS in dm and dm[OPUS]["kind"] == "quota_exhausted"
+
+
+# ── scan_account_model_regressions dedupe ───────────────────────────────────
+
+class TestScanRegressionsDedupe:
+    """Tests for scanner idempotency: a steady-state regression must NOT
+    re-fire on every tick."""
+
+    def setup_method(self):
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    def teardown_method(self):
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    async def test_dedupes_within_cooldown(self):
+        from app.max_plan_pool import (
+            _REGRESSION_COOLDOWN_SECONDS,
+            scan_account_model_regressions,
+        )
+        from app.account_model_regression import RegressionCandidate
+
+        acct_id = "a"
+        # Pre-seed a regression entry that's well within the 6h cooldown.
+        acct = _acct(id=acct_id, user_id="u1", name="A")
+        acct["disabled_models"] = {
+            "claude-r": {
+                "hits": 1,
+                "at": datetime.utcnow() - timedelta(seconds=60),
+                "kind": "regression",
+                "provider": "anthropic",
+            }
+        }
+        _account_by_id[acct_id] = acct
+
+        # Even if find_account_model_regressions still flags the cell, scan
+        # must dedupe and return an empty list (no new event to dispatch).
+        candidate = RegressionCandidate(
+            account_id=acct_id, provider="anthropic", model="claude-r",
+            account_rate=0.0, project_median=0.5,
+            sample_size=5, distinct_accounts=2,
+        )
+        with patch(
+            "app.account_model_regression.find_account_model_regressions",
+            new=AsyncMock(return_value=[candidate]),
+        ), patch("app.max_plan_pool._persist_rate_limit_state"):
+            fired = await scan_account_model_regressions(session=None)
+        assert fired == []
+        # Within cooldown the entry must NOT have been bumped — at_dt unchanged.
+        assert acct["disabled_models"]["claude-r"]["hits"] == 1
+        # Sanity: the cooldown is ~6h, much longer than the 60s gap above.
+        assert _REGRESSION_COOLDOWN_SECONDS > 60
+
+    async def test_fires_when_no_prior_entry(self):
+        from app.account_model_regression import RegressionCandidate
+        from app.max_plan_pool import scan_account_model_regressions
+
+        acct_id = "a"
+        acct = _acct(id=acct_id, user_id="u1", name="A")
+        _account_by_id[acct_id] = acct
+
+        candidate = RegressionCandidate(
+            account_id=acct_id, provider="anthropic", model="claude-r",
+            account_rate=0.1, project_median=0.9,
+            sample_size=5, distinct_accounts=2,
+        )
+        with patch(
+            "app.account_model_regression.find_account_model_regressions",
+            new=AsyncMock(return_value=[candidate]),
+        ), patch("app.max_plan_pool._persist_rate_limit_state"):
+            fired = await scan_account_model_regressions(session=None)
+        assert len(fired) == 1
+        ev = fired[0]
+        assert ev["account_id"] == acct_id
+        assert ev["provider"] == "anthropic"
+        assert ev["model"] == "claude-r"
+        assert ev["account_rate"] == 0.1
+        assert ev["project_median"] == 0.9
+        assert ev["sample_size"] == 5
+        # Quarantine state must be persisted in-memory.
+        assert acct["disabled_models"]["claude-r"]["kind"] == "regression"

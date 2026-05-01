@@ -28,6 +28,17 @@ interface TaskDetailDrawerProps {
 
 type Tab = 'details' | 'logs';
 
+function hasMergedPr(task: Task): boolean {
+  return !!(task.pr_url || task.artifacts?.some(a => a.pr_url));
+}
+
+function isAutonomousMerge(task: Task): boolean {
+  if ((task.created_by ?? '').toUpperCase() === 'USER') return false;
+  const ctx = task.context ?? {};
+  if (ctx['review_dismissed'] || ctx['user_overrode_review']) return false;
+  return true;
+}
+
 export function TaskDetailDrawer({
   task,
   tasks,
@@ -163,6 +174,11 @@ export function TaskDetailDrawer({
               <div className="flex items-center gap-2 flex-wrap">
                 <StatusBadge status={task.status} />
                 <TaskTypeBadge taskType={task.task_type} />
+                {hasMergedPr(task) && (
+                  isAutonomousMerge(task)
+                    ? <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/25">Autonomous merge</span>
+                    : <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-500/15 text-blue-400 border border-blue-500/25">Operator-assisted merge</span>
+                )}
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">

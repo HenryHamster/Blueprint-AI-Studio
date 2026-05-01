@@ -15,8 +15,8 @@ vi.mock('recharts', () => ({
   Area: () => null,
 }));
 
-import { PoolAccountHealthPanel } from './DashboardHome';
-import type { AccountHealthEntry } from './DashboardHome';
+import { PoolAccountHealthPanel } from './PoolAccountHealthPanel';
+import type { AccountHealthEntry } from './PoolAccountHealthPanel';
 
 function makeAccount(overrides: Partial<AccountHealthEntry> = {}): AccountHealthEntry {
   return {

@@ -7,6 +7,8 @@ Covers:
   - operator_rejection_rate calculation in _spawn_strategic_review direction stats
   - Active-task guard: _spawn_design_doc_update and _spawn_strategic_review return False when blocked
   - _build_shipped_changes_manifest: cutoff, filtering, grouping, cap
+  - Autonomy fields (lifetime_autonomous_prs_merged, lifetime_operator_actions, retirement_eligible)
+    in directions_summary for the strategic agent
 """
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -15,8 +17,9 @@ import pytest
 from unittest.mock import AsyncMock
 from sqlalchemy import select
 
+import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, RECOMMENDED_MODE_META_KEY
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import _spawn_design_doc_update, _spawn_strategic_review, _build_shipped_changes_manifest
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -493,6 +496,73 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
 
 
 @pytest.mark.asyncio
+async def test_retirement_eligibility_fields_in_direction_stats(db_session):
+    """lifetime_autonomous_prs_merged, lifetime_operator_actions, and retirement_eligible are set on each direction stat."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-ret-eligible",
+                "status": "active",
+                "text": "Eligible direction",
+                "priority": "high",
+                # 2 explicit autonomous + 2 legacy fallback = 4 from history; 7 from aggregate → total 11
+                "research_history": [
+                    {"autonomous_prs_merged": 2, "prs_merged": 2, "operator_action_count": 0},
+                    {"prs_merged": 2},  # legacy: no autonomous_prs_merged, falls back to prs_merged
+                ],
+                "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+            },
+            {
+                "id": "d-ret-ineligible-ops",
+                "status": "active",
+                "text": "Ineligible: has operator actions",
+                "priority": "medium",
+                "research_history": [
+                    {"autonomous_prs_merged": 15, "prs_merged": 15, "operator_action_count": 1},
+                ],
+                "history_aggregate": {"total_autonomous_prs_merged": 0, "total_operator_actions": 0},
+            },
+            {
+                "id": "d-ret-ineligible-count",
+                "status": "active",
+                "text": "Ineligible: not enough autonomous merges",
+                "priority": "low",
+                "research_history": [
+                    {"autonomous_prs_merged": 5, "prs_merged": 5, "operator_action_count": 0},
+                ],
+                "history_aggregate": {"total_autonomous_prs_merged": 4, "total_operator_actions": 0},
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    by_id = {s["id"]: s for s in payload["directions_summary"]}
+
+    eligible = by_id["d-ret-eligible"]
+    assert eligible["lifetime_autonomous_prs_merged"] == 11  # 2 + 2 (fallback) + 7
+    assert eligible["lifetime_operator_actions"] == 0
+    assert eligible["retirement_eligible"] is True
+
+    ineligible_ops = by_id["d-ret-ineligible-ops"]
+    assert ineligible_ops["lifetime_operator_actions"] == 1
+    assert ineligible_ops["retirement_eligible"] is False
+
+    ineligible_count = by_id["d-ret-ineligible-count"]
+    assert ineligible_count["lifetime_autonomous_prs_merged"] == 9  # 5 + 4
+    assert ineligible_count["retirement_eligible"] is False
+
+
+@pytest.mark.asyncio
 async def test_cost_fields_present_when_history_has_merge_data(db_session):
     """cost_per_merged_pr and estimated_cost_usd appear when history has tasks_created + avg_time_to_merge_hours + merges."""
     from app.routers.admin_analytics import ON_DEMAND_RATE
@@ -932,6 +1002,55 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
     assert d_stat.get("recommended_mode") == "pause", (
         "Expected recommended_mode='pause' in direction stats for pause-mode direction"
     )
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_prompt_suffix_includes_mode_hints(db_session):
+    """Strategic review prompt suffix should spell out mode-specific guidance per direction."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-mode-audit",
+                "status": "active",
+                "text": "Direction in audit mode",
+                "priority": "high",
+                "recommended_mode": "audit",
+            },
+            {
+                "id": "d-mode-pause",
+                "status": "active",
+                "text": "Direction in pause mode",
+                "priority": "low",
+                "recommended_mode": "pause",
+            },
+            {
+                "id": "d-mode-operator",
+                "status": "active",
+                "text": "Operator-pinned fundamentals direction",
+                "priority": "medium",
+                "recommended_mode": "fundamentals",
+                RECOMMENDED_MODE_META_KEY: {"source": "operator", "set_at": "2026-04-01T00:00:00"},
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    suffix = payload["prompt_suffix"]
+
+    assert "Mode hints for this cycle:" in suffix
+    assert "d-mode-audit" in suffix and "audit mode" in suffix
+    assert "d-mode-pause" in suffix and "do not propose new feature work for" in suffix
+    assert "d-mode-operator" in suffix and "fundamentals mode" in suffix
 
 
 @pytest.mark.asyncio
@@ -2045,6 +2164,84 @@ async def test_strategic_review_includes_drift_signals_when_drift_present(db_ses
 
 
 @pytest.mark.asyncio
+async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(db_session):
+    """_spawn_strategic_review persists a drift snapshot and enriches the payload
+    with consecutive_flagged_cycles when prior flagged snapshots exist."""
+    from datetime import timedelta
+    from app.drift_detection import DirectionDriftSnapshot
+    from app.time_utils import _utcnow
+
+    project = _make_project(
+        directions=[
+            {"id": "d-trend01", "status": "active", "text": "x", "priority": "medium",
+             "system_id": "sys-T"},
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed two prior flagged snapshots to simulate previous cycles.
+    now = _utcnow()
+    for i in range(2, 0, -1):
+        db_session.add(DirectionDriftSnapshot(
+            project_id=project.id,
+            direction_id="d-trend01",
+            snapshot_at=now - timedelta(hours=i * 6),
+            claimed_changes_count=5,
+            actually_merged_prs=0,
+            claim_shipped_consistency=0.0,
+            over_claim_flag=False,
+            stalled_despite_churn_flag=True,
+        ))
+    await db_session.commit()
+
+    # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
+    for i in range(5):
+        db_session.add(Task(
+            project_id=project.id,
+            title=f"trend claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-trend01"}],
+            context={"direction_id": "d-trend01"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        ))
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    sr_tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    assert sr_tasks, "No strategic_review task spawned"
+    payload = sr_tasks[0].payloads[0]
+    assert "drift_signals" in payload, f"drift_signals missing; keys: {sorted(payload.keys())}"
+    drift = payload["drift_signals"]
+    assert "d-trend01" in drift.get("by_direction", {}), (
+        f"d-trend01 not in by_direction: {list(drift.get('by_direction', {}).keys())}"
+    )
+    sig = drift["by_direction"]["d-trend01"]
+    # 2 prior flagged + 1 current (written by persist_drift_snapshot) = 3 consecutive
+    assert "consecutive_flagged_cycles" in sig, f"consecutive_flagged_cycles missing from sig: {sig}"
+    assert sig["consecutive_flagged_cycles"] == 3
+
+    # Verify snapshot was persisted to DB (one new row for the current cycle).
+    from sqlmodel import select as _select
+    snap_result = await db_session.execute(
+        _select(DirectionDriftSnapshot).where(
+            DirectionDriftSnapshot.project_id == project.id,
+            DirectionDriftSnapshot.direction_id == "d-trend01",
+        )
+    )
+    snaps = snap_result.scalars().all()
+    assert len(snaps) == 3, f"Expected 3 snapshots (2 seeded + 1 persisted), got {len(snaps)}"
+
+
+@pytest.mark.asyncio
 async def test_strategic_review_payload_documents_recommended_mode(db_session):
     """The optional `recommended_mode` field is part of the StrategicReviewPayload
     schema (validated via validate_internal_payload). Absence in a typical
@@ -2263,4 +2460,108 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
     trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
     assert "directions_summary" in trimmed_keys, (
         f"Trimmed list must include directions_summary; meta={meta}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_drift_signals_survives_budget_pressure(db_session):
+    """drift_signals must not be dropped when low-priority fields are evicted.
+
+    Constructs a bloated project that forces the packer to drop low-priority
+    fields, then asserts drift_signals (now medium priority) is still present
+    while at least one low-priority field is absent from the payload.
+    """
+    import json as _json
+    from app.payload_schemas import _MAX_PAYLOAD_BYTES
+
+    # 50 bulky directions to force budget pressure
+    directions = [
+        {
+            "id": f"d-dp{i:02d}",
+            "status": "active",
+            "text": f"Direction {i} " + ("pressure filler " * 40),
+            "priority": "medium",
+            "system_id": "sys-dp",
+            "research_history": [
+                {
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                    "tasks_created": 1,
+                    "key_finding_descriptions": [f"finding {j} " * 20 for j in range(5)],
+                    "failed_task_details": [],
+                    "timestamp": "2026-04-01T00:00:00Z",
+                }
+                for _ in range(8)
+            ],
+            "research_context": "context narrative " * 200,
+        }
+        for i in range(50)
+    ]
+    project = _make_project(
+        directions=directions,
+        vision={"purpose": "budget pressure test"},
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": "x"},
+            "gaps": [
+                {"id": f"g{i}", "name": f"gap {i}", "description": "x" * 500,
+                 "history": [f"h{j}" * 10 for j in range(20)],
+                 "past_moves": [f"m{j}" * 10 for j in range(20)],
+                 "evidence": [f"e{j}" * 10 for j in range(20)]}
+                for i in range(20)
+            ],
+            "archived_gaps": [{"id": f"ag{i}", "name": "archived"} for i in range(40)],
+            "friction": [],
+            "capabilities": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    # Add stalled tasks so drift_signals is non-empty and included in the payload
+    for i in range(5):
+        db_session.add(Task(
+            project_id=project.id,
+            title=f"drift claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x", "current_direction_id": "d-dp00"}],
+            context={"direction_id": "d-dp00"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        ))
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [t for t in result.scalars().all() if t.first_payload.get("type") == "strategic_review"]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    # Payload must stay under hard cap
+    serialized_size = len(_json.dumps(payload, default=str).encode())
+    assert serialized_size < _MAX_PAYLOAD_BYTES
+
+    meta = payload["_packer_meta"]
+    dropped_keys = {entry["key"] for entry in meta.get("dropped", [])}
+
+    # drift_signals (medium priority) must survive budget pressure
+    assert "drift_signals" in payload, (
+        f"drift_signals was dropped under budget pressure; dropped={dropped_keys}"
+    )
+
+    # Confirm budget pressure existed (something was trimmed or dropped)
+    trimmed_keys = {entry["key"] for entry in meta.get("trimmed", [])}
+    assert dropped_keys or trimmed_keys, (
+        f"Expected budget pressure (trims or drops); meta={meta}"
+    )
+
+    # drift_signals must not be among the dropped fields
+    assert "drift_signals" not in dropped_keys, (
+        f"drift_signals should not be dropped; dropped={dropped_keys}"
     )

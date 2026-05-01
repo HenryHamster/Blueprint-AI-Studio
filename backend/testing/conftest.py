@@ -93,6 +93,8 @@ async def db_session():
                 "task",
                 # Remaining dependents of project
                 "projectmember", "residualremediationcase", "systemmaturity",
+                # Drift time-series (project_id not a FK constraint, safe to delete standalone)
+                "directiondriftsnapshot",
                 # Base tables
                 "project", "maxplanaccount", "userintegration", "alloweduser",
             ):
@@ -151,6 +153,23 @@ def reset_digest_cache():
     _default_cache.clear()
     yield
     _default_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_config():
+    """Snapshot and restore runtime_config around every test.
+
+    Tests that call admin-settings PATCH endpoints mutate the global
+    runtime_config dict in-place (e.g. residual_audit_defer_escalation_threshold).
+    Without a reset those mutations bleed into unrelated tests and break
+    assertions that rely on hardcoded defaults.
+    """
+    import copy
+    from app import shared_state
+    snapshot = copy.deepcopy(shared_state.runtime_config)
+    yield
+    shared_state.runtime_config.clear()
+    shared_state.runtime_config.update(snapshot)
 
 
 @pytest.fixture(autouse=True)

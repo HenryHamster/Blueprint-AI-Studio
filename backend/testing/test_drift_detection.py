@@ -1,4 +1,5 @@
-"""Tests for drift_detection.compute_direction_drift.
+"""Tests for drift_detection.compute_direction_drift, persist_drift_snapshot,
+and last_n_drift_snapshots.
 
 Synthetic claims-vs-shipped fixtures verify:
  - healthy direction: high consistency, no flags
@@ -7,14 +8,23 @@ Synthetic claims-vs-shipped fixtures verify:
  - no-data direction: returns neutral signal, not error
  - per-system rollup correctness across multiple directions
  - fresh PRs older than the window are excluded
+ - persist_drift_snapshot writes rows and prunes excess history
+ - last_n_drift_snapshots returns newest-first ordered rows
 """
 import uuid
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
 
-from app.drift_detection import compute_direction_drift
+from app.drift_detection import (
+    DirectionDriftSnapshot,
+    _DRIFT_SNAPSHOT_RETENTION,
+    compute_direction_drift,
+    last_n_drift_snapshots,
+    persist_drift_snapshot,
+)
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -293,3 +303,200 @@ async def test_direction_without_system_id_skips_system_rollup(db_session):
     drift = await compute_direction_drift(db_session, project)
     assert "d-orphan" in drift["by_direction"]
     assert drift["by_system"] == {}
+
+
+# ── Test 9: persist_drift_snapshot writes one row per direction ────────────
+
+@pytest.mark.asyncio
+async def test_persist_drift_snapshot_writes_rows(db_session):
+    """persist_drift_snapshot inserts one DirectionDriftSnapshot per direction."""
+    project = Project(
+        name="Snapshot Write Project",
+        user_id="test-user-123",
+        directions=[_direction("d-a"), _direction("d-b")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drift = await compute_direction_drift(db_session, project)
+    await persist_drift_snapshot(db_session, project, drift)
+    await db_session.commit()
+
+    rows = (
+        await db_session.execute(
+            select(DirectionDriftSnapshot).where(
+                DirectionDriftSnapshot.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+    direction_ids = {r.direction_id for r in rows}
+    assert direction_ids == {"d-a", "d-b"}
+    for row in rows:
+        assert row.claim_shipped_consistency == 1.0
+        assert row.over_claim_flag is False
+        assert row.stalled_despite_churn_flag is False
+
+
+# ── Test 10: persist_drift_snapshot prunes to retention limit ─────────────
+
+@pytest.mark.asyncio
+async def test_persist_drift_snapshot_prunes_excess(db_session):
+    """After _DRIFT_SNAPSHOT_RETENTION + 1 writes, only the newest rows remain."""
+    project = Project(
+        name="Snapshot Prune Project",
+        user_id="test-user-123",
+        directions=[_direction("d-prune")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    neutral_drift = {
+        "by_direction": {
+            "d-prune": {
+                "claimed_changes_count": 0,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 1.0,
+                "over_claim_flag": False,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
+
+    # Insert _DRIFT_SNAPSHOT_RETENTION + 1 snapshots (one over the limit).
+    for _ in range(_DRIFT_SNAPSHOT_RETENTION + 1):
+        await persist_drift_snapshot(db_session, project, neutral_drift)
+        await db_session.commit()
+
+    count_result = await db_session.execute(
+        select(DirectionDriftSnapshot).where(
+            DirectionDriftSnapshot.project_id == project.id,
+            DirectionDriftSnapshot.direction_id == "d-prune",
+        )
+    )
+    rows = count_result.scalars().all()
+    assert len(rows) == _DRIFT_SNAPSHOT_RETENTION, (
+        f"Expected {_DRIFT_SNAPSHOT_RETENTION} rows after pruning, got {len(rows)}"
+    )
+
+
+# ── Test 11: persist_drift_snapshot is a no-op for empty drift ────────────
+
+@pytest.mark.asyncio
+async def test_persist_drift_snapshot_noop_on_empty(db_session):
+    """persist_drift_snapshot does nothing when by_direction is empty."""
+    project = Project(
+        name="Empty Snapshot Project",
+        user_id="test-user-123",
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    empty_drift = {"by_direction": {}}
+    await persist_drift_snapshot(db_session, project, empty_drift)
+    await db_session.commit()
+
+    rows = (
+        await db_session.execute(
+            select(DirectionDriftSnapshot).where(
+                DirectionDriftSnapshot.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert rows == []
+
+
+# ── Test 12: last_n_drift_snapshots returns newest-first ─────────────────
+
+@pytest.mark.asyncio
+async def test_last_n_drift_snapshots_returns_newest_first(db_session):
+    """last_n_drift_snapshots returns rows ordered newest-first, limited to n."""
+    project = Project(
+        name="Snapshot Query Project",
+        user_id="test-user-123",
+        directions=[_direction("d-query")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    drift_with_flags = {
+        "by_direction": {
+            "d-query": {
+                "claimed_changes_count": 5,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": True,
+            }
+        }
+    }
+    neutral_drift = {
+        "by_direction": {
+            "d-query": {
+                "claimed_changes_count": 0,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 1.0,
+                "over_claim_flag": False,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
+
+    # Write 3 neutral then 1 flagged (newest).
+    for _ in range(3):
+        await persist_drift_snapshot(db_session, project, neutral_drift)
+        await db_session.commit()
+    await persist_drift_snapshot(db_session, project, drift_with_flags)
+    await db_session.commit()
+
+    snapshots = await last_n_drift_snapshots(db_session, project.id, "d-query", n=2)
+    assert len(snapshots) == 2
+    # Newest should have the flags set.
+    assert snapshots[0].over_claim_flag is True
+    assert snapshots[0].stalled_despite_churn_flag is True
+    # Second-newest was neutral.
+    assert snapshots[1].over_claim_flag is False
+
+
+# ── Test 13: Non-default thresholds from runtime_config are respected ───────
+
+@pytest.mark.asyncio
+async def test_custom_thresholds_from_runtime_config_are_respected(db_session):
+    """Lowered over_claim_min_claims=2 should flag a direction with 2 claims, 0 merges."""
+    project = Project(
+        name="Custom Threshold Project",
+        user_id="test-user-123",
+        directions=[_direction("d-threshold")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 tasks claim shipped, none merged — won't flag with default min=3, will with min=2
+    for _ in range(2):
+        await _make_completed_task(
+            db_session, project, direction_id="d-threshold",
+            pr_merged=False, has_pr_artifact=False,
+        )
+
+    patched_config = {
+        "drift_over_claim_min_claims": 2,
+        "drift_over_claim_consistency_threshold": 0.5,
+        "drift_stall_min_claims": 2,
+    }
+    with patch("app.shared_state.runtime_config", patched_config):
+        drift = await compute_direction_drift(db_session, project)
+
+    sig = drift["by_direction"]["d-threshold"]
+    assert sig["claimed_changes_count"] == 2
+    assert sig["over_claim_flag"] is True, "lowered threshold should trigger over_claim_flag"
+    assert sig["stalled_despite_churn_flag"] is True, "lowered stall_min should trigger stalled flag"

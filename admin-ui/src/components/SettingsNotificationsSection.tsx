@@ -21,6 +21,7 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'DIRECTION_MILESTONE', label: 'Direction Milestone', description: 'When a direction is auto-completed, auto-paused, or auto-retired', defaultOn: true },
   { key: 'AUTO_FIX_ESCALATED', label: 'CI Auto-Fix Escalated', description: 'When CI auto-fix repeatedly fails and the branch is suspended', defaultOn: true },
   { key: 'RESIDUAL_FIX_ESCALATED', label: 'Residual Fix Escalated', description: 'When a residual fingerprint remediation repeatedly fails and is suspended', defaultOn: true },
+  { key: 'RESIDUAL_FIX_UNSUSPENDED', label: 'Residual Fix Unsuspended', description: 'When a previously-suspended residual fingerprint case is manually re-enabled by an operator', defaultOn: false },
 ];
 
 interface SettingsNotificationsSectionProps {

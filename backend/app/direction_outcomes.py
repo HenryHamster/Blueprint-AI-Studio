@@ -78,6 +78,39 @@ def is_autonomous_merge(task: Task) -> bool:
     return True
 
 
+_AUTONOMY_RETIREMENT_THRESHOLD = 10
+
+
+def compute_direction_autonomy_state(direction: dict) -> dict:
+    """Return lifetime autonomy metrics and retirement eligibility for a direction.
+
+    Reads research_history and history_aggregate; applies a legacy fallback so
+    pre-attribution entries (no autonomous_prs_merged key) treat prs_merged as
+    autonomous — consistent with _fold_evicted_into_aggregate and admin_digest.
+
+    A direction is retirement-eligible when lifetime_autonomous_prs_merged >= 10
+    AND lifetime_operator_actions == 0 (zero-tolerance for operator intervention).
+    """
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    lifetime_autonomous = (
+        sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
+        + (agg.get("total_autonomous_prs_merged") or 0)
+    )
+    lifetime_op_actions = (
+        sum(h.get("operator_action_count", 0) for h in history)
+        + (agg.get("total_operator_actions") or 0)
+    )
+    return {
+        "lifetime_autonomous_prs_merged": lifetime_autonomous,
+        "lifetime_operator_actions": lifetime_op_actions,
+        "retirement_eligible": (
+            lifetime_autonomous >= _AUTONOMY_RETIREMENT_THRESHOLD
+            and lifetime_op_actions == 0
+        ),
+    }
+
+
 def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     """Longest path length in a subtask dependency DAG.
 

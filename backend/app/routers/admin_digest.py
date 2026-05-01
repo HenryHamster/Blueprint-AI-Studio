@@ -13,7 +13,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.notification_dispatch import dispatch_external_notification
+from app.notification_dispatch import dispatch_external_notification, post_residual_fix_unsuspend_message
 
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
@@ -1053,6 +1053,8 @@ async def get_residual_fingerprints(
                 ResidualRemediationCase.last_spawned_pr_number,
                 ResidualRemediationCase.consecutive_failure_count,
                 ResidualRemediationCase.suspended_at,
+                ResidualRemediationCase.audit_defer_count,
+                ResidualRemediationCase.audit_deferred_system_id,
             ))
         )
         for c in case_rows.scalars().all():
@@ -1073,6 +1075,8 @@ async def get_residual_fingerprints(
             entry["last_spawned_pr_number"] = c.last_spawned_pr_number
             entry["consecutive_failure_count"] = c.consecutive_failure_count
             entry["suspended_at"] = c.suspended_at.isoformat() if c.suspended_at else None
+            entry["audit_defer_count"] = c.audit_defer_count
+            entry["audit_deferred_system_id"] = c.audit_deferred_system_id
         enriched.append(entry)
 
     return {
@@ -1143,6 +1147,8 @@ async def list_residual_cases(
                 "consecutive_failure_count": c.consecutive_failure_count,
                 "suspended_at": c.suspended_at.isoformat() if c.suspended_at else None,
                 "sample_message": (c.sample_messages[0] if c.sample_messages else c.sample_message),
+                "audit_defer_count": c.audit_defer_count,
+                "audit_deferred_system_id": c.audit_deferred_system_id,
             }
             for c in rows
         ],
@@ -1212,6 +1218,45 @@ async def unignore_residual_case(
     case.updated_at = _utcnow()
     await session.commit()
     return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.ACTIVE}
+
+
+@router.post("/residual-cases/{fingerprint}/unsuspend")
+async def unsuspend_residual_case(
+    fingerprint: str,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Re-enable a SUSPENDED residual fingerprint case.
+
+    Transitions status back to ACTIVE, clears suspended_at, and resets
+    consecutive_failure_count to 0. Returns 404 if no SUSPENDED case
+    exists for (project_id, fingerprint). The cooldown (last_spawned_at)
+    is intentionally preserved so the case does not immediately re-spawn.
+    """
+    result = await session.execute(
+        select(ResidualRemediationCase).where(
+            ResidualRemediationCase.project_id == project_id,
+            ResidualRemediationCase.fingerprint == fingerprint,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None or case.status != ResidualRemediationCaseStatus.SUSPENDED:
+        raise HTTPException(status_code=404, detail="No SUSPENDED case found for this fingerprint and project")
+    case.status = ResidualRemediationCaseStatus.ACTIVE
+    case.suspended_at = None
+    case.consecutive_failure_count = 0
+    case.updated_at = _utcnow()
+    session.add(case)
+    await post_residual_fix_unsuspend_message(session, project_id, fingerprint)
+    await session.commit()
+    return {
+        "id": str(case.id),
+        "fingerprint": fingerprint,
+        "status": ResidualRemediationCaseStatus.ACTIVE,
+        "consecutive_failure_count": 0,
+        "suspended_at": None,
+    }
 
 
 @router.post("/residual-fingerprints/clear")
@@ -1405,6 +1450,7 @@ async def _compute_digest(
         task_filters.append(Task.project_id == project_id)
 
     _DIGEST_TASK_ROW_CAP = 5000
+    _ACTIVE_TASKS_DISPLAY_LIMIT = 5
     # Project payloads[0] and status_log[-1]->>'t' SQL-side on PostgreSQL.
     # Loading the full JSONB arrays for 5000 rows blew a Cloud Run instance
     # past its 4 GiB limit under concurrent polling; with projection each
@@ -1468,7 +1514,8 @@ async def _compute_digest(
             .limit(_DIGEST_TASK_ROW_CAP)
         )
         all_tasks = list(tasks_result.scalars().all())
-    if len(all_tasks) == _DIGEST_TASK_ROW_CAP:
+    tasks_capped = len(all_tasks) == _DIGEST_TASK_ROW_CAP
+    if tasks_capped:
         logger.warning(
             "admin_digest task query hit %d-row safety cap (window=%dh, project_id=%s); digest metrics may be truncated",
             _DIGEST_TASK_ROW_CAP, hours, project_id,
@@ -1593,6 +1640,7 @@ async def _compute_digest(
                 prs_merged = 0
                 autonomous_prs_merged = 0
                 assisted_prs_merged = 0
+                operator_action_count = 0
                 prs_rejected = 0
                 findings_tasks_created = 0
                 merge_time_values: List[float] = []
@@ -1625,6 +1673,7 @@ async def _compute_digest(
                         # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
                         autonomous_prs_merged += entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
                         assisted_prs_merged += entry.get("assisted_prs_merged", 0) or 0
+                        operator_action_count += entry.get("operator_action_count", 0) or 0
                         prs_rejected += entry.get("prs_rejected") or 0
                         dir_reviews_dismissed += entry.get("reviews_dismissed") or 0
                         dir_reviews_overridden += entry.get("reviews_overridden") or 0
@@ -1761,6 +1810,15 @@ async def _compute_digest(
                 lifetime_conversion_rate = (
                     round(lifetime_prs_merged / lifetime_tasks_created, 3) if lifetime_tasks_created > 0 else None
                 )
+                lifetime_autonomous_prs_merged = (
+                    sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in _history_all)
+                    + (_agg.get("total_autonomous_prs_merged") or 0)
+                )
+                lifetime_operator_actions = (
+                    sum(h.get("operator_action_count", 0) for h in _history_all)
+                    + (_agg.get("total_operator_actions") or 0)
+                )
+                retirement_eligible = lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
@@ -1884,6 +1942,7 @@ async def _compute_digest(
                     "prs_merged": prs_merged,
                     "autonomous_prs_merged": autonomous_prs_merged,
                     "assisted_prs_merged": assisted_prs_merged,
+                    "operator_action_count": operator_action_count,
                     "prs_rejected": prs_rejected,
                     "acceptance_rate": acceptance_rate,
                     "conversion_rate": conversion_rate,
@@ -1926,6 +1985,9 @@ async def _compute_digest(
                     "lifetime_prs_rejected": lifetime_prs_rejected,
                     "lifetime_tasks_failed": lifetime_tasks_failed,
                     "lifetime_conversion_rate": lifetime_conversion_rate,
+                    "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
+                    "lifetime_operator_actions": lifetime_operator_actions,
+                    "retirement_eligible": retirement_eligible,
                     "review_quality": {
                         "reviews_dismissed": dir_reviews_dismissed,
                         "reviews_overridden": dir_reviews_overridden,
@@ -2292,11 +2354,11 @@ async def _compute_digest(
             "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0),
         })
 
-    # --- active_tasks list (up to 5, oldest started first) ---
+    # --- active_tasks list (oldest started first, capped at _ACTIVE_TASKS_DISPLAY_LIMIT) ---
     _now_active = _utcnow()
     from app.review_pipeline import _max_review_iterations
     active_tasks_list = []
-    for t in active_tasks_all[:5]:
+    for t in active_tasks_all[:_ACTIVE_TASKS_DISPLAY_LIMIT]:
         at_dir_id = (t.context or {}).get("direction_id")
         at_dir_text = dir_id_to_text.get(str(at_dir_id)) if at_dir_id else None
         if t.vm_provisioned_at:
@@ -2663,6 +2725,9 @@ async def _compute_digest(
         round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
         if _pipeline_total_created_d > 0 else None
     )
+    pipeline_autonomous_prs_merged = sum(d.get("autonomous_prs_merged") or 0 for d in direction_progress_list)
+    pipeline_assisted_prs_merged = sum(d.get("assisted_prs_merged") or 0 for d in direction_progress_list)
+    pipeline_operator_action_count = sum(d.get("operator_action_count") or 0 for d in direction_progress_list)
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
@@ -3558,6 +3623,7 @@ async def _compute_digest(
 
     return {
         "window_hours": hours,
+        "tasks_truncated": tasks_capped,
         "total_merge_retries_saved": total_merge_retries_saved,
         "first_attempt_success_rate": _first_attempt_success_rate,
         "first_review_approval_rate": _first_review_approval_rate,
@@ -3622,6 +3688,9 @@ async def _compute_digest(
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
         "pipeline_conversion_rate": pipeline_conversion_rate,
+        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
+        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
+        "pipeline_operator_action_count": pipeline_operator_action_count,
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,

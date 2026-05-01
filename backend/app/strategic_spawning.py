@@ -15,6 +15,7 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
+from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
 from app.models import Task, Project, TaskHistory, TaskStatus, ProjectMessage, SystemMaturity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
@@ -173,6 +174,48 @@ def _summarize_drift_signals(drift: dict) -> dict:
     }
 
 
+# How many stored snapshots to look back when computing consecutive_flagged_cycles.
+_DRIFT_TREND_LOOKBACK = 5
+
+
+async def _enrich_drift_with_trend(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    drift_summary: dict,
+) -> dict:
+    """Add consecutive_flagged_cycles to each direction already in drift_summary.
+
+    For each interesting direction, reads the last _DRIFT_TREND_LOOKBACK stored
+    snapshots (newest first) and counts how many consecutive leading entries had
+    at least one flag set. This lets the strategic agent distinguish a one-off
+    spike from a sustained breakdown without reading the full history.
+
+    Only enriches directions already filtered into drift_summary by
+    _summarize_drift_signals, so the extra queries are bounded by the
+    flagged-direction count (typically 0–3 per project).
+    """
+    from app.drift_detection import last_n_drift_snapshots
+    by_direction = (drift_summary or {}).get("by_direction") or {}
+    if not by_direction:
+        return drift_summary
+    enriched_directions = {}
+    for direction_id, sig in by_direction.items():
+        snapshots = await last_n_drift_snapshots(
+            session, project_id, direction_id, n=_DRIFT_TREND_LOOKBACK
+        )
+        consecutive = 0
+        for snap in snapshots:
+            if snap.over_claim_flag or snap.stalled_despite_churn_flag:
+                consecutive += 1
+            else:
+                break
+        enriched_sig = dict(sig)
+        if consecutive > 0:
+            enriched_sig["consecutive_flagged_cycles"] = consecutive
+        enriched_directions[direction_id] = enriched_sig
+    return {**drift_summary, "by_direction": enriched_directions}
+
+
 # Per-payload caps used by the strategic-spawn schema's summarize_fns. These are
 # what the agent sees by default; for full content the agent uses ./fetch.
 _DIRECTIONS_SUMMARY_KEEP = 12
@@ -262,6 +305,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "is_self_repo":                    {"priority": "critical"},
     "model":                           {"priority": "critical"},
     "effort":                          {"priority": "critical"},
+    "prompt_suffix":                   {"priority": "high"},
     # Vision + intent — small but load-bearing for every decision
     "vision":                          {"priority": "critical"},
     # User-facing state the agent must respond to
@@ -286,7 +330,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "prediction_calibration_note":     {"priority": "low"},
     # Mode-aware additions: only present when non-empty
     "system_maturity":                 {"priority": "low"},
-    "drift_signals":                   {"priority": "low"},
+    # drift_signals is actionable mode-switch input (audit/pause triggers), so it
+    # must survive budget pressure — promoted to medium alongside conversation_thread.
+    "drift_signals":                   {"priority": "medium"},
 }
 
 
@@ -993,6 +1039,17 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (agg.get("total_prs_rejected") or 0)
         total_failed = sum(h.get("tasks_failed", 0) for h in history) + (agg.get("total_tasks_failed") or 0)
         total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (agg.get("total_tasks_failed_infra") or 0)
+        # Autonomy lifetime totals — legacy fallback treats prs_merged as autonomous
+        # (same interpretation as admin_digest.py and direction_metrics.py).
+        lifetime_autonomous = (
+            sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history)
+            + (agg.get("total_autonomous_prs_merged") or 0)
+        )
+        lifetime_op_actions = (
+            sum(h.get("operator_action_count", 0) for h in history)
+            + (agg.get("total_operator_actions") or 0)
+        )
+        retirement_eligible = lifetime_autonomous >= 10 and lifetime_op_actions == 0
         taxonomy_totals: dict[str, int] = {}
         for h in history:
             for tkey, tval in (h.get("taxonomy_summary") or {}).items():
@@ -1019,6 +1076,9 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         if taxonomy_totals:
             stat_entry["taxonomy_summary"] = taxonomy_totals
         stat_entry["quality_score"] = round(_compute_direction_quality_score(d), 3)
+        stat_entry["lifetime_autonomous_prs_merged"] = lifetime_autonomous
+        stat_entry["lifetime_operator_actions"] = lifetime_op_actions
+        stat_entry["retirement_eligible"] = retirement_eligible
         if total_rejected > 0:
             stat_entry["prs_rejected"] = total_rejected
         if operator_rejection_rate is not None and total_rejected > 0:
@@ -1063,6 +1123,21 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         if _rec_mode and _rec_mode != "ship":
             stat_entry["recommended_mode"] = _rec_mode
         direction_stats.append(stat_entry)
+
+    mode_hint_lines = []
+    for d in included_directions:
+        mode = normalized_recommended_mode(d)
+        hint = mode_prompt_hint(mode)
+        if not hint and mode != "pause":
+            continue
+        direction_label = f"{d.get('id')}: {(d.get('text') or '')[:120]}".strip()
+        if mode == "pause":
+            hint = (
+                "Mode hint: this direction is in pause mode. do not propose new feature "
+                "work for this direction in this cycle; defer new findings against it."
+            )
+        mode_hint_lines.append(f"- {direction_label} — {hint}")
+    prompt_suffix = "\n".join(["Mode hints for this cycle:"] + mode_hint_lines) if mode_hint_lines else None
 
     # Recently rejected proposals (last 30 days) — surfaced so the strategic
     # agent avoids re-proposing similar work the user already declined.
@@ -1139,9 +1214,12 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
     # project has no SystemMaturity rows or no in-window task data.
     system_maturity_payload = await _build_system_maturity_payload(project, session)
     try:
-        from app.drift_detection import compute_direction_drift
+        from app.drift_detection import compute_direction_drift, persist_drift_snapshot
         drift_raw = await compute_direction_drift(session, project)
+        await persist_drift_snapshot(session, project, drift_raw)
         drift_summary = _summarize_drift_signals(drift_raw)
+        if drift_summary.get("by_direction"):
+            drift_summary = await _enrich_drift_with_trend(session, project.id, drift_summary)
     except Exception:  # noqa: BLE001 — drift signals are best-effort
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
@@ -1174,6 +1252,7 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         "open_messages": open_msgs,
         "conversation_thread": conversation_thread,
         **({"rejected_proposals": rejected_proposals} if rejected_proposals else {}),
+        **({"prompt_suffix": prompt_suffix} if prompt_suffix else {}),
         # Mode-aware: include only when non-empty so cold-start projects
         # don't carry empty fields through the strategic payload size cap.
         **({"system_maturity": system_maturity_payload} if system_maturity_payload else {}),

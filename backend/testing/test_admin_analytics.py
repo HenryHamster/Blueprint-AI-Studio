@@ -2,11 +2,14 @@
 import uuid
 from collections import deque
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
 
 from app import shared_state
+from app.models import Artifact, ArtifactType
+from app.routers import admin_analytics
 from app.time_utils import _utcnow
 from app.models import TaskStatus
 from testing.factories import make_project, make_task
@@ -203,6 +206,298 @@ class TestTaskDurationStats:
         phase = resp.json()["phase_duration_stats"]
         assert phase["provisioning"] == {"p50_seconds": 20.0, "sample_size": 3}
         assert phase["execution"] == {"p50_seconds": 200.0, "sample_size": 3}
+
+
+class TestOpenPrs:
+    @pytest.fixture(autouse=True)
+    def _reset_open_prs_cache(self):
+        admin_analytics._open_prs_cache.clear()
+        yield
+        admin_analytics._open_prs_cache.clear()
+
+    @staticmethod
+    def _github_pr(number: int, *, title: str = "Open PR", branch: str = "feature/test") -> dict:
+        return {
+            "number": number,
+            "html_url": f"https://github.com/acme/widgets/pull/{number}",
+            "title": title,
+            "head": {"ref": branch},
+            "created_at": "2026-04-29T12:00:00Z",
+        }
+
+    @pytest.mark.asyncio
+    async def test_project_without_github_repo_returns_empty_without_external_calls(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(1)])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"open_prs": []}
+        token_mock.assert_not_awaited()
+        prs_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_token_lookup_error_returns_empty_and_skips_github(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        db_session.add(project)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(side_effect=RuntimeError("boom"))
+        prs_mock = AsyncMock(return_value=[self._github_pr(1)])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"open_prs": []}
+        token_mock.assert_awaited_once()
+        prs_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_falsy_token_returns_empty(self, client: AsyncClient, db_session, monkeypatch):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        db_session.add(project)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value=None)
+        prs_mock = AsyncMock(return_value=[self._github_pr(1)])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"open_prs": []}
+        token_mock.assert_awaited_once()
+        prs_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unmatched_github_pr_is_orphaned(self, client: AsyncClient, db_session, monkeypatch):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        db_session.add(project)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(17, title="Lonely PR", branch="lonely-branch")])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "open_prs": [
+                {
+                    "pr_number": 17,
+                    "pr_url": "https://github.com/acme/widgets/pull/17",
+                    "pr_title": "Lonely PR",
+                    "pr_branch": "lonely-branch",
+                    "pr_created_at": "2026-04-29T12:00:00Z",
+                    "tasks": [],
+                    "is_orphaned": True,
+                }
+            ]
+        }
+        token_mock.assert_awaited_once()
+        prs_mock.assert_awaited_once_with("token", "acme", "widgets")
+
+    @pytest.mark.asyncio
+    async def test_artifact_match_links_active_task_and_dedupes_context_match(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            title="Implement monitor",
+            payloads=[{"type": "review", "prompt": "x"}],
+            context={"review_loop": {"pr_number": 42}},
+        )
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/acme/widgets/pull/42",
+        )
+        db_session.add(project)
+        db_session.add(task)
+        db_session.add(artifact)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(42, title="Monitor PR", branch="feature/monitor")])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["open_prs"][0]["is_orphaned"] is False
+        assert body["open_prs"][0]["tasks"] == [
+            {
+                "task_id": str(task.id),
+                "task_status": TaskStatus.IN_PROGRESS,
+                "task_type": "review",
+                "task_title": "Implement monitor",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_review_loop_pr_number_links_task(self, client: AsyncClient, db_session, monkeypatch):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            title="Review monitor",
+            payloads=[{"type": "review", "prompt": "x"}],
+            context={"review_loop": {"pr_number": 55}},
+        )
+        db_session.add(project)
+        db_session.add(task)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(55, title="Review PR", branch="review-branch")])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        pr = resp.json()["open_prs"][0]
+        assert pr["is_orphaned"] is False
+        assert pr["tasks"] == [
+            {
+                "task_id": str(task.id),
+                "task_status": TaskStatus.EVALUATING,
+                "task_type": "review",
+                "task_title": "Review monitor",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rollup_pr_number_links_task(self, client: AsyncClient, db_session, monkeypatch):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.PROVISIONING,
+            title="Rollup monitor",
+            payloads=[{"type": "plan", "prompt": "x"}],
+            context={"rollup_pr_number": 56},
+        )
+        db_session.add(project)
+        db_session.add(task)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(56, title="Rollup PR", branch="rollup-branch")])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        pr = resp.json()["open_prs"][0]
+        assert pr["is_orphaned"] is False
+        assert pr["tasks"] == [
+            {
+                "task_id": str(task.id),
+                "task_status": TaskStatus.PROVISIONING,
+                "task_type": "plan",
+                "task_title": "Rollup monitor",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ])
+    async def test_terminal_status_task_is_excluded_even_when_pr_matches(
+        self, client: AsyncClient, db_session, monkeypatch, status
+    ):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        task = make_task(
+            project_id=project.id,
+            status=status,
+            title="Terminal task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            context={"review_loop": {"pr_number": 77}, "rollup_pr_number": 77},
+        )
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/acme/widgets/pull/77",
+        )
+        db_session.add(project)
+        db_session.add(task)
+        db_session.add(artifact)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(77, title="Terminal PR")])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        resp = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert resp.status_code == 200
+        pr = resp.json()["open_prs"][0]
+        assert pr["tasks"] == []
+        assert pr["is_orphaned"] is True
+
+    @pytest.mark.asyncio
+    async def test_second_call_uses_cache_without_second_github_fetch(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = make_project(github_owner="acme", github_repo="widgets")
+        db_session.add(project)
+        await db_session.commit()
+
+        from app import github, services
+
+        token_mock = AsyncMock(return_value="token")
+        prs_mock = AsyncMock(return_value=[self._github_pr(88, title="Cached PR")])
+        monkeypatch.setattr(services, "_get_project_github_token", token_mock)
+        monkeypatch.setattr(github, "get_open_pull_requests", prs_mock)
+
+        first = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+        second = await client.get(f"/api/admin/open-prs?project_id={project.id}")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json() == first.json()
+        token_mock.assert_awaited_once()
+        prs_mock.assert_awaited_once_with("token", "acme", "widgets")
 
 
 class TestAdminRecordFailureResult:

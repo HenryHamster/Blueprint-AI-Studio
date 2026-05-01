@@ -102,6 +102,7 @@ async def get_settings(
         "autonomous_research_interval_minutes": _runtime_config.get("autonomous_research_interval_minutes", 30),
         "max_concurrent_auto_remediations": _runtime_config.get("max_concurrent_auto_remediations", 2),
         "residual_remediation_cooldown_hours": _runtime_config.get("residual_remediation_cooldown_hours", 24),
+        "residual_audit_defer_escalation_threshold": int(_runtime_config.get("residual_audit_defer_escalation_threshold", 5)),
         "provider_tier_model_map": _runtime_config.get("provider_tier_model_map", {}),
         "task_type_categories": _runtime_config.get("task_type_categories", {}),
         "category_routing": _runtime_config.get("category_routing", {}),
@@ -124,6 +125,9 @@ async def get_settings(
         "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
         "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
         "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
+        "drift_over_claim_min_claims": int(_runtime_config.get("drift_over_claim_min_claims", 3)),
+        "drift_over_claim_consistency_threshold": float(_runtime_config.get("drift_over_claim_consistency_threshold", 0.4)),
+        "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
         "reserved_slots_for_types": _runtime_config.get("reserved_slots_for_types", {"create": 1, "research": 1}),
         "max_pipeline_slots": _runtime_config.get("max_pipeline_slots", 4),
         "strategic_research_frequency": _runtime_config.get("strategic_research_frequency", 6),
@@ -290,11 +294,43 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 720):
             raise HTTPException(status_code=400, detail="residual_remediation_cooldown_hours must be between 1 and 720")
         _runtime_config["residual_remediation_cooldown_hours"] = val
+    if "residual_audit_defer_escalation_threshold" in payload:
+        try:
+            val = int(payload["residual_audit_defer_escalation_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="residual_audit_defer_escalation_threshold must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="residual_audit_defer_escalation_threshold must be between 1 and 50")
+        _runtime_config["residual_audit_defer_escalation_threshold"] = val
     if "warm_continuity_enabled" in payload:
         val = payload["warm_continuity_enabled"]
         if not isinstance(val, bool):
             raise HTTPException(status_code=400, detail="warm_continuity_enabled must be a boolean")
         _runtime_config["warm_continuity_enabled"] = val
+    if "drift_over_claim_min_claims" in payload:
+        try:
+            val = int(payload["drift_over_claim_min_claims"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="drift_over_claim_min_claims must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="drift_over_claim_min_claims must be between 1 and 50")
+        _runtime_config["drift_over_claim_min_claims"] = val
+    if "drift_over_claim_consistency_threshold" in payload:
+        try:
+            val = float(payload["drift_over_claim_consistency_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="drift_over_claim_consistency_threshold must be a number")
+        if not (0.0 <= val <= 1.0):
+            raise HTTPException(status_code=400, detail="drift_over_claim_consistency_threshold must be between 0.0 and 1.0")
+        _runtime_config["drift_over_claim_consistency_threshold"] = round(val, 3)
+    if "drift_stall_min_claims" in payload:
+        try:
+            val = int(payload["drift_stall_min_claims"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="drift_stall_min_claims must be a number")
+        if not (1 <= val <= 50):
+            raise HTTPException(status_code=400, detail="drift_stall_min_claims must be between 1 and 50")
+        _runtime_config["drift_stall_min_claims"] = val
     if "next_role_poll_timeout_secs" in payload:
         try:
             val = int(payload["next_role_poll_timeout_secs"])
@@ -706,6 +742,11 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
             # severity and joins the default-on list per the
             # direction-milestone-webhook-pattern playbook.
             "RESIDUAL_FIX_SPAWNED", "RESIDUAL_FIX_MERGED", "RESIDUAL_FIX_ESCALATED",
+            # Recovery event: operator manually unsuspends a suspended fingerprint.
+            # Opt-in only (not in default list) — informational, not urgent.
+            "RESIDUAL_FIX_UNSUSPENDED",
+            # Escalation fired when a case is deferred by audit too many times.
+            "RESIDUAL_FIX_AUDIT_DEFERRED",
         ])
         enabled_events = val.get("enabled_events", ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "DIRECTION_MILESTONE", "RESIDUAL_FIX_ESCALATED"])
         if not isinstance(enabled_events, list):
@@ -811,6 +852,10 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
                     "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
                     "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
                     "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
+                    "drift_over_claim_min_claims": int(_runtime_config.get("drift_over_claim_min_claims", 3)),
+                    "drift_over_claim_consistency_threshold": float(_runtime_config.get("drift_over_claim_consistency_threshold", 0.4)),
+                    "drift_stall_min_claims": int(_runtime_config.get("drift_stall_min_claims", 5)),
+                    "residual_audit_defer_escalation_threshold": int(_runtime_config.get("residual_audit_defer_escalation_threshold", 5)),
                     "notification_config": _runtime_config.get("notification_config", {
                         "webhook_url": "",
                         "enabled_events": ["TASK_FAILED", "APPROVAL_NEEDED", "DEPLOY_HEALTH_ALERT", "REMEDIATION_ESCALATED", "RESIDUAL_FIX_ESCALATED"],

@@ -24,6 +24,12 @@ export interface AutonomousConfigSectionProps {
   setConfigMaxProvisionRetries: (v: number) => void;
   configMaxRollupRetries: number;
   setConfigMaxRollupRetries: (v: number) => void;
+  configDriftOverClaimMinClaims: number;
+  setConfigDriftOverClaimMinClaims: (v: number) => void;
+  configDriftConsistencyThreshold: number;
+  setConfigDriftConsistencyThreshold: (v: number) => void;
+  configDriftStallMinClaims: number;
+  setConfigDriftStallMinClaims: (v: number) => void;
   autonomousConfigOpen: boolean;
   setAutonomousConfigOpen: React.Dispatch<React.SetStateAction<boolean>>;
   savingConfigField: string | null;
@@ -43,6 +49,9 @@ export function AutonomousConfigSection({
   configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
   configMaxProvisionRetries, setConfigMaxProvisionRetries,
   configMaxRollupRetries, setConfigMaxRollupRetries,
+  configDriftOverClaimMinClaims, setConfigDriftOverClaimMinClaims,
+  configDriftConsistencyThreshold, setConfigDriftConsistencyThreshold,
+  configDriftStallMinClaims, setConfigDriftStallMinClaims,
   autonomousConfigOpen, setAutonomousConfigOpen,
   savingConfigField, saveConfigField,
   clearResidualFingerprints,
@@ -291,6 +300,66 @@ export function AutonomousConfigSection({
               disabled={savingConfigField === 'max_rollup_retries'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Drift detection thresholds */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Minimum task claims in window before over-claim flag fires (default 3).">Drift claim min</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={configDriftOverClaimMinClaims}
+              onChange={e => setConfigDriftOverClaimMinClaims(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('drift_over_claim_min_claims', configDriftOverClaimMinClaims)}
+              disabled={savingConfigField === 'drift_over_claim_min_claims'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save (default: 3)"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Consistency ratio below which over-claim flag fires (default 0.4 = 40% of claims merged).">Drift consistency</label>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={configDriftConsistencyThreshold}
+              onChange={e => setConfigDriftConsistencyThreshold(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('drift_over_claim_consistency_threshold', configDriftConsistencyThreshold)}
+              disabled={savingConfigField === 'drift_over_claim_consistency_threshold'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save (default: 0.4)"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Minimum claims with zero merges before stalled flag fires (default 5).">Drift stall min</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={configDriftStallMinClaims}
+              onChange={e => setConfigDriftStallMinClaims(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('drift_stall_min_claims', configDriftStallMinClaims)}
+              disabled={savingConfigField === 'drift_stall_min_claims'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save (default: 5)"
             >
               <Check className="w-3.5 h-3.5" />
             </button>

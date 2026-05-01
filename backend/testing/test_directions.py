@@ -20,7 +20,7 @@ from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import _handle_research_completion, _calibrate_scope, predict_spawn_success, _poor_decomp_history
-from app.direction_metrics import _compute_acceptance_rate, _compute_direction_quality_score, _compute_momentum_factor, _compute_productivity_score, _compute_rolling_median_review_iterations
+from app.direction_metrics import _compute_acceptance_rate, _compute_autonomy_threshold_state, _compute_direction_quality_score, _compute_momentum_factor, _compute_productivity_score, _compute_rolling_median_review_iterations
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
 
@@ -1453,6 +1453,71 @@ class TestRollingMedianReviewIterations:
             {"median_review_iterations": 3},
         ]}
         assert _compute_rolling_median_review_iterations(d) == 2.0
+
+
+class TestComputeAutonomyThresholdState:
+    """Unit tests for _compute_autonomy_threshold_state — pure function, no DB."""
+
+    def test_empty_direction_returns_zeros_and_ineligible(self):
+        result = _compute_autonomy_threshold_state({})
+        assert result["lifetime_autonomous_prs_merged"] == 0
+        assert result["lifetime_operator_actions"] == 0
+        assert result["retirement_eligible"] is False
+
+    def test_below_threshold_not_eligible(self):
+        d = {"research_history": [
+            {"autonomous_prs_merged": 3, "operator_action_count": 0},
+            {"autonomous_prs_merged": 5, "operator_action_count": 0},
+        ]}
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_autonomous_prs_merged"] == 8
+        assert result["lifetime_operator_actions"] == 0
+        assert result["retirement_eligible"] is False
+
+    def test_at_threshold_eligible(self):
+        d = {"research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}]}
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_autonomous_prs_merged"] == 10
+        assert result["retirement_eligible"] is True
+
+    def test_operator_action_blocks_eligibility(self):
+        d = {"research_history": [{"autonomous_prs_merged": 12, "operator_action_count": 1}]}
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_autonomous_prs_merged"] == 12
+        assert result["lifetime_operator_actions"] == 1
+        assert result["retirement_eligible"] is False
+
+    def test_from_aggregate_only(self):
+        d = {
+            "research_history": [],
+            "history_aggregate": {"total_autonomous_prs_merged": 12, "total_operator_actions": 0},
+        }
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_autonomous_prs_merged"] == 12
+        assert result["retirement_eligible"] is True
+
+    def test_combines_history_and_aggregate(self):
+        d = {
+            "research_history": [{"autonomous_prs_merged": 3, "operator_action_count": 0}],
+            "history_aggregate": {"total_autonomous_prs_merged": 7, "total_operator_actions": 0},
+        }
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_autonomous_prs_merged"] == 10
+        assert result["retirement_eligible"] is True
+
+    def test_legacy_fallback_treats_prs_merged_as_autonomous(self):
+        d = {"research_history": [{"prs_merged": 5}]}  # no autonomous_prs_merged key
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_autonomous_prs_merged"] == 5
+
+    def test_aggregate_operator_actions_also_block_eligibility(self):
+        d = {
+            "research_history": [{"autonomous_prs_merged": 10, "operator_action_count": 0}],
+            "history_aggregate": {"total_autonomous_prs_merged": 0, "total_operator_actions": 1},
+        }
+        result = _compute_autonomy_threshold_state(d)
+        assert result["lifetime_operator_actions"] == 1
+        assert result["retirement_eligible"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

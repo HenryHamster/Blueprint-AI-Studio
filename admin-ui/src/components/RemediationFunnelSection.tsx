@@ -92,6 +92,8 @@ interface ResidualFingerprint {
   last_spawned_pr_number?: number | null;
   consecutive_failure_count?: number | null;
   suspended_at?: string | null;
+  audit_defer_count?: number | null;
+  audit_deferred_system_id?: string | null;
 }
 
 interface ResidualFingerprintsData {
@@ -190,6 +192,8 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   const [undoFingerprints, setUndoFingerprints] = useState<Map<string, ResidualFingerprint>>(new Map());
   const [ignoreErrors, setIgnoreErrors] = useState<Map<string, string>>(new Map());
   const [showIgnored, setShowIgnored] = useState(true);
+  const [unsuspendedFingerprints, setUnsuspendedFingerprints] = useState<Set<string>>(new Set());
+  const [unsuspendErrors, setUnsuspendErrors] = useState<Map<string, string>>(new Map());
 
   function handleIgnore(fp: ResidualFingerprint) {
     const fingerprint = fp.fingerprint;
@@ -210,6 +214,22 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         setIgnoredFingerprints(prev => { const s = new Set(prev); s.delete(fingerprint); return s; });
         setUndoFingerprints(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
         setIgnoreErrors(prev => new Map([...prev, [fingerprint, err instanceof Error ? err.message : 'error']]));
+      });
+  }
+
+  function handleUnsuspend(fp: ResidualFingerprint) {
+    const fingerprint = fp.fingerprint;
+    setUnsuspendedFingerprints(prev => new Set([...prev, fingerprint]));
+    setUnsuspendErrors(prev => { const m = new Map(prev); m.delete(fingerprint); return m; });
+
+    const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+    apiFetch(`/api/admin/residual-cases/${encodeURIComponent(fingerprint)}/unsuspend${qs}`, { method: 'POST' })
+      .then(r => {
+        if (!r.ok) throw new Error(`${r.status}`);
+      })
+      .catch((err: unknown) => {
+        setUnsuspendedFingerprints(prev => { const s = new Set(prev); s.delete(fingerprint); return s; });
+        setUnsuspendErrors(prev => new Map([...prev, [fingerprint, err instanceof Error ? err.message : 'error']]));
       });
   }
 
@@ -352,6 +372,22 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </button>
         )}
       </div>
+
+      {(() => {
+        const deferred = (residuals?.top_residuals ?? []).filter(r => (r.audit_defer_count ?? 0) > 0);
+        if (deferred.length === 0) return null;
+        const systemIds = Array.from(new Set(deferred.map(r => r.audit_deferred_system_id).filter(Boolean) as string[]));
+        const sysLabel = systemIds.length > 0 && systemIds.length <= 3
+          ? ` on systems ${systemIds.join(', ')}`
+          : '';
+        return (
+          <div className="mb-2 text-[10px]">
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30">
+              {deferred.length} {deferred.length === 1 ? 'case' : 'cases'} audit-deferred{sysLabel}
+            </span>
+          </div>
+        );
+      })()}
 
       {/* Horizontal funnel */}
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
@@ -689,6 +725,9 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                   const undoFp = undoFingerprints.get(r.fingerprint);
                   const ignoreError = ignoreErrors.get(r.fingerprint);
                   const canIgnore = !r.case_status || r.case_status === 'ACTIVE' || r.case_status === 'REMEDIATING';
+                  const isUnsuspended = unsuspendedFingerprints.has(r.fingerprint);
+                  const unsuspendError = unsuspendErrors.get(r.fingerprint);
+                  const canUnsuspend = r.case_status === 'SUSPENDED' && !isUnsuspended;
 
                   if (isIgnored && undoFp) {
                     return (
@@ -714,16 +753,35 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                         </span>
                         <span className="text-[10px] text-neutral-500 shrink-0">{relativeTime(r.most_recent_at)}</span>
                         {(() => {
-                          const label = caseStatusLabel(r);
+                          const effectiveR = isUnsuspended ? { ...r, case_status: 'ACTIVE', consecutive_failure_count: 0 } : r;
+                          const label = caseStatusLabel(effectiveR);
                           if (!label) return null;
-                          const style = CASE_STATUS_STYLES[r.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+                          const style = CASE_STATUS_STYLES[effectiveR.case_status ?? ''] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                           return (
                             <span className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${style}`}>
                               {label}
                             </span>
                           );
                         })()}
+                        {(r.audit_defer_count ?? 0) > 0 && (
+                          <span
+                            className={`font-mono text-[9px] font-semibold px-1.5 py-0.5 rounded border shrink-0 ${(r.audit_defer_count ?? 0) >= 3 ? 'bg-violet-500/30 text-violet-300 border-violet-500/50' : 'bg-violet-500/15 text-violet-400 border-violet-500/30'}`}
+                            title={`Auto-remediation is held until${r.audit_deferred_system_id ? ` system ${r.audit_deferred_system_id}` : ' the named system'} completes its audit`}
+                          >
+                            DEFERRED ×{r.audit_defer_count}{r.audit_deferred_system_id ? ` · ${r.audit_deferred_system_id}` : ''}
+                          </span>
+                        )}
                         <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
+                        {canUnsuspend && (
+                          <button
+                            type="button"
+                            onClick={() => handleUnsuspend(r)}
+                            className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-orange-700/60 text-orange-400 hover:text-orange-200 hover:border-orange-500 transition-colors"
+                            aria-label={`Unsuspend fingerprint ${r.fingerprint}`}
+                          >
+                            Unsuspend
+                          </button>
+                        )}
                         {canIgnore && (
                           <button
                             type="button"
@@ -735,10 +793,18 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                           </button>
                         )}
                       </div>
+                      {unsuspendError && (
+                        <div className="text-[10px] text-red-400 mb-1">Failed to unsuspend: {unsuspendError}</div>
+                      )}
                       {ignoreError && (
                         <div className="text-[10px] text-red-400 mb-1">Failed to ignore: {ignoreError}</div>
                       )}
                       <div className="text-[11px] text-neutral-400 leading-snug mb-1.5">{truncate(r.sample_message, 140)}</div>
+                      {(r.audit_defer_count ?? 0) > 0 && (
+                        <div className="text-[10px] text-violet-400/70 mb-1.5">
+                          held by audit{r.audit_deferred_system_id ? ` on ${r.audit_deferred_system_id}` : ''} — spawning paused until audit completes
+                        </div>
+                      )}
                       <div className="flex gap-2 flex-wrap">
                         {r.example_task_ids.map(id => (
                           <a

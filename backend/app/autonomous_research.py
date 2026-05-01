@@ -44,6 +44,7 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
 # Re-export the self_audit helpers for backwards compat with callers /
 # tests that patch them under ``app.autonomous_research``.
 from app.self_audit_dispatch import (  # noqa: E402, F401 — re-export
+    _record_residual_audit_deferral,
     _should_dispatch_self_audit,
     _spawn_self_audit_task,
 )
@@ -1542,6 +1543,52 @@ async def _spawn_review_convergence_investigation(
     return new_task.id
 
 
+async def _infer_fingerprint_audit_system(
+    project: Project,
+    session: AsyncSession,
+    task_ids: list,
+) -> str | None:
+    """Return system_id if fingerprint tasks all map to a single system in audit/fundamentals mode.
+
+    Reuses the direction→system_id mapping from project.directions (same as self_audit_dispatch).
+    Returns None when the mapping is ambiguous (no direction link, multiple systems, or unset mode).
+    """
+    from app.models import SystemMaturity
+    dir_to_system: dict[str, str] = {
+        d["id"]: d["system_id"]
+        for d in (project.directions or [])
+        if d.get("id") and d.get("system_id")
+    }
+    if not dir_to_system or not task_ids:
+        return None
+    uuids = []
+    for tid in task_ids[:5]:
+        try:
+            uuids.append(uuid.UUID(str(tid)))
+        except (ValueError, AttributeError):
+            pass
+    if not uuids:
+        return None
+    rows = (await session.execute(
+        select(Task.context).where(Task.id.in_(uuids))
+    )).all()
+    system_ids: set[str] = set()
+    for (ctx,) in rows:
+        did = (ctx or {}).get("direction_id")
+        if did and did in dir_to_system:
+            system_ids.add(dir_to_system[did])
+    if len(system_ids) != 1:
+        return None
+    sid = next(iter(system_ids))
+    mat = (await session.execute(
+        select(SystemMaturity).where(
+            SystemMaturity.project_id == project.id,
+            SystemMaturity.system_id == sid,
+        )
+    )).scalar_one_or_none()
+    return sid if mat and mat.recommended_mode in ("audit", "fundamentals") else None
+
+
 async def _spawn_residual_fingerprint_remediation(project: Project, session: AsyncSession) -> int:
     """Spawn a create-type remediation task for the top uncooled residual CODE_ERROR fingerprint.
 
@@ -1623,6 +1670,19 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
             continue
         last_spawned = last_spawned_by_fp.get(fp)
         if last_spawned is not None and (now_dt - last_spawned) < cooldown_delta:
+            continue
+
+        # Defer if all sampled tasks map to a single system in audit/fundamentals mode.
+        _audit_sid = await _infer_fingerprint_audit_system(
+            project, session, fp_entry.get("task_ids") or []
+        )
+        if _audit_sid:
+            logger.info(
+                "[AUTO REMEDIATION] Deferring fingerprint %s: system %r is in "
+                "audit/fundamentals mode (project %s).",
+                fp[:32], _audit_sid, project.id,
+            )
+            await _record_residual_audit_deferral(session, project.id, fp, _audit_sid)
             continue
 
         # Require a high count before remediating non-error-shaped clusters.

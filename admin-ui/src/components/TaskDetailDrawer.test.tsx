@@ -165,6 +165,47 @@ describe('TaskDetailDrawer', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it('shows Autonomous merge badge for ORCHESTRATOR-created merged task', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ created_by: 'ORCHESTRATOR', pr_url: 'https://github.com/example/repo/pull/1', status: 'COMPLETED' })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('Autonomous merge')).toBeInTheDocument();
+    expect(screen.queryByText('Operator-assisted merge')).not.toBeInTheDocument();
+  });
+
+  it('shows Operator-assisted merge badge when review_dismissed is true', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({
+          created_by: 'ORCHESTRATOR',
+          pr_url: 'https://github.com/example/repo/pull/2',
+          status: 'COMPLETED',
+          context: { review_dismissed: true },
+        })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('Operator-assisted merge')).toBeInTheDocument();
+    expect(screen.queryByText('Autonomous merge')).not.toBeInTheDocument();
+  });
+
+  it('shows no merge badge for non-merged tasks', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'IN_PROGRESS' })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.queryByText('Autonomous merge')).not.toBeInTheDocument();
+    expect(screen.queryByText('Operator-assisted merge')).not.toBeInTheDocument();
+  });
+
   it('copy logs button calls clipboard.writeText with the log content', async () => {
     const user = userEvent.setup();
     // userEvent.setup() installs its own clipboard stub (configurable: true).

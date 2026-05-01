@@ -913,14 +913,18 @@ class MaxPlanAccount(SQLModel, table=True):
 
 
 # --- Residual-case reaper thresholds ---
-# Both are tunable via runtime_config using the same-named lowercase keys
+# All are tunable via runtime_config using the same-named lowercase keys
 # (e.g. runtime_config.get("residual_stale_close_hours", RESIDUAL_STALE_CLOSE_HOURS)).
 # RESIDUAL_STALE_CLOSE_HOURS:     Hours of fingerprint silence before an ACTIVE case is
 #   closed organically OR a stuck REMEDIATING case is auto-resolved to RESOLVED.
 # RESIDUAL_RECENT_HIT_DEFER_HOURS: If a fingerprint's last_seen_at is within this window,
 #   defer the ACTIVE → CLOSED_ORGANICALLY close even if the 72 h outer window has elapsed.
+# RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD: Consecutive audit deferrals on a single
+#   fingerprint before a BLOCKER ProjectMessage is posted (one-shot per streak; resets
+#   to 0 when a fix spawns so future audit cycles can re-escalate).
 RESIDUAL_STALE_CLOSE_HOURS = 72
 RESIDUAL_RECENT_HIT_DEFER_HOURS = 1
+RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD = 5
 
 
 class ResidualCaseStatus(str, Enum):
@@ -1009,6 +1013,13 @@ class ResidualRemediationCase(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
+    # Audit-mode deferral fields (added 0056). Nullable / default-0 so existing
+    # rows backfilled by migration server_default work without a Python-side touch.
+    audit_defer_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    audit_deferred_system_id: Optional[str] = Field(default=None)
 
     __table_args__ = (
         Index("ix_residual_case_status_last_seen", "status", "last_seen_at"),
