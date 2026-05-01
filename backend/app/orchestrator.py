@@ -95,26 +95,27 @@ async def _lock_task_for_mutation(
     *,
     allowed_statuses: tuple[TaskStatus, ...] | None = None,
     reason: str = "task mutation",
-    expected_updated_at=None,
     expected_snapshot: dict | None = None,
     snapshot_fn=None,
 ) -> Task | None:
     """Lock a task before a hot-path mutation and rollback on skipped rows.
 
-    Phase B3: ``expected_updated_at`` enables the commit-release-relock pattern
-    used to break lock windows around long-running GitHub I/O. When set, the
-    re-acquired row's ``updated_at`` must match the snapshot — if a peer
-    mutated the row during the unlocked window we defer (return None) so the
-    caller can either retry on the next sweep or surface a conflict.
+    Commit-release-relock pattern (Phase B3) is used to break lock windows
+    around long-running GitHub I/O. When ``expected_snapshot`` +
+    ``snapshot_fn`` are passed, the re-acquired row is compared against the
+    pre-release content snapshot — if a peer mutated it during the unlocked
+    window we defer (return None) so the caller can retry on the next
+    sweep or surface a conflict.
 
-    R5-W2-A: ``expected_snapshot`` + ``snapshot_fn`` is the content-based
-    replacement for ``expected_updated_at`` that CI-polling sites use.
-    Heartbeats with ``onupdate=_utcnow`` advance ``updated_at`` every ~30s,
-    so the original timestamp validator falsely deferred on every
-    overlapping heartbeat. The snapshot pair lets the caller capture the
-    fields it actually cares about (e.g. status + review_loop pr_number /
-    ci_passed / review_approved / iteration) and defer only when one of
-    those has actually changed.
+    R5-W2-A: this content-based snapshot replaced an earlier
+    ``expected_updated_at`` timestamp validator that false-tripped on every
+    overlapping heartbeat (heartbeats with ``onupdate=_utcnow`` advance
+    ``updated_at`` every ~30s). The snapshot pair lets the caller capture
+    the fields it actually cares about (e.g. status + review_loop
+    pr_number / ci_passed / review_approved / iteration) and defer only
+    when one of those has actually changed. R6-W3-B: dropped the unused
+    ``expected_updated_at`` parameter — every CI-polling caller migrated
+    to the snapshot pair, leaving the timestamp branch dead.
     """
     async with task_lock(session, task_id) as task:
         if task is None:
@@ -127,14 +128,6 @@ async def _lock_task_for_mutation(
                 reason,
                 task_id,
                 task.status,
-            )
-            await session.rollback()
-            return None
-        if expected_updated_at is not None and task.updated_at != expected_updated_at:
-            logger.info(
-                "[ORCHESTRATOR] %s for task %s deferred: row mutated during unlocked window "
-                "(expected updated_at=%s, found %s)",
-                reason, task_id, expected_updated_at, task.updated_at,
             )
             await session.rollback()
             return None

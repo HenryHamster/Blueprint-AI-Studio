@@ -29,8 +29,9 @@ These tests exercise:
     a. The two helpers in rollup_management (`_release_parent_lock`
        and `_relock_parent`) with mocked slow GitHub calls.
     b. The orchestrator's `_lock_task_for_mutation` helper with the
-       legacy ``expected_updated_at`` validation kwarg (kept for
-       sites that don't yet adopt the content-snapshot pattern).
+       content-snapshot ``expected_snapshot`` + ``snapshot_fn`` validation
+       (R6-W3-B dropped the dead ``expected_updated_at`` predecessor —
+       every CI-polling caller migrated to the snapshot pair).
     c. The end-to-end staging-state-conflict case where a concurrent
        transaction modifies the row during the unlocked window.
     d. R4-W1 specific: heartbeat-overlap (heartbeat-only updates do
@@ -652,11 +653,15 @@ async def test_ensure_branch_returns_none_on_failure(monkeypatch, db_session):
 
 
 @pytest.mark.asyncio
-async def test_lock_task_for_mutation_validates_expected_updated_at(db_session):
-    """`_lock_task_for_mutation` (orchestrator) gained an
-    `expected_updated_at` kwarg in Phase B3. When the row's updated_at has
-    advanced past the snapshot, it must defer (return None) — not silently
-    apply mutations against stale data.
+async def test_lock_task_for_mutation_validates_expected_snapshot(db_session):
+    """`_lock_task_for_mutation` (orchestrator) defers when the post-relock
+    content snapshot differs from the pre-release one.
+
+    R5-W2-A replaced the original Phase B3 ``expected_updated_at`` timestamp
+    validator (which false-tripped on every overlapping heartbeat because
+    ``onupdate=_utcnow`` advances ``updated_at`` ~every 30s) with a
+    content-based snapshot pair. R6-W3-B then dropped the dead timestamp
+    parameter entirely — this test guards the surviving snapshot path.
     """
     from app.orchestrator import _lock_task_for_mutation
 
@@ -673,27 +678,32 @@ async def test_lock_task_for_mutation_validates_expected_updated_at(db_session):
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
-    real_updated_at = task.updated_at
 
-    # Stale snapshot (1s ago) — the helper must observe the mismatch
-    stale_snapshot = real_updated_at - timedelta(seconds=1)
+    def _status_snapshot(t: Task) -> dict:
+        return {"status": t.status}
+
+    # Stale snapshot — claims status=QUEUED but the row is EVALUATING.
+    stale_snapshot = {"status": TaskStatus.QUEUED}
     locked = await _lock_task_for_mutation(
         db_session, task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
-        reason="B3 staleness test",
-        expected_updated_at=stale_snapshot,
+        reason="snapshot mismatch test",
+        expected_snapshot=stale_snapshot,
+        snapshot_fn=_status_snapshot,
     )
     assert locked is None, (
         "Expected _lock_task_for_mutation to return None when the snapshot "
         "is stale; got a Task — the staleness guard is missing."
     )
 
-    # Correct snapshot — should succeed.
+    # Matching snapshot — should succeed.
+    matching_snapshot = {"status": TaskStatus.EVALUATING}
     locked2 = await _lock_task_for_mutation(
         db_session, task.id,
         allowed_statuses=(TaskStatus.EVALUATING,),
-        reason="B3 staleness test (matched)",
-        expected_updated_at=real_updated_at,
+        reason="snapshot match test",
+        expected_snapshot=matching_snapshot,
+        snapshot_fn=_status_snapshot,
     )
     assert locked2 is not None
     assert locked2.id == task.id
@@ -702,10 +712,11 @@ async def test_lock_task_for_mutation_validates_expected_updated_at(db_session):
 
 
 @pytest.mark.asyncio
-async def test_lock_task_for_mutation_no_expected_means_no_validation(db_session):
-    """When `expected_updated_at` is not passed, the helper retains its
-    original behaviour (no staleness check) — backward-compatible with
-    the Phase A1 callsites that don't yet use the new kwarg.
+async def test_lock_task_for_mutation_no_snapshot_means_no_validation(db_session):
+    """When neither ``expected_snapshot`` nor ``snapshot_fn`` is passed, the
+    helper retains its original behaviour (no staleness check) —
+    backward-compatible with callsites that don't need the relock-validate
+    pattern.
     """
     from app.orchestrator import _lock_task_for_mutation
 
