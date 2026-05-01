@@ -97,7 +97,12 @@ def _capture_rollup_parent_snapshot(parent: Task) -> dict:
     }
 
 
-async def _release_parent_lock(parent: Task, session: AsyncSession) -> dict:
+async def _release_parent_lock(
+    parent: Task,
+    session: AsyncSession,
+    *,
+    context_dirty: bool = False,
+) -> dict:
     """Commit any pending mutations on parent and release the FOR UPDATE lock.
 
     Returns a content snapshot that ``_relock_parent`` will compare against
@@ -114,16 +119,35 @@ async def _release_parent_lock(parent: Task, session: AsyncSession) -> dict:
     juggle two sessions. ``populate_existing=True`` in ``_relock_parent``
     bypasses the identity-map cache (audit C1) for the re-SELECT.
 
-    Round 4 W1 (audit C1): ``flag_modified(parent, "context")`` is
-    invoked before commit. After a prior ``_relock_parent`` call did
-    ``populate_existing`` + ``expire_all``, the next mutation to
-    ``parent.context`` may not be detected as dirty by SQLA's change-
-    tracking (empirically verified against the merge handler test —
-    full reassignment to ``task.context`` did not flush at the next
-    commit). The flag_modified is a no-op when the attribute is already
-    tracked, but corrects the state when it isn't.
+    R5-W3-B (audit 2026-04-30): the prior version of this function called
+    ``flag_modified(parent, "context")`` UNCONDITIONALLY, which forced a
+    JSONB-column rewrite on every commit even when the caller hadn't
+    actually mutated ``parent.context``. Most release sites in
+    ``_check_and_trigger_rollup`` (lines ~954, ~1033, ~1098, ~1224, ~1290,
+    ~1343) are read-only — the function snapshots state, releases the lock
+    around external I/O, then re-acquires. With ~6 release/relock cycles
+    per rollup decision and parent contexts that can grow to 100+ KB,
+    flag_modified-on-every-release amplified TOAST-write traffic by 6x for
+    no DB-correctness benefit.
+
+    Switched to caller-driven: callers that mutated ``parent.context``
+    before this call MUST pass ``context_dirty=True``. The default of
+    ``False`` matches the actual behavior of every read-only call site.
+    Callers that mutate context after a re-lock typically do so via
+    ``parent.context = {...}`` and ``session.add(parent)`` directly, then
+    ``session.commit()`` — those don't go through this function and the
+    SQLA assignment-tracking already detects the mutation.
+
+    Historical note (Round 4 W1 audit C1): the unconditional
+    ``flag_modified`` was added because, after a prior ``_relock_parent``
+    did ``populate_existing`` + ``expire_all``, the NEXT mutation to
+    ``parent.context`` could go undetected by SQLA's change-tracking —
+    empirically verified against the merge handler test. That risk still
+    applies for callers that DO mutate context before release, hence the
+    explicit ``context_dirty`` flag (rather than removing the call
+    entirely).
     """
-    if parent.context is not None:
+    if context_dirty and parent.context is not None:
         flag_modified(parent, "context")
     session.add(parent)
     await session.commit()
@@ -153,11 +177,13 @@ async def _relock_parent(
     pr_merged. ``populate_existing=True`` forces SQLA to refresh
     attributes on the cached identity-map instance from this SELECT,
     bypassing the cache that previously made the validation a no-op
-    under ``expire_on_commit=False``. ``_release_parent_lock`` calls
-    ``flag_modified(parent, "context")`` before commit so the mutation
-    persists across the populate_existing's change-tracking reset
-    (verified empirically — see ci_completion.py for the canonical
-    comment).
+    under ``expire_on_commit=False``. When the caller mutates
+    ``parent.context`` before release, it must pass
+    ``context_dirty=True`` to ``_release_parent_lock`` so the
+    ``flag_modified`` call fires and the mutation persists across the
+    populate_existing's change-tracking reset (R5-W3-B; verified
+    empirically — see ci_completion.py for the canonical comment).
+    Read-only release sites omit the flag and pay no JSONB-write cost.
 
     Round 5 W1 (HIGH-2 belt-and-suspenders): callers can pass the
     released-but-cached ``parent`` instance via ``parent_in_session`` so
