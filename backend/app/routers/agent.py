@@ -2343,18 +2343,25 @@ async def next_role(
     # Liveness signal: receiving the request itself proves the VM is alive.
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
 
-    # Look up a QUEUED task pinned to this VM. JSONB context query uses
-    # `as_string()` to match the project's existing pattern (see
-    # autonomous_research.py / direction_lifecycle.py for prior art).
-    # Optional prior_pr_number filter narrows the lookup so a stray
-    # pin from an unrelated chain doesn't get claimed.
+    # Look up a QUEUED task pinned to this VM.
+    # R5-W2-B: lead the predicate with ``Task.context.has_key(...)`` so the
+    # JSONB ``?`` operator can satisfy the lookup via ``ix_task_context_gin``.
+    # The prior ``->>`` equality form casts to text and bypasses the GIN
+    # index, forcing a SeqScan over Task that grows linearly with the
+    # QUEUED queue. ``has_key`` narrows the candidate set to the (small)
+    # warm-pinned QUEUED rows, then the ``->>`` equality finalizes the
+    # match. Postgres consistently picks the GIN-cheaper predicate first.
+    # Optional prior_pr_number filter narrows further so a stray pin from
+    # an unrelated chain doesn't get claimed.
     stmt = select(Task).where(
         Task.status == TaskStatus.QUEUED,
+        Task.context.has_key("warm_target_vm_id"),
         Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id,
     )
     if req.prior_pr_number is not None:
         stmt = stmt.where(
-            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
+            Task.context.has_key("warm_target_pr"),
+            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number),
         )
     stmt = stmt.with_for_update(skip_locked=True)
 
@@ -2439,9 +2446,12 @@ async def next_role(
     # No matching warm-pinned task. Check whether another VM owns an
     # IN_PROGRESS task for this PR — if so, the warm chain has already
     # forked and this VM should exit cleanly.
+    # R5-W2-B: same GIN-friendly pattern as above — ``has_key`` filters
+    # via the JSONB ``?`` operator before the ``->>`` equality cast.
     if req.prior_pr_number is not None:
         other_stmt = select(Task).where(
             Task.status == TaskStatus.IN_PROGRESS,
+            Task.context.has_key("warm_target_pr"),
             Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number),
             Task.vm_instance_id.is_not(None),
             Task.vm_instance_id != req.vm_instance_id,
