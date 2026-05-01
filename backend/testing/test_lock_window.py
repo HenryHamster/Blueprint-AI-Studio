@@ -743,6 +743,317 @@ async def test_lock_task_for_mutation_no_snapshot_means_no_validation(db_session
     await db_session.rollback()
 
 
+# ── CI-polling snapshot coverage (R6-W4-A, audit MED-4) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_capture_ci_polling_snapshot_includes_all_5_fields():
+    """`_capture_ci_polling_snapshot` must return a dict with the 5 fields
+    that the CI-polling lock-window break protects: status (Task-level)
+    plus review_loop.{pr_number, ci_passed, review_approved, iteration}.
+
+    Heartbeat-only updates touch none of these — that's the whole point
+    of the content-snapshot validator (R5-W2-A). If a future refactor
+    drops a field or renames a key in review_loop, the CI polling sites
+    will silently stop deferring on that mutation; this test pins the
+    contract.
+    """
+    from app.orchestrator import _capture_ci_polling_snapshot
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="ci snapshot",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "pr_number": 17,
+                "ci_passed": False,
+                "review_approved": False,
+                "iteration": 2,
+            },
+        },
+    )
+
+    snapshot = _capture_ci_polling_snapshot(task)
+    assert set(snapshot.keys()) == {
+        "status", "pr_number", "ci_passed", "review_approved", "iteration",
+    }, (
+        f"Snapshot must include exactly the 5 protected fields; got {set(snapshot.keys())}. "
+        "Adding/removing keys is a contract change — update the CI polling sites in lockstep."
+    )
+    assert snapshot["status"] == TaskStatus.EVALUATING
+    assert snapshot["pr_number"] == 17
+    assert snapshot["ci_passed"] is False
+    assert snapshot["review_approved"] is False
+    assert snapshot["iteration"] == 2
+
+
+@pytest.mark.asyncio
+async def test_capture_ci_polling_snapshot_handles_missing_review_loop():
+    """When ``context`` lacks a ``review_loop`` key (early in the pipeline,
+    or when the task hasn't entered review yet), the snapshot must still
+    return all 5 keys with None placeholders so callers can compare
+    deterministically across the pre/post-release boundary."""
+    from app.orchestrator import _capture_ci_polling_snapshot
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="ci snapshot pre-review",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+        context={},
+    )
+    snapshot = _capture_ci_polling_snapshot(task)
+    assert snapshot == {
+        "status": TaskStatus.EVALUATING,
+        "pr_number": None,
+        "ci_passed": None,
+        "review_approved": None,
+        "iteration": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_lock_with_matching_ci_snapshot_succeeds(db_session):
+    """When the CI-polling snapshot at re-acquire time matches the
+    pre-release snapshot exactly, the lock must succeed and return the
+    Task — peer made no observable change in the unlocked window."""
+    from app.orchestrator import _capture_ci_polling_snapshot, _lock_task_for_mutation
+
+    project = Project(name="ci snapshot match", user_id="user-ci-match")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "pr_number": 100,
+                "ci_passed": False,
+                "review_approved": False,
+                "iteration": 1,
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    pre_snapshot = _capture_ci_polling_snapshot(task)
+
+    locked = await _lock_task_for_mutation(
+        db_session, task.id,
+        allowed_statuses=(TaskStatus.EVALUATING,),
+        reason="ci snapshot match test",
+        expected_snapshot=pre_snapshot,
+        snapshot_fn=_capture_ci_polling_snapshot,
+    )
+    assert locked is not None, (
+        "Expected lock success when snapshot matches; got None — the validator "
+        "false-tripped on an unchanged row."
+    )
+    assert locked.id == task.id
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_lock_with_mutated_status_defers(db_session):
+    """When a peer transitions ``status`` (e.g. EVALUATING → COMPLETED on
+    PR merge) during the unlocked window, the CI-polling re-lock must
+    detect the mismatch via the snapshot and return None so the caller
+    skips applying stale CI-polling mutations on top of the peer's
+    state-machine advance."""
+    from app.orchestrator import _capture_ci_polling_snapshot, _lock_task_for_mutation
+
+    project = Project(name="ci snapshot status mutate", user_id="user-ci-status")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "pr_number": 200,
+                "ci_passed": False,
+                "review_approved": False,
+                "iteration": 1,
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Forge a snapshot claiming status was COMPLETED while the row is
+    # still EVALUATING — the unit-level analog of "peer transitioned
+    # status during my unlocked window".
+    stale_snapshot = {
+        "status": TaskStatus.COMPLETED,
+        "pr_number": 200,
+        "ci_passed": False,
+        "review_approved": False,
+        "iteration": 1,
+    }
+    locked = await _lock_task_for_mutation(
+        db_session, task.id,
+        allowed_statuses=(TaskStatus.EVALUATING,),
+        reason="ci snapshot status mutate test",
+        expected_snapshot=stale_snapshot,
+        snapshot_fn=_capture_ci_polling_snapshot,
+    )
+    assert locked is None, (
+        "Expected None when snapshot's status field doesn't match the row — "
+        "CI polling must defer on peer status transitions."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,old_value,new_value",
+    [
+        ("pr_number", 300, 301),
+        ("ci_passed", False, True),
+        ("review_approved", False, True),
+        ("iteration", 1, 2),
+    ],
+)
+async def test_lock_with_mutated_review_loop_field_defers(
+    db_session, field, old_value, new_value,
+):
+    """When any review_loop field tracked by the snapshot moves during
+    the unlocked window, the re-lock must defer (return None). Each of
+    the 4 review_loop fields is independently load-bearing: a peer
+    advancing iteration, flipping ci_passed/review_approved, or moving
+    to a new PR all signal the review pipeline took a step under us.
+
+    The snapshot pair captures the *observed* (old) value at release
+    time; if the row's actual value has moved to (new), the re-lock
+    must return None.
+    """
+    from app.orchestrator import _capture_ci_polling_snapshot, _lock_task_for_mutation
+
+    project = Project(name=f"ci snapshot {field} mutate", user_id="user-ci-rl")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "pr_number": 300,
+                "ci_passed": False,
+                "review_approved": False,
+                "iteration": 1,
+                field: new_value,  # Row carries the *new* value
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Caller's pre-release snapshot still reflects the OLD value for the
+    # mutated field. The other fields match so we isolate the per-field
+    # check.
+    stale_snapshot = {
+        "status": TaskStatus.EVALUATING,
+        "pr_number": 300,
+        "ci_passed": False,
+        "review_approved": False,
+        "iteration": 1,
+        field: old_value,
+    }
+    locked = await _lock_task_for_mutation(
+        db_session, task.id,
+        allowed_statuses=(TaskStatus.EVALUATING,),
+        reason=f"ci snapshot {field} mutate test",
+        expected_snapshot=stale_snapshot,
+        snapshot_fn=_capture_ci_polling_snapshot,
+    )
+    assert locked is None, (
+        f"Expected None when review_loop.{field} moved {old_value!r} -> "
+        f"{new_value!r}; got a Task. The CI-polling snapshot validator "
+        f"is missing the {field} field."
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_with_only_heartbeat_change_succeeds(db_session):
+    """The whole point of the content snapshot (vs. ``updated_at``):
+    heartbeat-only mutations advance ``updated_at`` and ``last_heartbeat``
+    via ``onupdate=_utcnow`` but leave the 5 CI-polling fields untouched,
+    so the re-lock must succeed.
+
+    Mirror of ``test_relock_parent_ignores_heartbeat_only_changes``
+    (rollup-management variant) — pinned for the orchestrator's CI-
+    polling helper too. Without this, every overlapping heartbeat would
+    false-defer the CI poll loop and the whole review pipeline would
+    stall under load.
+    """
+    from app.orchestrator import _capture_ci_polling_snapshot, _lock_task_for_mutation
+
+    project = Project(name="ci snapshot heartbeat", user_id="user-ci-hb")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create"}],
+        context={
+            "review_loop": {
+                "pr_number": 400,
+                "ci_passed": False,
+                "review_approved": False,
+                "iteration": 1,
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    pre_snapshot = _capture_ci_polling_snapshot(task)
+    pre_updated_at = task.updated_at
+
+    # Simulate a heartbeat: bump last_heartbeat. The ``onupdate=_utcnow``
+    # trigger advances ``updated_at`` (the field the legacy validator
+    # checked); the content snapshot stays unchanged.
+    await asyncio.sleep(0.01)
+    task.last_heartbeat = datetime.utcnow()
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    if task.updated_at == pre_updated_at:
+        pytest.skip(
+            "onupdate did not advance updated_at within the test window — "
+            "cannot exercise the heartbeat-overlap regression."
+        )
+
+    locked = await _lock_task_for_mutation(
+        db_session, task.id,
+        allowed_statuses=(TaskStatus.EVALUATING,),
+        reason="ci snapshot heartbeat overlap test",
+        expected_snapshot=pre_snapshot,
+        snapshot_fn=_capture_ci_polling_snapshot,
+    )
+    assert locked is not None, (
+        "Heartbeat-only mutation false-tripped the CI-polling snapshot validator. "
+        "The 5-field snapshot must NOT include heartbeat-mutated fields (R5-W2-A)."
+    )
+    await db_session.rollback()
+
+
 # ── R5-W3-B context_dirty regression (R6 audit) ─────────────────────────────
 
 
