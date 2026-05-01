@@ -359,9 +359,16 @@ step "Done"
 cat <<DONE
 Cutover complete. Next steps when you're confident things are stable (24-48h):
   1. Remove infra/terraform/alloydb.tf
-  2. terraform apply  (destroys AlloyDB cluster — saves ~\$15/day)
-  3. Optionally: gcloud secrets delete alloydb-postgres-password
-  4. Disable old DATABASE_URL versions:
+  2. Remove the 'alloydb_cpu_high' alert resource block from infra/terraform/monitoring.tf
+     (R4-W4 M7, audit 2026-04-29: the alert filter targets resource.type
+     "alloydb.googleapis.com/Instance" which won't exist post-teardown —
+     the alert is not auto-deleted by removing alloydb.tf because Cloud
+     Monitoring filters are literal strings, not Terraform resource refs.
+     If left in place it persists as a no-op zero-series policy in the
+     monitoring console forever.)
+  3. terraform apply  (destroys AlloyDB cluster — saves ~\$15/day)
+  4. Optionally: gcloud secrets delete alloydb-postgres-password
+  5. Disable old DATABASE_URL versions:
      gcloud secrets versions list DATABASE_URL --project=$PROJECT_ID
      # for each version-number prior to today's swap:
      gcloud secrets versions disable <N> --secret=DATABASE_URL

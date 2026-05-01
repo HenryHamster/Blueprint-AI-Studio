@@ -104,11 +104,33 @@ resource "google_cloud_run_v2_service" "orchestrator" {
   # (containers, volumes, scaling, vpc_access); CI tracks the env-var
   # *content*. Drift between cloudbuild.yaml and this file is reviewable
   # in source control because both are checked in.
+  #
+  # ============================================================
+  # WARNING TO OPERATORS — env-var changes here are SILENTLY IGNORED
+  # ============================================================
+  # `template[0].containers[0].env` is on ignore_changes. That means:
+  #   - Adding a new `env { name = "X" value = "y" }` block in this file
+  #     will NOT push that variable to the running Cloud Run revision.
+  #   - `terraform plan` may even show "no changes" for env-var edits.
+  #
+  # To actually add or modify a Cloud Run env var:
+  #   1. Edit `backend/cloudbuild.yaml`'s `--set-env-vars` argument list
+  #      (THIS is what the deploy step runs and it owns env-var content).
+  #   2. OPTIONALLY mirror the new var here in this file for documentation
+  #      (drift-readability — operators reading cloud_run.tf can see what
+  #      the running service has).
+  #
+  # Do NOT expect `terraform apply` to update env vars on the running
+  # revision. The shadow declarations in this file exist only so terraform
+  # plan stays clean against the existing state. See R3-W4 (audit
+  # 2026-04-30) and R4-W4 M6 (audit 2026-04-29) for the ownership rationale.
+  # ============================================================
   lifecycle {
     ignore_changes = [
       template[0].containers[0].image,
-      template[0].containers[0].env, # CI deploys via cloudbuild.yaml own the env-var set;
-      # Terraform tracks structure, CI tracks content. See R3-W4 (audit 2026-04-30).
+      # See WARNING block above — env-var changes in this file are silently
+      # ignored. The authoritative source is cloudbuild.yaml's --set-env-vars.
+      template[0].containers[0].env,
     ]
   }
 }

@@ -9,14 +9,22 @@
 # operator manually re-built the URL. This script does the full chain.
 #
 # Walk:
-#   1. terraform taint random_password.cloud_sql_db_password
+#   1. terraform taint 'random_password.cloud_sql_db_password[0]'
 #   2. terraform apply -var="use_cloud_sql=true"  (regenerates pw + secret version)
 #   3. Read NEW pw from Secret Manager
 #   4. Read Cloud SQL private IP from terraform output
-#   5. URL-encode pw and construct new postgresql+asyncpg URL
-#   6. Add new DATABASE_URL secret version
-#   7. Force Cloud Run to a new revision (re-pin current image)
-#   8. Poll for the new revision to report Ready=True
+#   5. Verify the rotated pw authenticates against Cloud SQL (live SELECT 1)
+#   6. URL-encode pw and construct new postgresql+asyncpg URL
+#   7. Add new DATABASE_URL secret version  (POINT OF NO RETURN — operator confirm)
+#   8. Force Cloud Run to a new revision (re-pin current image)
+#   9. Poll for the new revision to report Ready=True
+#
+# Failure handling: ERR trap (set immediately below) covers steps 1-6 with a
+# manual-recovery message that explains how to complete the rotation if
+# terraform apply or the live-auth check fails. The trap is disarmed once
+# the operator confirms the DATABASE_URL secret-version add (step 7) — past
+# that the rotation is committed and any error is a "retry the swap"
+# situation, not a "the rotation broke things" situation.
 #
 # Pre-requisites:
 #   - terraform apply -var="use_cloud_sql=true" (Cloud SQL must already exist)
@@ -37,6 +45,22 @@
 #   shred -u /tmp/prev.url
 
 set -euo pipefail
+
+# R4-W4 H8 (audit 2026-04-29): if any step fails after the taint has been
+# accepted but before terraform apply succeeds, the operator is left with
+# state that says "regenerate" but on-disk SQL user / DATABASE_URL secret
+# untouched. Print explicit recovery instructions so the operator doesn't
+# layer a panic-fix on top of a half-rotation.
+trap 'rc=$?; echo; echo "ROTATION FAILED at line $LINENO (exit $rc). Manual recovery:"; \
+      echo "  1. Run: terraform -chdir=$TERRAFORM_DIR apply -auto-approve -var=\"use_cloud_sql=true\""; \
+      echo "     (idempotent — completes the rotation if state is partial)"; \
+      echo "  2. Verify the new password is live: gcloud secrets versions access latest \\"; \
+      echo "     --secret=cloud-sql-postgres-password --project=$PROJECT_ID"; \
+      echo "     should match what the SQL user authenticates with."; \
+      echo "  3. DO NOT add a new DATABASE_URL secret version until step 2 succeeds and SQL auth works."; \
+      echo "  4. After auth confirmed, re-run this script — taint is idempotent on a fresh password,"; \
+      echo "     and the secret-version-add steps below have a final confirm gate."; \
+      exit $rc' ERR
 
 PROJECT_ID="${PROJECT_ID:-}"
 REGION="${REGION:-us-central1}"
@@ -67,7 +91,11 @@ if ! confirm "Rotate the Cloud SQL DB password and refresh DATABASE_URL? Cloud R
 fi
 
 step "1. Taint random_password.cloud_sql_db_password"
-terraform -chdir="$TERRAFORM_DIR" taint random_password.cloud_sql_db_password
+# R4-W4 H7 (audit 2026-04-29): the resource is declared with `count = var.use_cloud_sql ? 1 : 0`
+# in cloud_sql.tf, so the address is `random_password.cloud_sql_db_password[0]`.
+# The bare-name taint command was broken-on-arrival ("resource not found").
+# Quote the brackets so the shell doesn't try to glob them.
+terraform -chdir="$TERRAFORM_DIR" taint 'random_password.cloud_sql_db_password[0]'
 
 step "2. terraform apply -var=\"use_cloud_sql=true\""
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve -var="use_cloud_sql=true"
@@ -92,7 +120,51 @@ if [[ -z "$CLOUDSQL_IP" ]]; then
 fi
 echo "Cloud SQL IP: $CLOUDSQL_IP"
 
-step "5. URL-encode password and construct new DATABASE_URL"
+step "5. Verify the rotated password authenticates against Cloud SQL"
+# R4-W4 H8 (audit 2026-04-29): the prior version of this script jumped from
+# "secret value read" straight to "DATABASE_URL secret-version add". If
+# terraform apply rotated the random_password and updated cloud-sql-postgres-password
+# but the Cloud SQL user UPDATE failed silently (e.g. the google_sql_user
+# resource hit an API hiccup), we'd ship a DATABASE_URL that no longer
+# authenticates and Cloud Run would crashloop on the next revision.
+#
+# Strategy: try a lightweight `SELECT 1` from this workstation through the
+# Cloud SQL Auth Proxy (`gcloud sql connect`). If it succeeds we know the
+# rotated password is actually live on the SQL user. If it fails, the ERR
+# trap fires with recovery instructions and we never write the new
+# DATABASE_URL version.
+#
+# Note: `gcloud sql connect` requires that the operator's workstation has
+# its public IP in the instance's authorized_networks OR the Cloud SQL
+# Auth Proxy is running. Both are workstation-side concerns; this script
+# stays in-band and trusts the operator has connectivity.
+CLOUDSQL_INSTANCE="$(terraform -chdir="$TERRAFORM_DIR" output -raw cloud_sql_instance_name 2>/dev/null || true)"
+if [[ -z "$CLOUDSQL_INSTANCE" ]]; then
+  echo "WARNING: cloud_sql_instance_name terraform output is empty. Skipping live-auth verification."
+  echo "         (The rotation may still be valid, but if it isn't, the DATABASE_URL swap below will be irreversible without rollback.)"
+  if ! confirm "Continue without live-auth check?"; then
+    exit 1
+  fi
+else
+  echo "Verifying rotated password against $CLOUDSQL_INSTANCE..."
+  # PGPASSWORD is the standard libpq env var; gcloud sql connect honors it
+  # and forwards to psql. Avoid argv exposure of the password.
+  if ! PGPASSWORD="$NEW_PW" gcloud sql connect "$CLOUDSQL_INSTANCE" \
+        --user=postgres --database=postgres --quiet --project="$PROJECT_ID" \
+        <<< "SELECT 1;" >/dev/null 2>&1; then
+    echo "ERROR: the rotated password does NOT authenticate against $CLOUDSQL_INSTANCE." >&2
+    echo "       Possible causes:" >&2
+    echo "         - terraform apply succeeded on the random_password resource but the" >&2
+    echo "           google_sql_user UPDATE failed (re-run terraform apply)." >&2
+    echo "         - gcloud sql connect cannot reach the instance from this workstation" >&2
+    echo "           (check authorized_networks or use the Cloud SQL Auth Proxy)." >&2
+    echo "       NOT writing a new DATABASE_URL secret version — old one still authoritative." >&2
+    exit 1
+  fi
+  echo "Live-auth check passed."
+fi
+
+step "6. URL-encode password and construct new DATABASE_URL"
 # URL-encode for defense-in-depth even though override_special is URL-safe.
 # Append ?ssl=require so asyncpg requests TLS (server-side enforced via
 # ssl_mode=ENCRYPTED_ONLY).
@@ -105,17 +177,28 @@ NEW_URL="postgresql+asyncpg://postgres:${ENCODED_PW}@${CLOUDSQL_IP}:5432/postgre
 NEW_PW=""
 ENCODED_PW=""
 
-step "6. Add new DATABASE_URL secret version"
-if ! confirm "Add new DATABASE_URL secret version? (Cloud Run will pick it up on next revision.)"; then
-  echo "Aborting before secret swap. The old DATABASE_URL still works against the rotated password ONLY if Cloud Run has not yet recycled — once it does, connections will fail. Re-run this script."
-  exit 1
+step "7. Add new DATABASE_URL secret version"
+# R4-W4 H8 (audit 2026-04-29): point-of-no-return gate. Terraform apply
+# has succeeded AND the rotated password is verified to authenticate. From
+# this point forward, writing a new DATABASE_URL secret version is the
+# operator-driven irreversible commit. Disable the ERR trap here so a
+# transient `gcloud secrets versions add` failure surfaces a different
+# message (the rotation succeeded; only the secret swap failed, retry that
+# specific step manually).
+if ! confirm "POINT OF NO RETURN: Add new DATABASE_URL secret version? Cloud Run will read the new URL on the next revision boot."; then
+  echo "Aborting before DATABASE_URL swap. The rotated password is live on the SQL user;"
+  echo "the OLD DATABASE_URL will continue to authenticate. To finish the rotation later,"
+  echo "re-run this script — it will detect state is partial and complete the swap."
+  trap - ERR  # operator-driven abort, not a script failure
+  exit 0
 fi
+trap - ERR  # post-confirm: failures here are not "rotation broke", they're "secret-add retry"
 printf '%s' "$NEW_URL" | gcloud secrets versions add DATABASE_URL --data-file=- --project="$PROJECT_ID"
 echo "Added. Prior versions remain accessible for rollback:"
 gcloud secrets versions list DATABASE_URL --project="$PROJECT_ID" --limit=3
 NEW_URL=""
 
-step "7. Force Cloud Run to pick up the new secret"
+step "8. Force Cloud Run to pick up the new secret"
 # Cloud Run pulls --set-secrets values at instance startup; re-pinning the
 # current image forces a new revision without leaving any persistent
 # rotation-only env vars in the revision YAML (env mutations would survive
@@ -132,7 +215,7 @@ gcloud run services update blueprint-orchestrator \
   --image="$CURRENT_IMAGE" \
   --project="$PROJECT_ID"
 
-step "8. Poll for new revision to become Ready"
+step "9. Poll for new revision to become Ready"
 for i in {1..24}; do
   REVISION="$(gcloud run services describe blueprint-orchestrator \
     --region="$REGION" --format='value(status.latestReadyRevisionName)' \

@@ -185,7 +185,7 @@ resource "google_monitoring_alert_policy" "cloudsql_up" {
 resource "google_logging_metric" "cloud_sql_backup_failure" {
   count       = local.alerting_enabled ? 1 : 0
   name        = "cloud_sql_backup_failure"
-  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3, R3-W4 M6)."
+  description = "Count of failed Cloud SQL backup operations from audit logs (Wave F4 M3, R3-W4 M6, R4-W4 M8)."
   # R3-W4 M6 (audit 2026-04-30): broadened from the original
   # `cloudsql.instances.backup.*` regex, which missed the actual method
   # names Cloud SQL emits in audit logs. Real method names include:
@@ -197,13 +197,28 @@ resource "google_logging_metric" "cloud_sql_backup_failure" {
   # required because Cloud Logging filter syntax interprets `.` as
   # any-character; we want literal `.` matches between method-name
   # segments.
+  #
+  # R4-W4 M8 (audit 2026-04-29): severity widened from `ERROR` to
+  # `(ERROR OR WARNING)`. Cloud SQL emits backup-termination events at
+  # severity=WARNING for transient causes (e.g. temporary IO contention,
+  # maintenance-window collision) that still leave the recovery window
+  # unhealthy. With ERROR-only filtering, those incidents went unnoticed
+  # and were only caught when the next-day backup also failed and the
+  # operator hit the 7-day retention floor. The false-positive cost
+  # (alert pings for a transient WARNING that self-recovers) is
+  # acceptable — the alert documentation directs the operator to verify
+  # via `gcloud sql backups list`, which surfaces the actual recovery
+  # window in seconds. A real-failed-backup test in the next restore
+  # drill should validate the regex captures both severity bands; if
+  # WARNING-only events are too noisy, narrow back to ERROR with a note
+  # that transient WARNING-only failures will be missed.
   filter = <<-EOT
     resource.type="cloudsql_database"
     AND (
       protoPayload.methodName=~"cloudsql\.instances\.(create)?[Bb]ackup.*"
       OR protoPayload.methodName=~"cloudsql\.backupRuns\.(insert|create)"
     )
-    AND severity=ERROR
+    AND (severity=ERROR OR severity=WARNING)
   EOT
   metric_descriptor {
     metric_kind = "DELTA"
@@ -235,7 +250,7 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
   notification_channels = [google_monitoring_notification_channel.email[0].id]
 
   documentation {
-    content   = "Cloud SQL emitted a backup-failure event. The 7-day retention of `cloudsql_backups` means a single failure is recoverable, but two consecutive failures shrink the recoverable window. Runbook: docs/db-operations.md (Restore procedure) — verify the instance is healthy and re-trigger via `gcloud sql backups create --instance=<name>`."
+    content   = "Cloud SQL emitted a backup-failure event (severity=ERROR or WARNING). The 7-day retention of `cloudsql_backups` means a single failure is recoverable, but two consecutive failures shrink the recoverable window. R4-W4 M8 (audit 2026-04-29): severity was widened to include WARNING, so this alert may fire on transient backup terminations that self-recover — verify the actual recovery window via `gcloud sql backups list --instance=<name>` before declaring an outage. Runbook: docs/db-operations.md (Restore procedure) — verify the instance is healthy and re-trigger via `gcloud sql backups create --instance=<name>`."
     mime_type = "text/markdown"
   }
 }
