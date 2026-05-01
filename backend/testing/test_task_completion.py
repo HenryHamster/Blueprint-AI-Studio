@@ -47,7 +47,7 @@ from app.task_completion import (
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
-from app.models import Alert, AlertSeverity, TaskStatus
+from app.models import Alert, AlertSeverity, Task, TaskStatus
 from sqlalchemy import select as _sa_select
 from testing.factories import make_project, make_task
 
@@ -500,15 +500,18 @@ class TestEnsureBranch:
             return_value=None,
         )
 
-        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+        # R4-W1 (audit C2): _ensure_branch returns Task | None.
+        # Success returns the freshly-locked Task instance.
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
 
-        assert ok is True
+        assert relocked is not None
+        assert isinstance(relocked, Task)
         # Only source-branch SHA lookup + create, no verify path
         assert get_sha.await_count == 1
         assert create.await_count == 1
         # First attempt: force_refresh must be False
         assert get_token.await_args.kwargs.get("force_refresh") is False
-        assert task.status != TaskStatus.FAILED
+        assert relocked.status != TaskStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_transient_verify_error_does_not_short_circuit(
@@ -547,11 +550,12 @@ class TestEnsureBranch:
             side_effect=[RuntimeError("boom"), None],
         )
 
-        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
 
-        assert ok is True
+        # R4-W1 (audit C2): success returns the relocked Task instance.
+        assert relocked is not None
         assert get_sha.await_count == 3
-        assert task.status != TaskStatus.FAILED
+        assert relocked.status != TaskStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_force_refresh_on_retry(self, db_session, mocker, _patch_ensure_branch_deps):
@@ -586,9 +590,10 @@ class TestEnsureBranch:
             side_effect=[RuntimeError("down"), None],
         )
 
-        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
 
-        assert ok is True
+        # R4-W1 (audit C2): success returns the relocked Task instance.
+        assert relocked is not None
         # Attempt 0: force_refresh=False; attempt 1: force_refresh=True
         refresh_flags = [
             c.kwargs.get("force_refresh") for c in get_token.await_args_list
@@ -625,12 +630,13 @@ class TestEnsureBranch:
             side_effect=HTTPException(status_code=422, detail="reference exists"),
         )
 
-        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+        relocked = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
 
-        assert ok is True
+        # R4-W1 (audit C2): success returns the relocked Task instance.
+        assert relocked is not None
         assert create.await_count == 1
         assert get_sha.await_count == 2
-        assert task.status != TaskStatus.FAILED
+        assert relocked.status != TaskStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_failure_after_all_retries_marks_task_failed(
@@ -664,9 +670,11 @@ class TestEnsureBranch:
             "app.main._maybe_create_failure_alert", new_callable=AsyncMock
         )
 
-        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+        result = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
 
-        assert ok is False
+        # R4-W1 (audit C2): failure returns None and marks the task FAILED.
+        assert result is None
+        await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED
         assert "Failed to create plan branch" in (task.latest_status_message or "")
         assert alert.await_count == 1
@@ -693,9 +701,11 @@ class TestEnsureBranch:
             "app.task_completion.get_branch_sha", new_callable=AsyncMock
         )
 
-        ok = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
+        result = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
 
-        assert ok is False
+        # R4-W1 (audit C2): failure returns None and marks the task FAILED.
+        assert result is None
+        await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED
         # Token fetch failed before any GitHub call — verify was never reached.
         assert get_sha.await_count == 0
@@ -4113,7 +4123,6 @@ class TestPlanSubtaskScopeAwareEffort:
         return json.dumps({"subtasks": subtasks})
 
     async def _setup_plan_task(self, db_session, mocker, parent_effort="medium"):
-        mocker.patch("app.task_completion._ensure_branch", new_callable=AsyncMock, return_value=True)
         mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
         mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
@@ -4128,6 +4137,15 @@ class TestPlanSubtaskScopeAwareEffort:
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
+        # R4-W1 (audit C2): _ensure_branch now returns Task | None on
+        # success/failure (was bool). Patch to return the task instance
+        # to mimic the success path. The function is imported lazily
+        # inside _handle_plan_completion, so patch the source module.
+        mocker.patch(
+            "app.task_completion._ensure_branch",
+            new_callable=AsyncMock,
+            return_value=task,
+        )
         return task
 
     async def _child_tasks(self, db_session, parent_task):

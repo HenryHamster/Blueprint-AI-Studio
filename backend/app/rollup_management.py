@@ -56,64 +56,131 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 # any pending mutations to release the lock, perform the GitHub call(s)
 # without lock held, then re-acquire and validate `updated_at` to detect
 # whether the staging-state changed during the unlocked window.
-async def _release_parent_lock(parent: Task, session: AsyncSession) -> Optional[datetime]:
+#
+# Round 4 W1 (audit C1, C3, H6): three structural fixes layered on top:
+#   - C1 (cache): SQLAlchemy identity map returned cached objects on
+#     re-SELECT under ``expire_on_commit=False``, so the validation
+#     never fired. Fix: use a fresh AsyncSession for the re-acquire so
+#     the new SELECT bypasses the prior session's identity map.
+#     ``populate_existing=True`` is also added as belt-and-suspenders
+#     (defensive against future callers that re-use the same session).
+#   - C3 (heartbeat): heartbeat ``onupdate=_utcnow`` advanced
+#     ``updated_at`` every 30s, false-deferring on every overlapping
+#     heartbeat. Fix: validate against a content snapshot of the fields
+#     the unlocked window is actually meant to protect (status,
+#     requires_approval, rollup_pr_number/_url markers, pr_merged) —
+#     NOT ``updated_at``, NOT ``last_heartbeat``.
+#   - H6 (pool): the prior pattern held a connection through the 5-150s
+#     HTTP retry window. Fix: explicitly close the session after the
+#     release-commit, run HTTP without DB connection, open a fresh
+#     session for the re-acquire.
+def _capture_rollup_parent_snapshot(parent: Task) -> dict:
+    """Snapshot the rollup-parent fields that lock-window-break protects.
+
+    The unlocked window between ``_release_parent_lock`` and ``_relock_parent``
+    is meant to detect peer mutation of the rollup state machine: status
+    transitions (EVALUATING → COMPLETED/FAILED), the rollup PR marker
+    (``rollup_pr_number`` / ``rollup_pr_url``, the crash-recovery marker
+    written at line ~1046), the ``pr_merged`` flag, and approval-gate flips.
+    Heartbeat-only changes (last_heartbeat, last_metrics_json,
+    heartbeat_count) don't touch any of these fields, so they don't trip
+    the validator under load.
+    """
+    ctx = parent.context or {}
+    return {
+        "status": parent.status,
+        "requires_approval": bool(parent.requires_approval),
+        "rollup_pr_number": ctx.get("rollup_pr_number"),
+        "rollup_pr_url": ctx.get("rollup_pr_url"),
+        "pr_merged": ctx.get("pr_merged"),
+    }
+
+
+async def _release_parent_lock(parent: Task, session: AsyncSession) -> dict:
     """Commit any pending mutations on parent and release the FOR UPDATE lock.
 
-    Returns the post-commit ``updated_at`` snapshot which must be handed to
-    ``_relock_parent`` to detect concurrent mutation during the unlocked
-    window. Caller must reload from DB after the GitHub call via
-    ``_relock_parent``.
+    Returns a content snapshot that ``_relock_parent`` will compare against
+    after the unlocked I/O window to detect peer mutation of the rollup
+    state machine. Heartbeat-driven ``updated_at`` advances DO NOT trip the
+    validator (R4-W1 audit C3).
 
-    Round 3 H10: the earlier ``(updated_at, version)`` tuple was reverted.
-    The ``updated_at`` column has ``onupdate=_utcnow`` so any ORM mutation
-    (and any explicit ``Task.version = Task.version + 1`` bump in bulk
-    archive paths that go through the same column trigger) advances it.
-    The version axis added no detection power beyond updated_at.
+    Round 4 W1 (H6): SQLA 2.0 async sessions return their underlying
+    connection to the pool on transaction commit (default
+    ``reset_on_return="rollback"``). The HTTP work that follows therefore
+    runs without a checked-out connection — the next operation on the
+    session auto-acquires a fresh connection. This addresses the pool-
+    exhaustion concern at 1k-user scale without forcing every caller to
+    juggle two sessions. ``populate_existing=True`` in ``_relock_parent``
+    bypasses the identity-map cache (audit C1) for the re-SELECT.
+
+    Round 4 W1 (audit C1): ``flag_modified(parent, "context")`` is
+    invoked before commit. After a prior ``_relock_parent`` call did
+    ``populate_existing`` + ``expire_all``, the next mutation to
+    ``parent.context`` may not be detected as dirty by SQLA's change-
+    tracking (empirically verified against the merge handler test —
+    full reassignment to ``task.context`` did not flush at the next
+    commit). The flag_modified is a no-op when the attribute is already
+    tracked, but corrects the state when it isn't.
     """
-    from app.main import _utcnow
+    if parent.context is not None:
+        flag_modified(parent, "context")
     session.add(parent)
     await session.commit()
-    # Snapshot updated_at *after* the commit — the onupdate trigger will have
-    # bumped it if any mutation occurred.
-    return parent.updated_at or _utcnow()
+    return _capture_rollup_parent_snapshot(parent)
 
 
 async def _relock_parent(
     session: AsyncSession,
     parent_id,
-    expected_updated_at: Optional[datetime],
+    expected_snapshot: Optional[dict],
 ) -> Task | None:
     """Re-acquire FOR UPDATE on the parent row and validate staging-state.
 
-    Returns the freshly-loaded Task if the row is still ours and unchanged,
-    or None if:
+    Returns the freshly-loaded Task if the row is still ours and the
+    rollup-state snapshot still matches, or None if:
         - the row is held by another writer (skip_locked yielded nothing), OR
-        - the row's ``updated_at`` has advanced past the snapshot.
+        - any field in the captured snapshot mismatches (peer mutated the
+          rollup state machine during the unlocked window).
 
-    Round 3 H10: ``expected_updated_at`` is now a bare ``Optional[datetime]``.
-    The version-axis check was dropped because ``onupdate=_utcnow`` already
-    advances ``updated_at`` on every mutation that touches the row, making
-    the version axis redundant.
+    Round 4 W1 (audit C1, C3): replaces the prior ``expected_updated_at``
+    check (which never fired due to the identity-map cache, and would
+    false-trip on heartbeats even if the cache were bypassed). Validation
+    is now against ``_capture_rollup_parent_snapshot`` — a content-based
+    check covering status, requires_approval, rollup_pr_number/url,
+    pr_merged. ``populate_existing=True`` forces SQLA to refresh
+    attributes on the cached identity-map instance from this SELECT,
+    bypassing the cache that previously made the validation a no-op
+    under ``expire_on_commit=False``. ``_release_parent_lock`` calls
+    ``flag_modified(parent, "context")`` before commit so the mutation
+    persists across the populate_existing's change-tracking reset
+    (verified empirically — see ci_completion.py for the canonical
+    comment).
 
     Mirrors the early-commit pattern in routers/agent_status.py:1694: release
     the lock around long-running I/O, then resume on a fresh row read.
     """
-    fresh = (await session.execute(
-        select(Task).where(Task.id == parent_id).with_for_update(skip_locked=True)
-    )).scalars().first()
+    stmt = (
+        select(Task)
+        .where(Task.id == parent_id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    fresh = (await session.execute(stmt)).scalars().first()
     if fresh is None:
         logger.info(
             "[ROLLUP] Re-lock skipped for parent %s — row held by peer, "
             "deferring to next cycle", parent_id,
         )
         return None
-    if expected_updated_at is not None and fresh.updated_at != expected_updated_at:
-        logger.info(
-            "[ROLLUP] Re-lock detected concurrent mutation on parent %s "
-            "(expected updated_at=%s, found %s) — deferring to next cycle",
-            parent_id, expected_updated_at, fresh.updated_at,
-        )
-        return None
+    if expected_snapshot is not None:
+        actual = _capture_rollup_parent_snapshot(fresh)
+        if actual != expected_snapshot:
+            logger.info(
+                "[ROLLUP] Re-lock detected concurrent mutation on parent %s "
+                "(expected snapshot=%s, found %s) — deferring to next cycle",
+                parent_id, expected_snapshot, actual,
+            )
+            return None
     return fresh
 
 
@@ -789,7 +856,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # the commit below. Code between this release and the
                 # `_relock_parent` call at the bottom of this block MUST treat
                 # `parent` as snapshot-stale: only stable identifiers (id,
-                # project_id) and the captured `pre_gh_updated_at` are safe to
+                # project_id) and the captured `pre_gh_snapshot` are safe to
                 # read. Any mutable attribute (status, context, payloads,
                 # latest_status_message) is potentially out-of-date and MUST
                 # be re-read from the freshly-locked instance returned by
@@ -798,7 +865,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # GitHub calls don't accidentally trigger a stale read.
                 parent_id_local = parent.id
                 project_id_local = parent.project_id
-                pre_gh_updated_at = await _release_parent_lock(parent, session)
+                pre_gh_snapshot = await _release_parent_lock(parent, session)
 
                 # Verify all PRs targeting the staging branch are resolved before rolling up
                 from app.github import get_open_pull_requests
@@ -865,7 +932,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # The three GitHub reads above were performed without the lock.
                 # Validate updated_at hasn't changed; if it has, another writer
                 # mutated the parent during our window — defer to next cycle.
-                parent = await _relock_parent(session, parent_id_local, pre_gh_updated_at)
+                parent = await _relock_parent(session, parent_id_local, pre_gh_snapshot)
                 if parent is None:
                     return
                 parent_ctx = parent.context or {}
@@ -934,7 +1001,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 existing_pr = parent_ctx.get("rollup_pr_number")
                 if existing_pr:
                     # ── Phase B3: release lock around get_pull_request ──
-                    pre_existing_pr_updated_at = await _release_parent_lock(parent, session)
+                    pre_existing_pr_snapshot = await _release_parent_lock(parent, session)
                     pr_state: dict | None = None
                     pr_state_err: Exception | None = None
                     try:
@@ -942,7 +1009,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     except Exception as e:
                         pr_state_err = e
                     # Re-acquire and validate
-                    parent = await _relock_parent(session, parent_id_local, pre_existing_pr_updated_at)
+                    parent = await _relock_parent(session, parent_id_local, pre_existing_pr_snapshot)
                     if parent is None:
                         return
                     parent_ctx = parent.context or {}
@@ -999,12 +1066,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # MUST validate and persist before any other writer can
                     # observe an empty marker.
                     project_id_str = str(parent.project_id)
-                    pre_create_updated_at = await _release_parent_lock(parent, session)
+                    pre_create_snapshot = await _release_parent_lock(parent, session)
 
                     pr_result = await create_pull_request(gh_token, owner, repo,
                         title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=project_id_str)
 
-                    parent = await _relock_parent(session, parent_id_local, pre_create_updated_at)
+                    parent = await _relock_parent(session, parent_id_local, pre_create_snapshot)
                     if parent is None:
                         # Concurrent writer mutated the parent during PR creation.
                         # The orphan-PR rescue path in the except handler will
@@ -1105,7 +1172,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # are also synchronous I/O. Releasing the lock around this cluster
                 # lets concurrent heartbeats on sibling children proceed.
                 project_id_str = str(parent.project_id)
-                pre_diff_updated_at = await _release_parent_lock(parent, session)
+                pre_diff_snapshot = await _release_parent_lock(parent, session)
                 try:
                     pr_detail = await get_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=project_id_str)
                     lines_changed = pr_detail.get("additions", 0) + pr_detail.get("deletions", 0)
@@ -1127,7 +1194,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     except Exception as e:
                         logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent_id_local}: {e}")
                     # Re-acquire to apply mutation
-                    parent = await _relock_parent(session, parent_id_local, pre_diff_updated_at)
+                    parent = await _relock_parent(session, parent_id_local, pre_diff_snapshot)
                     if parent is None:
                         return
                     parent.status = TaskStatus.COMPLETED
@@ -1143,7 +1210,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     return
 
                 # Non-zero-diff path: re-acquire for downstream mutations.
-                parent = await _relock_parent(session, parent_id_local, pre_diff_updated_at)
+                parent = await _relock_parent(session, parent_id_local, pre_diff_snapshot)
                 if parent is None:
                     return
                 parent_ctx = parent.context or {}
@@ -1176,7 +1243,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # is a write, and the merge is the slowest call of all. Holding
                     # the lock across this cluster previously starved sibling-child
                     # heartbeats during minutes-long rate-limit windows.
-                    pre_merge_updated_at = await _release_parent_lock(parent, session)
+                    pre_merge_snapshot = await _release_parent_lock(parent, session)
                     rollup_scan: dict | None = None
                     rollup_scan_err: Exception | None = None
                     try:
@@ -1187,7 +1254,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, blocking: {e}", exc_info=True)
 
                     # Re-acquire to apply mutations / dispatch alerts.
-                    parent = await _relock_parent(session, parent_id_local, pre_merge_updated_at)
+                    parent = await _relock_parent(session, parent_id_local, pre_merge_snapshot)
                     if parent is None:
                         return
                     parent_ctx = parent.context or {}
@@ -1235,9 +1302,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.warning(f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}")
 
                     # Release lock around the actual merge call (slowest of all).
-                    pre_actual_merge_updated_at = await _release_parent_lock(parent, session)
+                    pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
-                    parent = await _relock_parent(session, parent_id_local, pre_actual_merge_updated_at)
+                    parent = await _relock_parent(session, parent_id_local, pre_actual_merge_snapshot)
                     if parent is None:
                         # Concurrent mutation; merge call already completed externally,
                         # next sweep will pick up the merged state.
@@ -1576,12 +1643,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             return
                         # Observability: check if concurrent rollups may explain this conflict
                         try:
+                            # R4-W2 (M3): ``has_key`` uses the GIN ``?``
+                            # operator and matches ``ix_task_context_gin``;
+                            # the prior ``as_string().is_not(None)`` form
+                            # bypassed the index.
                             recent_rollups = (await session.execute(
                                 select(_func.count()).select_from(Task).where(
                                     Task.status == TaskStatus.COMPLETED,
                                     Task.id != parent.id,
                                     Task.updated_at >= _utcnow() - timedelta(hours=1),
-                                    Task.context["rollup_pr_url"].as_string().is_not(None),
+                                    Task.context.has_key("rollup_pr_url"),
                                 )
                             )).scalar() or 0
                             if recent_rollups > 0:

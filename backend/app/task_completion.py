@@ -1532,13 +1532,43 @@ def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:
         start = text.find("[", start + 1)
     return None
 
+# Round 4 W1 (audit C3): content snapshot used by ``_ensure_branch`` for
+# lock-window-break validation. Heartbeat-driven ``updated_at`` advances
+# every 30s and would false-defer under load. Validate against the fields
+# the branch-creation window protects.
+def _capture_branch_creation_snapshot(task: Task) -> dict:
+    """Snapshot the fields the branch-creation lock-window-break protects.
+
+    The window between commit-release and re-acquire is meant to detect
+    peer mutation of the post-plan / post-research status flow. The
+    relevant fields are:
+      - status: must remain EVALUATING (the value the caller advanced to
+        before calling _ensure_branch); a peer transition would invalidate
+        the branch-creation outcome
+      - context.plan_branch / context.research_branch: a peer may have
+        already created the staging branch; we must not overwrite
+    Heartbeat-only updates don't touch any of these.
+    """
+    ctx = task.context or {}
+    return {
+        "status": task.status,
+        "plan_branch": ctx.get("plan_branch"),
+        "research_branch": ctx.get("research_branch"),
+    }
+
+
 async def _ensure_branch(
     task: Task, branch_name: str, source_branch: str,
     label: str, session: AsyncSession
-) -> bool:
+) -> Task | None:
     """Create a branch, or verify it already exists.
 
-    Returns True on success, False on failure (task set to FAILED).
+    Returns:
+        - The freshly-locked Task on success (caller continues mutating
+          under the new lock).
+        - None on failure (task set to FAILED) OR when a peer mutated the
+          row during the unlocked window and we deferred. In both cases
+          the caller should ``return`` without further mutation.
 
     Round 3 H5 (lock-window break): callers (_handle_plan_completion,
     _handle_research_completion) run inside _process_post_commit while
@@ -1548,35 +1578,51 @@ async def _ensure_branch(
     Holding the task lock across that window starves concurrent
     heartbeats and false-orphans the row. We mirror the
     rollup_management.py ``_release_parent_lock`` / ``_relock_parent``
-    pattern: capture ``updated_at`` snapshot, commit-release before the
-    loop, run GitHub calls + sleeps without the lock, then re-acquire
-    with snapshot validation only on the failure path (where we mutate
-    the task to FAILED). Success path returns without re-acquiring —
-    the caller's next mutation re-locks naturally.
+    pattern: capture a content snapshot, commit-release before the loop,
+    run GitHub calls + sleeps without the lock, then re-acquire with
+    snapshot validation.
+
+    Round 4 W1 (audit C1, C2, C3):
+      - C1 (cache): ``populate_existing=True`` on the re-SELECT bypasses
+        the identity-map cache that previously made the staleness
+        validation a no-op under ``expire_on_commit=False``.
+      - C2 (success path): the prior implementation returned True on
+        success WITHOUT re-acquiring the lock. Callers
+        (_handle_plan_completion, _handle_research_completion) then
+        mutated ``task.context`` and committed *as if* locked — but
+        they were not. Fix: success path now also re-acquires FOR UPDATE
+        and returns the fresh Task. Caller swaps its local ``task``
+        binding to the returned instance and proceeds under the new
+        lock. If re-acquire fails (peer holds), return None and let the
+        caller defer (the branch was created, but we couldn't re-lock —
+        the next sweep observes the branch artifact and proceeds).
+      - C3 (heartbeat): the prior ``updated_at`` validation tripped on
+        every overlapping heartbeat. Fix: validate against
+        ``_capture_branch_creation_snapshot`` — content fields only.
     """
     # Deferred import to avoid circular dependency
     from app.main import _maybe_create_failure_alert  # noqa: PLC0415
 
-    # Round 3 H5: snapshot identifiers BEFORE releasing, snapshot
-    # ``updated_at`` AFTER releasing. ``parent_id_local`` mirrors the
-    # snapshot-stale convention from rollup_management.py — between
-    # release and re-acquire, the in-memory ``task`` is detached and
-    # only stable ids are safe to read. ``updated_at`` must be captured
-    # AFTER commit because the lock-release commit itself bumps the
-    # timestamp via ``onupdate=_utcnow``; capturing pre-commit would
-    # always trigger a false "peer mutated" path on re-acquire.
-    # Mirrors the pattern in rollup_management._release_parent_lock.
+    # Round 4 W1: capture snapshot BEFORE the release-commit so the
+    # snapshot reflects the pre-commit content, not the post-commit
+    # ``updated_at`` (which the prior implementation needed but the new
+    # content-based validator does not). ``parent_id_local`` mirrors the
+    # snapshot-stale convention: between release and re-acquire, the
+    # in-memory ``task`` is detached and only stable ids + the captured
+    # snapshot are safe to read.
     parent_id_local = task.id
     parent_task_type = task.first_payload.get("type", "")
     parent_auto_remediation = task.auto_remediation
     parent_context_snapshot = dict(task.context or {})
+    pre_branch_snapshot = _capture_branch_creation_snapshot(task)
     session.add(task)
-    await session.commit()  # release task FOR UPDATE lock
-    pre_branch_updated_at = task.updated_at
+    await session.commit()  # release task FOR UPDATE lock; SQLA returns
+                            # the connection to the pool (audit H6).
 
     max_retries = 5
     gh_token = owner = repo = None
     last_err = None
+    branch_created = False
     for _attempt in range(max_retries):
         try:
             gh_token, owner, repo = await get_github_token_for_task(
@@ -1584,14 +1630,16 @@ async def _ensure_branch(
             sha = await get_branch_sha(gh_token, owner, repo, source_branch)
             await create_branch(gh_token, owner, repo, branch_name, sha)
             logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
-            return True
+            branch_created = True
+            break
         except Exception as e:
             last_err = e
             if gh_token:
                 try:
                     await get_branch_sha(gh_token, owner, repo, branch_name)
                     logger.info(f"[{label}] Branch {branch_name} already exists — reusing")
-                    return True
+                    branch_created = True
+                    break
                 except HTTPException as verify_exc:
                     if verify_exc.status_code == 404:
                         # Branch genuinely doesn't exist — count against attempt budget
@@ -1611,28 +1659,47 @@ async def _ensure_branch(
                     logger.exception(f"[{label}] Branch {branch_name} creation failed after {max_retries} attempts")
                 else:
                     logger.exception(f"[{label}] Cannot create branch — GitHub token unavailable")
-    e = last_err
 
-    # Round 3 H5: re-acquire with snapshot validation before applying the
-    # FAILED mutation. If a peer mutated the row during our retry window,
-    # defer (don't overwrite) and let the next sweep handle the failure
-    # via _process_post_commit's normal entry path.
-    fresh = (await session.execute(
-        select(Task).where(Task.id == parent_id_local).with_for_update(skip_locked=True)
-    )).scalars().first()
+    # Round 4 W1 (C1, C2, C3): re-acquire with snapshot validation on
+    # BOTH the success path (C2 — caller will mutate task.context) AND
+    # the failure path (mark FAILED). Content snapshot replaces
+    # updated_at. To bypass the identity-map cache, ``session.expire``
+    # the in-memory instance AND set ``populate_existing=True`` on the
+    # SELECT (mirrors reaper.py:382: populate_existing alone is
+    # unreliable with ``with_for_update(skip_locked=True)`` on async
+    # sessions).
+    session.expire(task)
+    fresh_stmt = (
+        select(Task)
+        .where(Task.id == parent_id_local)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    fresh = (await session.execute(fresh_stmt)).scalars().first()
+    _defer_kind = "post-success context" if branch_created else "failure"
     if fresh is None:
         logger.info(
             f"[{label}] Task {parent_id_local} held by peer after branch retries — "
-            f"deferring failure mutation to next sweep"
+            f"deferring {_defer_kind} mutation to next sweep"
         )
-        return False
-    if pre_branch_updated_at is not None and fresh.updated_at != pre_branch_updated_at:
+        return None
+    fresh_snapshot = _capture_branch_creation_snapshot(fresh)
+    if fresh_snapshot != pre_branch_snapshot:
         logger.info(
-            f"[{label}] Task {parent_id_local} mutated during branch-retry window "
-            f"(expected updated_at={pre_branch_updated_at}, found {fresh.updated_at}) — "
-            f"deferring failure mutation to next sweep"
+            f"[{label}] Task {parent_id_local} mutated during branch-creation window "
+            f"(expected snapshot={pre_branch_snapshot}, found {fresh_snapshot}) — "
+            f"deferring {_defer_kind} mutation to next sweep"
         )
-        return False
+        return None
+
+    if branch_created:
+        # C2: success — return the relocked task so caller mutates under
+        # the new lock. Caller MUST swap its ``task`` reference to the
+        # returned instance.
+        return fresh
+
+    # Failure path
+    e = last_err
     task = fresh
     task.status = TaskStatus.FAILED
     task.latest_status_message = f"Failed to create {label.lower()} branch: {type(e).__name__}: {e!r}"[:500]
@@ -1644,7 +1711,7 @@ async def _ensure_branch(
     session.add(task)
     await _maybe_create_failure_alert(task, session, f"Failed to create branch: {type(e).__name__}: {e!r}"[:200])
     await session.commit()
-    return False
+    return None
 
 # ---------------------------------------------------------------------------
 # Completion handlers

@@ -178,8 +178,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     short_id = str(task.id).replace("-", "")[:8]
     plan_branch = f"plan/{short_id}"
 
-    if not await _ensure_branch(task, plan_branch, parent_base, "PLAN", session):
+    # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
+    # On success, returns the freshly-locked Task (caller mutates under
+    # the new lock). On failure or peer-mutation defer, returns None.
+    relocked = await _ensure_branch(task, plan_branch, parent_base, "PLAN", session)
+    if relocked is None:
         return
+    task = relocked
 
     task.context = {**(task.context or {}), "plan_branch": plan_branch, "parent_base": parent_base}
     session.add(task)

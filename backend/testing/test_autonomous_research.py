@@ -76,7 +76,11 @@ async def _add_direction(
 
 def _patch_research_externals(mocker):
     """Patch all external calls needed by _handle_research_completion."""
-    mocker.patch("app.research_completion._ensure_branch", new=AsyncMock(return_value=True))
+    # R4-W1 (audit C2): _ensure_branch returns Task | None, not bool. Pass-through
+    # the task argument so the caller's `task = relocked` swap binds to the same row.
+    async def _passthrough_ensure_branch(task, *_a, **_kw):
+        return task
+    mocker.patch("app.research_completion._ensure_branch", new=_passthrough_ensure_branch)
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])

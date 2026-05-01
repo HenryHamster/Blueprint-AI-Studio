@@ -158,6 +158,34 @@ async def _post_merge_summary(
         logger.warning(f"[CI] Failed to post merge summary on PR #{pr_number}: {exc}")
 
 
+# Round 4 W1 (audit C3): content snapshot used by the merge handler's
+# lock-window-break. Heartbeat-driven ``updated_at`` advances every 30s,
+# so the prior ``updated_at`` validation would false-defer under load.
+# Validate against the merge-gate fields instead.
+def _capture_merge_snapshot(task: Task) -> dict:
+    """Snapshot the merge-gate fields lock-window-break protects.
+
+    Fields covered:
+      - status: must remain the same (typically EVALUATING) for the merge
+        path to apply without overwriting a peer's terminal transition
+      - review_loop.iteration: review-fix iteration counter
+      - review_loop.review_approved / verdict: the review gate flag
+      - review_loop.ci_passed: the CI gate flag
+    Heartbeat-only updates (last_heartbeat, last_metrics_json,
+    heartbeat_count) do NOT touch any of these, so they don't trip the
+    validator under heartbeat overlap.
+    """
+    ctx = task.context or {}
+    review_loop = ctx.get("review_loop") or {}
+    return {
+        "status": task.status,
+        "review_loop_iteration": review_loop.get("iteration"),
+        "review_loop_review_approved": review_loop.get("review_approved"),
+        "review_loop_verdict": review_loop.get("verdict"),
+        "review_loop_ci_passed": review_loop.get("ci_passed"),
+    }
+
+
 async def _attempt_merge_with_retry_and_escalation(
     task: Task,
     gh_token: str,
@@ -177,9 +205,23 @@ async def _attempt_merge_with_retry_and_escalation(
     retry loop (5 + 15 + 45 = 65s combined) hold that lock across long-running
     GitHub I/O, starving concurrent heartbeats on the same row. We mirror the
     rollup_management ``_release_parent_lock`` / ``_relock_parent`` pattern:
-    capture ``updated_at`` snapshot, commit-release, run the merge calls
-    without lock, then re-acquire with snapshot validation. If a peer mutated
-    the row during the unlocked window, the re-acquire fails and we defer.
+    capture a content snapshot, commit-release, run the merge calls without
+    lock, then re-acquire with snapshot validation. If a peer mutated the row
+    during the unlocked window, the re-acquire fails and we defer.
+
+    Round 4 W1 (audit C1, C3): the prior implementation snapshot ``updated_at``
+    and validated against it on re-acquire. Two structural bugs:
+      - C1 (cache): SQLAlchemy's identity map under ``expire_on_commit=False``
+        returned the cached pre-commit instance on re-SELECT, so
+        ``fresh_task.updated_at`` always equalled ``pre_merge_updated_at`` and
+        the validation never fired. Fix: ``populate_existing=True`` on the
+        re-SELECT forces SQLA to refresh attributes from the new row.
+      - C3 (heartbeat): even with the cache fix, ``onupdate=_utcnow``
+        advances ``updated_at`` on every heartbeat. Under load every
+        merge attempt would false-defer. Fix: validate against a content
+        snapshot of the fields the merge window protects (status,
+        review_loop.iteration, review_loop.review_approved/verdict,
+        ci_passed) — heartbeat-only mutations don't touch those fields.
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.main import _maybe_create_failure_alert
@@ -191,21 +233,39 @@ async def _attempt_merge_with_retry_and_escalation(
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
     ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
 
-    # Round 3 H4: capture snapshot + release lock around the merge calls.
+    # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
     # rollup_management.py: the in-memory ``task`` is stale after release;
-    # only stable identifiers (id, project_id) are safe to read between
-    # release and re-acquire.
+    # only stable identifiers (id, project_id) and the captured snapshot
+    # are safe to read between release and re-acquire.
     #
-    # IMPORTANT: snapshot updated_at AFTER the commit. Any ORM-tracked
-    # mutation that lands in this commit advances ``updated_at`` via
-    # ``onupdate=_utcnow``, so capturing pre-commit would always trigger
-    # a false "peer mutated" path on re-acquire. Mirrors the pattern in
-    # rollup_management._release_parent_lock.
+    # The snapshot covers fields the merge gate protects from peer mutation:
+    #   - status: must remain EVALUATING for the merge to apply
+    #   - review_loop.iteration: review-fix iteration counter; advances if
+    #     a fix-completion handler has already moved on
+    #   - review_loop.review_approved / verdict: the gate flag itself; if
+    #     a peer (e.g. APPROVE handler) cleared/changed it we must defer
+    #   - review_loop.ci_passed: the other gate; same logic
+    # ``updated_at`` is intentionally NOT in the snapshot — heartbeat
+    # ``onupdate=_utcnow`` advances it every 30s and would false-defer
+    # the merge under load (audit C3).
     parent_id_local = task.id
+    pre_merge_snapshot = _capture_merge_snapshot(task)
+    # R4-W1 (audit C1): explicitly mark ``context`` dirty before the commit.
+    # The merge-failure path mutates ``task.context`` via full reassignment
+    # AFTER the prior populate_existing reset SQLA's change-tracking; in
+    # some SQLA states the post-populate assignment is not detected as
+    # dirty (verified empirically against test_merge_failure_final_warn:
+    # without flag_modified, the second invocation's commit failed to
+    # persist the first invocation's dirty mutations). ``flag_modified``
+    # is a no-op when the attribute is already tracked, but corrects the
+    # state when it isn't.
+    flag_modified(task, "context")
     session.add(task)
-    await session.commit()  # release task FOR UPDATE lock
-    pre_merge_updated_at = task.updated_at
+    await session.commit()  # release task FOR UPDATE lock; SQLA returns
+                            # the connection to the pool until the next
+                            # operation auto-acquires (audit H6 — no
+                            # connection held during the GitHub window).
 
     merge_result = await merge_pull_request(gh_token, owner, repo, ci_pr_number)
     if not merge_result.get("merged") and not merge_result.get("conflict") and source != "webhook":
@@ -221,19 +281,32 @@ async def _attempt_merge_with_retry_and_escalation(
     # unlocked window, defer to next sweep. The merge call may have already
     # succeeded externally; the next sweep observes pr_state.merged=True via
     # get_pull_request below.
-    fresh_task = (await session.execute(
-        select(Task).where(Task.id == parent_id_local).with_for_update(skip_locked=True)
-    )).scalars().first()
+    #
+    # Round 4 W1 (audit C1): bypass SQLAlchemy's identity-map cache so the
+    # re-SELECT actually reads fresh DB state. ``populate_existing=True``
+    # is the canonical hint, but reaper.py:382 documents that under async
+    # sessions + ``with_for_update(skip_locked=True)`` it doesn't always
+    # refresh reliably. Belt-and-suspenders: also call ``session.expire``
+    # on the task instance (mirrors reaper's ``expire_all`` pattern) so
+    # the next SELECT cannot return cached attributes.
+    fresh_stmt = (
+        select(Task)
+        .where(Task.id == parent_id_local)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    fresh_task = (await session.execute(fresh_stmt)).scalars().first()
     if fresh_task is None:
         logger.info(
             f"[CI] Task {parent_id_local} held by peer after merge call — "
             f"deferring to next sweep ({source})"
         )
         return bool(merge_result.get("merged"))
-    if pre_merge_updated_at is not None and fresh_task.updated_at != pre_merge_updated_at:
+    fresh_snapshot = _capture_merge_snapshot(fresh_task)
+    if fresh_snapshot != pre_merge_snapshot:
         logger.info(
             f"[CI] Task {parent_id_local} mutated during merge window "
-            f"(expected updated_at={pre_merge_updated_at}, found {fresh_task.updated_at}) — "
+            f"(expected snapshot={pre_merge_snapshot}, found {fresh_snapshot}) — "
             f"deferring to next sweep ({source})"
         )
         return bool(merge_result.get("merged"))

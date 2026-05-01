@@ -669,9 +669,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     short_id = str(task.id).replace("-", "")[:8]
     research_branch = f"research/{short_id}"
 
-    # Create staging branch for this research batch
-    if not await _ensure_branch(task, research_branch, original_base, "RESEARCH", session):
+    # Create staging branch for this research batch.
+    # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
+    # On success, returns the freshly-locked Task (caller mutates under
+    # the new lock). On failure or peer-mutation defer, returns None.
+    relocked = await _ensure_branch(task, research_branch, original_base, "RESEARCH", session)
+    if relocked is None:
         return
+    task = relocked
 
     # Validate dependencies if present
     if not _validate_plan_dependencies(findings):

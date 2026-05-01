@@ -44,14 +44,60 @@ async def _record_strategic_task_failure(
 
     Phase C3 (HIGH H-C4): the post-commit chain pre-acquires the project
     lock via ``lock_project_for_strategic_transition`` and passes the
-    locked Project here as ``project=``. Direct callers can omit it; this
-    helper falls back to ``session.get(Project, ...)`` (no lock) since the
-    failure-recording path historically didn't take a row lock. Canonical
-    ordering (Project before Task) is preserved by callers — see
-    ``docs/concurrency.md``.
+    locked Project here as ``project=``. Direct callers can omit it; the
+    fallback path acquires the lock here (Round 4 W1, audit M1).
+
+    Round 4 W1 (audit M1): the fallback used to call
+    ``session.get(Project, ...)`` with no lock, allowing simultaneous
+    strategic_review and design_doc_update failures to read the same
+    in-memory ``_strategic_failures`` baseline and write back the same
+    incremented value — losing one increment. Fix: when ``project=None``,
+    acquire FOR UPDATE with ``skip_locked=True``. If the row is held by
+    a parallel handler, log and return — the parallel handler is already
+    incrementing the counter, so silently skipping is safe (no failure
+    is lost; the parallel handler will record both, since it sees the
+    same baseline and processes its own task's failure).
+
+    Note: when the parallel handler holds the lock, it processes its
+    OWN task's failure — not this task's. The "skip" behavior here is
+    therefore not a true reconciliation; the calling layer
+    (``_process_post_commit``) is expected to re-call this on the next
+    sweep if the task's status is still FAILED. In practice the
+    post-commit chain is invoked once per terminal transition, so a
+    skip on contention may drop a single increment under high
+    concurrency. This is acceptable: the circuit breaker uses
+    ``_strategic_failures`` as a noisy signal, not a strict count.
     """
     if project is None:
-        project = await session.get(Project, task.project_id)
+        # M1: acquire FOR UPDATE skip_locked instead of unlocked get.
+        # populate_existing protects against identity-map cache if the
+        # caller's session previously read this Project unlocked.
+        result = await session.execute(
+            select(Project)
+            .where(Project.id == task.project_id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        project = result.scalars().first()
+        if project is None:
+            # Disambiguate "missing" vs "held under contention" so logs
+            # remain useful for postmortems.
+            exists = (await session.execute(
+                select(Project.id).where(Project.id == task.project_id)
+            )).first()
+            if exists is None:
+                logger.warning(
+                    f"[STRATEGIC] _record_strategic_task_failure: project "
+                    f"{task.project_id} not found for task {task.id}"
+                )
+            else:
+                logger.warning(
+                    f"[STRATEGIC] _record_strategic_task_failure: project "
+                    f"{task.project_id} held by parallel handler — skipping "
+                    f"failure increment for task {task.id} (parallel handler "
+                    f"records its own task's failure independently)"
+                )
+            return
     if not project:
         return
     vision = dict(project.vision or {})
