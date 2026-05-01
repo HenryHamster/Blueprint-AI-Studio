@@ -75,6 +75,22 @@ def downgrade() -> None:
     # place. Downgrades to pre-0068 work fine without reverting this data.
 
     # M4: drop the server_default we added.
+    #
+    # R5-W5 MED-3 caveat: on a Postgres DB whose tables were initially
+    # bootstrapped via ``SQLModel.metadata.create_all`` (e.g. test fixtures
+    # that bypass alembic), ``last_audited_at`` already has the
+    # ``func.now()`` server_default declared on the model. The upgrade()
+    # alter_column above is a no-op against such a DB, but this downgrade()
+    # would still drop the model-declared default, leaving the bootstrapped
+    # DB without a default that the model expects. This is acceptable
+    # because:
+    #   1. test fixtures don't run migration downgrades — they tear down
+    #      with metadata.drop_all,
+    #   2. real Postgres deployments always go through alembic upgrade,
+    #      so the default on disk is the one this migration set,
+    #   3. detecting the bootstrap case at runtime would require inspecting
+    #      pg_attrdef and rebuilding the original default, far more
+    #      complexity than the edge case warrants.
     if bind.dialect.name == "postgresql":
         op.alter_column(
             "systemmaturity",
