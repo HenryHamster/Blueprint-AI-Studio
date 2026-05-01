@@ -1321,12 +1321,23 @@ async def orchestrator_worker():
                 # Keyed by (user_id, model) — model=None is conservative and would
                 # hold a Sonnet task when only Opus is rate-limited (or vice versa).
                 _user_pool_available: Dict[Tuple[str, str | None], bool] = {}
+                # R5-W5 MED-5: cache Project→user_id within a single dispatch
+                # cycle. When task.launched_by_user_id is NULL, the previous
+                # implementation called session.get(Project, ...) per task —
+                # 50 NULL-launcher candidates = 50 redundant Project SELECTs
+                # every cycle.
+                _project_user_cache: Dict[uuid.UUID, str] = {}
 
                 async def _user_has_available_account(task: Task) -> bool:
                     user_id = task.launched_by_user_id
                     if not user_id:
-                        proj = await session.get(Project, task.project_id)
-                        user_id = proj.user_id if proj else ""
+                        cached = _project_user_cache.get(task.project_id)
+                        if cached is not None:
+                            user_id = cached
+                        else:
+                            proj = await session.get(Project, task.project_id)
+                            user_id = proj.user_id if proj else ""
+                            _project_user_cache[task.project_id] = user_id
                     model = _extract_task_model(task)
                     cache_key = (user_id, model)
                     if cache_key in _user_pool_available:

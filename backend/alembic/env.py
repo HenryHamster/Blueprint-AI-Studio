@@ -53,7 +53,20 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    # ``transaction_per_migration=True`` (R5 audit MEDIUM-A): some migrations
+    # need to break out of the transactional-DDL guarantee to issue commands
+    # like ``CREATE INDEX CONCURRENTLY`` (alembic 0067 issues an
+    # ``op.execute("COMMIT")`` for exactly this reason). Without this flag,
+    # the entire ``alembic upgrade head`` run is wrapped in one transaction
+    # — so the commit in 0067 leaks into any subsequent migration (0068+),
+    # which then runs in autocommit and silently regresses alembic's
+    # atomicity guarantee. Per-migration transactions scope each migration's
+    # transaction to itself; 0067's commit only affects 0067.
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        transaction_per_migration=True,
+    )
 
     with context.begin_transaction():
         context.run_migrations()
