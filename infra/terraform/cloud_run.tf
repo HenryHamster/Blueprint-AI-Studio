@@ -9,9 +9,22 @@ resource "google_cloud_run_v2_service" "orchestrator" {
 
     # Pin the min/max instance scaling so redeploys don't drift back to defaults.
     # Reaper + orchestrator background loops need min=1 to stay warm.
+    #
+    # R6-W2-CRIT (audit 2026-04-30): max=1 is intentional. The lifespan in
+    # backend/app/lifecycle.py spawns 9 background services (reaper,
+    # orchestrator_worker, gcp_cleanup, gcp_image_cleanup, secret_reconciliation,
+    # stale_branch_cleanup, auto_archive, config_sync, availability_refresh).
+    # None of them have leader election — per-row safety holds via
+    # task_lock(skip_locked=True) and FOR UPDATE, but side effects are not
+    # per-row: GitHub/GCP API poll rates would multiply Nx, _provision_coroutines
+    # is a per-instance dict racing against _get_actual_gcp_vm_count, stale-branch
+    # cleanup and image pruner would issue N redundant deletes.
+    # Until pg_advisory_lock leader election lands in lifecycle.py
+    # (see TODO there), max MUST stay at 1 — DO NOT bump without first
+    # implementing leader election.
     scaling {
       min_instance_count = 1
-      max_instance_count = 5
+      max_instance_count = 1
     }
     # Per-instance concurrency (default is 80). Bumped so the admin UI polling
     # + background loops don't hit "no available instance" 429s during cold

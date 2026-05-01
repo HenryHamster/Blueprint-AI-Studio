@@ -104,6 +104,41 @@ async def lifespan(app):
     # Check deployment state (detect new deploy, rollback, or normal restart)
     await _init_deployment_state()
 
+    # TODO(R6-W2-CRIT, audit 2026-04-30): Add Postgres advisory-lock leader
+    # election around the background services below before bumping
+    # infra/terraform/cloud_run.tf max_instance_count above 1. Today these
+    # services have NO leader election — per-row safety holds via
+    # task_lock(skip_locked=True) and FOR UPDATE, but side effects are not
+    # per-row: GitHub/GCP API polls multiply Nx, _provision_coroutines is a
+    # per-instance dict racing _get_actual_gcp_vm_count, stale-branch cleanup
+    # and image pruner issue N redundant deletes. Cloud Run is currently
+    # capped at max=1 as defense-in-depth so this is dormant, but the cap
+    # blocks horizontal scale.
+    #
+    # Sketch of the fix (use a dedicated session that's never closed so the
+    # session-level lock auto-releases only when the lifespan ends):
+    #
+    #     from sqlalchemy import text
+    #     BACKGROUND_LOCK_ID = 0xB1EB1EB1EB1EB1EB  # arbitrary 64-bit constant
+    #     leader_session = AsyncSessionLocal()
+    #     await leader_session.__aenter__()
+    #     result = await leader_session.execute(
+    #         text("SELECT pg_try_advisory_lock(:lock_id)"),
+    #         {"lock_id": BACKGROUND_LOCK_ID},
+    #     )
+    #     is_leader = result.scalar()
+    #     if not is_leader:
+    #         await leader_session.close()
+    #         logger.info("[STARTUP] Not background-leader; skipping background services")
+    #         yield
+    #         return
+    #     # Otherwise: own the lock for the lifespan, spawn services, release
+    #     # in shutdown via leader_session.close() (advisory locks are released
+    #     # automatically when the session/connection closes).
+    #
+    # The non-leader branch must still serve HTTP traffic (FastAPI request
+    # routes, /health, etc.) — only background services are leader-gated.
+
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
 
