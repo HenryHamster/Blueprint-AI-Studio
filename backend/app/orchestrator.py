@@ -62,6 +62,33 @@ def _clear_retry_after_state(task_or_ctx) -> None:
     clear_retry_after(task_or_ctx)
 
 
+def _capture_ci_polling_snapshot(task: Task) -> dict:
+    """Snapshot the CI-polling fields a lock-window break must protect.
+
+    R5-W2-A: ``updated_at`` advances every ~30s via the heartbeat
+    ``onupdate=_utcnow`` and would false-defer the CI-polling re-acquire
+    on every overlapping heartbeat. We validate against content fields
+    instead — the ones whose mutation indicates a peer took over CI
+    handling for this task:
+
+      - ``status``: the most load-bearing; if a peer transitioned the
+        task out of EVALUATING (e.g. to COMPLETED on PR merge or FAILED
+        on PR delete), we must not re-apply CI-polling mutations on top.
+      - ``review_loop.{pr_number, ci_passed, review_approved, iteration}``:
+        if any of these moved, the review pipeline advanced under us.
+
+    Heartbeat-only updates touch none of these.
+    """
+    rl = ((task.context or {}).get("review_loop") or {})
+    return {
+        "status": task.status,
+        "pr_number": rl.get("pr_number"),
+        "ci_passed": rl.get("ci_passed"),
+        "review_approved": rl.get("review_approved"),
+        "iteration": rl.get("iteration"),
+    }
+
+
 async def _lock_task_for_mutation(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -69,6 +96,8 @@ async def _lock_task_for_mutation(
     allowed_statuses: tuple[TaskStatus, ...] | None = None,
     reason: str = "task mutation",
     expected_updated_at=None,
+    expected_snapshot: dict | None = None,
+    snapshot_fn=None,
 ) -> Task | None:
     """Lock a task before a hot-path mutation and rollback on skipped rows.
 
@@ -77,6 +106,15 @@ async def _lock_task_for_mutation(
     re-acquired row's ``updated_at`` must match the snapshot — if a peer
     mutated the row during the unlocked window we defer (return None) so the
     caller can either retry on the next sweep or surface a conflict.
+
+    R5-W2-A: ``expected_snapshot`` + ``snapshot_fn`` is the content-based
+    replacement for ``expected_updated_at`` that CI-polling sites use.
+    Heartbeats with ``onupdate=_utcnow`` advance ``updated_at`` every ~30s,
+    so the original timestamp validator falsely deferred on every
+    overlapping heartbeat. The snapshot pair lets the caller capture the
+    fields it actually cares about (e.g. status + review_loop pr_number /
+    ci_passed / review_approved / iteration) and defer only when one of
+    those has actually changed.
     """
     async with task_lock(session, task_id) as task:
         if task is None:
@@ -100,6 +138,16 @@ async def _lock_task_for_mutation(
             )
             await session.rollback()
             return None
+        if expected_snapshot is not None and snapshot_fn is not None:
+            current_snapshot = snapshot_fn(task)
+            if current_snapshot != expected_snapshot:
+                logger.info(
+                    "[ORCHESTRATOR] %s for task %s deferred: row mutated during unlocked window "
+                    "(expected snapshot=%s, found %s)",
+                    reason, task_id, expected_snapshot, current_snapshot,
+                )
+                await session.rollback()
+                return None
         return task
 
 
@@ -2742,7 +2790,9 @@ async def orchestrator_worker():
                             # GitHub rate-limit can hold this call for minutes;
                             # holding the lock starves concurrent heartbeats on
                             # the same task. Release, fetch, re-acquire-validate.
-                            ci_pre_pr_updated_at = ci_task.updated_at
+                            # R5-W2-A: content snapshot, not updated_at —
+                            # heartbeat onupdate would false-defer every poll.
+                            ci_pre_pr_snapshot = _capture_ci_polling_snapshot(ci_task)
                             await session.commit()
                             try:
                                 pr_data = await get_pull_request(ci_gh_token, ci_owner, ci_repo, ci_pr_number)
@@ -2752,7 +2802,8 @@ async def orchestrator_worker():
                                     session, ci_task_id,
                                     allowed_statuses=(TaskStatus.EVALUATING,),
                                     reason="CI polling after PR fetch error",
-                                    expected_updated_at=ci_pre_pr_updated_at,
+                                    expected_snapshot=ci_pre_pr_snapshot,
+                                    snapshot_fn=_capture_ci_polling_snapshot,
                                 )
                                 if ci_task is None:
                                     continue
@@ -2799,7 +2850,8 @@ async def orchestrator_worker():
                                 session, ci_task_id,
                                 allowed_statuses=(TaskStatus.EVALUATING,),
                                 reason="CI polling after PR fetch",
-                                expected_updated_at=ci_pre_pr_updated_at,
+                                expected_snapshot=ci_pre_pr_snapshot,
+                                snapshot_fn=_capture_ci_polling_snapshot,
                             )
                             if ci_task is None:
                                 continue
@@ -3004,7 +3056,9 @@ async def orchestrator_worker():
                                 # The retry helper internally retries on 422; cumulative
                                 # wait can be 30s+. Drop the lock so concurrent heartbeats
                                 # on this same task (rollup parents share a row) don't queue.
-                                ci_pre_update_branch_updated_at = ci_task.updated_at
+                                # R5-W2-A: content snapshot, not updated_at —
+                                # heartbeat onupdate would false-defer every poll.
+                                ci_pre_update_branch_snapshot = _capture_ci_polling_snapshot(ci_task)
                                 ci_pid_str = str(ci_task.project_id)
                                 _expected_head_sha = pr_data.get("head", {}).get("sha") or None
                                 await session.commit()
@@ -3021,7 +3075,8 @@ async def orchestrator_worker():
                                     session, ci_task_id,
                                     allowed_statuses=(TaskStatus.EVALUATING,),
                                     reason="CI polling after update_branch",
-                                    expected_updated_at=ci_pre_update_branch_updated_at,
+                                    expected_snapshot=ci_pre_update_branch_snapshot,
+                                    snapshot_fn=_capture_ci_polling_snapshot,
                                 )
                                 if ci_task is None:
                                     continue
@@ -3265,7 +3320,9 @@ async def orchestrator_worker():
                         # Even with TTL caching, a cache miss makes a real GitHub
                         # API call that can hang during rate-limit. Drop the lock
                         # so concurrent heartbeats proceed.
-                        ci_pre_check_updated_at = ci_task.updated_at
+                        # R5-W2-A: content snapshot, not updated_at —
+                        # heartbeat onupdate would false-defer every poll.
+                        ci_pre_check_snapshot = _capture_ci_polling_snapshot(ci_task)
                         ci_project_id_str = str(ci_task.project_id)
                         await session.commit()
                         # Dedup cached — siblings on the same head_sha collapse
@@ -3276,7 +3333,8 @@ async def orchestrator_worker():
                             session, ci_task_id,
                             allowed_statuses=(TaskStatus.EVALUATING,),
                             reason="CI polling after check_runs fetch",
-                            expected_updated_at=ci_pre_check_updated_at,
+                            expected_snapshot=ci_pre_check_snapshot,
+                            snapshot_fn=_capture_ci_polling_snapshot,
                         )
                         if ci_task is None:
                             continue

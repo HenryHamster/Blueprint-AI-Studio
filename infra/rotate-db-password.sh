@@ -29,6 +29,15 @@
 # Pre-requisites:
 #   - terraform apply -var="use_cloud_sql=true" (Cloud SQL must already exist)
 #   - gcloud authenticated
+#   - gcloud's cloud_sql_proxy component installed (bundled by default; if
+#     missing run `gcloud components install cloud_sql_proxy`). Step 5
+#     uses `gcloud sql connect --use-cloud-sql-proxy` to reach the
+#     private-IP-only instance.
+#   - workstation has private connectivity to the VPC (typically via VPN
+#     or by running this from a bastion / Cloud Shell session that's
+#     peered with `agent_vpc`). The Cloud SQL Auth Proxy can negotiate
+#     authentication, but the proxied TCP still has to land on the
+#     private IP.
 #   - run from a workstation that holds Terraform local state
 #
 # Idempotency: each step checks state. Re-running after a partial failure is safe
@@ -129,15 +138,19 @@ step "5. Verify the rotated password authenticates against Cloud SQL"
 # authenticates and Cloud Run would crashloop on the next revision.
 #
 # Strategy: try a lightweight `SELECT 1` from this workstation through the
-# Cloud SQL Auth Proxy (`gcloud sql connect`). If it succeeds we know the
-# rotated password is actually live on the SQL user. If it fails, the ERR
-# trap fires with recovery instructions and we never write the new
-# DATABASE_URL version.
+# Cloud SQL Auth Proxy (`gcloud sql connect --use-cloud-sql-proxy`). If it
+# succeeds we know the rotated password is actually live on the SQL user.
+# If it fails, the ERR trap fires with recovery instructions and we never
+# write the new DATABASE_URL version.
 #
-# Note: `gcloud sql connect` requires that the operator's workstation has
-# its public IP in the instance's authorized_networks OR the Cloud SQL
-# Auth Proxy is running. Both are workstation-side concerns; this script
-# stays in-band and trusts the operator has connectivity.
+# R5-W3 A (audit 2026-04-30): the Cloud SQL instance is `ipv4_enabled = false`
+# (see cloud_sql.tf), so the default `gcloud sql connect` path (which
+# whitelists the operator's public IPv4 and connects over public IP) is
+# broken-by-design — there is no public IP on this instance. The
+# `--use-cloud-sql-proxy` flag tunnels via the Cloud SQL Auth Proxy
+# (private IP-aware) and works against a private-only instance. The
+# operator's gcloud already bundles the proxy binary, so this introduces
+# no new tooling dependency.
 CLOUDSQL_INSTANCE="$(terraform -chdir="$TERRAFORM_DIR" output -raw cloud_sql_instance_name 2>/dev/null || true)"
 if [[ -z "$CLOUDSQL_INSTANCE" ]]; then
   echo "WARNING: cloud_sql_instance_name terraform output is empty. Skipping live-auth verification."
@@ -146,18 +159,24 @@ if [[ -z "$CLOUDSQL_INSTANCE" ]]; then
     exit 1
   fi
 else
-  echo "Verifying rotated password against $CLOUDSQL_INSTANCE..."
+  echo "Verifying rotated password against $CLOUDSQL_INSTANCE via Cloud SQL Auth Proxy..."
   # PGPASSWORD is the standard libpq env var; gcloud sql connect honors it
   # and forwards to psql. Avoid argv exposure of the password.
+  # --use-cloud-sql-proxy: required because the instance is private-IP only
+  # (ipv4_enabled = false in cloud_sql.tf). Without this flag, gcloud
+  # attempts a direct public-IPv4 connection that cannot exist.
   if ! PGPASSWORD="$NEW_PW" gcloud sql connect "$CLOUDSQL_INSTANCE" \
         --user=postgres --database=postgres --quiet --project="$PROJECT_ID" \
+        --use-cloud-sql-proxy \
         <<< "SELECT 1;" >/dev/null 2>&1; then
     echo "ERROR: the rotated password does NOT authenticate against $CLOUDSQL_INSTANCE." >&2
     echo "       Possible causes:" >&2
     echo "         - terraform apply succeeded on the random_password resource but the" >&2
     echo "           google_sql_user UPDATE failed (re-run terraform apply)." >&2
-    echo "         - gcloud sql connect cannot reach the instance from this workstation" >&2
-    echo "           (check authorized_networks or use the Cloud SQL Auth Proxy)." >&2
+    echo "         - The Cloud SQL Auth Proxy can't reach the instance's private IP" >&2
+    echo "           from this workstation (check VPN / private-services access)." >&2
+    echo "         - gcloud lacks the cloud_sql_proxy bundled component (run" >&2
+    echo "           'gcloud components install cloud_sql_proxy')." >&2
     echo "       NOT writing a new DATABASE_URL secret version — old one still authoritative." >&2
     exit 1
   fi
