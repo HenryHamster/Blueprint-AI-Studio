@@ -1547,6 +1547,12 @@ def _capture_branch_creation_snapshot(task: Task) -> dict:
         the branch-creation outcome
       - context.plan_branch / context.research_branch: a peer may have
         already created the staging branch; we must not overwrite
+      - auto_remediation: snapshotted at line 1615 and read on the
+        failure path at line 1710 (record_task_result). If a peer flips
+        this between snapshot and re-acquire, the failure record would
+        carry a stale flag (R5 audit MEDIUM-C).
+      - requires_approval: read post-window in places that consume the
+        relocked task; included so peer flips trip the validator.
     Heartbeat-only updates don't touch any of these.
     """
     ctx = task.context or {}
@@ -1554,6 +1560,8 @@ def _capture_branch_creation_snapshot(task: Task) -> dict:
         "status": task.status,
         "plan_branch": ctx.get("plan_branch"),
         "research_branch": ctx.get("research_branch"),
+        "auto_remediation": task.auto_remediation,
+        "requires_approval": task.requires_approval,
     }
 
 
