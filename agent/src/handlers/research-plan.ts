@@ -17,13 +17,15 @@ import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, excludeAgentHelpers, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
+import { parseBackendTimestamp } from '../utils/time.js';
 
 // ── Pure data transformation helpers (exported for testing) ─────────────────
 
 export function calcMessageAge(m: Record<string, unknown>): string {
   if (!m.created_at) return '?';
-  const ms = Date.now() - new Date(String(m.created_at)).getTime();
-  if (isNaN(ms)) return '?';
+  const d = parseBackendTimestamp(String(m.created_at));
+  if (!d) return '?';
+  const ms = Date.now() - d.getTime();
   const h = Math.floor(ms / 3600000);
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
@@ -1620,9 +1622,9 @@ echo ""
     const formatRelativeDays = (iso: string): string => {
       if (!iso) return '';
       try {
-        const ts = Date.parse(iso);
-        if (Number.isNaN(ts)) return '';
-        const days = Math.max(0, Math.floor((Date.now() - ts) / 86400000));
+        const d = parseBackendTimestamp(iso);
+        if (!d) return '';
+        const days = Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000));
         if (days === 0) return 'today';
         if (days === 1) return '1 day ago';
         return `${days} days ago`;

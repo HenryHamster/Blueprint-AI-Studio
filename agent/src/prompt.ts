@@ -4,6 +4,7 @@ import { WORKSPACE } from './index.js';
 import type { BuildConfig } from './index.js';
 import { formatProjectContext } from './prompts/project-context.js';
 import { isReadOnlyTaskType } from './taskCapabilities.js';
+import { parseBackendTimestamp } from './utils/time.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -74,8 +75,8 @@ export function strVal(v: unknown, fallback = ''): string {
 // "2d ago", "1w ago"). Returns '' when the input can't be parsed.
 export function relativeTimeFromIso(iso: string, now: Date = new Date()): string {
   if (!iso) return '';
-  const then = new Date(iso);
-  if (Number.isNaN(then.getTime())) return '';
+  const then = parseBackendTimestamp(iso);
+  if (!then) return '';
   const diffMs = now.getTime() - then.getTime();
   if (diffMs < 0) return 'just now';
   const minutes = Math.floor(diffMs / 60000);

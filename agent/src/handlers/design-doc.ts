@@ -10,6 +10,7 @@ import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
 } from '../prompt.js';
+import { parseBackendTimestamp } from '../utils/time.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
 // Analyzes codebase architecture and incrementally updates the design doc
@@ -71,7 +72,9 @@ export async function handleDesignDocUpdate(
   const openMessagesText = openMessages.length > 0
     ? openMessages.map(m => {
         const age = m.created_at ? (() => {
-          const ms = Date.now() - new Date(String(m.created_at)).getTime();
+          const d = parseBackendTimestamp(String(m.created_at));
+          if (!d) return '?';
+          const ms = Date.now() - d.getTime();
           const h = Math.floor(ms / 3600000);
           return h < 24 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
         })() : '?';
