@@ -23,6 +23,17 @@ def upgrade() -> None:
     if bind.dialect.name != "postgresql":
         # SQLite fallback — column-only index keeps metadata invariants happy
         # in tests; expression-on-JSON path filtering is Postgres-only.
+        #
+        # R5-W5 MED-4 caveat: this is a B-tree on a JSON-storing TEXT/BLOB
+        # column that no test query references — wasted index space on
+        # SQLite-based test runs. Kept anyway because:
+        #   1. SQLite test DBs are in-memory and short-lived (no real cost)
+        #   2. removing it would require either skipping the migration entry
+        #      or adding a MIGRATION_ONLY_INDEXES opt-out to the
+        #      test_model_indexes_covered_by_migrations invariant — both add
+        #      machinery for a cosmetic gain
+        #   3. real Postgres deploys hit the CONCURRENTLY branch below and
+        #      get the proper expression-with-WHERE partial index
         op.create_index("ix_task_payloads_type_active", "task", ["payloads"])
         return
     # CONCURRENTLY cannot run inside a transaction block. Commit the
