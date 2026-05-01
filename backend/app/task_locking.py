@@ -78,11 +78,24 @@ async def task_lock(
             t.retry_after_until = None
             t.requeue_in_flight = True
         await session.commit()  # release lock
+
+    Round 5 W1 (audit CRITICAL): ``populate_existing=True`` is required.
+    The orchestrator dispatch loop loads candidate Tasks via
+    ``load_only(<projection>)``; those projection-deferred instances enter
+    the session's identity map. A subsequent ``task_lock`` re-SELECT
+    without ``populate_existing`` returns the cached projected instance
+    (SQLAlchemy's identity-map default), so reads of non-projected columns
+    (``vm_instance_id``, ``title``, ...) trigger sync lazy-load →
+    MissingGreenlet under async, crashing the entire dispatch cycle.
+    Setting ``populate_existing=True`` forces SQLA to refresh attributes
+    from this SELECT regardless of identity-map state — the FOR UPDATE
+    re-acquire returns fresh data semantics, not a cached projection.
     """
     stmt = (
         select(Task)
         .where(Task.id == task_id)
         .with_for_update(skip_locked=skip_locked)
+        .execution_options(populate_existing=True)
     )
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)

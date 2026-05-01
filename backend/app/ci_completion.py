@@ -289,6 +289,16 @@ async def _attempt_merge_with_retry_and_escalation(
     # refresh reliably. Belt-and-suspenders: also call ``session.expire``
     # on the task instance (mirrors reaper's ``expire_all`` pattern) so
     # the next SELECT cannot return cached attributes.
+    #
+    # Round 5 W1 (HIGH-1): the comment above promised ``session.expire``
+    # but the code only set ``populate_existing=True``. Add the expire()
+    # belt-and-suspenders, mirroring task_completion.py:1671 where the
+    # same pattern reliably refreshes the locked instance under async +
+    # skip_locked. The ``task`` here is the released-but-cached instance
+    # post-commit; expire() marks its attributes stale so any read
+    # between here and the fresh SELECT below would refresh, and the
+    # populate_existing SELECT clobbers any stale identity-map state.
+    session.expire(task)
     fresh_stmt = (
         select(Task)
         .where(Task.id == parent_id_local)

@@ -27,6 +27,7 @@ _pr_merge_negative_cache: dict[uuid.UUID, float] = {}
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -133,6 +134,8 @@ async def _relock_parent(
     session: AsyncSession,
     parent_id,
     expected_snapshot: Optional[dict],
+    *,
+    parent_in_session: Task | None = None,
 ) -> Task | None:
     """Re-acquire FOR UPDATE on the parent row and validate staging-state.
 
@@ -156,9 +159,27 @@ async def _relock_parent(
     (verified empirically — see ci_completion.py for the canonical
     comment).
 
+    Round 5 W1 (HIGH-2 belt-and-suspenders): callers can pass the
+    released-but-cached ``parent`` instance via ``parent_in_session`` so
+    we ``session.expire`` it before the re-SELECT. ``populate_existing``
+    alone has been observed to be unreliable under async +
+    ``with_for_update(skip_locked=True)`` (reaper.py:382 documents this);
+    expiring the cached instance first guarantees the re-SELECT cannot
+    return stale identity-map attributes. Mirrors the
+    ``session.expire(task)`` pattern at task_completion.py:1671 and
+    ci_completion.py.
+
     Mirrors the early-commit pattern in routers/agent_status.py:1694: release
     the lock around long-running I/O, then resume on a fresh row read.
     """
+    if parent_in_session is not None:
+        try:
+            session.expire(parent_in_session)
+        except InvalidRequestError:
+            # Object detached from this session (e.g. expunged elsewhere)
+            # — expire_all() is a safe broader fallback; the populate_existing
+            # SELECT below will repopulate whatever we still need.
+            session.expire_all()
     stmt = (
         select(Task)
         .where(Task.id == parent_id)
@@ -932,7 +953,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # The three GitHub reads above were performed without the lock.
                 # Validate updated_at hasn't changed; if it has, another writer
                 # mutated the parent during our window — defer to next cycle.
-                parent = await _relock_parent(session, parent_id_local, pre_gh_snapshot)
+                parent = await _relock_parent(
+                    session, parent_id_local, pre_gh_snapshot,
+                    parent_in_session=parent,
+                )
                 if parent is None:
                     return
                 parent_ctx = parent.context or {}
@@ -1009,7 +1033,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     except Exception as e:
                         pr_state_err = e
                     # Re-acquire and validate
-                    parent = await _relock_parent(session, parent_id_local, pre_existing_pr_snapshot)
+                    parent = await _relock_parent(
+                        session, parent_id_local, pre_existing_pr_snapshot,
+                        parent_in_session=parent,
+                    )
                     if parent is None:
                         return
                     parent_ctx = parent.context or {}
@@ -1071,7 +1098,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     pr_result = await create_pull_request(gh_token, owner, repo,
                         title=pr_title, head=staging_branch, base=target_branch, body=pr_body, project_id=project_id_str)
 
-                    parent = await _relock_parent(session, parent_id_local, pre_create_snapshot)
+                    parent = await _relock_parent(
+                        session, parent_id_local, pre_create_snapshot,
+                        parent_in_session=parent,
+                    )
                     if parent is None:
                         # Concurrent writer mutated the parent during PR creation.
                         # The orphan-PR rescue path in the except handler will
@@ -1194,7 +1224,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     except Exception as e:
                         logger.warning(f"[ROLLUP] Failed to delete staging branch '{staging_branch}' for task {parent_id_local}: {e}")
                     # Re-acquire to apply mutation
-                    parent = await _relock_parent(session, parent_id_local, pre_diff_snapshot)
+                    parent = await _relock_parent(
+                        session, parent_id_local, pre_diff_snapshot,
+                        parent_in_session=parent,
+                    )
                     if parent is None:
                         return
                     parent.status = TaskStatus.COMPLETED
@@ -1210,7 +1243,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     return
 
                 # Non-zero-diff path: re-acquire for downstream mutations.
-                parent = await _relock_parent(session, parent_id_local, pre_diff_snapshot)
+                parent = await _relock_parent(
+                    session, parent_id_local, pre_diff_snapshot,
+                    parent_in_session=parent,
+                )
                 if parent is None:
                     return
                 parent_ctx = parent.context or {}
@@ -1254,7 +1290,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         logger.error(f"[SECURITY] Rollup scan failed for PR #{rollup_pr_number}, blocking: {e}", exc_info=True)
 
                     # Re-acquire to apply mutations / dispatch alerts.
-                    parent = await _relock_parent(session, parent_id_local, pre_merge_snapshot)
+                    parent = await _relock_parent(
+                        session, parent_id_local, pre_merge_snapshot,
+                        parent_in_session=parent,
+                    )
                     if parent is None:
                         return
                     parent_ctx = parent.context or {}
@@ -1304,7 +1343,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
-                    parent = await _relock_parent(session, parent_id_local, pre_actual_merge_snapshot)
+                    parent = await _relock_parent(
+                        session, parent_id_local, pre_actual_merge_snapshot,
+                        parent_in_session=parent,
+                    )
                     if parent is None:
                         # Concurrent mutation; merge call already completed externally,
                         # next sweep will pick up the merged state.
