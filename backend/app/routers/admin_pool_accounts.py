@@ -289,14 +289,16 @@ async def _compute_account_health_summary(
     for s in summaries:
         acct_id = s["id"]
         state = "disabled" if s["state"] == "fully_disabled" else s["state"]
-        rate_limited_models = [
-            {
+        rate_limited_models = []
+        for m in s["rate_limited_models"]:
+            entry: dict = {
                 "model": m["model"],
                 "cooldown_type": m["kind"],
                 "cooldown_seconds_remaining": m["cooldown_remaining_seconds"],
             }
-            for m in s["rate_limited_models"]
-        ]
+            if m.get("regression_stats"):
+                entry["regression_stats"] = m["regression_stats"]
+            rate_limited_models.append(entry)
         accounts.append({
             "account_id": acct_id,
             "label": s.get("name", acct_id),

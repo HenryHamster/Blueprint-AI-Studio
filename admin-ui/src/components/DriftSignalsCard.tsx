@@ -2,6 +2,12 @@ import { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
 
+interface DriftHistoryPoint {
+  snapshot_at: string;
+  claim_shipped_consistency: number;
+  over_claim_flag: boolean;
+}
+
 interface DriftSignal {
   over_claim_flag: boolean;
   stalled_despite_churn_flag: boolean;
@@ -13,6 +19,27 @@ interface DriftSignal {
 interface DriftDirection extends DriftSignal {
   direction_id: string;
   direction_text: string;
+  drift_history?: DriftHistoryPoint[];
+}
+
+function DriftSparkline({ points }: { points: DriftHistoryPoint[] }) {
+  const values = points.map(p => p.claim_shipped_consistency);
+  if (values.length < 2) return null;
+  const min = Math.min(...values), max = Math.max(...values);
+  const range = max - min || 1;
+  const W = 48, H = 14, P = 1;
+  const pts = values
+    .map((v, i) =>
+      `${(P + (i / (values.length - 1)) * (W - P * 2)).toFixed(1)},${(P + (1 - (v - min) / range) * (H - P * 2)).toFixed(1)}`
+    )
+    .join(' ');
+  const latest = values[values.length - 1];
+  const stroke = latest < 0.4 ? '#f87171' : latest < 0.7 ? '#fbbf24' : '#34d399';
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} role="img" aria-label="consistency trend" className="inline-block align-middle shrink-0">
+      <polyline points={pts} fill="none" stroke={stroke} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 export interface DriftSnapshot {
@@ -102,6 +129,9 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
                   >
                     {Math.round(d.claim_shipped_consistency * 100)}% consistent
                   </span>
+                )}
+                {d.drift_history && d.drift_history.length >= 2 && (
+                  <DriftSparkline points={d.drift_history} />
                 )}
                 <span className="text-[9px] text-neutral-500 ml-auto">
                   {d.actually_merged_prs}/{d.claimed_changes_count} merged

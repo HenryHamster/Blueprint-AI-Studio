@@ -1373,7 +1373,7 @@ async def get_drift_snapshot(
     uses this to surface claim-vs-shipped divergence without requiring operators
     to understand the raw signal format.
     """
-    from app.drift_detection import compute_direction_drift  # noqa: PLC0415
+    from app.drift_detection import compute_direction_drift, last_n_drift_snapshots  # noqa: PLC0415
 
     project = await session.get(Project, project_id)
     if project is None:
@@ -1390,8 +1390,23 @@ async def get_drift_snapshot(
     snapshot = await compute_direction_drift(session, project, window_days=window_days)
     direction_map = {d["id"]: d.get("text", "") for d in (project.directions or []) if d.get("id")}
 
-    flagged = [
-        {
+    _SPARKLINE_N = 7
+    flagged = []
+    for did, sig in snapshot["by_direction"].items():
+        if not (sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag")):
+            continue
+        raw_snaps = await last_n_drift_snapshots(session, project.id, did, n=_SPARKLINE_N)
+        # Reverse to chronological order for sparkline rendering (oldest first).
+        history = [
+            {
+                "snapshot_at": s.snapshot_at.isoformat(),
+                "claim_shipped_consistency": s.claim_shipped_consistency,
+                "over_claim_flag": s.over_claim_flag,
+                "stalled_despite_churn_flag": s.stalled_despite_churn_flag,
+            }
+            for s in reversed(raw_snaps)
+        ]
+        flagged.append({
             "direction_id": did,
             "direction_text": direction_map.get(did, ""),
             "over_claim_flag": sig["over_claim_flag"],
@@ -1399,10 +1414,8 @@ async def get_drift_snapshot(
             "claimed_changes_count": sig["claimed_changes_count"],
             "actually_merged_prs": sig["actually_merged_prs"],
             "claim_shipped_consistency": sig["claim_shipped_consistency"],
-        }
-        for did, sig in snapshot["by_direction"].items()
-        if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag")
-    ]
+            "history": history,
+        })
 
     return {
         "flagged_directions": flagged,

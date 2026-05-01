@@ -8,7 +8,7 @@ Synthetic claims-vs-shipped fixtures verify:
  - no-data direction: returns neutral signal, not error
  - per-system rollup correctness across multiple directions
  - fresh PRs older than the window are excluded
- - persist_drift_snapshot writes rows and prunes excess history
+ - persist_drift_snapshot writes rows, emits drift alerts, and prunes excess history
  - last_n_drift_snapshots returns newest-first ordered rows
 """
 import uuid
@@ -22,10 +22,11 @@ from app.drift_detection import (
     DirectionDriftSnapshot,
     _DRIFT_SNAPSHOT_RETENTION,
     compute_direction_drift,
+    drift_history_series,
     last_n_drift_snapshots,
     persist_drift_snapshot,
 )
-from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Artifact, ArtifactType, Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
 
@@ -500,3 +501,273 @@ async def test_custom_thresholds_from_runtime_config_are_respected(db_session):
     assert sig["claimed_changes_count"] == 2
     assert sig["over_claim_flag"] is True, "lowered threshold should trigger over_claim_flag"
     assert sig["stalled_despite_churn_flag"] is True, "lowered stall_min should trigger stalled flag"
+
+
+# ── Test 14: drift_history_series returns serialised sparkline data ─────────
+
+@pytest.mark.asyncio
+async def test_drift_history_series_returns_serialised_sparkline_data(db_session):
+    """drift_history_series returns newest-first serialised dicts with ISO timestamps."""
+    project = Project(
+        name="History Series Project",
+        user_id="test-user-123",
+        directions=[_direction("d-series")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    flagged_drift = {
+        "by_direction": {
+            "d-series": {
+                "claimed_changes_count": 4,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 0.0,
+                "over_claim_flag": True,
+                "stalled_despite_churn_flag": True,
+            }
+        }
+    }
+    neutral_drift = {
+        "by_direction": {
+            "d-series": {
+                "claimed_changes_count": 0,
+                "actually_merged_prs": 0,
+                "claim_shipped_consistency": 1.0,
+                "over_claim_flag": False,
+                "stalled_despite_churn_flag": False,
+            }
+        }
+    }
+
+    # 3 neutral snapshots then 1 flagged (newest).
+    for _ in range(3):
+        await persist_drift_snapshot(db_session, project, neutral_drift)
+        await db_session.commit()
+    await persist_drift_snapshot(db_session, project, flagged_drift)
+    await db_session.commit()
+
+    series = await drift_history_series(db_session, project.id, "d-series", n=3)
+    assert len(series) == 3
+    # Newest first: most recent was flagged.
+    assert series[0]["over_claim_flag"] is True
+    assert series[0]["claim_shipped_consistency"] == 0.0
+    assert isinstance(series[0]["snapshot_at"], str), "snapshot_at must be ISO string"
+    # Second-newest was neutral.
+    assert series[1]["over_claim_flag"] is False
+    assert series[1]["claim_shipped_consistency"] == 1.0
+    # All entries must have the expected keys.
+    for entry in series:
+        assert "snapshot_at" in entry
+        assert "claim_shipped_consistency" in entry
+        assert "over_claim_flag" in entry
+        assert "stalled_despite_churn_flag" in entry
+
+
+# ── Tests for Alert creation on drift flags ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_no_drift_creates_no_alert(db_session):
+    """persist_drift_snapshot with no flags creates no Alert rows."""
+    from app.models import Alert
+    project = Project(
+        name="No Drift Alerts Project",
+        user_id="test-user-123",
+        directions=[_direction("d-clean")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    neutral = {"by_direction": {"d-clean": {
+        "claimed_changes_count": 0, "actually_merged_prs": 0,
+        "claim_shipped_consistency": 1.0, "over_claim_flag": False,
+        "stalled_despite_churn_flag": False,
+    }}}
+    await persist_drift_snapshot(db_session, project, neutral)
+    await db_session.commit()
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_over_claim_flag_creates_warning_alert(db_session):
+    """A single over_claim_flag snapshot creates one WARNING Alert."""
+    from app.models import Alert, AlertSeverity
+    project = Project(
+        name="Over Claim Alert Project",
+        user_id="test-user-123",
+        directions=[_direction("d-oc")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    flagged = {"by_direction": {"d-oc": {
+        "claimed_changes_count": 5, "actually_merged_prs": 1,
+        "claim_shipped_consistency": 0.2, "over_claim_flag": True,
+        "stalled_despite_churn_flag": False,
+    }}}
+    await persist_drift_snapshot(db_session, project, flagged)
+    await db_session.commit()
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "over-claim drift" in alerts[0].title
+    assert "d-oc" in alerts[0].title
+    assert "5" in alerts[0].message
+    assert "1" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_repeated_drift_flag_no_duplicate_alert(db_session):
+    """Persisting the same flagged signal twice yields only one Alert (dedup)."""
+    from app.models import Alert
+    project = Project(
+        name="Dedup Alert Project",
+        user_id="test-user-123",
+        directions=[_direction("d-dup")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    flagged = {"by_direction": {"d-dup": {
+        "claimed_changes_count": 4, "actually_merged_prs": 0,
+        "claim_shipped_consistency": 0.0, "over_claim_flag": True,
+        "stalled_despite_churn_flag": False,
+    }}}
+    await persist_drift_snapshot(db_session, project, flagged)
+    await db_session.commit()
+    await persist_drift_snapshot(db_session, project, flagged)
+    await db_session.commit()
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 1, "second persist should not create a duplicate alert"
+
+
+@pytest.mark.asyncio
+async def test_flag_cleared_no_new_alert(db_session):
+    """After a flag fires once, a subsequent neutral snapshot creates no new Alert."""
+    from app.models import Alert
+    project = Project(
+        name="Flag Cleared Project",
+        user_id="test-user-123",
+        directions=[_direction("d-clear")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    flagged = {"by_direction": {"d-clear": {
+        "claimed_changes_count": 3, "actually_merged_prs": 0,
+        "claim_shipped_consistency": 0.0, "over_claim_flag": True,
+        "stalled_despite_churn_flag": False,
+    }}}
+    neutral = {"by_direction": {"d-clear": {
+        "claimed_changes_count": 0, "actually_merged_prs": 0,
+        "claim_shipped_consistency": 1.0, "over_claim_flag": False,
+        "stalled_despite_churn_flag": False,
+    }}}
+    await persist_drift_snapshot(db_session, project, flagged)
+    await db_session.commit()
+    await persist_drift_snapshot(db_session, project, neutral)
+    await db_session.commit()
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 1, "neutral snapshot should not create additional alerts"
+
+
+@pytest.mark.asyncio
+async def test_stalled_flag_creates_warning_alert(db_session):
+    """A stalled_despite_churn_flag snapshot creates a stalled-despite-churn Alert."""
+    from app.models import Alert, AlertSeverity
+    project = Project(
+        name="Stalled Alert Project",
+        user_id="test-user-123",
+        directions=[_direction("d-stall-alert")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Use patched thresholds so only stalled fires (over_claim_min raised above claimed)
+    flagged = {"by_direction": {"d-stall-alert": {
+        "claimed_changes_count": 5, "actually_merged_prs": 0,
+        "claim_shipped_consistency": 0.0, "over_claim_flag": False,
+        "stalled_despite_churn_flag": True,
+    }}}
+    await persist_drift_snapshot(db_session, project, flagged)
+    await db_session.commit()
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "stalled-despite-churn drift" in alerts[0].title
+    assert "d-stall-alert" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_both_flags_create_two_alerts(db_session):
+    """When both over_claim_flag and stalled_despite_churn_flag are set, two Alerts are created."""
+    from app.models import Alert
+    project = Project(
+        name="Both Flags Project",
+        user_id="test-user-123",
+        directions=[_direction("d-both")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    flagged = {"by_direction": {"d-both": {
+        "claimed_changes_count": 5, "actually_merged_prs": 0,
+        "claim_shipped_consistency": 0.0, "over_claim_flag": True,
+        "stalled_despite_churn_flag": True,
+    }}}
+    await persist_drift_snapshot(db_session, project, flagged)
+    await db_session.commit()
+
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 2
+    titles = {a.title for a in alerts}
+    assert any("over-claim drift" in t for t in titles)
+    assert any("stalled-despite-churn drift" in t for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_drift_history_series_returns_empty_for_no_history(db_session):
+    """drift_history_series returns [] when no snapshots exist yet."""
+    project = Project(
+        name="Empty History Project",
+        user_id="test-user-123",
+        directions=[_direction("d-empty-series")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    series = await drift_history_series(db_session, project.id, "d-empty-series")
+    assert series == []

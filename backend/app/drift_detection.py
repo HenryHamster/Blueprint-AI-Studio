@@ -151,6 +151,47 @@ def _build_direction_signal(
     }
 
 
+async def _maybe_create_drift_alerts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    signal: dict[str, Any],
+) -> None:
+    """Emit a WARNING Alert for each drift flag; skip if undismissed alert exists."""
+    from app.models import Alert, AlertSeverity  # lazy: avoids circular import
+
+    claimed = signal.get("claimed_changes_count", 0)
+    merged = signal.get("actually_merged_prs", 0)
+    candidates: list[tuple[str, str]] = []
+    if signal.get("over_claim_flag"):
+        candidates.append((
+            f"over-claim drift: direction {direction_id}",
+            f"Direction {direction_id} claims {claimed} changes but only {merged} PRs merged in 7d",
+        ))
+    if signal.get("stalled_despite_churn_flag"):
+        candidates.append((
+            f"stalled-despite-churn drift: direction {direction_id}",
+            f"Direction {direction_id} has {claimed} claimed changes but 0 PRs merged in 7d",
+        ))
+    for title, message in candidates:
+        existing = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title == title,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        ).scalars().first()
+        if not existing:
+            session.add(Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=title,
+                message=message,
+            ))
+
+
 async def compute_direction_drift(
     session: AsyncSession,
     project: Project,
@@ -322,6 +363,9 @@ async def persist_drift_snapshot(
 
     await session.flush()
 
+    for direction_id, signal in by_direction.items():
+        await _maybe_create_drift_alerts(session, project.id, direction_id, signal)
+
     for direction_id in by_direction:
         excess = (
             await session.execute(
@@ -362,3 +406,34 @@ async def last_n_drift_snapshots(
             )
         ).scalars().all()
     )
+
+
+# Number of snapshots returned by drift_history_series — aligns with the default
+# window_days so the sparkline covers one full rolling window.
+_DRIFT_HISTORY_SERIES_N = 7
+
+
+async def drift_history_series(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    n: int = _DRIFT_HISTORY_SERIES_N,
+) -> list[dict[str, Any]]:
+    """Return serialised drift history for a direction, newest first.
+
+    Each element contains the fields needed to render a sparkline:
+        snapshot_at (ISO string), claim_shipped_consistency (float 0-1),
+        over_claim_flag (bool), stalled_despite_churn_flag (bool).
+
+    Returns an empty list when no history exists yet.
+    """
+    snapshots = await last_n_drift_snapshots(session, project_id, direction_id, n=n)
+    return [
+        {
+            "snapshot_at": s.snapshot_at.isoformat(),
+            "claim_shipped_consistency": s.claim_shipped_consistency,
+            "over_claim_flag": s.over_claim_flag,
+            "stalled_despite_churn_flag": s.stalled_despite_churn_flag,
+        }
+        for s in snapshots
+    ]

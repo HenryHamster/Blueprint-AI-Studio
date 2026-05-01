@@ -61,6 +61,31 @@ describe('PoolAccountHealthPanel', () => {
     expect(screen.queryByTitle('Dominant failure class (24h)')).not.toBeInTheDocument();
   });
 
+  it('renders regression diagnostic line for regression-quarantined models', () => {
+    const account = makeAccount({
+      state: 'disabled',
+      rate_limited_models: [
+        {
+          model: 'claude-opus-4-7',
+          cooldown_type: 'regression',
+          cooldown_seconds_remaining: 3600,
+          regression_stats: {
+            account_rate: 0.42,
+            project_median: 0.78,
+            sample_size: 25,
+            distinct_accounts: 3,
+          },
+        },
+      ],
+    });
+    render(<PoolAccountHealthPanel accounts={[account]} loading={false} />);
+
+    const diag = screen.getByText(/regression on claude-opus-4-7/);
+    expect(diag).toBeInTheDocument();
+    expect(diag.textContent).toContain('42% vs project median 78%');
+    expect(diag.textContent).toContain('n=25 over 3 accounts');
+  });
+
   it('applies reduced opacity for disabled and disqualified accounts', () => {
     const { rerender } = render(
       <PoolAccountHealthPanel

@@ -22,6 +22,7 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'AUTO_FIX_ESCALATED', label: 'CI Auto-Fix Escalated', description: 'When CI auto-fix repeatedly fails and the branch is suspended', defaultOn: true },
   { key: 'RESIDUAL_FIX_ESCALATED', label: 'Residual Fix Escalated', description: 'When a residual fingerprint remediation repeatedly fails and is suspended', defaultOn: true },
   { key: 'RESIDUAL_FIX_UNSUSPENDED', label: 'Residual Fix Unsuspended', description: 'When a previously-suspended residual fingerprint case is manually re-enabled by an operator', defaultOn: false },
+  { key: 'account_model_regression_quarantined', label: 'Account/Model Regression Quarantined', description: 'When a provider/model pair is auto-quarantined due to detected regression in success rate', defaultOn: true },
 ];
 
 interface SettingsNotificationsSectionProps {

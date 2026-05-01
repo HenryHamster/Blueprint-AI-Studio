@@ -1056,12 +1056,15 @@ def get_all_account_health_summaries(
                 continue
             total_cooldown = _cooldown_seconds_for_info(info)
             remaining = max(0.0, total_cooldown - (now - at_dt).total_seconds())
-            rate_limited_models.append({
+            entry: dict = {
                 "model": model_name,
                 "kind": info.get("kind", "rate_limit"),
                 "hits": info.get("hits", 1),
                 "cooldown_remaining_seconds": int(remaining),
-            })
+            }
+            if info.get("kind") == "regression" and isinstance(info.get("regression_stats"), dict):
+                entry["regression_stats"] = dict(info["regression_stats"])
+            rate_limited_models.append(entry)
 
         results.append({
             "id": acct["id"],

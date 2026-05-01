@@ -4,10 +4,19 @@ import { useState } from 'react';
 
 type AccountHealthState = 'healthy' | 'probing' | 'disqualified' | 'disabled';
 
+interface RegressionStats {
+  account_rate: number;
+  project_median: number;
+  sample_size: number;
+  distinct_accounts: number;
+  started_at?: string;
+}
+
 interface RateLimitedModel {
   model: string;
   cooldown_seconds_remaining: number;
-  cooldown_type: 'rate_limit' | 'quota_exhausted';
+  cooldown_type: 'rate_limit' | 'quota_exhausted' | 'regression';
+  regression_stats?: RegressionStats;
 }
 
 export interface AccountHealthEntry {
@@ -146,6 +155,15 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                 {acct.disabled_reason && (
                   <p className="text-[10px] text-red-400/80 mt-0.5 truncate">{acct.disabled_reason}</p>
                 )}
+                {acct.rate_limited_models.filter(m => m.cooldown_type === 'regression' && m.regression_stats).map(m => {
+                  const rs = m.regression_stats!;
+                  const modelLabel = m.model.includes('/') ? m.model.split('/').pop()! : m.model;
+                  return (
+                    <p key={m.model} className="text-[10px] text-amber-400/80 mt-0.5">
+                      regression on {modelLabel}: {Math.round(rs.account_rate * 100)}% vs project median {Math.round(rs.project_median * 100)}% (n={rs.sample_size} over {rs.distinct_accounts} accounts)
+                    </p>
+                  );
+                })}
               </button>
               {expanded && acct.rate_limited_models.length > 0 && (
                 <div className="mt-2 pt-2 border-t border-neutral-800/50 flex flex-wrap gap-1">

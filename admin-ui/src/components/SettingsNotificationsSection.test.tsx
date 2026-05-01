@@ -42,4 +42,21 @@ describe('SettingsNotificationsSection', () => {
     fireEvent.click(getToggleButton('Remediation Escalation'));
     expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED', 'REMEDIATION_ESCALATED']);
   });
+
+  it('shows account/model regression quarantined and toggles it in enabled_events', () => {
+    const onUpdateEnabledEvents = vi.fn();
+    const { rerender } = render(
+      <SettingsNotificationsSection {...baseProps} enabledEvents={['TASK_FAILED', 'account_model_regression_quarantined']} onUpdateEnabledEvents={onUpdateEnabledEvents} />
+    );
+
+    expect(screen.getByText('Account/Model Regression Quarantined')).toBeInTheDocument();
+    fireEvent.click(getToggleButton('Account/Model Regression Quarantined'));
+    expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED']);
+
+    rerender(
+      <SettingsNotificationsSection {...baseProps} enabledEvents={['TASK_FAILED']} onUpdateEnabledEvents={onUpdateEnabledEvents} />
+    );
+    fireEvent.click(getToggleButton('Account/Model Regression Quarantined'));
+    expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED', 'account_model_regression_quarantined']);
+  });
 });

@@ -242,4 +242,71 @@ describe('DriftSignalsCard', () => {
       expect.stringContaining('project_id=my-project-xyz'),
     );
   });
+
+  it('renders sparkline when drift_history has sufficient points', async () => {
+    const driftHistory = [
+      { snapshot_at: '2026-04-22T00:00:00Z', claim_shipped_consistency: 0.8, over_claim_flag: false },
+      { snapshot_at: '2026-04-23T00:00:00Z', claim_shipped_consistency: 0.5, over_claim_flag: false },
+      { snapshot_at: '2026-04-24T00:00:00Z', claim_shipped_consistency: 0.3, over_claim_flag: true },
+      { snapshot_at: '2026-04-25T00:00:00Z', claim_shipped_consistency: 0.2, over_claim_flag: true },
+      { snapshot_at: '2026-04-26T00:00:00Z', claim_shipped_consistency: 0.1, over_claim_flag: true },
+    ];
+
+    apiFetchMock.mockResolvedValue(
+      jsonResponse(
+        makeSnapshot({
+          flagged_count: 1,
+          flagged_directions: [
+            {
+              direction_id: 'd-hist',
+              direction_text: 'Ship retry backoff',
+              over_claim_flag: true,
+              stalled_despite_churn_flag: false,
+              claimed_changes_count: 5,
+              actually_merged_prs: 0,
+              claim_shipped_consistency: 0.1,
+              drift_history: driftHistory,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<DriftSignalsCard projectId="proj-sparkline" />);
+
+    await act(async () => {});
+    await user.click(screen.getByRole('button'));
+
+    expect(screen.getByRole('img', { name: /consistency trend/i })).toBeInTheDocument();
+  });
+
+  it('omits sparkline when drift_history is absent', async () => {
+    apiFetchMock.mockResolvedValue(
+      jsonResponse(
+        makeSnapshot({
+          flagged_count: 1,
+          flagged_directions: [
+            {
+              direction_id: 'd-no-hist',
+              direction_text: 'No history direction',
+              over_claim_flag: true,
+              stalled_despite_churn_flag: false,
+              claimed_changes_count: 3,
+              actually_merged_prs: 0,
+              claim_shipped_consistency: 0.0,
+            },
+          ],
+        }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<DriftSignalsCard projectId="proj-no-spark" />);
+
+    await act(async () => {});
+    await user.click(screen.getByRole('button'));
+
+    expect(screen.queryByRole('img', { name: /consistency trend/i })).not.toBeInTheDocument();
+  });
 });

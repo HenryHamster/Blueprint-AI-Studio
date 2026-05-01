@@ -376,28 +376,29 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
   it('renders nothing when cost_per_merge_exceeds_threshold is false', () => {
     const d = makeDirection({ cost_per_merge_exceeds_threshold: false, cost_per_merged_pr: 1.50 });
     render(<DirectionCard {...makeProps(d)} />);
-    expect(screen.queryByText('High cost/PR')).not.toBeInTheDocument();
+    expect(screen.queryByText('High cost / autonomous merge')).not.toBeInTheDocument();
   });
 
   it('renders nothing when cost_per_merge_exceeds_threshold is absent', () => {
     const d = makeDirection();
     render(<DirectionCard {...makeProps(d)} />);
-    expect(screen.queryByText('High cost/PR')).not.toBeInTheDocument();
+    expect(screen.queryByText('High cost / autonomous merge')).not.toBeInTheDocument();
   });
 
   it('renders amber warning badge when cost_per_merge_exceeds_threshold is true', () => {
     const d = makeDirection({ cost_per_merge_exceeds_threshold: true, cost_per_merged_pr: 45.00 });
     render(<DirectionCard {...makeProps(d)} />);
-    const badge = screen.getByText('High cost/PR');
+    const badge = screen.getByText('High cost / autonomous merge');
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/amber/);
   });
 
-  it('badge title includes the cost_per_merged_pr value', () => {
+  it('badge title names the autonomous-only denominator', () => {
     const d = makeDirection({ cost_per_merge_exceeds_threshold: true, cost_per_merged_pr: 45.00 });
     render(<DirectionCard {...makeProps(d)} />);
-    const badge = screen.getByText('High cost/PR');
-    expect(badge.getAttribute('title')).toMatch(/\$45\.00/);
+    const badge = screen.getByText('High cost / autonomous merge');
+    expect(badge.getAttribute('title')).toMatch(/Cost per autonomous merge: \$45\.00/);
+    expect(badge.getAttribute('title')).toMatch(/autonomous merges only/);
   });
 
   it('renders provider/model breakdown from retirement_consideration_evidence', () => {
@@ -415,7 +416,7 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
       },
     });
     render(<DirectionCard {...makeProps(d)} />);
-    expect(screen.getByText('High cost/PR')).toBeInTheDocument();
+    expect(screen.getByText('High cost / autonomous merge')).toBeInTheDocument();
     // Top entry rendered with model label and percentage share.
     expect(screen.getByText(/claude-opus-4-7 80%/)).toBeInTheDocument();
     expect(screen.getByText(/gpt-5\.4 20%/)).toBeInTheDocument();
@@ -431,7 +432,7 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
       },
     });
     render(<DirectionCard {...makeProps(d)} />);
-    expect(screen.getByText('High cost/PR')).toBeInTheDocument();
+    expect(screen.getByText('High cost / autonomous merge')).toBeInTheDocument();
     // 30/40 = 75%, 10/40 = 25%.
     expect(screen.getByText(/claude-opus-4-7 75%/)).toBeInTheDocument();
     expect(screen.getByText(/gpt-5\.4 25%/)).toBeInTheDocument();
@@ -440,7 +441,7 @@ describe('DirectionCard cost-per-merge retirement warning', () => {
   it('renders only the badge (no breakdown) when neither split source is provided', () => {
     const d = makeDirection({ cost_per_merge_exceeds_threshold: true, cost_per_merged_pr: 45.00 });
     render(<DirectionCard {...makeProps(d)} />);
-    expect(screen.getByText('High cost/PR')).toBeInTheDocument();
+    expect(screen.getByText('High cost / autonomous merge')).toBeInTheDocument();
     // No model labels should appear when there is no breakdown data.
     expect(screen.queryByText(/claude-opus-4-7/)).not.toBeInTheDocument();
     expect(screen.queryByText(/gpt-5\.4/)).not.toBeInTheDocument();

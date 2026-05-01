@@ -5980,6 +5980,72 @@ async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, 
     assert "claim_shipped_consistency" in flagged
     assert "window_days" in data
     assert "generated_at" in data
+    # history field present; empty when no stored snapshots exist yet
+    assert "history" in flagged
+    assert isinstance(flagged["history"], list)
+
+
+@pytest.mark.asyncio
+async def test_drift_snapshot_history_series_returned(client: AsyncClient, db_session):
+    """Flagged direction includes history sparkline from stored DirectionDriftSnapshot rows."""
+    from app.drift_detection import DirectionDriftSnapshot
+    from app.models import Task, TaskStatus
+    from app.time_utils import _utcnow as _now
+    from datetime import timedelta
+
+    dir_id = "d-trend"
+    project = make_project(
+        directions=[{"id": dir_id, "text": "Trend test", "status": "active", "priority": "high"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Insert 3 historical drift snapshots (oldest → newest)
+    base_time = _now() - timedelta(hours=6)
+    for i in range(3):
+        snap = DirectionDriftSnapshot(
+            project_id=project.id,
+            direction_id=dir_id,
+            snapshot_at=base_time + timedelta(hours=i),
+            claimed_changes_count=4,
+            actually_merged_prs=0,
+            claim_shipped_consistency=0.0,
+            over_claim_flag=True,
+            stalled_despite_churn_flag=False,
+        )
+        db_session.add(snap)
+
+    # Add enough tasks to trigger the over_claim_flag in the live compute
+    now = _now()
+    for _ in range(4):
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": dir_id, "shipped": True},
+            created_at=now - timedelta(hours=1),
+        )
+        db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/drift-snapshot?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["flagged_count"] == 1
+    flagged = data["flagged_directions"][0]
+    assert flagged["direction_id"] == dir_id
+    history = flagged["history"]
+    assert isinstance(history, list)
+    assert len(history) == 3
+    # history is oldest-first (chronological order for sparkline)
+    for entry in history:
+        assert "snapshot_at" in entry
+        assert "claim_shipped_consistency" in entry
+        assert "over_claim_flag" in entry
+        assert "stalled_despite_churn_flag" in entry
+    # chronological order: each snapshot_at >= previous
+    times = [entry["snapshot_at"] for entry in history]
+    assert times == sorted(times)
 
 
 @pytest.mark.asyncio

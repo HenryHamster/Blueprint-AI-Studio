@@ -879,16 +879,16 @@ function DirectionCardImpl({
               ranked.sort((a, b) => (b.share ?? 0) - (a.share ?? 0) || b.cost - a.cost);
               const top = ranked.slice(0, 3);
               const tooltip = top.length > 0
-                ? `Cost per merged PR: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — exceeds project median by 3×\n` +
+                ? `Cost per autonomous merge: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — autonomous merges only; operator-assisted merges are excluded from the denominator.\n` +
                   top.map(r => `${r.key}: $${r.cost.toFixed(2)}${r.share != null ? ` (${Math.round(r.share * 100)}%)` : ''}`).join('\n')
-                : `Cost per merged PR: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — exceeds project median by 3×`;
+                : `Cost per autonomous merge: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — autonomous merges only; operator-assisted merges are excluded from the denominator.`;
               return (
                 <>
                   <span
                     title={tooltip}
                     className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
                   >
-                    High cost/PR
+                    High cost / autonomous merge
                   </span>
                   {top.length > 0 && (
                     <span
