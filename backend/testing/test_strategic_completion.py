@@ -686,6 +686,47 @@ class TestRecordStrategicTaskFailure:
         # Should not raise
         await _record_strategic_task_failure(task, strat_fail_db)
 
+    @pytest.mark.asyncio
+    async def test_contention_skip_when_peer_holds_lock(self, mocker):
+        """R5-W4 MEDIUM-D test 2: when project=None and the FOR UPDATE
+        skip_locked SELECT returns None but the row genuinely exists,
+        the function must log + return cleanly without raising.
+
+        This exercises the "held by parallel handler" branch documented
+        in the function docstring. The parallel handler is incrementing
+        the same counter; silently skipping is safe by design.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+        import uuid
+
+        # Build a Task without persisting it — the function reads
+        # project_id and id from the in-memory instance.
+        task = Task(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "p"}],
+            context={},
+        )
+
+        # First execute call: locked SELECT returns None (peer holds lock).
+        # Second execute call: exists check returns a row (project exists).
+        first_result = MagicMock()
+        first_result.scalars.return_value.first.return_value = None
+        second_result = MagicMock()
+        second_result.first.return_value = (task.project_id,)
+
+        session = MagicMock()
+        session.execute = AsyncMock(side_effect=[first_result, second_result])
+        session.add = MagicMock()  # not called in this branch
+
+        # Must return cleanly without raising.
+        await _record_strategic_task_failure(task, session, project=None)
+
+        # Validate: locked SELECT and existence-disambiguator SELECT both ran;
+        # session.add was NOT called (no project mutation in skip branch).
+        assert session.execute.await_count == 2
+        session.add.assert_not_called()
+
 
 # ── _check_direction_starvation ──────────────────────────────────────────────
 
