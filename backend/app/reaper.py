@@ -1561,10 +1561,18 @@ async def reaper_service():
                 # (orchestrator skips tasks where retry_after > now).
                 try:
                     # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
+                    # Audit R4-W2 (M2): filter ``retry_after_until IS NOT NULL``
+                    # at SQL — without this, the LIMIT _BATCH budget was wasted
+                    # iterating QUEUED rows that never had a retry_after set
+                    # (the common case), starving the actual stale-far-future
+                    # candidates the sweep was meant to catch.
                     _retry_cutoff = now + timedelta(minutes=RETRY_AFTER_MAX_MINUTES)
                     _queued_with_retry = (await session.execute(
                         select(Task)
-                        .where(Task.status == TaskStatus.QUEUED)
+                        .where(
+                            Task.status == TaskStatus.QUEUED,
+                            Task.retry_after_until.is_not(None),
+                        )
                         .limit(_BATCH)
                     )).scalars().all()
                     if len(_queued_with_retry) >= _BATCH:

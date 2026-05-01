@@ -1246,10 +1246,23 @@ async def orchestrator_worker():
                         acct["active_tasks"] = db_count
 
                 # Step 1: Find candidate tasks WITHOUT lock (read-only scan for dep filtering)
+                # R4-W2 (H4): drop heavy JSONB (status_log_data, history blob)
+                # via load_only so a 50-row candidate pull doesn't TOAST-fetch
+                # the death-trace window from every QUEUED task. Include
+                # ``status_log`` per memory ``reference_load_only_event_listeners.md``
+                # — Task.status / latest_status_message setters trigger event
+                # listeners that read status_log, which raises MissingGreenlet
+                # if it's a deferred-loaded attribute (no async session bound).
                 candidate_stmt = select(Task).where(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval.is_(False)
-                ).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
+                ).options(load_only(
+                    Task.id, Task.status, Task.priority, Task.created_at,
+                    Task.requires_approval, Task.retry_after_until,
+                    Task.context, Task.depends_on, Task.launched_by_user_id,
+                    Task.project_id, Task.payloads, Task.status_log,
+                    Task.latest_status_message,
+                )).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
                 # Per-user pool availability cache. Rate-limit-origin retry_after
@@ -1792,12 +1805,22 @@ async def orchestrator_worker():
                 # Step 3: Re-read ONLY the tasks we're about to dispatch. This
                 # scan is read-only; the row is locked with task_lock() at the
                 # top of the per-task mutation block below.
+                # R4-W2 (H4): same load_only filter as the candidate fetch
+                # — heavy JSONB columns aren't needed for the dispatch gate
+                # work either. ``status_log`` retained for event-listener
+                # reads on Task.status mutations downstream.
                 queued_tasks = []
                 if eligible_ids:
                     dispatch_stmt = select(Task).where(
                         Task.id.in_(eligible_ids),
                         Task.status == TaskStatus.QUEUED,
-                    )
+                    ).options(load_only(
+                        Task.id, Task.status, Task.priority, Task.created_at,
+                        Task.requires_approval, Task.retry_after_until,
+                        Task.context, Task.depends_on, Task.launched_by_user_id,
+                        Task.project_id, Task.payloads, Task.status_log,
+                        Task.latest_status_message,
+                    ))
                     queued_tasks = list((await session.execute(dispatch_stmt)).scalars().all())
 
                 logger.info(f"[ORCHESTRATOR] Cycle: {len(queued_tasks)} queued, {active_count} active, {slots_available} slots, pool={len(_account_by_id)} accounts")

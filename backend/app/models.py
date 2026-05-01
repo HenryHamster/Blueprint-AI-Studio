@@ -471,6 +471,19 @@ class Task(SQLModel, table=True):
             "status",
             postgresql_where=text("parent_task_id IS NOT NULL"),
         ),
+        # Partial expression index on the leading payload's ``type`` so the
+        # orchestrator pipeline budget query (every 5s) can filter active
+        # tasks by type without SeqScanning every PROVISIONING/IN_PROGRESS
+        # row. Postgres-only via alembic 0067 raw SQL on
+        # ``(payloads -> 0 ->> 'type')`` WHERE status IN ('PROVISIONING',
+        # 'IN_PROGRESS'). Metadata Index entry registers the name + a
+        # column reference (``payloads``) for the
+        # test_model_indexes_covered_by_migrations invariant. See R4-W2 / H5.
+        Index(
+            "ix_task_payloads_type_active",
+            "payloads",
+            postgresql_where=text("status IN ('PROVISIONING', 'IN_PROGRESS')"),
+        ),
         # Defense-in-depth size cap on payloads JSONB (audit 2026-04-29 D4 /
         # finding M-S5). The Python layer's ``pack_under_budget`` already caps
         # strategic-spawn payloads at 120 KB, but a future code path could

@@ -10,7 +10,6 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -2180,6 +2179,15 @@ async def agent_heartbeat(
                 "[HEARTBEAT_BEACON] task=%s vm=%s msg=%s",
                 req.task_id, token.get("vm_instance_id"), msg[:300],
             )
+    # Heartbeat counter (R4-W2 H1+H2+H3+M10): increment on EVERY heartbeat
+    # (hoisted out of the metrics-conditional block — metrics-less heartbeats
+    # were never advancing the counter, biasing the audit-trail gate). ORM
+    # mutation replaces the prior Core ``UPDATE`` (1 round-trip vs 2; in-
+    # memory value stays in sync with persisted value, fixing the
+    # ``synchronize_session="auto"`` off-by-one).
+    task.heartbeat_count = (task.heartbeat_count or 0) + 1
+    hb_count = task.heartbeat_count  # already incremented in-memory
+
     if req.metrics or req.tool_trace is not None:
         # Phase B2 (audit 2026-04-29 / finding C3): hot fields (last_metrics,
         # last_tool_use_at) are dedicated columns — cheap in-place column
@@ -2224,23 +2232,9 @@ async def agent_heartbeat(
         # lottery: at 30s cadence consecutive heartbeats from the same VM
         # hit the same modulo bucket (delta=30s, 30%5==0), so ~20% of VMs
         # always persisted and ~80% never persisted (audit C1).
-        # ``attempt_count`` was the suggested replacement but it only
-        # increments on retry/failure paths, never on heartbeats — so it
-        # would also produce nothing useful here.
-        # Round 2 F2 stored the counter in ``task.context['_heartbeat_count']``
-        # but bumping a JSONB subkey re-serializes the whole blob every
-        # heartbeat, defeating B2's TOAST-savings (Round 3 C1). The counter
-        # now lives in a dedicated ``Task.heartbeat_count`` Integer column
-        # (alembic 0066). Atomic SQL increment so two-pod racing heartbeats
-        # don't collide on a stale-read cycle. The locked row already gives
-        # a fresh read; ``task.heartbeat_count + 1`` is the value the SQL
-        # increment just wrote.
-        await session.execute(
-            sql_update(Task)
-            .where(Task.id == task.id)
-            .values(heartbeat_count=Task.heartbeat_count + 1)
-        )
-        hb_count = task.heartbeat_count + 1
+        # The counter lives in a dedicated ``Task.heartbeat_count`` Integer
+        # column (alembic 0066) and is bumped above (R4-W2) — the gate just
+        # reads the in-memory value.
         persist_audit_trail = (hb_count % 5 == 0)
 
         if persist_audit_trail:

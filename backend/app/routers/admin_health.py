@@ -453,9 +453,13 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
     # return NULL when the key is absent, so the IS NOT NULL predicate is
     # dialect-agnostic. SQLite has no GIN — the index_safe variant matters
     # only on Postgres but the predicate evaluates correctly either way.
+    # R4-W2 (M3): use ``has_key`` (compiles to JSONB ``?`` operator) so the
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate. The prior
+    # ``as_string().is_not(None)`` form casts to text and never matches the
+    # GIN index, forcing a SeqScan.
     pinned_where = [
         Task.status == TaskStatus.QUEUED,
-        Task.context["warm_target_vm_id"].as_string().is_not(None),
+        Task.context.has_key("warm_target_vm_id"),
     ]
     pinned_stmt = (
         select(Task)

@@ -295,6 +295,143 @@ async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(client: Async
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_count_increments_per_heartbeat(client: AsyncClient, db_session):
+    """R4-W2 (H1+H2+H3+M10): the dedicated ``Task.heartbeat_count`` column
+    advances by exactly one on every heartbeat, regardless of whether the
+    request carries metrics/tool_trace.
+
+    This pins three regressions guarded by R4-W2:
+
+      - H1 — replaces a separate Core ``UPDATE`` round-trip with an ORM
+        mutation that SQLAlchemy coalesces into the existing commit-time
+        UPDATE. If the ORM-mutation path regresses to the Core UPDATE,
+        ``synchronize_session="auto"`` would re-introduce H2's off-by-one.
+      - H3 — the increment used to live inside ``if req.metrics or
+        req.tool_trace`` so metrics-less heartbeats never advanced the
+        counter, biasing the every-5th audit-trail-persist gate.
+      - M10 — the in-memory ``task.heartbeat_count`` was stale after a
+        Core UPDATE; the ORM-mutation path keeps the in-memory value
+        consistent with the DB row.
+    """
+    project = Project(name="Heartbeat Count Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-hb-count",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    initial = task.heartbeat_count
+    assert initial == 0, f"new task should default heartbeat_count=0, got {initial}"
+
+    token = create_agent_token(str(task.id), "agent-vm-hb-count")
+    headers = {"x-agent-token": token}
+
+    # 5 metrics-less heartbeats — H3 says these MUST advance the counter.
+    for _ in range(5):
+        resp = await client.post(
+            "/api/agent/heartbeat",
+            json={"task_id": str(task.id), "status_message": "still running"},
+            headers=headers,
+        )
+        assert resp.status_code == 200, f"heartbeat failed: {resp.text}"
+
+    await db_session.refresh(task)
+    assert task.heartbeat_count == initial + 5, (
+        f"expected heartbeat_count to advance by 5 (one per metrics-less heartbeat), "
+        f"got initial={initial} → final={task.heartbeat_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_audit_gate_fires_every_5th(client: AsyncClient, db_session):
+    """R4-W2: ``metrics_history`` is persisted to ``task.context`` only on
+    every 5th heartbeat (with metrics), not on the 1st-4th.
+
+    The audit-trail ring-buffer (``metrics_history``, ``_tool_trace``)
+    persistence is gated by ``hb_count % 5 == 0`` so that we don't rewrite
+    the JSONB blob on every cycle (round 2 audit C3 — JSONB rewrite was the
+    failure mode B2 was created to fix). With H3's hoisted increment,
+    ``hb_count`` advances on every heartbeat regardless of whether metrics
+    are attached, so the gate fires predictably on the 5th metrics-bearing
+    request.
+
+    Skips the round-1 timestamp-modulo lottery (``int(last_heartbeat.timestamp())
+    % 5``) where ~80% of VMs never persisted because consecutive 30s heartbeats
+    landed in the same modulo bucket.
+    """
+    project = Project(name="Heartbeat Audit Gate Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-audit-gate",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-audit-gate")
+    headers = {"x-agent-token": token}
+    metrics_payload = {
+        "task_id": str(task.id),
+        "status_message": "still running",
+        "metrics": {"rss_mb": 100.0, "heap_used_mb": 50.0},
+    }
+
+    # Heartbeats 1-4 — counter advances but metrics_history must not be persisted.
+    for i in range(1, 5):
+        resp = await client.post(
+            "/api/agent/heartbeat",
+            json=metrics_payload,
+            headers=headers,
+        )
+        assert resp.status_code == 200, f"heartbeat {i} failed: {resp.text}"
+        await db_session.refresh(task)
+        assert task.heartbeat_count == i, (
+            f"after heartbeat {i}: expected count={i}, got {task.heartbeat_count}"
+        )
+        ctx = task.context or {}
+        assert "metrics_history" not in ctx, (
+            f"after heartbeat {i}: metrics_history must NOT be persisted "
+            f"(every-5th gate), got context={ctx!r}"
+        )
+
+    # Heartbeat 5 — gate fires, metrics_history persisted.
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json=metrics_payload,
+        headers=headers,
+    )
+    assert resp.status_code == 200, f"5th heartbeat failed: {resp.text}"
+    await db_session.refresh(task)
+    assert task.heartbeat_count == 5
+    ctx = task.context or {}
+    assert "metrics_history" in ctx, (
+        f"after heartbeat 5: metrics_history MUST be persisted (every-5th gate fires), "
+        f"got context={ctx!r}"
+    )
+    history = ctx["metrics_history"]
+    assert isinstance(history, list)
+    assert len(history) == 1, (
+        f"expected exactly one metrics_history entry on first gate fire, "
+        f"got {history!r}"
+    )
+    assert history[0].get("rss_mb") == 100.0
+
+
+@pytest.mark.asyncio
 async def test_agent_status_complete_with_artifacts_creates_artifact_record(client: AsyncClient, db_session, mocker):
     """
     Tests that completing a task with artifact information creates an Artifact record

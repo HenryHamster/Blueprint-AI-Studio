@@ -3014,10 +3014,12 @@ async def _compute_digest(
         )
     )
     _inv_tasks = _inv_result.scalars().all()
+    # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate.
     _rem_result = await session.execute(
         select(Task).where(
             *_funnel_filters,
-            Task.context["diagnosis_task_id"].as_string().is_not(None),
+            Task.context.has_key("diagnosis_task_id"),
         )
     )
     _rem_tasks = _rem_result.scalars().all()
@@ -3263,10 +3265,12 @@ async def _compute_digest(
         "merge_rate": round(_merged_with_prior / _prior_resolved, 4) if _prior_resolved else None,
     }
 
+    # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate.
     _cum_filters = [
         Task.status == TaskStatus.COMPLETED,
         or_(
-            Task.context["diagnosis_task_id"].as_string().is_not(None),
+            Task.context.has_key("diagnosis_task_id"),
             Task.auto_remediation.is_(True),  # promoted column (audit W1)
         ),
         Task.context["pr_merged"].as_boolean() == True,  # noqa: E712
