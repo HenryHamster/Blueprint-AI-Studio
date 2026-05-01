@@ -26,6 +26,16 @@
 # that the rotation is committed and any error is a "retry the swap"
 # situation, not a "the rotation broke things" situation.
 #
+# EXPECTED BEHAVIOR DURING ROTATION:
+# Between step 7 (DATABASE_URL secret-version add) and step 9 (new revision
+# Ready), the OLD Cloud Run revision continues serving with connections
+# holding the OLD password. After step 2's terraform apply rotates the SQL
+# user, those connections fail auth on next pre-ping (~9 min via
+# pool_recycle=540) or next reconnect. pool_pre_ping=True in
+# backend/app/database.py prevents hard failure, but expect elevated request
+# latency for up to ~9 minutes during rollover. This is by design; Cloud Run
+# gracefully drains old revisions while the new revision serves.
+#
 # Pre-requisites:
 #   - terraform apply -var="use_cloud_sql=true" (Cloud SQL must already exist)
 #   - gcloud authenticated
