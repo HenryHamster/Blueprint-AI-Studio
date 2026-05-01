@@ -2080,9 +2080,21 @@ async def orchestrator_worker():
                     #    reselect the same broken account every attempt).
                     _blacklist = (task.context or {}).get("blacklisted_accounts")
                     _sticky = (task.context or {}).get("provision_failed_accounts") or []
-                    task_project = await session.get(Project, task.project_id)
-                    # Launcher pays; fall back to project owner for autonomous tasks
-                    dispatch_user_id = task.launched_by_user_id or (task_project.user_id if task_project else "")
+                    # Launcher pays; fall back to project owner for autonomous tasks.
+                    # R6-W3-D: reuse the cycle-local _project_user_cache built during
+                    # eligibility filtering so we don't re-issue a Project SELECT per
+                    # dispatched task (extends R5-W5 MED-5 from the eligibility scan
+                    # to the dispatch site).
+                    if task.launched_by_user_id:
+                        dispatch_user_id = task.launched_by_user_id
+                    else:
+                        cached_owner = _project_user_cache.get(task.project_id)
+                        if cached_owner is not None:
+                            dispatch_user_id = cached_owner
+                        else:
+                            task_project = await session.get(Project, task.project_id)
+                            dispatch_user_id = task_project.user_id if task_project else ""
+                            _project_user_cache[task.project_id] = dispatch_user_id
                     task_model = _extract_task_model(task)
                     # Prune stale blacklist entries — accounts whose model cooldown has expired
                     # should be eligible again, otherwise rate-limited tasks get stuck forever
