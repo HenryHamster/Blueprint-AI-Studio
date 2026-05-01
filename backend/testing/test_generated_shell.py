@@ -575,7 +575,13 @@ def _discover_static_scripts() -> list[Path]:
     the docker image where /app == repo root."""
     root = Path(__file__).resolve().parent.parent.parent  # backend/testing/../../..
     candidates: list[Path] = []
-    for pattern in ("scripts/*.sh", "infra/packer/*.sh"):
+    # R6-W3-E: include infra/*.sh (rotate-db-password.sh, restore-drill.sh,
+    # migrate-alloydb-to-cloudsql.sh) so syntactic regressions in our
+    # operational shell scripts are caught at lint time. The R5-W3 H1
+    # `gcloud sql connect` issue was a runtime bug a static lint can't
+    # catch, but at least syntax errors and shellcheck warnings are now
+    # gated.
+    for pattern in ("scripts/*.sh", "infra/*.sh", "infra/packer/*.sh"):
         candidates.extend(root.glob(pattern))
     # Filter out anything that's not actually a bash script (some .sh
     # might be zsh / sh). Read the shebang to confirm.
