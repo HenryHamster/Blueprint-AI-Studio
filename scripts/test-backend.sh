@@ -153,6 +153,18 @@ else
     -e WS_TICKET_SECRET=ci-test-secret"
 fi
 
+# Mount admin-ui/src read-only so test_invariants.py's frontend size
+# guardrails can actually run inside Docker. Without this they silently
+# skip (admin-ui isn't in the backend Dockerfile build context) and
+# breaches accumulate unnoticed (R6 finding). The mount target
+# /admin-ui/src is one of the candidate paths in
+# `_resolve_admin_ui_src_root()`. CI runs without this mount; the
+# guardrails fail loudly there until the workflow is updated similarly.
+if [ "$USE_DOCKER" = "1" ] && [ -d ../admin-ui/src ]; then
+  ADMIN_UI_HOST_PATH="$(cd ../admin-ui/src && pwd)"
+  ENV_ARGS="$ENV_ARGS -v ${ADMIN_UI_HOST_PATH}:/admin-ui/src:ro"
+fi
+
 ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \
@@ -162,7 +174,11 @@ ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
 _run() {
   # _run <cmd...> — runs inside Docker or directly, with env vars set
   if [ "$USE_DOCKER" = "1" ]; then
-    docker run --rm $ENV_ARGS blueprint-backend-test "$@"
+    # MSYS_NO_PATHCONV=1: stop Git Bash on Windows from translating
+    # the host path in `-v /d/path:/admin-ui/src` to a Windows-style
+    # path before passing it to docker.exe (the colon + leading slash
+    # look like a Windows drive ref to MSYS).
+    MSYS_NO_PATHCONV=1 docker run --rm $ENV_ARGS blueprint-backend-test "$@"
   else
     # Replace leading "python3" with $PYTHON if set (venv interpreter)
     if [ -n "${PYTHON:-}" ] && [ "$1" = "python3" ]; then

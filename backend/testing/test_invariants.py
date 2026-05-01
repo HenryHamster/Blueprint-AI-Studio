@@ -851,21 +851,79 @@ class TestBackendModuleSizeGuardrails:
 FRONTEND_SIZE_LIMITS = _SIZE_LIMITS["frontend"]
 
 
+def _resolve_admin_ui_src_root() -> str | None:
+    """Locate ``admin-ui/src`` across local + Docker test environments.
+
+    Search order:
+      1. ``ADMIN_UI_SRC`` env override (caller-supplied path).
+      2. ``/admin-ui/src`` (Docker volume-mount target used by
+         ``scripts/test-backend.sh``).
+      3. Host filesystem at ``../../admin-ui/src`` from this test file
+         (``backend/testing/`` → repo root).
+
+    Returns the first existing path or ``None`` if none resolve. The
+    caller decides whether ``None`` should skip or fail — see
+    ``TestFrontendSizeGuardrails`` (we fail loudly in CI to surface the
+    silent-skip regression that R6 caught).
+    """
+    env_override = os.getenv("ADMIN_UI_SRC")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/admin-ui/src")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui", "src")
+        )
+    )
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+_ADMIN_UI_SRC_ROOT = _resolve_admin_ui_src_root()
+
+
 def _get_frontend_path(relative: str) -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui", "src", relative)
+    if _ADMIN_UI_SRC_ROOT is None:
+        # Caller must have already failed via _require_admin_ui_src(); this
+        # is the defensive fallback that returns a path the assertion will
+        # surface as a clear file-not-found error.
+        return os.path.join("admin-ui-src-not-found", relative)
+    return os.path.join(_ADMIN_UI_SRC_ROOT, relative)
 
 
 class TestFrontendSizeGuardrails:
-    """Loose upper bounds to catch runaway frontend file growth."""
+    """Loose upper bounds to catch runaway frontend file growth.
+
+    R6 regression: previously this class skipped silently when
+    ``admin-ui`` wasn't on disk — the Docker test image (``./backend``
+    build context) excludes it, so CI never enforced these limits and
+    breaches accumulated unnoticed. Failing loud forces the operator to
+    either mount/copy ``admin-ui/src`` into the test environment, set
+    ``ADMIN_UI_SRC=/path/to/admin-ui/src``, or explicitly opt out via
+    ``SKIP_FRONTEND_SIZE_GUARDRAILS=1``.
+    """
 
     @staticmethod
-    def _skip_if_missing() -> None:
+    def _require_admin_ui_src() -> None:
         import pytest
-        if not os.path.isdir(os.path.join(os.path.dirname(__file__), "..", "..", "admin-ui")):
-            pytest.skip("admin-ui directory not present")
+        if os.getenv("SKIP_FRONTEND_SIZE_GUARDRAILS") == "1":
+            pytest.skip("SKIP_FRONTEND_SIZE_GUARDRAILS=1 set")
+        if _ADMIN_UI_SRC_ROOT is None:
+            pytest.fail(
+                "Frontend size guardrails could not locate admin-ui/src. "
+                "Searched ADMIN_UI_SRC env, /admin-ui/src (Docker mount), "
+                "and ../../admin-ui/src (host filesystem). To run the "
+                "guardrails inside Docker, mount the directory "
+                "(e.g. `docker run -v $(pwd)/admin-ui/src:/admin-ui/src:ro ...`) "
+                "or set ADMIN_UI_SRC to a path the container can read. "
+                "Set SKIP_FRONTEND_SIZE_GUARDRAILS=1 to opt out explicitly."
+            )
 
     def _check_frontend(self, relative_path: str) -> None:
-        self._skip_if_missing()
+        self._require_admin_ui_src()
         max_lines = FRONTEND_SIZE_LIMITS[relative_path]
         path = _get_frontend_path(relative_path)
         with open(path) as f:
