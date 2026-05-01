@@ -135,7 +135,10 @@ class AllowedUser(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
-    last_login_at: Optional[datetime] = None
+    last_login_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
 
 class UserIntegration(SQLModel, table=True):
@@ -157,8 +160,14 @@ class UserIntegration(SQLModel, table=True):
     # GitHub Fine-Grained Personal Access Token (Alternative to App Installation)
     github_pat: Optional[str] = None
 
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
 
     __table_args__ = (
         UniqueConstraint("user_id", name="uq_userintegration_user_id"),
@@ -220,7 +229,10 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(Text, nullable=True),
     )
-    running_update_acknowledged_at: Optional[datetime] = Field(default=None)
+    running_update_acknowledged_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Living architectural description maintained by design doc update agent
     design_doc: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
     # Toggle autonomous research/task generation
@@ -253,7 +265,10 @@ class ProjectMember(SQLModel, table=True):
     # Allowed values: 'owner' | 'member' | 'viewer'. Enforced server-side by
     # ``chk_projectmember_role`` (alembic 0065 / audit L-S1, Postgres-only).
     role: str = Field(default="member")
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
 
 
 class Task(SQLModel, table=True):
@@ -303,7 +318,10 @@ class Task(SQLModel, table=True):
     plan_output: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
 
     # Agent Heartbeat mechanism
-    last_heartbeat: Optional[datetime] = Field(default=None)
+    last_heartbeat: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     # Heartbeat-hot fields promoted from Task.context JSONB (audit 2026-04-29 B2 / C3).
     # The heartbeat handler rewrote the whole context blob every 30s/VM — at 200
@@ -313,7 +331,10 @@ class Task(SQLModel, table=True):
     # (metrics_history, _tool_trace) stay in context but only persist every
     # 5th heartbeat (handler-side modulo).
     last_metrics_json: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
-    last_tool_use_at: Optional[datetime] = Field(default=None)
+    last_tool_use_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     # Heartbeat audit-trail gate counter (R3-W1 / Round 3 C1, alembic 0066).
     # Round 2 F2 stored this in ``task.context['_heartbeat_count']`` to gate
@@ -336,7 +357,10 @@ class Task(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
-    started_at: Optional[datetime] = Field(default=None)
+    started_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Auto-populated on INSERT (default_factory + server_default) and UPDATE
     # (onupdate). Consumed by reaper.py's EVALUATING stale sweep and
     # rollup_management.py age calculations so "last touched" can be
@@ -354,9 +378,18 @@ class Task(SQLModel, table=True):
     archived: bool = Field(default=False)
 
     # VM lifecycle timing for cost tracking
-    vm_provisioned_at: Optional[datetime] = Field(default=None)
-    vm_started_at: Optional[datetime] = Field(default=None)
-    vm_stopped_at: Optional[datetime] = Field(default=None)
+    vm_provisioned_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    vm_started_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    vm_stopped_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     vm_spot: bool = Field(default=False)
 
     # Lifecycle flags promoted from JSONB context (audit 2026-04-25 W1).
@@ -365,14 +398,26 @@ class Task(SQLModel, table=True):
     post_commit_pending: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
     post_commit_failed: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
     requeue_in_flight: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
-    infra_wait_until: Optional[datetime] = Field(default=None)
-    retry_after_until: Optional[datetime] = Field(default=None)
+    infra_wait_until: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    retry_after_until: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     previous_error_fingerprint: Optional[str] = Field(default=None)
     auto_remediation: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
     strategic_cycle_id: Optional[str] = Field(default=None, max_length=36)
     spawn_failed: bool = Field(default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
-    last_remediation_at: Optional[datetime] = Field(default=None)
-    last_token_refresh_at: Optional[datetime] = Field(default=None)
+    last_remediation_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    last_token_refresh_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     provider: Optional[str] = Field(default=None)
     account_id: Optional[str] = Field(default=None)
     model: Optional[str] = Field(default=None)
@@ -519,7 +564,10 @@ class TaskHistory(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     task_id: uuid.UUID = Field(foreign_key="task.id", index=True)
 
-    timestamp: datetime = Field(default_factory=_utcnow)
+    timestamp: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
     action: str # e.g., "STATUS_CHANGE", "SPLIT", "SPAWNED_CHILD", "MODIFIED_PAYLOAD"
     details: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
 
@@ -574,7 +622,10 @@ class Alert(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
-    dismissed_at: Optional[datetime] = None
+    dismissed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
@@ -610,11 +661,23 @@ class StrategicCycle(SQLModel, table=True):
     # Phase tracking. *_started_at = task creation time;
     # *_completed_at = terminal status.
     phase1_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
-    phase1_started_at: datetime = Field(default_factory=_utcnow)
-    phase1_completed_at: Optional[datetime] = Field(default=None)
+    phase1_started_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    phase1_completed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     phase2_task_id: Optional[uuid.UUID] = Field(default=None, foreign_key="task.id")
-    phase2_started_at: Optional[datetime] = Field(default=None)
-    phase2_completed_at: Optional[datetime] = Field(default=None)
+    phase2_started_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    phase2_completed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     # Outcome accounting (filled on phase 2 completion).
     directions_created: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default=text("0")))
@@ -632,10 +695,13 @@ class StrategicCycle(SQLModel, table=True):
     # SQLite (test) and Postgres (prod) without per-dialect cast syntax.
     cycle_metadata: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, default=dict))
 
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
     updated_at: datetime = Field(
         default_factory=_utcnow,
-        sa_column_kwargs={"onupdate": _utcnow},
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
 
 
@@ -646,7 +712,10 @@ class OrchestratorErrorAck(SQLModel, table=True):
     global ack covering every bucket whose last_seen_iso <= acknowledged_at.
     """
     key: str = Field(primary_key=True, max_length=255)
-    acknowledged_at: datetime = Field(default_factory=_utcnow)
+    acknowledged_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
     acknowledged_by: str = Field(default="")
 
 
@@ -671,7 +740,10 @@ class ProjectMessage(SQLModel, table=True):
     context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=True, default={}))
     status: str = Field(default="open")  # "open" | "resolved"
     resolution: Optional[str] = None
-    resolved_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
     # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(
@@ -699,7 +771,10 @@ class DeploymentState(SQLModel, table=True):
     id: int = Field(default=1, primary_key=True)
     current_revision: str = Field(default="")       # Cloud Run K_REVISION
     current_sha: str = Field(default="")             # git commit SHA
-    deployed_at: datetime = Field(default_factory=_utcnow)
+    deployed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
     status: str = Field(default=DeploymentStatus.STABLE, sa_column=Column(String, default=DeploymentStatus.STABLE))
     last_known_good_revision: str = Field(default="")
     last_known_good_sha: str = Field(default="")
@@ -707,7 +782,10 @@ class DeploymentState(SQLModel, table=True):
     rollback_reason: Optional[str] = Field(default=None)
     rollback_count: int = Field(default=0)           # consecutive rollbacks (reset on STABLE)
     pause_reason: Optional[str] = Field(default=None)
-    paused_at: Optional[datetime] = Field(default=None)
+    paused_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Cumulative pause-time, split by origin. Timers consult the sum via
     # app.pause_clock to subtract pause windows from their elapsed
     # calculations. Split for observability (self-inflicted vs external-dep
@@ -741,7 +819,10 @@ class DeploymentState(SQLModel, table=True):
     # Persisted pipeline events ring buffer — alert windows survive restarts
     pipeline_events_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Timestamp when HALTED state was entered — used for auto-recovery timer
-    halted_at: Optional[datetime] = Field(default=None)
+    halted_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Optimistic-concurrency version (audit 2026-04-25 W1 / F4): bumped on
     # every write so concurrent mutations from different code paths can
     # detect lost-write hazards without holding the row lock for the whole
@@ -781,22 +862,37 @@ class MaxPlanAccount(SQLModel, table=True):
     provider_metadata: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     enabled: bool = Field(default=True)
     total_tasks: int = Field(default=0)
-    token_created_at: Optional[datetime] = Field(default=None)  # When the token was added (for age tracking)
+    token_created_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )  # When the token was added (for age tracking)
     rate_limit_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Usage caps (null = unlimited).
     daily_task_cap: Optional[int] = Field(default=None)
     max_concurrent_tasks: Optional[int] = Field(default=None)
     auto_disable_after_rate_limits: Optional[int] = Field(default=None)
     daily_task_count: int = Field(default=0)
-    daily_task_count_reset_at: Optional[datetime] = Field(default=None)
+    daily_task_count_reset_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     disabled_reason: Optional[str] = Field(default=None)
     # Set when auto-disable trips (rate-limit threshold). Persisted so
     # recheck_disabled_accounts can re-enable after cooldown across
     # orchestrator restarts. Null for never-disabled or admin-disabled
     # accounts (admin disable doesn't auto-recover).
-    disabled_at: Optional[datetime] = Field(default=None)
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    disabled_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
 
 
 # --- Residual-case reaper thresholds ---
@@ -846,8 +942,14 @@ class ResidualRemediationCase(SQLModel, table=True):
         default=ResidualCaseStatus.ACTIVE,
         sa_column=Column(String, nullable=False, default=ResidualCaseStatus.ACTIVE),
     )
-    first_seen_at: datetime = Field(default_factory=_utcnow)
-    last_seen_at: datetime = Field(default_factory=_utcnow)
+    first_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    last_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
     hit_count: int = Field(default=1)
     sample_message: Optional[str] = Field(default=None)
     # Lifecycle fields (added 0054). All nullable / default-0 / default-[]
@@ -858,12 +960,18 @@ class ResidualRemediationCase(SQLModel, table=True):
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
     last_spawned_pr_number: Optional[int] = Field(default=None)
-    last_spawned_at: Optional[datetime] = Field(default=None)
+    last_spawned_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     consecutive_failure_count: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
-    suspended_at: Optional[datetime] = Field(default=None)
+    suspended_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     sample_messages: List[str] = Field(
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
@@ -876,8 +984,14 @@ class ResidualRemediationCase(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
     )
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
 
     __table_args__ = (
         Index("ix_residual_case_status_last_seen", "status", "last_seen_at"),
@@ -927,7 +1041,10 @@ class Artifact(SQLModel, table=True):
     logs: Optional[str] = None
 
     iteration: int = Field(default=0)
-    created_at: datetime = Field(default_factory=_utcnow)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
 
     task: Task = Relationship(back_populates="artifacts")
 
