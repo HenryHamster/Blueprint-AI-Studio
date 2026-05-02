@@ -59,8 +59,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = '0061'
-down_revision = '0060'
+revision = "0063"
+down_revision = "0062"
 branch_labels = None
 depends_on = None
 

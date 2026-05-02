@@ -40,8 +40,8 @@ Create Date: 2026-04-29 00:00:00.000000
 from alembic import op
 
 
-revision = '0064'
-down_revision = '0063'
+revision = "0066"
+down_revision = "0065"
 branch_labels = None
 depends_on = None
 
