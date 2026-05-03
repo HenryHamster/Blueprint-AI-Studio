@@ -1306,6 +1306,14 @@ async def orchestrator_worker():
                     Task.context, Task.depends_on, Task.launched_by_user_id,
                     Task.project_id, Task.payloads, Task.status_log,
                     Task.latest_status_message,
+                    # Round 5 (2026-05-03): include parent_task_id — downstream
+                    # filter_rollup_conflicts at orchestrator_filters.py:184 reads
+                    # candidate.parent_task_id; deferring it triggers MissingGreenlet
+                    # under async and crashes the entire dispatch cycle, freezing
+                    # all QUEUED tasks. Same gotcha class as status_log per memory
+                    # `reference_load_only_event_listeners.md` — load_only that
+                    # excludes columns downstream code reads is fragile.
+                    Task.parent_task_id,
                 )).order_by(Task.priority.desc().nullslast(), Task.created_at.asc()).limit(max(slots_available * 2, 50))  # Fetch extra; NULL priority = lowest
                 candidate_tasks = (await session.execute(candidate_stmt)).scalars().all()
 
@@ -1875,6 +1883,7 @@ async def orchestrator_worker():
                         Task.context, Task.depends_on, Task.launched_by_user_id,
                         Task.project_id, Task.payloads, Task.status_log,
                         Task.latest_status_message,
+                        Task.parent_task_id,  # see candidate_stmt comment above
                     ))
                     queued_tasks = list((await session.execute(dispatch_stmt)).scalars().all())
 
