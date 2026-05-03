@@ -275,6 +275,45 @@ both the feature and the cleanup unshipped. Report-and-skip lets the
 feature land AND makes the debt visible for proper prioritization.
 `;
 
+// Within-task fix-iteration history. Each retry attempt of the within-VM
+// lint/test fix loop currently spawns a fresh Claude subprocess with no
+// memory of what prior iterations tried. When the first attempt picks the
+// wrong remediation (e.g. refactor source instead of bumping the size cap
+// JSON), the next iterations repeat it and the task fails after exhausting
+// the retry budget on the same wrong choice. This history mechanism gives
+// the next iteration's prompt visibility into what already didn't work.
+export interface FixAttempt {
+  attemptNumber: number;
+  diffStat: string;
+  errorTail: string;
+}
+
+const FIX_HISTORY_MAX_CHARS = 2000;
+const FIX_HISTORY_ERROR_TAIL_CHARS = 400;
+
+export function formatFixIterationHistory(attempts: FixAttempt[]): string {
+  if (attempts.length === 0) return '';
+
+  const renderEntry = (a: FixAttempt): string => {
+    const diff = a.diffStat.trim() || '(no file changes detected)';
+    const tail = a.errorTail.trim().slice(0, FIX_HISTORY_ERROR_TAIL_CHARS);
+    return `### Fix iteration ${a.attemptNumber}\nChanges made (cumulative from task start):\n${diff}\n\nFailure that persisted after this iteration:\n${tail}`;
+  };
+
+  const header = `## Previous Fix Attempts\n\nEach iteration below tried to fix the same failure but the failure persisted (or shifted). Don't repeat the same approach — if it didn't work, the root cause is somewhere else. Read the failure message literally; project-specific assertions often encode the remediation procedure.\n`;
+
+  // Drop oldest attempts until total fits in the budget — the most recent
+  // attempts are the most informative for "don't repeat what just failed".
+  let kept = [...attempts];
+  while (kept.length > 0) {
+    const body = kept.map(renderEntry).join('\n\n');
+    const out = `${header}\n${body}\n`;
+    if (out.length <= FIX_HISTORY_MAX_CHARS) return out;
+    kept = kept.slice(1);
+  }
+  return '';
+}
+
 // ── Git exclude for agent helper scripts ────────────────────────────────────
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they

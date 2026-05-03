@@ -60,6 +60,8 @@ import {
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
+  formatFixIterationHistory,
+  type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
 
@@ -137,6 +139,76 @@ describe('formatPlaybook', () => {
     });
     expect(result).toContain('Relevance: same direction; 2 overlapping file(s)');
     expect(result).toContain('use this when touching router code');
+  });
+});
+
+// ── formatFixIterationHistory ─────────────────────────────────────────────────
+describe('formatFixIterationHistory', () => {
+  it('returns empty string when no attempts recorded', () => {
+    expect(formatFixIterationHistory([])).toBe('');
+  });
+
+  it('renders a single attempt with diff stat and error tail', () => {
+    const attempts: FixAttempt[] = [
+      {
+        attemptNumber: 1,
+        diffStat: ' agent/src/foo.ts | 12 ++++++++----',
+        errorTail: 'TypeError: foo is not a function',
+      },
+    ];
+    const out = formatFixIterationHistory(attempts);
+    expect(out).toContain('Previous Fix Attempts');
+    expect(out).toContain('Fix iteration 1');
+    expect(out).toContain('agent/src/foo.ts | 12');
+    expect(out).toContain('TypeError: foo is not a function');
+  });
+
+  it('renders multiple attempts in order', () => {
+    const attempts: FixAttempt[] = [
+      { attemptNumber: 1, diffStat: 'a.ts | 5 +++--', errorTail: 'error A' },
+      { attemptNumber: 2, diffStat: 'b.ts | 8 ++++----', errorTail: 'error B' },
+    ];
+    const out = formatFixIterationHistory(attempts);
+    expect(out.indexOf('Fix iteration 1')).toBeLessThan(out.indexOf('Fix iteration 2'));
+    expect(out).toContain('error A');
+    expect(out).toContain('error B');
+  });
+
+  it('renders fallback text when diff stat is empty', () => {
+    const attempts: FixAttempt[] = [
+      { attemptNumber: 1, diffStat: '', errorTail: 'eslint failed' },
+    ];
+    expect(formatFixIterationHistory(attempts)).toContain('(no file changes detected)');
+  });
+
+  it('truncates accumulated history below the 2KB cap by dropping oldest entries', () => {
+    // A long error tail per attempt → many attempts will exceed 2000 chars.
+    const longTail = 'X'.repeat(800);
+    const attempts: FixAttempt[] = Array.from({ length: 10 }, (_, i) => ({
+      attemptNumber: i + 1,
+      diffStat: `f${i}.ts | 10 +++++-----`,
+      errorTail: longTail,
+    }));
+    const out = formatFixIterationHistory(attempts);
+    expect(out.length).toBeLessThanOrEqual(2000);
+    // Most recent attempt MUST survive (newest is most informative for the
+    // "don't repeat this" intent); oldest is the one we drop. Check the
+    // file-name in the diff stat to disambiguate from "Fix iteration 1" being
+    // a prefix of "Fix iteration 10".
+    expect(out).toContain('f9.ts');     // attempt 10's diff (i = 9)
+    expect(out).not.toContain('f0.ts'); // attempt 1's diff (i = 0) was dropped
+  });
+
+  it('preserves header even when only one entry survives truncation', () => {
+    const longTail = 'Y'.repeat(2500);  // single entry already exceeds budget
+    const attempts: FixAttempt[] = [
+      { attemptNumber: 5, diffStat: 'big.ts | 100 +++', errorTail: longTail },
+    ];
+    const out = formatFixIterationHistory(attempts);
+    // Header keeps the agent oriented; the error tail is auto-capped at 400 chars
+    // by renderEntry, so a single entry always fits in the 2000-char budget.
+    expect(out).toContain('Previous Fix Attempts');
+    expect(out).toContain('Fix iteration 5');
   });
 });
 

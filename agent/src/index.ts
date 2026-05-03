@@ -8,6 +8,13 @@ import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole } from './reset.js';
 import {
+  formatFixIterationHistory,
+  type FixAttempt,
+  READ_THE_FAILURE_MESSAGE,
+  SIZE_GUARDRAIL_GUIDANCE,
+  PRIOR_ATTEMPT_DIVERGENCE,
+} from './prompt.js';
+import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
   STALE_RESULT_RETRY_BASE_MS, STALE_RESULT_RETRY_MAX_MS,
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
@@ -1608,12 +1615,33 @@ export function errorFingerprint(msg: string): string {
 }
 
 /** Run lint checks in a loop, asking Claude to fix failures up to MAX_LINT_FIX_ATTEMPTS times. */
+// Snapshot the cumulative working-tree change against task-start HEAD. Used
+// by the within-task fix loops to give the next iteration's prompt visibility
+// into what prior iterations actually modified — so it can pivot when the
+// same approach has already been tried and failed.
+function captureFixIterationDiffStat(): string {
+  try {
+    return execSync('git diff HEAD --stat --no-color', {
+      cwd: WORKSPACE,
+      encoding: 'utf-8',
+      timeout: 5000,
+    }).trim();
+  } catch {
+    return '(diff capture failed)';
+  }
+}
+
+function buildFixLoopGuidanceSuffix(): string {
+  return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
+}
+
 export async function lintFixLoop(
   changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
   context: string = 'the code you just wrote', model?: string, effort?: string,
   buildConfig?: BuildConfig
 ): Promise<boolean> {
   let prevFingerprint: string | null = null;
+  const prevAttempts: FixAttempt[] = [];
   for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
     try {
       statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
@@ -1626,12 +1654,22 @@ export async function lintFixLoop(
         sendLog(ws, `Lint error unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
         return false;
       }
+      // On retry (attempt >= 1), record what the previous Claude call
+      // actually did + the failure that persisted, so the next iteration's
+      // prompt can pivot away from approaches that didn't work.
+      if (attempt >= 1) {
+        prevAttempts.push({
+          attemptNumber: attempt,
+          diffStat: captureFixIterationDiffStat(),
+          errorTail: msg.slice(-800),
+        });
+      }
       prevFingerprint = fingerprint;
       sendLog(ws, `Pre-commit check failed (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
-      await runClaudeCode(
-        `The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef, model, effort
-      );
+      const historySection = prevAttempts.length > 0 ? `${formatFixIterationHistory(prevAttempts)}\n\n` : '';
+      const guidanceSuffix = attempt >= 1 ? buildFixLoopGuidanceSuffix() : '';
+      const fixPrompt = `${historySection}The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}${guidanceSuffix}`;
+      await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     }
   }
@@ -2167,6 +2205,7 @@ export async function testFixLoop(
   }
 
   let prevFingerprint: string | null = null;
+  const prevAttempts: FixAttempt[] = [];
   const maxFixAttempts = Math.max(0, options.maxFixAttempts ?? MAX_TEST_FIX_ATTEMPTS);
   const totalAttempts = maxFixAttempts + 1;
   const phasePrefix = options.phaseLabel ? `${options.phaseLabel}: ` : '';
@@ -2330,6 +2369,16 @@ export async function testFixLoop(
       const failureSummary = combinedFailures.slice(-8000);
       return { passed: false, testFailuresDetected: true, failureSummary };
     }
+    // On retry (attempt >= 1), record what the previous Claude call
+    // actually changed + the test failures that persisted, so the next
+    // iteration's prompt can pivot if the same approach already failed.
+    if (attempt >= 1) {
+      prevAttempts.push({
+        attemptNumber: attempt,
+        diffStat: captureFixIterationDiffStat(),
+        errorTail: combinedFailures.slice(-800),
+      });
+    }
     prevFingerprint = fingerprint;
     if (attempt < maxFixAttempts) {
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
@@ -2369,9 +2418,11 @@ export async function testFixLoop(
       // head and the actual failure line at the end. 5000 chars is
       // enough to carry a diagnostic traceback or a handful of failed
       // assertions without drowning the agent in noise.
+      const historySection = prevAttempts.length > 0 ? `${formatFixIterationHistory(prevAttempts)}\n\n` : '';
+      const guidanceSuffix = attempt >= 1 ? buildFixLoopGuidanceSuffix() : '';
       const fixPrompt = baselineFailures
-        ? `${analysisPrefix}${guidance}\n\nFailures to fix:\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}${preExistingNote.slice(-1500)}`
-        : `${analysisPrefix}${guidance}\n\nAll test failures (baseline skipped — pre-existing failures are also fair game on this task):\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}`;
+        ? `${historySection}${analysisPrefix}${guidance}\n\nFailures to fix:\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}${preExistingNote.slice(-1500)}${guidanceSuffix}`
+        : `${historySection}${analysisPrefix}${guidance}\n\nAll test failures (baseline skipped — pre-existing failures are also fair game on this task):\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}${guidanceSuffix}`;
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
     } else {
