@@ -16,10 +16,10 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
 from app.research_completion import _parse_research_findings, _calibrate_finding_scope
-from app.task_completion import _validate_plan_dependencies
+from app.plan_completion import _validate_plan_dependencies
 from app.failure_classification import classify_failure
 from app.routers.agent_status import record_task_result
-from app.main import should_rollback
+from app.deploy_health import should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion
 from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _spawn_pipeline_task

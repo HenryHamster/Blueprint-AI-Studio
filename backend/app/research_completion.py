@@ -76,6 +76,8 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
 from app.task_completion import (
     _extract_json_array,
     _ensure_branch,
+)
+from app.plan_completion import (
     _validate_plan_dependencies,
     _log_file_overlaps,
     TASK_PRIORITY_MAP,

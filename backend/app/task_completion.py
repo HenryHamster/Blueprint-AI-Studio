@@ -38,6 +38,17 @@ from app.models import (
 )
 from app.plan_completion import (
     TASK_PRIORITY_MAP,
+    # Re-exports — task_completion is the canonical completion-API import surface
+    # for downstream modules (task_lifecycle, research_completion, tests). The
+    # implementations live in plan_completion.py, but a 2026-05-03 ruff --fix
+    # quietly removed these as "unused" within task_completion.py and silently
+    # broke every downstream importer. noqa pins them so a future --fix sweep
+    # can't repeat the regression.
+    _handle_plan_completion,  # noqa: F401
+    _inject_file_overlap_deps,  # noqa: F401
+    _log_file_overlaps,  # noqa: F401
+    _parse_plan_output,  # noqa: F401
+    _validate_plan_dependencies,  # noqa: F401
 )
 from app.research_context import _build_research_context
 from app.routers.agent import get_github_token_for_task

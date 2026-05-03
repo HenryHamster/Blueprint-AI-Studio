@@ -13,10 +13,12 @@ from app.models import Alert, AlertSeverity, TaskStatus
 from app.main import (
     _maybe_create_failure_alert,
     _maybe_create_circuit_breaker_alert,
+)
+from app.deploy_health import (
     _create_auto_pause_alerts,
     _create_auto_resume_alerts,
+    _create_forced_resume_alerts,
 )
-from app.deploy_health import _create_forced_resume_alerts
 from testing.factories import make_project, make_task, make_alert
 
 
