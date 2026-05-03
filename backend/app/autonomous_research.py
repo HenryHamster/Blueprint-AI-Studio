@@ -835,7 +835,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             created_by="ORCHESTRATOR",
         )
         session.add(new_task)
-        await _increment_research_spawn_count(project, session)
+        # NOTE: counter is NOT incremented here. _research_spawn_count is
+        # actually a research-COMPLETION counter despite the name — the
+        # strategic_research_frequency gate at autonomous_research.py:384 is
+        # meant to fire after N actual research findings have landed, not
+        # after N tasks were queued. Incrementing on spawn caused 3
+        # back-to-back strategic reviews on the 2026-05-03 dogfood run because
+        # the very first strategic_review's Phase 2 spawned ~4 research tasks
+        # AT ONCE, the spawn loop bumped the counter past the modulo trigger,
+        # and the next iteration of _check_idle_research immediately spawned
+        # strategic review #2 with zero findings to consume. The increment
+        # now lives in _handle_research_completion (research_completion.py).
         history = TaskHistory(
             task_id=new_task.id, action="SPAWNED",
             details={"spawned_by": "AUTONOMOUS_LOOP", "trigger": "post_merge_or_idle"}

@@ -499,6 +499,21 @@ def _build_preventive_context(
 
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
+    # Increment _research_spawn_count on completion (variable name is legacy;
+    # see autonomous_research.py:837 — semantic is "completed research cycles
+    # since last strategic refresh"). The strategic_research_frequency gate
+    # uses this to decide when to fire a strategic_review. Incrementing here
+    # rather than at spawn time prevents the cascade observed on 2026-05-03
+    # where one strategic_review spawned 4 research tasks AT ONCE and
+    # immediately tripped the modulo-6 gate for the next strategic_review.
+    from sqlalchemy.orm.attributes import flag_modified
+    project_obj = await session.get(Project, task.project_id)
+    if project_obj is not None:
+        new_count = ((project_obj.vision or {}).get("_research_spawn_count") or 0) + 1
+        project_obj.vision = {**(project_obj.vision or {}), "_research_spawn_count": new_count}
+        flag_modified(project_obj, "vision")
+        session.add(project_obj)
+
     # Depth guard: prevent infinite research recursion
     MAX_RESEARCH_DEPTH = 3
     research_depth = (task.context or {}).get("research_depth", 0)
