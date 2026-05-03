@@ -1579,7 +1579,7 @@ async def test_direction_cap_on_reactivation(client: AsyncClient, mocker):
             f"/api/admin/projects/{project_id}/directions",
             json={"text": f"Active {i + 1}", "priority": "medium"},
         )
-    paused_resp = await client.post(
+    await client.post(
         f"/api/admin/projects/{project_id}/directions",
         json={"text": "To be paused", "priority": "low"},
     )

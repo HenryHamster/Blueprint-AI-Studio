@@ -409,13 +409,15 @@ def _find_cycle_members(adj: Dict[str, list]) -> set:
     color = dict.fromkeys(adj, WHITE)
     members: set = set()
     def dfs(n, stack):
-        color[n] = GRAY; stack.append(n)
+        color[n] = GRAY
+        stack.append(n)
         for d in adj.get(n, []):
             if color.get(d) == GRAY:
                 members.update(stack[stack.index(d):])
             elif color.get(d) == WHITE:
                 dfs(d, stack)
-        stack.pop(); color[n] = BLACK
+        stack.pop()
+        color[n] = BLACK
     for n in list(adj):
         if color[n] == WHITE:
             dfs(n, [])

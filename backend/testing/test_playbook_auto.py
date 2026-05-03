@@ -86,8 +86,8 @@ async def test_three_failures_trigger_auto_entry(db_session: AsyncSession):
     project = await _make_project(db_session)
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
-    t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
-    t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
     # t3 is the "current" task passed to _check_recurring_failures
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
 
@@ -110,7 +110,7 @@ async def test_two_failures_do_not_trigger_entry(db_session: AsyncSession):
     project = await _make_project(db_session)
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
-    t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
     # t2 is the "current" task
     t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
 
@@ -127,8 +127,8 @@ async def test_duplicate_detection_prevents_recreation(db_session: AsyncSession)
     project = await _make_project(db_session)
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
-    t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
-    t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
 
     # First call creates the entry
@@ -157,8 +157,8 @@ async def test_cap_of_five_is_respected(db_session: AsyncSession):
 
     # 3 failures that would normally trigger a new entry
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
-    t1 = await _make_failed_task(db_session, project.id, status_message=common_msg)
-    t2 = await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
+    await _make_failed_task(db_session, project.id, status_message=common_msg)
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
 
     await _check_recurring_failures(t3, db_session)
@@ -174,8 +174,8 @@ async def test_applicable_types_reflect_task_types(db_session: AsyncSession):
     project = await _make_project(db_session)
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
-    t1 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
-    t2 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="fix")
+    await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
+    await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="fix")
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
 
     await _check_recurring_failures(t3, db_session)
@@ -199,8 +199,8 @@ async def test_old_failures_outside_7_day_window_ignored(db_session: AsyncSessio
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     # 2 old failures (> 7 days ago)
-    t1 = await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
-    t2 = await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
+    await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
+    await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
     # 1 recent failure (the current task)
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
 
@@ -710,7 +710,8 @@ def test_stale_file_refs_penalty():
     clean_entry = {"confirmed_count": 5, "stale_file_refs": False, "content": "y"}
     no_flag_entry = {"confirmed_count": 5, "content": "z"}
 
-    stale_penalty = lambda v: 1 if v.get("stale_file_refs") else 0
+    def stale_penalty(v):
+        return 1 if v.get("stale_file_refs") else 0
     assert stale_penalty(stale_entry) == 1
     assert stale_penalty(clean_entry) == 0
     assert stale_penalty(no_flag_entry) == 0
@@ -1983,8 +1984,8 @@ def test_maybe_auto_playbook_deduplicates():
         _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
     )
 
-    dir_slug = "dirabc123"[:8]  # matches the slug logic: direction_key[:8].replace("-","").replace("_","")
     # Compute the key that would be generated for direction "dir-abc123"
+    # (slug logic: direction_key[:8].replace("-","").replace("_",""))
     direction_key = "dir-abc123"
     expected_slug = direction_key[:8].replace("-", "").replace("_", "")
     existing_key = f"playbook/first-attempt-{expected_slug}-test-coverage"
@@ -2156,7 +2157,7 @@ async def test_extract_review_feedback_accumulates_on_first_iteration(db_session
     db_session.add(task)
     await db_session.flush()
 
-    keys = await extract_review_feedback_to_playbook(
+    await extract_review_feedback_to_playbook(
         task, review_loop, pr_number=99, original_task_type="create", session=db_session
     )
     await db_session.flush()
@@ -2291,7 +2292,7 @@ async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_sessio
     db_session.add(task)
     await db_session.flush()
 
-    keys = await extract_review_feedback_to_playbook(
+    await extract_review_feedback_to_playbook(
         task, review_loop, pr_number=42, original_task_type="create", session=db_session
     )
     await db_session.flush()

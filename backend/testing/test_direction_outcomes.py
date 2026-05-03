@@ -197,7 +197,6 @@ async def test_guard_invalid_uuid_in_history(db_session: AsyncSession):
 @pytest.mark.asyncio
 async def test_guard_no_child_tasks(db_session: AsyncSession):
     """Breaks without updating when research task has no child tasks."""
-    research_task = await _make_research_task.__wrapped__ if hasattr(_make_research_task, "__wrapped__") else None
     direction_id = "d-nochildren"
     project = await _create_project(db_session, directions=[
         _make_direction(direction_id, str(uuid.uuid4()))

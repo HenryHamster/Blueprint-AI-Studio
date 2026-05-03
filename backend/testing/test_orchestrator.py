@@ -1435,7 +1435,6 @@ class TestRollupDeferral:
 
         assert len(pending_rollup_files) == 3, "All 3 child files should be in pending rollup set"
 
-        eligible_ids = [candidate.id]
         cfiles = set((candidate.context or {}).get("related_files", []))
         stale_overlap = cfiles & pending_rollup_files.keys()
         should_defer = len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5

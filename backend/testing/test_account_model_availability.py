@@ -26,7 +26,6 @@ from app.account_model_availability import (
     account_success_rate_7d_for_type,
     refresh_account_available_models,
 )
-from app.models import LLMAuthMode, LLMProviderName
 from app.max_plan_pool import (
     _account_by_id,
     _max_plan_pool_lock,
@@ -34,9 +33,10 @@ from app.max_plan_pool import (
     select_max_plan_account,
     select_max_plan_account_balanced,
 )
+from app.models import LLMAuthMode, LLMProviderName
+from app.providers.registry import get_provider
 
 OPUS = "claude-opus-4-7"
-from app.providers.registry import get_provider
 
 
 # ---------------------------------------------------------------------------

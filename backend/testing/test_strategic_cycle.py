@@ -107,8 +107,8 @@ async def test_get_by_task_finds_cycle(db_session):
 @pytest.mark.asyncio
 async def test_recent_for_agent_context_returns_legacy_shape(db_session):
     project = await _make_project(db_session)
-    for i in range(3):
-        cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    for _ in range(3):
+        await strategic_cycle.create(db_session, project_id=project.id)
         await db_session.commit()
     history = await strategic_cycle.recent_for_agent_context(db_session, project.id, limit=5)
     assert len(history) == 3

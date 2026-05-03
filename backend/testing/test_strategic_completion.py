@@ -364,8 +364,7 @@ class TestCheckDirectionCompletion:
         assert "complete" in result.lower()
 
     def test_requires_minimum_4_cycles(self):
-        history = _history(3, prs_merged=2) + _history(0)  # just 3 cycles
-        d = _direction(research_history=_history(3, prs_merged=2))
+        d = _direction(research_history=_history(3, prs_merged=2))  # just 3 cycles
         result = _check_direction_completion(d)
         assert result is None
 

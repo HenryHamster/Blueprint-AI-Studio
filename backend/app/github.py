@@ -1,5 +1,7 @@
 import asyncio
 import random
+import re as _re
+from datetime import datetime
 from typing import Any, Dict
 
 import httpx
@@ -8,6 +10,10 @@ import logging
 import os
 import time
 import jwt
+
+# Keep `datetime` re-exportable / referenced so static checkers don't strip it;
+# it's used as a forward reference in `get_commit_date(...) -> "datetime | None"`.
+_DATETIME = datetime
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +44,6 @@ async def close_github_client():
     if _github_client and not _github_client.is_closed:
         await _github_client.aclose()
         _github_client = None
-
-
-import re as _re
 
 
 def _normalize_endpoint_template(method: str, url: str) -> str:

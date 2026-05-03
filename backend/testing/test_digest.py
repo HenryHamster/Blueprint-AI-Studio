@@ -37,7 +37,7 @@ async def test_digest_empty_window(client: AsyncClient):
     assert response.status_code == 200
     data = response.json()
     assert data["window_hours"] == 24
-    assert data["tasks_truncated"] == False  # no tasks → well below the 5000-row cap
+    assert data["tasks_truncated"] is False  # no tasks → well below the 5000-row cap
     assert data["completed_count"] == 0
     assert data["failed_count"] == 0
     assert data["pending_approval_count"] == 0
@@ -1294,7 +1294,6 @@ async def test_digest_direction_progress_excludes_no_activity(client: AsyncClien
 @pytest.mark.asyncio
 async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_session):
     """prs_merged is summed from research_history entries within the time window."""
-    window_start = _utcnow() - timedelta(hours=24)
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
 
@@ -2533,7 +2532,6 @@ async def test_failure_group_rate_limit(client: AsyncClient, db_session):
 
     rate_limit_group = next(g for g in data["failure_groups"] if g["failure_class"] == "RATE_LIMIT")
     assert rate_limit_group["count"] == 1
-    task_ids = [t["task_id"] for t in rate_limit_group["tasks"]]
     assert any("Rate Limited Task" in t.get("title", "") for t in rate_limit_group["tasks"])
 
 
@@ -5317,8 +5315,6 @@ async def test_unsuspend_residual_case_clears_state(client: AsyncClient, db_sess
     await db_session.refresh(project)
 
     fingerprint = "err-fp-unsuspend"
-    from datetime import timezone
-    suspended_at = _utcnow().replace(tzinfo=timezone.utc) if _utcnow().tzinfo is None else _utcnow()
     case = ResidualRemediationCase(
         project_id=project.id,
         fingerprint=fingerprint,

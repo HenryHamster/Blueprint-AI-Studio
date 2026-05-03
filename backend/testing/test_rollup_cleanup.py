@@ -777,7 +777,7 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
         status=TaskStatus.FAILED,
         context={"failure_category": "AGENT_TIMEOUT"},
     )
-    child2 = await _make_task(
+    await _make_task(
         cleanup_db, project.id,
         parent_task_id=parent.id,
         status=TaskStatus.FAILED,
@@ -1618,7 +1618,7 @@ async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, m
         },
         plan_output="some plan",
     )
-    merged_child = await _make_task(
+    await _make_task(
         cleanup_db, project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,
@@ -1679,7 +1679,7 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
         },
         plan_output="some plan",
     )
-    merged_child = await _make_task(
+    await _make_task(
         cleanup_db, project.id,
         parent_task_id=parent.id,
         status=TaskStatus.COMPLETED,

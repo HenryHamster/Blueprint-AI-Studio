@@ -8,12 +8,13 @@ All deferred imports from ``app.main`` are intentional — they avoid circular
 imports (task_lifecycle is imported BY main) and preserve test-patchability
 (tests mock via ``app.main.<name>``).
 """
+import asyncio
 import copy
 import json
 import logging
+import random as _random
 import re
 import uuid
-import asyncio
 from typing import Dict
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +33,8 @@ from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCO
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
+from app.review_pipeline import _spawn_pipeline_task
+from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.notification_dispatch import (
     is_residual_remediation_task,
     post_remediation_result_message,
@@ -881,13 +884,6 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     logger.info(f"[REQUEUE] Parent {parent.id} re-evaluating — {retried_count} failed children retried")
     return retried_count
 
-from app.review_pipeline import (
-    _spawn_pipeline_task,
-)
-
-from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
-
-import random as _random
 
 async def _merge_with_retry(
     merge_pull_request_fn, gh_token: str, owner: str, repo: str,

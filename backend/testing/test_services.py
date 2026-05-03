@@ -22,15 +22,22 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
 import app.shared_state as _shared_state
-from app.services import _recover_orphaned_tasks, _persist_circuit_breakers, _persist_zone_health, _run_auto_archive_cycle
 from app.models import (
     Project, Task, TaskStatus, Artifact, ArtifactType,
     Alert, AlertSeverity, DeploymentState,
 )
+from app.routers.agent_status import _check_daily_cost_ceiling
+from app.services import (
+    _persist_circuit_breakers,
+    _persist_zone_health,
+    _recover_orphaned_tasks,
+    _run_auto_archive_cycle,
+    gcp_cleanup_service,
+)
+from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
-from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
     _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
 
@@ -110,7 +117,7 @@ async def test_orphan_recovery_attempts_github_lookup(svc_db, mocker):
     """A COMPLETED ORCHESTRATOR create-task with no PR artifact and no review child
     should attempt a GitHub PR lookup."""
     project = await _make_project(svc_db)
-    task = await _make_completed_task(svc_db, project.id, task_type="create")
+    await _make_completed_task(svc_db, project.id, task_type="create")
 
     # Mock token fetch
     mock_get_token = AsyncMock(return_value=("gh_token", "owner", "repo"))
@@ -497,8 +504,6 @@ async def test_persist_zone_health_handles_missing_deploy_state(mocker):
 # gcp_cleanup_service
 # ══════════════════════════════════════════════════════════════════════════════
 
-from app.services import gcp_cleanup_service
-
 
 @pytest_asyncio.fixture()
 async def gcp_db(mocker):
@@ -545,8 +550,8 @@ async def test_gcp_cleanup_passes_active_vm_ids_to_cleanup(gcp_db, mocker):
     Completed/failed task VMs should NOT be included."""
     project = await _make_project(gcp_db)
 
-    prov_task = await _make_task_with_vm(gcp_db, project.id, TaskStatus.PROVISIONING, "agent-vm-prov-1")
-    ip_task = await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-ip-1")
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.PROVISIONING, "agent-vm-prov-1")
+    await _make_task_with_vm(gcp_db, project.id, TaskStatus.IN_PROGRESS, "agent-vm-ip-1")
     # These should NOT be included
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.COMPLETED, "agent-vm-done-1")
     await _make_task_with_vm(gcp_db, project.id, TaskStatus.FAILED, "agent-vm-fail-1")
@@ -613,7 +618,6 @@ async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
     mocker.patch("app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError))
 
     import app.main as _app_main
-    original_count = getattr(_app_main, "_last_gcp_vm_count", None)
 
     await gcp_cleanup_service()
 
@@ -641,8 +645,6 @@ async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 # _check_daily_cost_ceiling (agent_status.py)
 # ══════════════════════════════════════════════════════════════════════════════
-
-from app.routers.agent_status import _check_daily_cost_ceiling
 
 
 @pytest_asyncio.fixture()

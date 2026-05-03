@@ -28,6 +28,15 @@ from app.cochange_decomposition import (
     auto_decompose_findings_by_cochange,
     cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
 )
+from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
+    _HISTORY_AGG_DEFAULTS,
+    _DECOMP_AGG_DEFAULTS,
+    _fold_evicted_into_aggregate,
+    _compute_momentum_factor,
+    _compute_acceptance_rate,
+    _compute_productivity_score,
+    _update_cycle_history,
+)
 from app.failure_classification import classify_failure
 from app.finding_deduplication import (
     build_dedup_state,
@@ -37,6 +46,18 @@ from app.finding_deduplication import (
 )
 from app.payload_schemas import validate_internal_payload
 from app.playbook_learning import RECENT_SUCCESSES_TASK_TYPES, summarize_recent_successes
+from app.research_context import (  # noqa: F401 — re-exported for callers/tests
+    _parse_research_context,
+    _parse_eviction_counts,
+    _format_evicted_failed,
+    _format_eviction_body,
+    _build_research_context,
+)
+from app.research_direction_state import (  # noqa: F401 — re-exported for callers/tests
+    _compute_saturation,
+    _detect_dedup_deadlock,
+    apply_post_spawn_state,
+)
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE, scope_to_effort
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
@@ -73,30 +94,6 @@ _SCOPE_AWARE_EFFORT_TYPES = frozenset({"create", "fix", "refactor", "plan"})
 # collapsing to 0 for a direction with no successful medium merges, which would
 # permanently shut down medium exploration and prevent data collection.
 MEDIUM_EXPLORATION_FLOOR = 0.05
-
-from app.direction_metrics import (  # noqa: F401 — re-exported for callers/tests
-    _HISTORY_AGG_DEFAULTS,
-    _DECOMP_AGG_DEFAULTS,
-    _fold_evicted_into_aggregate,
-    _compute_momentum_factor,
-    _compute_acceptance_rate,
-    _compute_productivity_score,
-    _update_cycle_history,
-)
-
-
-from app.research_context import (  # noqa: F401 — re-exported for callers/tests
-    _parse_research_context,
-    _parse_eviction_counts,
-    _format_evicted_failed,
-    _format_eviction_body,
-    _build_research_context,
-)
-from app.research_direction_state import (  # noqa: F401 — re-exported for callers/tests
-    _compute_saturation,
-    _detect_dedup_deadlock,
-    apply_post_spawn_state,
-)
 
 
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:

@@ -69,7 +69,6 @@ def _reset_stats():
 @pytest.mark.asyncio
 async def test_dispatch_increments_dispatched_and_delivered_on_success():
     _reset_stats()
-    mock_resp = MagicMock(status_code=200)
     with patch("app.shared_state.runtime_config", _make_runtime_config()), \
          patch("app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=200)):
         await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})

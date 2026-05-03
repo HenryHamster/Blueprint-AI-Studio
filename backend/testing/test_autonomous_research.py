@@ -7202,7 +7202,8 @@ async def test_residual_ignored_case_not_selected(db_session, _clear_residual_st
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_spawn_skips_pause_mode_direction(db_session):
+async def test_spawn_skips_pause_mode_direction_solo(db_session):
+    """Solo-direction variant: when the only direction is pause-mode, no task spawns this tick."""
     project = Project(
         name="Pause Mode Project",
         user_id="test-user-123",
@@ -7247,7 +7248,8 @@ async def test_audit_mode_direction_dispatches_self_audit(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_fundamentals_mode_direction_injects_mode_hint(db_session, mocker):
+async def test_fundamentals_mode_direction_injects_mode_hint_legacy(db_session, mocker):
+    """Legacy assertion variant: requires the literal string "fundamentals mode" in suffix."""
     mocker.patch("app.autonomous_research._should_dispatch_self_audit", new=AsyncMock(return_value=None))
     project = Project(
         name="Fundamentals Mode Project",

@@ -9,10 +9,13 @@ Covers:
   6. Pre-pause VM count is restored (capped at 2) on resume
 """
 import copy
+import os
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -23,6 +26,7 @@ import app.deploy_health as _dh
 import app.health_check_primitives as _hcp
 import app.shared_state as _shared_state
 from app.models import DeploymentState, DeploymentStatus, Project
+from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 
 # Capture real function references at import time so tests can invoke them
 # after the dh_db fixture replaces them with AsyncMocks.
@@ -30,7 +34,6 @@ _REAL_CREATE_FORCED_RESUME_ALERTS = _dh._create_forced_resume_alerts
 
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
-from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 if not hasattr(_SQLiteTypeCompiler, "visit_JSONB"):
     _SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
 
@@ -1069,10 +1072,6 @@ async def test_full_recovery_pause_captures_target(dh_db):
 
 
 # ── Tests: task_results staleness guard (auto-resume deadlock) ───────────────
-
-import os
-from datetime import datetime, timedelta, timezone
-from collections import deque
 
 
 def _ts(minutes_ago: float) -> str:

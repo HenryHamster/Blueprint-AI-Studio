@@ -925,7 +925,6 @@ async def _process_direction_lifecycle(
                 # pattern before the 48h cooldown elapses — skipped on auto-retire
                 # since a retired direction is terminal and has no future cycles.
                 try:
-                    from app.autonomous_research import _spawn_direction_diagnosis
                     if await _spawn_direction_diagnosis(project, d, pause_reason, session):
                         d["diagnosis_spawned_at"] = _utcnow().isoformat()
                         directions_modified = True

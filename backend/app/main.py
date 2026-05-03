@@ -54,6 +54,7 @@ from app.shared_state import runtime_config as _runtime_config
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
 from app.time_utils import _utcnow
+from app.broadcast import manager, broadcast_to_project, _sanitize_log
 
 logger = logging.getLogger(__name__)
 
@@ -703,7 +704,6 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
             {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
         )
 
-from app.broadcast import manager, broadcast_to_project, _sanitize_log
 
 async def _maybe_create_failure_alert(
     task: "Task",

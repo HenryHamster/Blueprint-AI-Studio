@@ -75,7 +75,6 @@ def _merge_list(
     """
     base_by_key = {k: v for v in (baseline or []) if (k := _item_key(v)) is not None}
     agent_by_key = {k: v for v in (agent or []) if (k := _item_key(v)) is not None}
-    current_by_key = {k: v for v in (current or []) if (k := _item_key(v)) is not None}
 
     merged: list = []
     seen: set[str] = set()

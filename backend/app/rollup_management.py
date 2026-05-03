@@ -14,17 +14,6 @@ import uuid
 from datetime import timedelta
 from typing import Optional
 
-
-# Module-level negative cache for PR-merge verification keyed by task.id.
-# When a cycle discovers a child's PR isn't merged yet, the reaper's next
-# 60s tick (plus any fan-out from sibling completion events) would otherwise
-# re-fetch the same PR.  Stamping here is session-independent — unlike a
-# task.context mutation, which only persists if the caller happens to commit
-# the attached object.  A 30s TTL is short enough that a merge happening
-# between checks is detected within one cycle.
-_PR_MERGE_NEGATIVE_TTL_S = 30
-_pr_merge_negative_cache: dict[uuid.UUID, float] = {}
-
 from fastapi import HTTPException
 from sqlalchemy import func as _func
 from sqlalchemy.exc import InvalidRequestError
@@ -37,16 +26,25 @@ from app.models import (
     Task, Artifact, Project,
     TaskStatus, ArtifactType,
 )
-from app.shared_state import runtime_config as _runtime_config
 from app.review_pipeline import _spawn_pipeline_task, _is_pipeline_task_stale
-
-logger = logging.getLogger(__name__)
-
-
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
 )
+from app.shared_state import runtime_config as _runtime_config
+
+logger = logging.getLogger(__name__)
+
+
+# Module-level negative cache for PR-merge verification keyed by task.id.
+# When a cycle discovers a child's PR isn't merged yet, the reaper's next
+# 60s tick (plus any fan-out from sibling completion events) would otherwise
+# re-fetch the same PR.  Stamping here is session-independent — unlike a
+# task.context mutation, which only persists if the caller happens to commit
+# the attached object.  A 30s TTL is short enough that a merge happening
+# between checks is detected within one cycle.
+_PR_MERGE_NEGATIVE_TTL_S = 30
+_pr_merge_negative_cache: dict[uuid.UUID, float] = {}
 
 
 # Phase B3 (lock-window break): each GitHub API call inside

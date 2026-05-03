@@ -245,8 +245,8 @@ class TestGeneratedShellContract:
             f"`}}`, `)`, or another `poweroff` — otherwise bash continues "
             f"running code during the async shutdown window. Offenders:\n"
             + "\n".join(
-                f"  line {i}: `{l.strip()}` followed by `{n}`"
-                for i, l, n in offenders
+                f"  line {i}: `{line.strip()}` followed by `{n}`"
+                for i, line, n in offenders
             )
         )
 
@@ -361,7 +361,7 @@ class TestGeneratedShellContract:
             f"real newline (see task 8c9255a9 post-mortem). Remove "
             f"backslash escapes and backticks from comments inside the "
             f"generator f-string body.\n"
-            + "\n".join(f"  line {i}: {l!r}" for i, l in offenders)
+            + "\n".join(f"  line {i}: {line!r}" for i, line in offenders)
         )
 
     def test_no_multi_line_embedded_non_bash_code(self, gen: ShellGenerator):
@@ -410,7 +410,7 @@ class TestGeneratedShellContract:
             if lang:
                 offenders.append((marker, lang, body[:80]))
         assert not offenders, (
-            f"{gen.name}: detected multi-line embedded {', '.join(l for _, l, _ in offenders)} "
+            f"{gen.name}: detected multi-line embedded {', '.join(lang for _, lang, _ in offenders)} "
             f"heredocs in generated bash. Escape semantics across 3 layers "
             f"(generator→bash→embedded-lang) are a landmine that has bitten "
             f"us in production (see 0bcfd031 / c94d6d9b post-mortems).\n"

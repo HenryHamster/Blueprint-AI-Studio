@@ -22,6 +22,7 @@ from app.problem_model import (
     Source,
     append_revision_log,
     append_self_reflection,
+    apply_agent_update,
     archive_closed_gaps,
     is_empty,
     parse_problem_model,
@@ -254,8 +255,6 @@ def test_context_supports_free_form_project_type():
 # ---------------------------------------------------------------------------
 # apply_agent_update — the strategic-completion write-back helper
 # ---------------------------------------------------------------------------
-
-from app.problem_model import apply_agent_update
 
 
 def test_apply_agent_update_bumps_revision_and_timestamps():

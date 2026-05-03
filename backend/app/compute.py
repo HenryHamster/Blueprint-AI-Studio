@@ -1,17 +1,24 @@
-import json
-import os
-import tempfile
-import uuid
-import time
-import random
-import logging
 import asyncio
-import subprocess
+import base64 as _base64
+import json
+import logging
+import os
+import random
 import signal
+import subprocess
+import tempfile
 import threading
+import time
+import uuid
 from collections import OrderedDict as _OrderedDict, deque as _deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Re-exported below for existing `from app.compute import ...` callers (and
+# tests that mock via `app.compute.X`). Hoisted to module top to satisfy
+# E402; no circular-import risk because compute_manifest does not import
+# compute.
+from app.compute_manifest import validate_payload_uri, build_agent_secret_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -226,8 +233,6 @@ AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}
 # Scripts baked into the startup script as base64 blobs. Loaded at module
 # import time so a missing file fails fast instead of during VM provisioning.
 # See backend/app/_agent_scripts/__init__.py for rationale.
-import base64 as _base64
-
 _AGENT_SCRIPTS_DIR = Path(__file__).parent / "_agent_scripts"
 _MATERIALIZE_MANIFEST_B64 = _base64.b64encode(
     (_AGENT_SCRIPTS_DIR / "materialize_manifest.py").read_bytes()
@@ -291,10 +296,9 @@ if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run â€
         _image_family_last_check = time.time()
         logger.exception(f"[STARTUP] Image family validation FAILED â€” will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s")
 
-# Manifest builder + payload URI validator extracted to compute_manifest.py.
-# Re-exported here so existing `from app.compute import ...` callers (and
-# tests that mock via `app.compute.X`) continue to work unchanged.
-from app.compute_manifest import validate_payload_uri, build_agent_secret_manifest
+# Manifest builder + payload URI validator are imported at the top of this
+# module so they're re-exported for existing `from app.compute import ...`
+# callers (and tests that mock via `app.compute.X`).
 _REEXPORTS = (validate_payload_uri, build_agent_secret_manifest)  # keep referenced so linters don't strip the re-exports
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
