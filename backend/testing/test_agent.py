@@ -3632,6 +3632,240 @@ async def test_external_api_provider_model_config_without_fallback_does_not_requ
     assert "model/config" in task.latest_status_message
 
 
+# ── Open-PR handoff on agent-reported FAILED ──────────────────────────────
+# Regression for the "Refusing to delete stale branch" retry loop: when a
+# previous attempt opened a PR, the agent's setupWorkspace stale-branch guard
+# correctly refuses to delete the branch on retry — so naive requeue burns
+# the entire retry budget without ever progressing. The agent-reported FAILED
+# path must mirror the reaper's open-PR handoff (reaper.py:912-1048) and route
+# to EVALUATING + review pipeline instead of QUEUED.
+
+@pytest.mark.asyncio
+async def test_failed_with_open_pr_hands_off_to_review(client: AsyncClient, db_session, mocker):
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    spawn_mock = AsyncMock(return_value=(None, True))
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", spawn_mock)
+
+    project = Project(name="Open-PR Handoff", user_id="test-user-open-pr-handoff")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-open-pr-handoff",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/3575",
+    ))
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-open-pr-handoff")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "Refusing to delete stale branch blueprint/task-deadbeef: has 1 open PR(s) (#3575)",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_handoff"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        f"Expected EVALUATING, got {task.status} — open-PR handoff did not fire"
+    )
+    assert task.attempt_count == 1, "attempt_count must not increment on PR handoff"
+    assert "#3575" in (task.latest_status_message or "")
+    assert "handed off to review pipeline" in (task.latest_status_message or "")
+    spawn_mock.assert_awaited_once()
+    spawn_args = spawn_mock.await_args
+    assert spawn_args.args[1] == "review"
+    assert spawn_args.args[3] == 3575  # pr_number
+
+
+@pytest.mark.asyncio
+async def test_failed_with_merged_pr_marks_completed(client: AsyncClient, db_session, mocker):
+    """PR merged out-of-band before agent reported FAILED → COMPLETED, not retry."""
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": True}),
+    )
+
+    project = Project(name="Merged PR Handoff", user_id="test-user-merged-pr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-merged-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/4242",
+    ))
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-merged-pr")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_merged"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is True
+
+
+@pytest.mark.asyncio
+async def test_failed_with_closed_unmerged_pr_marks_terminal_failed(client: AsyncClient, db_session, mocker):
+    """PR closed without merging → terminal FAILED with closure marker; no retry."""
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+
+    project = Project(name="Closed PR Handoff", user_id="test-user-closed-pr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-closed-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/7777",
+    ))
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-closed-pr")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_closed"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("pr_closed_unmerged") is True
+    assert "#7777" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_failed_without_pr_artifact_uses_normal_retry(client: AsyncClient, db_session, mocker):
+    """Without a PR artifact, the FAILED path should still take the normal retry flow.
+
+    Guards against the open-PR handoff over-reaching and breaking unrelated retries.
+    """
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="No PR Retry", user_id="test-user-no-pr-retry")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-no-pr-retry",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-pr-retry")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    # Without a PR, normal retry path fires → QUEUED with attempt_count incremented.
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+
+
 @pytest.mark.asyncio
 async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncClient, db_session, mocker):
     """Non-gated task type (docs) receives pipeline_health via the else-branch."""

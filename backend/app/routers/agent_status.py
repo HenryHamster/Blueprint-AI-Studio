@@ -1269,6 +1269,120 @@ async def update_agent_status(
         old_vm_id = task.vm_instance_id
         await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
 
+        # Open-PR handoff: if a previous attempt already pushed a branch and
+        # opened a PR, retrying from scratch will collide with the agent's
+        # stale-branch guard (agent/src/index.ts setupWorkspace) which throws
+        # on a same-branch open PR — leading to an infinite "Refusing to
+        # delete stale branch" loop that exhausts the retry budget without
+        # ever progressing. Mirror the reaper's open-PR handoff
+        # (reaper.py:912-1048) so the agent-reported FAILED path also routes
+        # the task to review/EVALUATING instead of looping retries.
+        if payload.status == TaskStatus.FAILED:
+            try:
+                from app.reaper import _task_has_open_pr
+                _has_pr_artifact, _pr_num = await _task_has_open_pr(task, session)
+            except Exception as _pr_check_err:
+                logger.warning(f"[AGENT_STATUS] PR-artifact lookup failed for task {task.id}: {_pr_check_err}")
+                _has_pr_artifact, _pr_num = False, None
+            if _has_pr_artifact and _pr_num:
+                _gh_pr_state: str | None = None
+                _gh_pr_merged: bool = False
+                try:
+                    from app.routers.agent import get_github_token_for_task
+                    from app.github import get_pull_request
+                    _gh_token, _gh_owner, _gh_repo = await get_github_token_for_task(task.id, session)
+                    _pr_data = await get_pull_request(_gh_token, _gh_owner, _gh_repo, _pr_num)
+                    _gh_pr_state = _pr_data.get("state")
+                    _gh_pr_merged = bool(_pr_data.get("merged"))
+                except Exception as _gh_exc:
+                    # Mirror reaper behavior: assume open on transient GH failure
+                    # so a brief outage doesn't strand the task as FAILED-forever.
+                    logger.warning(
+                        f"[AGENT_STATUS] PR-state lookup failed for task {task.id} PR #{_pr_num}: "
+                        f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open"
+                    )
+                    _gh_pr_state = "open"
+                if _gh_pr_state == "closed" and _gh_pr_merged:
+                    logger.info(
+                        f"[AGENT_STATUS] Task {task.id} reported FAILED but PR #{_pr_num} was merged "
+                        f"out-of-band — marking COMPLETED"
+                    )
+                    task.status = TaskStatus.COMPLETED
+                    task.vm_instance_id = None
+                    task.last_heartbeat = None
+                    task.latest_status_message = f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
+                    task.context = {**(task.context or {}), "pr_merged": True}
+                    session.add(task)
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(task.project_id), "task_updated",
+                        {"task_id": str(task.id), "status": task.status},
+                    )
+                    return {"status": "accepted_pr_merged"}
+                if _gh_pr_state == "closed" and not _gh_pr_merged:
+                    logger.info(
+                        f"[AGENT_STATUS] Task {task.id} reported FAILED and PR #{_pr_num} closed "
+                        f"without merge — marking FAILED (no retry; PR was rejected)"
+                    )
+                    task.status = TaskStatus.FAILED
+                    task.vm_instance_id = None
+                    task.last_heartbeat = None
+                    task.latest_status_message = f"Reported FAILED; PR #{_pr_num} was closed without merging"
+                    task.context = {**(task.context or {}), "pr_closed_unmerged": True}
+                    # Exhaust retries so the orphan-resurrection sweep skips it.
+                    task.attempt_count = _runtime_config["max_retries"]
+                    session.add(task)
+                    await session.commit()
+                    await broadcast_to_project(
+                        str(task.project_id), "task_updated",
+                        {"task_id": str(task.id), "status": task.status},
+                    )
+                    return {"status": "accepted_pr_closed"}
+                # PR is still open — hand off to review pipeline.
+                logger.info(
+                    f"[AGENT_STATUS] Task {task.id} reported FAILED with open PR #{_pr_num}; "
+                    f"handing off to review pipeline (was attempt {task.attempt_count}/"
+                    f"{_runtime_config['max_retries']})"
+                )
+                task.status = TaskStatus.EVALUATING
+                task.vm_instance_id = None
+                task.last_heartbeat = None
+                task.latest_status_message = (
+                    f"Reported FAILED with open PR #{_pr_num}; handed off to review pipeline ({failure_class})"
+                )
+                session.add(task)
+                try:
+                    from app.review_pipeline import _spawn_pipeline_task
+                    _short_id = str(task.id).replace("-", "")[:8]
+                    _task_type = (task.first_payload or {}).get("type", "") or ""
+                    _type_prefix_map = {
+                        "docs": "docs", "deps": "deps", "migrate": "migrate",
+                        "refactor": "refactor", "perf": "task", "qa": "task",
+                        "security_audit": "task", "debug": "task", "smoketest": "task",
+                    }
+                    _branch_prefix = _type_prefix_map.get(_task_type, "task")
+                    _branch = f"blueprint/{_branch_prefix}-{_short_id}"
+                    _base_branch = (task.first_payload or {}).get("base_branch", "main")
+                    _original_prompt = (task.first_payload or {}).get("prompt", task.description or "")
+                    await _spawn_pipeline_task(
+                        task, "review", session, _pr_num, _branch, _base_branch,
+                        original_prompt=_original_prompt, original_task_id=str(task.id),
+                    )
+                except Exception as _spawn_exc:
+                    # Best-effort: if review-spawn fails, the reaper's stale-EVALUATING
+                    # sweep retries within 15min, and the 6h hard timeout bounds it.
+                    logger.warning(
+                        f"[AGENT_STATUS] Review spawn failed for FAILED-with-open-PR task {task.id}: "
+                        f"{type(_spawn_exc).__name__}: {_spawn_exc}",
+                        exc_info=True,
+                    )
+                await session.commit()
+                await broadcast_to_project(
+                    str(task.project_id), "task_updated",
+                    {"task_id": str(task.id), "status": task.status},
+                )
+                return {"status": "accepted_pr_handoff"}
+
         # Retry logic for failed tasks
         if payload.status == TaskStatus.FAILED and task.attempt_count < _runtime_config["max_retries"]:
             task.attempt_count += 1
