@@ -383,13 +383,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         (strategic_frequency > 0 and research_spawn_count > 0 and research_spawn_count % strategic_frequency == 0)
         or force_strategic
     )
-    # 2026-05-03: gate strategic spawn on no-active-strategic.
-    # _spawn_strategic_review/_spawn_design_doc_update internally dedup
-    # against active tasks and return False on conflict. Without this
-    # check, the counter stays at the same multiple-of-N (modulo trigger),
-    # next tick re-enters the spawn branch, calls the spawner, gets False
-    # again, loops indefinitely. User-visible: a stream of back-to-back
-    # strategic_review spawn-attempts every minute.
+    # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
+    # (b) no recent strategic spawn (regardless of terminal state).
+    #
+    # (a) covers normal dedup: the spawner internally returns False when an
+    #     active task exists, but the counter stays at the modulo trigger so
+    #     the next tick re-enters the spawn branch and loops indefinitely.
+    #
+    # (b) covers the cancellation/failure loop: when force_strategic=True
+    #     (no purpose / no active dirs / all saturated), the modulo check is
+    #     bypassed and EVERY tick wants to spawn. A user cancelling the
+    #     freshly-spawned strategic transitions it to CANCELLED (terminal),
+    #     so the active-only check at (a) returns 0 — and the next tick
+    #     spawns a new strategic instantly. Same for FAILED outcomes.
+    #     Cooldown gates this regardless of force_strategic.
     if is_strategic:
         from sqlalchemy import func as _strat_func
         has_active_strategic = (await session.execute(
@@ -408,6 +415,23 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 f"strategic task(s) exist for project {project.id}; falling through to tactical"
             )
             is_strategic = False  # skip the spawn block; tactical research below may still fire
+        else:
+            cooldown_minutes = _runtime_config.get("strategic_spawn_cooldown_minutes", 30)
+            cooldown_cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
+            recent_strategic = (await session.execute(
+                select(_strat_func.count()).select_from(Task).where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"].as_string().in_(["strategic_review", "design_doc_update"]),
+                    Task.created_at >= cooldown_cutoff,
+                )
+            )).scalar() or 0
+            if recent_strategic > 0:
+                logger.info(
+                    f"[STRATEGIC] Skipping strategic spawn — {recent_strategic} strategic "
+                    f"task(s) created in last {cooldown_minutes}min for project {project.id} "
+                    f"(force_strategic={force_strategic}); falling through to tactical"
+                )
+                is_strategic = False
 
     if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
