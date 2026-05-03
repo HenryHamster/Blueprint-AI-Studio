@@ -27,20 +27,20 @@ ZONE=$ZONE
 ORCHESTRATOR_URL=$ORCHESTRATOR_URL
 ORCHESTRATOR_SA=$ORCHESTRATOR_SA
 ARTIFACT_BUCKET=$ARTIFACT_BUCKET
-USE_CLOUD_SQL=${USE_CLOUD_SQL:-false}
 DB_IP=$DB_IP
 DB_PW_SECRET=$DB_PW_SECRET
 ADMIN_API_KEY=$ADMIN_API_KEY
 ADMIN_EMAIL=${ADMIN_EMAIL:-}
+ALERT_EMAIL=${ALERT_EMAIL:-}
+BILLING_ACCOUNT_ID=${BILLING_ACCOUNT_ID:-}
 EOF
 }
 
 load_config() {
   if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
-    USE_CLOUD_SQL="${USE_CLOUD_SQL:-false}"
-    # Backward compatibility for .setup-config files written before the
-    # AlloyDB/Cloud SQL-neutral DB_* keys were introduced.
+    # Backward compatibility for .setup-config files written before alloydb.tf
+    # was archived (when both AlloyDB and Cloud SQL paths existed).
     DB_IP="${DB_IP:-${ALLOYDB_IP:-}}"
     DB_PW_SECRET="${DB_PW_SECRET:-${ALLOYDB_PW_SECRET:-}}"
     return 0
@@ -218,6 +218,23 @@ if [ -z "$SKIP_TERRAFORM" ]; then
   read -p "Admin email (will be seeded as first project admin) [optional, can skip]: " ADMIN_EMAIL
   ADMIN_EMAIL=${ADMIN_EMAIL:-}
 
+  # ALERT_EMAIL drives Cloud Monitoring notification channel (used by Cloud SQL
+  # CPU/disk/connections/backup-failure alerts AND by budget.tf's monthly
+  # spend ceiling). Empty string disables both — keep that escape hatch for
+  # operators who explicitly want no alerting.
+  read -p "Alert email (Cloud Monitoring + budget alerts) [optional, can skip]: " ALERT_EMAIL
+  ALERT_EMAIL=${ALERT_EMAIL:-}
+
+  # BILLING_ACCOUNT_ID is required by budget.tf (budget alert at 50/90/100%
+  # of $200/mo). Find via `gcloud billing accounts list`. Empty string
+  # disables the budget resource (alerts still work if ALERT_EMAIL is set).
+  if [ -n "$ALERT_EMAIL" ]; then
+    read -p "GCP billing account ID (e.g. '01ABCD-234567-EFGH89') for budget alert [optional]: " BILLING_ACCOUNT_ID
+    BILLING_ACCOUNT_ID=${BILLING_ACCOUNT_ID:-}
+  else
+    BILLING_ACCOUNT_ID=""
+  fi
+
   echo ""
   info "Setting GCP project to $PROJECT_ID..."
   gcloud config set project "$PROJECT_ID" --quiet
@@ -226,45 +243,68 @@ if [ -z "$SKIP_TERRAFORM" ]; then
   # ─── Enable APIs ──────────────────────────────────────────────────────────
 
   info "Enabling required GCP APIs..."
+  # alloydb.googleapis.com removed 2026-05-02 (alloydb.tf archived). Re-add to
+  # this list AND restore the alloydb resource files if scaling back to AlloyDB
+  # — see infra/terraform/archive/README.md.
+  # cloudbilling + billingbudgets enable budget.tf's google_billing_budget alert.
   gcloud services enable \
     compute.googleapis.com \
     run.googleapis.com \
     cloudbuild.googleapis.com \
     secretmanager.googleapis.com \
     artifactregistry.googleapis.com \
-    alloydb.googleapis.com \
     sqladmin.googleapis.com \
     servicenetworking.googleapis.com \
     iam.googleapis.com \
     iamcredentials.googleapis.com \
+    cloudbilling.googleapis.com \
+    billingbudgets.googleapis.com \
     --quiet
   ok "APIs enabled"
+
+  # ─── Quota check ──────────────────────────────────────────────────────────
+  # MAX_CONCURRENT_VMS=10 (cloudbuild.yaml) × 2 vCPU per e2-standard-2 = 20 vCPU
+  # needed in the primary region. Default new-project CPUS quota is 8 — would
+  # cap concurrent agents at 4 with QUOTA_EXCEEDED on further provision attempts.
+  CPUS_QUOTA=$(gcloud compute regions describe "$REGION" --project="$PROJECT_ID" --format="value(quotas[metric=CPUS].limit)" 2>/dev/null | head -1)
+  if [ -n "$CPUS_QUOTA" ] && awk -v q="$CPUS_QUOTA" 'BEGIN{exit !(q < 20)}'; then
+    warn "CPUS quota in $REGION is $CPUS_QUOTA vCPU; MAX_CONCURRENT_VMS=10 needs ≥20."
+    warn "Provision attempts past your quota will hit QUOTA_EXCEEDED."
+    warn "Request an increase: https://console.cloud.google.com/iam-admin/quotas?project=$PROJECT_ID"
+    warn "Continuing anyway — you can apply now and request the bump in parallel."
+  fi
 
   # ─── Terraform ────────────────────────────────────────────────────────────
 
   info "Running Terraform..."
+
+  # GCS state bucket: bootstrap before init since provider.tf declares a GCS
+  # backend. Bucket name follows the convention <project>-tf-state. Idempotent
+  # — `gsutil mb` errors if the bucket exists, and we tolerate that.
+  TF_STATE_BUCKET="${PROJECT_ID}-tf-state"
+  if ! gsutil ls -b "gs://${TF_STATE_BUCKET}" >/dev/null 2>&1; then
+    info "Creating Terraform state bucket gs://${TF_STATE_BUCKET}..."
+    gsutil mb -p "$PROJECT_ID" -l "$REGION" "gs://${TF_STATE_BUCKET}" || fail "Failed to create state bucket"
+    gsutil versioning set on "gs://${TF_STATE_BUCKET}" >/dev/null 2>&1 || warn "Could not enable versioning on state bucket"
+  fi
+
   cd infra/terraform
 
-  terraform init -input=false
+  terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}"
 
-  USE_CLOUD_SQL="${USE_CLOUD_SQL:-false}"
-  TF_VARS="-var=project_id=$PROJECT_ID -var=region=$REGION -var=zone=$ZONE -var=use_cloud_sql=$USE_CLOUD_SQL"
+  # use_cloud_sql defaults true in variables.tf since alloydb.tf was archived.
+  TF_VARS="-var=project_id=$PROJECT_ID -var=region=$REGION -var=zone=$ZONE"
+  [ -n "$ALERT_EMAIL" ] && TF_VARS="$TF_VARS -var=alert_email=$ALERT_EMAIL"
+  [ -n "$BILLING_ACCOUNT_ID" ] && TF_VARS="$TF_VARS -var=billing_account_id=$BILLING_ACCOUNT_ID"
 
   terraform apply -auto-approve $TF_VARS || warn "Terraform apply had errors (may be OK on re-run, continuing...)"
 
   ORCHESTRATOR_URL=$(terraform output -raw orchestrator_url 2>/dev/null || echo "")
   ARTIFACT_BUCKET=$(terraform output -raw artifact_bucket_name 2>/dev/null || echo "")
   ORCHESTRATOR_SA=$(terraform output -raw orchestrator_service_account 2>/dev/null || echo "")
-  if [[ "$USE_CLOUD_SQL" == "true" ]]; then
-    DB_IP=$(terraform output -raw cloud_sql_ip_address 2>/dev/null || echo "")
-    DB_PW_SECRET=$(terraform output -raw cloud_sql_password_secret_id 2>/dev/null || echo "")
-    DB_LABEL="Cloud SQL"
-  else
-    DB_IP=$(terraform output -raw alloydb_ip_address 2>/dev/null || echo "")
-    DB_PW_SECRET=$(terraform output -raw alloydb_password_secret_id 2>/dev/null || echo "")
-    DB_LABEL="AlloyDB"
-  fi
-  echo "Using $DB_LABEL at $DB_IP"
+  DB_IP=$(terraform output -raw cloud_sql_ip_address 2>/dev/null || echo "")
+  DB_PW_SECRET=$(terraform output -raw cloud_sql_password_secret_id 2>/dev/null || echo "")
+  echo "Using Cloud SQL at $DB_IP"
 
   if [ -z "$ORCHESTRATOR_URL" ]; then
     fail "Could not read orchestrator_url from Terraform outputs."
@@ -289,13 +329,7 @@ urlencode() {
 
 DB_PASSWORD=$(gcloud secrets versions access latest --secret="$DB_PW_SECRET" --project="$PROJECT_ID")
 ENCODED_DB_PASSWORD=$(urlencode "$DB_PASSWORD")
-if [[ "$USE_CLOUD_SQL" == "true" ]]; then
-  DATABASE_URL="postgresql+asyncpg://postgres:${ENCODED_DB_PASSWORD}@${DB_IP}:5432/postgres?ssl=require"
-else
-  # AlloyDB also requires TLS — append ?ssl=require so asyncpg uses the
-  # request-rather-than-opportunistic SSL mode (mirrors Cloud SQL above).
-  DATABASE_URL="postgresql+asyncpg://postgres:${ENCODED_DB_PASSWORD}@${DB_IP}:5432/postgres?ssl=require"
-fi
+DATABASE_URL="postgresql+asyncpg://postgres:${ENCODED_DB_PASSWORD}@${DB_IP}:5432/postgres?ssl=require"
 DB_PASSWORD=""
 ENCODED_DB_PASSWORD=""
 

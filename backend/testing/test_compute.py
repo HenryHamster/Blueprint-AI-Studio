@@ -581,3 +581,152 @@ class TestSoonestZoneRecovery:
         past = datetime.now(timezone.utc) - timedelta(seconds=1)
         _cooldown_all_zones(past)
         assert compute.soonest_zone_recovery() is None
+
+
+class TestZoneInDisabledRegion:
+    """Tests for _zone_in_disabled_region()."""
+
+    def test_zone_in_disabled_region_extracts_region(self, monkeypatch):
+        monkeypatch.setattr(compute, "_DISABLED_REGIONS", frozenset(["us-east1", "us-west1"]))
+        assert compute._zone_in_disabled_region("us-east1-a") is True
+        assert compute._zone_in_disabled_region("us-east1-c") is True
+        assert compute._zone_in_disabled_region("us-west1-b") is True
+        assert compute._zone_in_disabled_region("us-central1-f") is False
+        assert compute._zone_in_disabled_region("us-east4-a") is False
+
+    def test_zone_in_disabled_region_empty_set(self, monkeypatch):
+        monkeypatch.setattr(compute, "_DISABLED_REGIONS", frozenset())
+        for zone, _ in compute.FALLBACK_ZONES:
+            assert compute._zone_in_disabled_region(zone) is False
+
+
+class TestActiveFallbackZones:
+    """Tests for _active_fallback_zones()."""
+
+    def test_no_disabled_returns_full_list(self, monkeypatch):
+        monkeypatch.setattr(compute, "_DISABLED_REGIONS", frozenset())
+        assert compute._active_fallback_zones() == compute.FALLBACK_ZONES
+
+    def test_filters_one_region(self, monkeypatch):
+        monkeypatch.setattr(compute, "_DISABLED_REGIONS", frozenset(["us-east1"]))
+        result = compute._active_fallback_zones()
+        result_zones = [z for z, _ in result]
+        assert "us-east1-c" not in result_zones
+        assert "us-east1-b" not in result_zones
+        assert "us-central1-a" in result_zones
+        assert "us-east4-a" in result_zones  # us-east4 not disabled, still present
+        assert len(result) == len(compute.FALLBACK_ZONES) - 2  # us-east1 had 2 zones
+
+    def test_filters_three_regions_leaves_central(self, monkeypatch):
+        monkeypatch.setattr(
+            compute, "_DISABLED_REGIONS", frozenset(["us-east1", "us-east4", "us-west1"])
+        )
+        result = compute._active_fallback_zones()
+        result_zones = [z for z, _ in result]
+        assert all(z.startswith("us-central1-") for z in result_zones)
+        assert len(result) == 4  # us-central1 has zones a, b, c, f
+
+
+class TestFormatOrphanStatus:
+    """Tests for _format_orphan_status()."""
+
+    def test_terminated_in_spot_mode_annotated(self, monkeypatch):
+        monkeypatch.setattr(compute, "VM_PROVISIONING_MODEL", "SPOT")
+        assert compute._format_orphan_status("TERMINATED") == "TERMINATED (likely spot preemption)"
+
+    def test_terminated_in_standard_mode_passthrough(self, monkeypatch):
+        monkeypatch.setattr(compute, "VM_PROVISIONING_MODEL", "STANDARD")
+        assert compute._format_orphan_status("TERMINATED") == "TERMINATED"
+
+    def test_running_in_spot_mode_passthrough(self, monkeypatch):
+        # Only TERMINATED gets the spot annotation; other statuses are
+        # not preemption-implied.
+        monkeypatch.setattr(compute, "VM_PROVISIONING_MODEL", "SPOT")
+        assert compute._format_orphan_status("RUNNING") == "RUNNING"
+        assert compute._format_orphan_status("STOPPING") == "STOPPING"
+        assert compute._format_orphan_status("PROVISIONING") == "PROVISIONING"
+
+
+class TestDisabledRegionsParsing:
+    """Tests for DISABLED_REGIONS env var parsing.
+
+    The parser at module scope reads os.getenv once. We can't re-trigger that
+    without importlib.reload, so we exercise the same logic inline.
+    """
+
+    @staticmethod
+    def _parse(raw: str) -> frozenset[str]:
+        # Mirror the production parser at compute.py:162-165.
+        normalized = raw.replace(";", ",")
+        return frozenset(r.strip() for r in normalized.split(",") if r.strip())
+
+    def test_empty_string(self):
+        assert self._parse("") == frozenset()
+
+    def test_single_region(self):
+        assert self._parse("us-east1") == frozenset({"us-east1"})
+
+    def test_comma_separated(self):
+        assert self._parse("us-east1,us-east4,us-west1") == frozenset(
+            {"us-east1", "us-east4", "us-west1"}
+        )
+
+    def test_semicolon_separated(self):
+        # Cloudbuild.yaml uses semicolons because gcloud --set-env-vars uses
+        # `,` as KEY=VAL delimiter.
+        assert self._parse("us-east1;us-east4;us-west1") == frozenset(
+            {"us-east1", "us-east4", "us-west1"}
+        )
+
+    def test_mixed_separators(self):
+        assert self._parse("us-east1;us-east4,us-west1") == frozenset(
+            {"us-east1", "us-east4", "us-west1"}
+        )
+
+    def test_whitespace_normalized(self):
+        assert self._parse(" us-east1 ; us-east4 ") == frozenset({"us-east1", "us-east4"})
+
+    def test_trailing_separators_dropped(self):
+        assert self._parse(";us-east1;;us-east4;") == frozenset({"us-east1", "us-east4"})
+
+    def test_duplicate_collapsed(self):
+        assert self._parse("us-east1,us-east1") == frozenset({"us-east1"})
+
+
+class TestGetVmStatus:
+    """Tests for get_vm_status() — used by reaper to detect spot preemption."""
+
+    def test_zone_unknown_returns_none(self):
+        assert compute.get_vm_status("agent-vm-abc", "unknown") is None
+        assert compute.get_vm_status("agent-vm-abc", "") is None
+
+    def test_running_status(self):
+        from unittest.mock import MagicMock, patch
+        mock_instance = MagicMock()
+        mock_instance.status = "RUNNING"
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.return_value = mock_instance
+            assert compute.get_vm_status("agent-vm-abc", "us-central1-a") == "RUNNING"
+
+    def test_terminated_status(self):
+        from unittest.mock import MagicMock, patch
+        mock_instance = MagicMock()
+        mock_instance.status = "TERMINATED"
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.return_value = mock_instance
+            assert compute.get_vm_status("agent-vm-abc", "us-central1-a") == "TERMINATED"
+
+    def test_not_found_returns_deleted(self):
+        from unittest.mock import patch
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.side_effect = Exception("404 was not found in zone")
+            # SPOT VMs use DELETE termination action, so preempted VMs become 404.
+            # get_vm_status returns the synthetic "DELETED" so reaper can distinguish
+            # vanished from API-failed.
+            assert compute.get_vm_status("agent-vm-abc", "us-central1-a") == "DELETED"
+
+    def test_other_api_error_returns_none(self):
+        from unittest.mock import patch
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            mock_client.return_value.get.side_effect = Exception("503 backend timeout")
+            assert compute.get_vm_status("agent-vm-abc", "us-central1-a") is None

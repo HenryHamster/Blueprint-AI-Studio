@@ -36,14 +36,23 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       # Placeholder image. CI/CD will overwrite this with the actual application image.
       image = "us-docker.pkg.dev/cloudrun/container/hello"
 
-      # Memory: 2Gi→4Gi on 2026-04-16. load_only() on hot queries reduces
-      # steady-state usage; 4Gi gives headroom for analytics endpoints that
-      # load 14-day task windows with full JSONB. CPU bumped to 2 vCPU to
-      # match — GC pressure needs CPU too.
+      # Cost-optimization 2026-05-02: 4Gi/2vCPU → 2Gi/1vCPU.
+      #
+      # CPU is the dominant always-on cost on no-cpu-throttling Cloud Run
+      # (~$62/mo per vCPU; memory is ~$6.50/mo per GiB). Halving CPU saves
+      # ~$62/mo, halving memory saves ~$13/mo. Total ~$75/mo savings.
+      #
+      # The 4Gi/2vCPU bump on 2026-04-16 was for analytics endpoints that
+      # load 14-day task windows with full JSONB. Those endpoints will be
+      # slower at 2Gi/1vCPU — bump back if Cloud Run logs show OOMKilled
+      # or sustained CPU saturation under analytics load.
+      #
+      # Watchpoint: `OOMKilled` events in Cloud Run logs, /health 503s
+      # under analytics load, GC pressure on long-running endpoints.
       resources {
         limits = {
-          memory = "4Gi"
-          cpu    = "2000m"
+          memory = "2Gi"
+          cpu    = "1000m"
         }
       }
 
@@ -108,11 +117,12 @@ resource "google_cloud_run_v2_service" "orchestrator" {
   # R3-W4 C2 (audit 2026-04-30): env reverted onto ignore_changes after
   # Round 2's M5 narrowing caused a regression. cloudbuild.yaml's
   # --set-env-vars is the source of truth and declaratively replaces the
-  # full env list with 11 vars (ALLOWED_ORIGINS, LOCAL_MODE,
-  # MAX_CONCURRENT_VMS, INITIAL_ADMIN_EMAIL, plus 7 others); this file
-  # only declares 7. Without ignore_changes on env, the next
-  # `terraform apply` planned to delete the 4 cloudbuild-only variables
-  # — taking ALLOWED_ORIGINS with them and triggering a CORS outage.
+  # full env list with 13 vars as of 2026-05-02 (ALLOWED_ORIGINS, LOCAL_MODE,
+  # MAX_CONCURRENT_VMS, INITIAL_ADMIN_EMAIL, VM_PROVISIONING_MODEL,
+  # DISABLED_REGIONS, plus 7 others); this file only declares 7. Without
+  # ignore_changes on env, the next `terraform apply` planned to delete the
+  # cloudbuild-only variables — taking ALLOWED_ORIGINS with them and
+  # triggering a CORS outage.
   # Ownership split: Terraform tracks the *structure* of the resource
   # (containers, volumes, scaling, vpc_access); CI tracks the env-var
   # *content*. Drift between cloudbuild.yaml and this file is reviewable

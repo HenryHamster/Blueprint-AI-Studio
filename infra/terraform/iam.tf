@@ -102,20 +102,22 @@ resource "google_storage_bucket_iam_member" "agent_bucket_reader" {
 }
 
 # ------------------------------------------------------------------------------
-# Migrator service account — used only by infra/migrate-alloydb-to-cloudsql.sh
-# to run pg_dump/pg_restore on a transient migrator VM. Has read access to
-# both DB password secrets and nothing else.
+# Migrator service account — kept for the inverse-direction restore drill.
+# Originally added for the AlloyDB→Cloud SQL cutover (now archived). Retained
+# because the documented Cloud SQL→AlloyDB restore path
+# (archive/README.md → "Restoring AlloyDB") reuses the same migrator VM
+# pattern. Has read access to the Cloud SQL password secret and nothing else;
+# the AlloyDB-password binding was removed when alloydb.tf was archived and
+# restoration appends it back manually.
 # ------------------------------------------------------------------------------
 resource "google_service_account" "migrator_sa" {
   account_id   = "migrator-sa"
   display_name = "DB Migrator SA (transient, used during AlloyDB→Cloud SQL cutover)"
 }
 
-resource "google_secret_manager_secret_iam_member" "migrator_alloydb_password_access" {
-  secret_id = google_secret_manager_secret.db_password_secret.id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.migrator_sa.email}"
-}
+# migrator_alloydb_password_access binding removed when alloydb.tf was
+# archived. Migrator-sa retains its Cloud SQL password binding below for
+# the existing migration script's reverse direction (see archive/README.md).
 
 resource "google_secret_manager_secret_iam_member" "migrator_cloud_sql_password_access" {
   count     = var.use_cloud_sql ? 1 : 0

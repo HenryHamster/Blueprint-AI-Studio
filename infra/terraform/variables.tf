@@ -40,13 +40,25 @@ variable "orchestrator_url" {
 }
 
 variable "use_cloud_sql" {
-  description = "Provision a Cloud SQL Postgres instance alongside AlloyDB. Used during the AlloyDB → Cloud SQL migration. After cutover, remove alloydb.tf and keep this true."
+  description = "Provision a Cloud SQL Postgres instance. Default true since alloydb.tf was archived 2026-05-02. Setting false will leave the deploy with NO database — only do this if you're restoring AlloyDB from archive/."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "alert_email" {
   description = "Email address that receives Cloud Monitoring alert pages (CPU, disk, connections, backup failure). Empty string disables alerting — no notification channel is created and alert policies skip themselves."
   type        = string
   default     = ""
+}
+
+variable "billing_account_id" {
+  description = "GCP billing account ID (e.g. '01ABCD-234567-EFGH89'). Required to create a budget alert. Empty string disables the budget resource. Find via `gcloud billing accounts list`."
+  type        = string
+  default     = ""
+}
+
+variable "monthly_budget_usd" {
+  description = "Monthly budget cap in USD. Email alerts fire at 50/90/100%% of this amount. Does NOT auto-stop spend — only warns. Default $200 matches the Path A cost target."
+  type        = number
+  default     = 200
 }

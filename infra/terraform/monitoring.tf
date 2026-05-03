@@ -276,53 +276,8 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
   }
 }
 
-# ------------------------------------------------------------------------------
-# AlloyDB — CPU > 80% (mirror of Cloud SQL CPU policy)
-#
-# Active for the duration that AlloyDB resources still exist in the Terraform
-# state (regardless of `use_cloud_sql`). Wave F4 M4: previously gated on
-# `!var.use_cloud_sql` so the alert went silent the moment Cloud SQL was
-# enabled — but during the cutover window both stacks are live and AlloyDB
-# is still the authoritative DB until the runbook flips DATABASE_URL.
-# Keeping the alert armed during cutover catches any AlloyDB CPU spike that
-# would mask a botched migration.
-#
-# R3-W4 M5 (audit 2026-04-30): the previous comment claimed this alert
-# auto-deletes when alloydb.tf is removed. That is WRONG — the filter is
-# a literal Cloud Monitoring resource.type string
-# (`alloydb.googleapis.com/Instance`), not a Terraform
-# google_alloydb_instance reference, so Terraform has no dependency edge
-# to drive deletion. After alloydb.tf is removed, this alert resource
-# will persist as a no-op (zero series matched, no notifications fire).
-# The cutover commit MUST also remove this alert block alongside
-# alloydb.tf, or the policy stays in the project's monitoring console
-# forever as cosmetic noise.
-# ------------------------------------------------------------------------------
-resource "google_monitoring_alert_policy" "alloydb_cpu" {
-  count        = local.alerting_enabled ? 1 : 0
-  display_name = "AlloyDB CPU > 80% (5 min)"
-  combiner     = "OR"
-  enabled      = true
-
-  conditions {
-    display_name = "CPU utilization above 80%"
-    condition_threshold {
-      filter          = "resource.type = \"alloydb.googleapis.com/Instance\" AND metric.type = \"alloydb.googleapis.com/instance/cpu/utilization\""
-      duration        = "300s"
-      comparison      = "COMPARISON_GT"
-      threshold_value = 0.8
-
-      aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
-      }
-    }
-  }
-
-  notification_channels = [google_monitoring_notification_channel.email[0].id]
-
-  documentation {
-    content   = "AlloyDB instance CPU has been above 80% for 5 minutes. This is dual-coverage during the AlloyDB → Cloud SQL migration window. Runbook: docs/db-migration-plan.md (Operational continuity)."
-    mime_type = "text/markdown"
-  }
-}
+# AlloyDB CPU alert was removed when alloydb.tf was archived (Cloud SQL CPU
+# alert above remains the active DB CPU monitor). To restore, mirror the
+# cloudsql_cpu block above and target resource.type
+# "alloydb.googleapis.com/Instance" / metric.type
+# "alloydb.googleapis.com/instance/cpu/utilization". See archive/README.md.

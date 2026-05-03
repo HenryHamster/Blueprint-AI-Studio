@@ -2368,6 +2368,7 @@ async def next_role(
     task = (await session.execute(stmt)).scalars().first()
 
     if task is not None:
+        from app.compute import VM_PROVISIONING_MODEL  # noqa: PLC0415
         task.vm_instance_id = req.vm_instance_id
         task.status = TaskStatus.IN_PROGRESS
         task.last_heartbeat = _utcnow()
@@ -2375,6 +2376,9 @@ async def next_role(
         # task. For warm-start we set it to "now" so existing
         # claim_latency / reaper logic operates on a fresh window.
         task.vm_provisioned_at = _utcnow()
+        # vm_spot mirrors orchestrator-mode for cost accounting; warm-start VMs
+        # are spawned by orchestrator with the same provisioning model as cold.
+        task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT")
         if task.started_at is None:
             task.started_at = _utcnow()
         # Carry warm-start signal forward into context._timing so the

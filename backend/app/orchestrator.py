@@ -24,6 +24,7 @@ from sqlmodel import select
 
 from app.compute import (
     INFRA_PROVISION_PATTERNS,
+    VM_PROVISIONING_MODEL,
     _capture_serial_for_vm,
     any_zone_available,
     get_provision_error,
@@ -2359,6 +2360,13 @@ async def orchestrator_worker():
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
+                    # vm_spot must be written here — it's read by ~30 cost-rate sites
+                    # (admin_digest, ci_completion, task_completion, etc.) gating
+                    # SPOT_RATE vs ON_DEMAND_RATE. Without this write every cost
+                    # dashboard overstates by ~3.3x when the orchestrator runs in
+                    # SPOT mode. compute.VM_PROVISIONING_MODEL is the source of truth
+                    # (env-driven; STANDARD by default).
+                    task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT")
                     task.last_heartbeat = None
                     _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
                     session.add(task)
@@ -2452,6 +2460,9 @@ async def orchestrator_worker():
                                             # a silent startup failure. last_heartbeat is left alone
                                             # so only real agent activity writes it.
                                             hb_task.vm_provisioned_at = _utcnow()
+                                            # vm_spot mirrors orchestrator-mode at provision-confirm time;
+                                            # see comment at the dispatch-site write above.
+                                            hb_task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT")
                                             # Save provision zone for diagnostics
                                             prov_zone = get_vm_zone(vm_id)
                                             hb_task.context = {**(hb_task.context or {}), "provision_zone": prov_zone}

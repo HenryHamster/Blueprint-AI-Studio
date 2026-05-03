@@ -12,7 +12,7 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.models import Task, TaskStatus, Project, Artifact, ArtifactType
-from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
+from app.compute import get_provision_error, record_zone_failure, _capture_serial_for_vm, get_vm_zone, get_vm_status, INFRA_PROVISION_PATTERNS, any_zone_available, soonest_zone_recovery
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health, resolve_retry_budget
 from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
@@ -650,7 +650,64 @@ async def reaper_service():
                         + ((task.error_logs or "") if hasattr(task, 'error_logs') else "")
                     )
                     is_rate_limited = classify_failure(task, logs=combined_logs) == "RATE_LIMIT"
-                    if is_rate_limited:
+
+                    # Spot preemption fast-path: when a SPOT VM is preempted
+                    # mid-task, GCP DELETEs the instance with 30s notice. The
+                    # agent never sends a final heartbeat, so the reaper sees
+                    # heartbeat_timeout. Without this fast-path, repeated
+                    # preemptions burn class_budget on a perfectly healthy task
+                    # — at ~5%% preemption rate over 30-min tasks, ~3 preempts
+                    # in a row exhausts retries on a task that would succeed
+                    # on STANDARD. Treat preemption as infra (skip
+                    # attempt_count++) similar to RATE_LIMIT below.
+                    is_spot_preemption = False
+                    prov_zone_for_status: str | None = None
+                    if (
+                        getattr(fresh_task, "vm_spot", False)
+                        and fresh_task.vm_instance_id
+                        and reap_reason_code in ("heartbeat_timeout_post_claim", "provision_timeout_pre_claim")
+                    ):
+                        prov_zone_for_status = (task.context or {}).get("provision_zone") or get_vm_zone(fresh_task.vm_instance_id)
+                        if prov_zone_for_status:
+                            try:
+                                vm_status = await asyncio.to_thread(
+                                    get_vm_status, fresh_task.vm_instance_id, prov_zone_for_status
+                                )
+                                # TERMINATED = preempted by GCP. DELETED = already gone
+                                # (DELETE termination action under SPOT). RUNNING = real
+                                # agent crash, not preemption.
+                                if vm_status in ("TERMINATED", "DELETED"):
+                                    is_spot_preemption = True
+                                    logger.warning(
+                                        f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
+                                        f"in {prov_zone_for_status} — vm_status={vm_status}, treating "
+                                        f"as preemption (skipping attempt_count++)"
+                                    )
+                            except Exception as e:
+                                logger.debug(f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}")
+
+                    if is_spot_preemption:
+                        # Skip attempt_count++ and provision_failures++ — preemption
+                        # isn't a code defect or account problem. Requeue cleanly.
+                        logger.info(
+                            f"[REAPER] Spot preemption — requeuing task {task.id} without burning retry budget"
+                        )
+                        new_ctx = dict(task.context or {})
+                        spot_count = (new_ctx.get("spot_preemption_count") or 0) + 1
+                        new_ctx["spot_preemption_count"] = spot_count
+                        if is_provision_failure:
+                            # Undo the provision_failures increment from the pre-claim path
+                            provision_failures -= 1
+                            new_ctx["provision_failures"] = provision_failures
+                        task.context = new_ctx
+                        can_retry = True
+                        record_pipeline_event(
+                            "spot_preemption",
+                            task_id=str(task.id),
+                            vm_id=fresh_task.vm_instance_id,
+                            zone=prov_zone_for_status,
+                        )
+                    elif is_rate_limited:
                         rl_acct_id = get_task_llm_account_id(task)
                         logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing immediately with account blacklisted")
                         # Disable the exhausted model on the account so the orchestrator's

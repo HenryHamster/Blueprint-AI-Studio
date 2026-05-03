@@ -1,17 +1,14 @@
 # ------------------------------------------------------------------------------
-# Cloud SQL for PostgreSQL — cheaper alternative to AlloyDB.
+# Cloud SQL for PostgreSQL — the primary database.
 #
-# Gated behind var.use_cloud_sql so it can be added alongside AlloyDB without
-# disturbing the running cluster. Cutover sequence:
-#   1. terraform apply -var="use_cloud_sql=true"  (creates Cloud SQL alongside AlloyDB)
-#   2. Run infra/migrate-alloydb-to-cloudsql.sh    (dumps AlloyDB → restores Cloud SQL)
-#   3. Update DATABASE_URL secret to the Cloud SQL connection string
-#   4. Redeploy Cloud Run (picks up new secret value)
-#   5. After stability period, remove alloydb.tf and re-apply
+# `var.use_cloud_sql` defaults true (variables.tf) since alloydb.tf was archived
+# 2026-05-02. Setting it false leaves the deploy with NO database; only do this
+# if you're in the middle of restoring AlloyDB (see archive/README.md).
 #
-# Reuses the existing private services access (google_service_networking_connection.vpc_connection
-# in alloydb.tf) — Google's managed-services VPC peering supports both engines on the
-# same allocation.
+# VPC peering (google_compute_global_address.private_ip_alloc +
+# google_service_networking_connection.vpc_connection) lives in vpc.tf. Both
+# managed-DB engines route through the same Google service-networking
+# connection, so the resources are colocated in vpc.tf where they belong.
 # ------------------------------------------------------------------------------
 
 resource "random_id" "cloud_sql_id_suffix" {

@@ -138,6 +138,84 @@ def _zone_success_rate(zone: str) -> float:
 _zone_lock = threading.RLock()
 MACHINE_TYPE = os.getenv("MACHINE_TYPE", "e2-standard-2")
 
+# Provisioning model: "STANDARD" (on-demand, full price, no termination) or
+# "SPOT" (60-91% cheaper, can be preempted with 30s notice). Default STANDARD
+# so local dev / tests don't accidentally request spot capacity. Cloud Run is
+# configured to set SPOT explicitly (see backend/cloudbuild.yaml).
+VM_PROVISIONING_MODEL = os.getenv("VM_PROVISIONING_MODEL", "STANDARD").upper()
+if VM_PROVISIONING_MODEL not in ("STANDARD", "SPOT"):
+    logger.warning(
+        f"[COMPUTE] Unknown VM_PROVISIONING_MODEL={VM_PROVISIONING_MODEL!r}, "
+        f"falling back to STANDARD"
+    )
+    VM_PROVISIONING_MODEL = "STANDARD"
+
+# Administratively disabled regions — VMs will not be spawned here.
+# Accepts `;` or `,` as separator (e.g. "us-east1;us-east4;us-west1").
+# `;` is the safe choice when wired through gcloud `--set-env-vars` because
+# `,` is gcloud's KEY=VALUE delimiter; using comma there would split the
+# region list into separate env vars. Used to mirror terraform: when
+# multi-region NAT is dropped from vpc.tf, those regions have no subnet, so
+# spawning would fail with cryptic missing-subnet errors. Listing them here
+# makes the orchestrator skip with an explicit
+# "administratively disabled (no subnet)" log instead.
+_DISABLED_REGIONS_RAW = os.getenv("DISABLED_REGIONS", "").replace(";", ",")
+_DISABLED_REGIONS = frozenset(
+    r.strip() for r in _DISABLED_REGIONS_RAW.split(",") if r.strip()
+)
+
+
+def _zone_in_disabled_region(zone: str) -> bool:
+    """True if the zone's region is in DISABLED_REGIONS."""
+    region = "-".join(zone.split("-")[:-1])  # us-central1-f → us-central1
+    return region in _DISABLED_REGIONS
+
+
+def _active_fallback_zones() -> list[tuple[str, str]]:
+    """FALLBACK_ZONES with administratively disabled regions filtered out.
+
+    Used by spawn-time iteration. Cleanup / monitoring paths still use the
+    full FALLBACK_ZONES list so stranded VMs in newly-disabled regions are
+    still found and cleaned (defense-in-depth — though terraform enforces
+    no-VMs-without-subnet so this should be empty).
+    """
+    if not _DISABLED_REGIONS:
+        return FALLBACK_ZONES
+    return [(z, s) for z, s in FALLBACK_ZONES if not _zone_in_disabled_region(z)]
+
+
+def _format_orphan_status(status: str) -> str:
+    """Augment status string with spot-preemption hint when in SPOT mode.
+
+    A TERMINATED VM in SPOT mode is overwhelmingly likely a preemption rather
+    than an orderly shutdown. Tagging the log line distinctly helps operators
+    distinguish capacity-driven kills from agent crashes.
+    """
+    if status == "TERMINATED" and VM_PROVISIONING_MODEL == "SPOT":
+        return f"{status} (likely spot preemption)"
+    return status
+
+
+# Module-load-time announce of operational config: visible in Cloud Run startup
+# logs so an operator who's debugging "why didn't a VM spawn in us-east1?" sees
+# the answer in the first log lines instead of having to grep production code.
+if _DISABLED_REGIONS:
+    _excluded_zones = [z for z, _ in FALLBACK_ZONES if _zone_in_disabled_region(z)]
+    logger.info(
+        f"[COMPUTE] DISABLED_REGIONS={sorted(_DISABLED_REGIONS)} — "
+        f"{len(_excluded_zones)} of {len(FALLBACK_ZONES)} fallback zones are "
+        f"administratively disabled (no subnet provisioned in this region): "
+        f"{_excluded_zones}. Active spawn pool: "
+        f"{[z for z, _ in _active_fallback_zones()]}"
+    )
+if VM_PROVISIONING_MODEL == "SPOT":
+    logger.info(
+        "[COMPUTE] VM_PROVISIONING_MODEL=SPOT — agent VMs will be created with "
+        "spot/preemptible pricing. Expect ~5%% mid-task termination rate; "
+        "reaper + retry handle re-spawn. Flip to STANDARD via env var to revert.",
+    )
+
+
 # Networking Configuration
 VPC_NETWORK = os.getenv("VPC_NETWORK", "agent-sandbox-vpc")
 VPC_SUBNET = os.getenv("VPC_SUBNET", "agent-sandbox-subnet")
@@ -797,6 +875,20 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     ]
     instance_config.service_accounts = [service_account]
 
+    # Apply spot/preemptible scheduling when configured. SPOT VMs are 60-91%
+    # cheaper but can be terminated by GCP with 30s notice when capacity is
+    # needed. Existing reaper + retry handles re-spawn on termination. Default
+    # is STANDARD; cloudbuild.yaml sets VM_PROVISIONING_MODEL=SPOT in prod.
+    if VM_PROVISIONING_MODEL == "SPOT":
+        scheduling = compute_v1.Scheduling()
+        scheduling.provisioning_model = "SPOT"
+        # DELETE on preemption: Spot VMs we provision are single-task and can't
+        # be restarted (the agent's startup-script work isn't idempotent against
+        # mid-run interruption). Letting GCP DELETE them on preemption avoids
+        # accumulating TERMINATED zombies that cleanup has to chase.
+        scheduling.instance_termination_action = "DELETE"
+        instance_config.scheduling = scheduling
+
     _cancel_event = threading.Event()
 
     def _insert_instance():
@@ -805,8 +897,11 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
         skipped_cooldown = []
 
         now_pre = datetime.now(timezone.utc)
-        healthy_zones = [(z, s) for z, s in FALLBACK_ZONES if not (_zone_health.get(z, {}).get("cooldown_expires_at") and now_pre < _zone_health[z]["cooldown_expires_at"])]
-        cooled_zones = [(z, s) for z, s in FALLBACK_ZONES if (z, s) not in healthy_zones]
+        # _active_fallback_zones() filters out admin-disabled regions (DISABLED_REGIONS env)
+        # so spawn attempts skip regions with no subnet provisioned.
+        active_zones = _active_fallback_zones()
+        healthy_zones = [(z, s) for z, s in active_zones if not (_zone_health.get(z, {}).get("cooldown_expires_at") and now_pre < _zone_health[z]["cooldown_expires_at"])]
+        cooled_zones = [(z, s) for z, s in active_zones if (z, s) not in healthy_zones]
         # Sort healthy zones by recent success rate (descending) so well-performing
         # zones are preferred. Zones with no history get neutral rate 0.5.
         # Use stable sort with a small random tiebreak to distribute load across
@@ -971,12 +1066,13 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
         if skipped_cooldown:
             logger.warning(f"Skipped {len(skipped_cooldown)} zones in cooldown: {skipped_cooldown}")
-        if not last_error and len(skipped_cooldown) == len(FALLBACK_ZONES):
-            # All zones in cooldown — find the one expiring soonest and wait (up to 2 min)
+        if not last_error and len(skipped_cooldown) == len(active_zones):
+            # All ACTIVE zones in cooldown — find the one expiring soonest and wait (up to 2 min).
+            # Disabled zones are excluded; they have no subnet, so even waiting wouldn't help.
             now_check = datetime.now(timezone.utc)
             soonest_zone = None
             soonest_wait = float('inf')
-            for z, sn in FALLBACK_ZONES:
+            for z, sn in active_zones:
                 expires = _zone_health.get(z, {}).get("cooldown_expires_at")
                 if expires:
                     remaining = (expires - now_check).total_seconds()
@@ -1013,7 +1109,7 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                     raise
             else:
                 logger.critical(
-                    f"ALL {len(FALLBACK_ZONES)} zones in cooldown, soonest expires in {soonest_wait:.0f}s "
+                    f"ALL {len(active_zones)} active zones in cooldown, soonest expires in {soonest_wait:.0f}s "
                     f"(>{ZONE_RECOVERY_WAIT_CAP_SECONDS}s cap) — failing this provision attempt"
                 )
                 raise Exception(f"All zones in cooldown — soonest: {soonest_wait:.0f}s")
@@ -1107,6 +1203,31 @@ def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
             "[COMPUTE] _capture_serial_for_vm failed for vm=%s zone=%s: %s: %s",
             vm_name, zone, type(e).__name__, e,
         )
+        return None
+
+
+def get_vm_status(vm_name: str, zone: str) -> str | None:
+    """Return GCE instance status (e.g. RUNNING, TERMINATED, STOPPING) or None
+    if the VM doesn't exist / API failed.
+
+    Used by reaper to distinguish spot preemption (TERMINATED) from real agent
+    crash (RUNNING but heartbeat stale). Cheap GCE API call, not async — wrap
+    in asyncio.to_thread when called from the reaper.
+    """
+    from google.cloud import compute_v1
+    if not zone or zone == "unknown":
+        return None
+    try:
+        client = compute_v1.InstancesClient()
+        instance = client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_name, timeout=10)
+        return getattr(instance, "status", None) or None
+    except Exception as e:
+        if "was not found" in str(e) or "404" in str(e):
+            # VM already gone — Spot DELETE termination action means preempted
+            # instances are deleted, not just stopped. Return a synthetic
+            # "DELETED" so callers can distinguish "vanished" from "API errored".
+            return "DELETED"
+        logger.debug(f"[COMPUTE] get_vm_status failed for vm={vm_name} zone={zone}: {e}")
         return None
 
 
@@ -1258,9 +1379,12 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     if not orphans:
         return result
 
-    # Phase 3: Parallel deletion (no blocking serial capture)
+    # Phase 3: Parallel deletion (no blocking serial capture).
+    # _format_orphan_status tags TERMINATED+SPOT VMs as "(likely spot
+    # preemption)" so operators distinguish capacity-driven kills from
+    # agent crashes when scanning logs.
     async def _delete_orphan(name: str, zone: str, status: str):
-        logger.warning(f"[GCP CLEANUP] Deleting orphan {name} ({zone}, {status})")
+        logger.warning(f"[GCP CLEANUP] Deleting orphan {name} ({zone}, {_format_orphan_status(status)})")
         try:
             async with _gcp_ops_semaphore:
                 success = await asyncio.to_thread(_delete_single_vm, name, zone)
@@ -1307,7 +1431,9 @@ def get_zone_health() -> dict:
                 cooldown_active = datetime.now(timezone.utc) < cooldown_expires
 
             consecutive = data.get("consecutive_failures", 0)
-            if consecutive == 0:
+            if _zone_in_disabled_region(zone):
+                status = "disabled"
+            elif consecutive == 0:
                 status = "healthy"
             elif cooldown_active:
                 status = "exhausted"
@@ -1336,14 +1462,18 @@ def get_zone_health_summary() -> dict:
     """Return a compact summary for health endpoints."""
     health = get_zone_health()
     exhausted = [z for z, d in health.items() if d["status"] == "exhausted"]
+    disabled = [z for z, d in health.items() if d["status"] == "disabled"]
     zone_success_rates = {
         z: d["success_rate"]
         for z, d in health.items()
         if d["success_rate"] is not None
     }
+    active_total = len(FALLBACK_ZONES) - len(disabled)
     return {
         "total_zones": len(FALLBACK_ZONES),
-        "available": len(FALLBACK_ZONES) - len(exhausted),
+        "active_zones": active_total,
+        "disabled": disabled,
+        "available": active_total - len(exhausted),
         "exhausted": exhausted,
         "cooldown_recovery": {
             z: health[z].get("cooldown_expires_at")
@@ -1355,10 +1485,14 @@ def get_zone_health_summary() -> dict:
 
 
 def any_zone_available() -> bool:
-    """Return True if at least one zone is not in cooldown."""
+    """Return True if at least one ACTIVE zone is not in cooldown.
+
+    Disabled zones are excluded — they have no subnet provisioned and cannot
+    accept VMs even if not in cooldown.
+    """
     now = datetime.now(timezone.utc)
     with _zone_lock:
-        for zone, _ in FALLBACK_ZONES:
+        for zone, _ in _active_fallback_zones():
             health = _zone_health.get(zone)
             if health is None:
                 return True  # Unknown = available
@@ -1407,11 +1541,15 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
 
 
 def soonest_zone_recovery() -> datetime | None:
-    """Return the earliest zone cooldown expiry, or None if a zone is available."""
+    """Return the earliest ACTIVE zone cooldown expiry, or None if a zone is available.
+
+    Disabled zones are excluded — they have no subnet so a "recovered" cooldown
+    in a disabled region wouldn't unlock spawning anyway.
+    """
     now = datetime.now(timezone.utc)
     soonest = None
     with _zone_lock:
-        for zone, _ in FALLBACK_ZONES:
+        for zone, _ in _active_fallback_zones():
             health = _zone_health.get(zone)
             if health is None:
                 return None  # Unknown = available now
