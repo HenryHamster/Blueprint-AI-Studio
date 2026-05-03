@@ -1821,6 +1821,18 @@ async def update_agent_status(
         # stale and the reaper to kill the task.
         # At this point the status change, artifact, and retry logic are all
         # persisted.  expire_on_commit=False keeps the task object usable.
+        # Capture task.id as a plain string BEFORE the commit attempt. If the
+        # commit raises (e.g. PendingRollbackError from an upstream session-state
+        # corruption), accessing `task.id` inside the except handler will trigger
+        # a lazy-load on the poisoned session, raise a SECOND exception, and mask
+        # the original commit failure. 2026-05-03 incident: the post-PR persist
+        # path on /api/agent/status returned 500s with `PendingRollbackError`
+        # tracebacks pointing AT THE LOGGER LINE rather than the actual upstream
+        # bug; trace-mining confirmed it was the `task.id` access in the f-string
+        # raising on a session that was already dead. Capturing as a local makes
+        # the original `early_exc` survive into the log so we can actually see
+        # which upstream operation poisoned the session.
+        _task_id_str = str(task.id)
         try:
             # Commit unconditionally if a transaction is open. The earlier
             # `if session.dirty or session.new` was unsafe: autoflush from any
@@ -1833,7 +1845,7 @@ async def update_agent_status(
             if session.in_transaction():
                 await session.commit()
         except Exception as early_exc:
-            logger.error(f"[PIPELINE] Early commit failed for {task.id}: {early_exc}", exc_info=True)
+            logger.error(f"[PIPELINE] Early commit failed for {_task_id_str}: {early_exc}", exc_info=True)
             try:
                 await session.rollback()
             except Exception:
