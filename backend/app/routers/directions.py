@@ -697,7 +697,7 @@ async def create_message(
     user: dict = Depends(get_current_user),
 ):
     """Create a message from the user to the autonomous system."""
-    project = await _get_user_project(project_id, user, session)
+    project = await _get_user_project(project_id, user["user_id"], session)
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty")
     if len(payload.content) > 5000:
@@ -729,7 +729,7 @@ async def list_messages(
     user: dict = Depends(get_current_user),
 ):
     """List messages for a project."""
-    project = await _get_user_project(project_id, user, session)
+    project = await _get_user_project(project_id, user["user_id"], session)
     stmt = select(ProjectMessage).where(ProjectMessage.project_id == project.id)
     if status:
         stmt = stmt.where(ProjectMessage.status == status)

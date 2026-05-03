@@ -642,7 +642,7 @@ def cmd_message(args):
         print("Error: message content required")
         return
     pid = get_project_id()
-    result = api("POST", f"/api/projects/{pid}/messages", {
+    result = api("POST", f"/api/admin/projects/{pid}/messages", {
         "content": content,
         "message_type": msg_type,
     })
@@ -655,7 +655,7 @@ def cmd_messages(args):
     status = "open"
     if args and args[0] == '--all':
         status = ""
-    url = f"/api/projects/{pid}/messages"
+    url = f"/api/admin/projects/{pid}/messages"
     if status:
         url += f"?status={status}"
     msgs = api("GET", url)
