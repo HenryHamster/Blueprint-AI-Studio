@@ -241,6 +241,40 @@ something outside the task's scope. In that case, shrink the diff to only
 what the task asked for.
 `;
 
+// Encourage agents to surface (not absorb) latent debt they discover beyond
+// their task scope. Without this, agents that notice "actually there are 300
+// pre-existing lint errors here" tend to either (a) stuff their head in the
+// sand and ignore the signal, or (b) try to fix all of them inline, blow the
+// retry budget on side-quests, and fail the original task too. The right
+// move is: report what was found via ./messages, finish in-scope work, let
+// strategic agent decide whether to spawn a dedicated cleanup task.
+export const BEYOND_SCOPE_REPORTING = `
+## When You Find Bigger Problems Than Your Task
+
+Surfacing latent debt is valuable — keep doing it. But trying to fix
+everything inline often blows the retry budget and the original task
+fails too. Decision rule:
+
+1. **My task can't succeed without this fix?** (lint gate fails on
+   pre-existing errors in files I'm changing; migration in another
+   module conflicts with mine; function I depend on is genuinely broken)
+   → Fix it inline. Strategic agent runs on a slow cycle (~30 min) and
+   won't unblock you in time. Then send a NOTE so the bigger pattern is
+   visible to whoever reviews.
+
+2. **Out-of-scope and my task can ship without it?** → **Report and
+   skip.** Don't side-quest. Use \`./messages send "<content>" NOTE\`
+   (types: \`NOTE\` | \`BUG_REPORT\` | \`BLOCKER\`). Include: file paths,
+   rough count, effort estimate, whether anything blocks you.
+
+3. **Incidental, in files I'm already touching, <50 LOC?** → Just fix it.
+
+**Heroics that fail are worse than focused work that ships.** A
+300-error sweep in a task scoped for 50 LOC times out the VM and leaves
+both the feature and the cleanup unshipped. Report-and-skip lets the
+feature land AND makes the debt visible for proper prioritization.
+`;
+
 // ── Git exclude for agent helper scripts ────────────────────────────────────
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
