@@ -161,8 +161,9 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
         const key = `${task.id}-${i}`;
         const outcome = implementedFindings.get(key);
 
-        if (!byDirection.has(dirId)) byDirection.set(dirId, []);
-        byDirection.get(dirId)!.push({
+        let bucket = byDirection.get(dirId);
+        if (!bucket) { bucket = []; byDirection.set(dirId, bucket); }
+        bucket.push({
           finding: f,
           taskId: task.id,
           taskCreatedAt: task.created_at,
@@ -372,6 +373,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                     {group.findings.map((ef) => {
                       const outcomeInfo = ef.outcome ? OUTCOME_STYLES[ef.outcome.status] : null;
                       const OutcomeIcon = outcomeInfo?.icon;
+                      const outcomeTaskId = ef.outcome?.taskId;
                       const fKey = `${ef.taskId}-${ef.findingIndex}`;
                       const isDetailOpen = expandedFinding === fKey;
                       return (
@@ -381,10 +383,10 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                           className="w-full text-left px-4 py-2 hover:bg-neutral-800/20 transition-colors"
                         >
                           <div className="flex items-center gap-2">
-                            {outcomeInfo && OutcomeIcon && ef.outcome?.taskId && onNavigateToTask
+                            {outcomeInfo && OutcomeIcon && outcomeTaskId && onNavigateToTask
                               ? (
                                 <button
-                                  onClick={e => { e.stopPropagation(); onNavigateToTask(ef.outcome!.taskId); }}
+                                  onClick={e => { e.stopPropagation(); onNavigateToTask(outcomeTaskId); }}
                                   className={`w-3 h-3 shrink-0 ${outcomeInfo.color} hover:opacity-70 transition-opacity`}
                                   title={`View task (${outcomeInfo.label})`}
                                 >
@@ -411,10 +413,10 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                             <div className="mt-2 ml-5 space-y-1.5" onClick={e => e.stopPropagation()}>
                               <p className="text-[11px] text-neutral-400 leading-relaxed">{ef.finding.description}</p>
                               <div className="flex items-center gap-3 flex-wrap text-[10px] text-neutral-600">
-                                {outcomeInfo && ef.outcome?.taskId && onNavigateToTask
+                                {outcomeInfo && outcomeTaskId && onNavigateToTask
                                   ? (
                                     <button
-                                      onClick={e => { e.stopPropagation(); onNavigateToTask(ef.outcome!.taskId); }}
+                                      onClick={e => { e.stopPropagation(); onNavigateToTask(outcomeTaskId); }}
                                       className={`${outcomeInfo.color} hover:underline`}
                                     >
                                       {outcomeInfo.label}

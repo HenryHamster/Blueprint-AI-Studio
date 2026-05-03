@@ -115,12 +115,14 @@ export function DeploySection({
             )}
 
             {/* External dependency health */}
-            {deployState.external_health && (
+            {deployState.external_health && (() => {
+              const externalHealth = deployState.external_health;
+              return (
               <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
                 <div className="text-[11px] text-neutral-500 uppercase tracking-wider mb-1">External Dependencies</div>
                 {EXTERNAL_DEP_ORDER.filter((dep) => {
-                  if (!(dep in deployState.external_health!)) return false;
-                  return typeof deployState.external_health?.[dep] === 'boolean';
+                  if (!(dep in externalHealth)) return false;
+                  return typeof externalHealth[dep] === 'boolean';
                 }).map((dep) => {
                   const healthy = deployState.external_health?.[dep];
                   const error = (deployState.external_health?.errors as Record<string, string> | undefined)?.[dep];
@@ -165,7 +167,8 @@ export function DeploySection({
                   </div>
                 )}
               </div>
-            )}
+              );
+            })()}
 
             {deployState.status === 'PAUSED' && deployState.pre_pause_max_vms != null && (
               <p className="text-xs text-neutral-400 bg-neutral-800/40 rounded-lg px-3 py-2">

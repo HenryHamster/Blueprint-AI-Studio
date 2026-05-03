@@ -224,20 +224,23 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       {task.created_by && (
         <DetailRow label="Created By"><span className="text-sm">{formatCreatedBy(task.created_by)}</span></DetailRow>
       )}
-      {task.parent_task_id && (
+      {task.parent_task_id && (() => {
+        const parentId = task.parent_task_id;
+        return (
         <DetailRow label="Parent Task">
           {onNavigateToTask ? (
             <button
-              onClick={() => onNavigateToTask(task.parent_task_id!)}
+              onClick={() => onNavigateToTask(parentId)}
               className="font-mono text-sm text-blue-400 hover:text-blue-300 hover:underline cursor-pointer"
             >
               {task.parent_task_id}
             </button>
           ) : (
-            <CopyableId value={task.parent_task_id} />
+            <CopyableId value={parentId} />
           )}
         </DetailRow>
-      )}
+        );
+      })()}
       <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
       {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm">{task.project_id}</span></DetailRow>}
       {task.vm_instance_id && (
@@ -324,8 +327,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         const heapVals = useSparklines ? history.map(h => h.heap_used_mb).filter((v): v is number => v != null) : [];
         const diskUsedVals = useSparklines
           ? history
-              .filter(h => h.disk_free_mb != null && h.disk_total_mb != null)
-              .map(h => h.disk_total_mb! - h.disk_free_mb!)
+              .map(h => (h.disk_total_mb != null && h.disk_free_mb != null) ? h.disk_total_mb - h.disk_free_mb : null)
+              .filter((v): v is number => v != null)
           : [];
         const cgroupVals = useSparklines ? history.map(h => h.cgroup_mb).filter((v): v is number => v != null) : [];
         const diskTotal = metrics.disk_total_mb;
@@ -383,13 +386,16 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       </>}
 
       {task.payloads && task.payloads.length > 0 && (() => {
-        const directions = task.payloads![0].directions as { text: string; priority?: string; status?: string }[] | undefined;
+        const firstPayload = task.payloads?.[0];
+        if (!firstPayload) return null;
+        const directions = firstPayload.directions as { text: string; priority?: string; status?: string }[] | undefined;
         if (!directions || directions.length === 0) return null;
         return <DirectionsSection directions={directions} />;
       })()}
 
       {task.payloads && task.payloads.length > 0 && (() => {
-        const payload = task.payloads![0];
+        const payload = task.payloads?.[0];
+        if (!payload) return null;
         const prompt = payload.prompt as string | undefined;
         const baseBranch = payload.base_branch as string | undefined;
         const prNumber = payload.pr_number as number | undefined;
@@ -670,10 +676,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                       </div>
                     )}
                     <div className="space-y-1">
-                      {prs.map((a, i) => (
+                      {prs.map((a, i) => a.pr_url ? (
                         <a
                           key={i}
-                          href={a.pr_url!}
+                          href={a.pr_url}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
@@ -681,7 +687,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                           {a.pr_url}
                           <ExternalLink className="w-3.5 h-3.5" />
                         </a>
-                      ))}
+                      ) : null)}
                       {commits.map((a, i) => (
                         <div key={i} className="flex items-center gap-2 text-sm font-mono text-neutral-300">
                           {a.commit_hash && <span className="text-emerald-400">{a.commit_hash.slice(0, 8)}</span>}

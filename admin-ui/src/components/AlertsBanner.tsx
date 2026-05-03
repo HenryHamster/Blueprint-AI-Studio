@@ -66,15 +66,18 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask }: Al
             <span className="text-neutral-500 mx-2">&middot;</span>
             <span className="opacity-80">{alert.message}</span>
           </div>
-          {alert.task_id && onViewTask && (
+          {alert.task_id && onViewTask && (() => {
+            const taskId = alert.task_id;
+            return (
             <button
-              onClick={() => onViewTask(alert.task_id!)}
+              onClick={() => onViewTask(taskId)}
               className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center gap-1"
               title="View task"
             >
               <ExternalLink className="w-3.5 h-3.5" />
             </button>
-          )}
+            );
+          })()}
           <button
             onClick={() => onDismiss(alert.id)}
             className="shrink-0 opacity-60 hover:opacity-100 transition-opacity"

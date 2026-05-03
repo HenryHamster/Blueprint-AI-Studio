@@ -511,9 +511,10 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
   // Fallback: free-text string. When the schema declares `examples`, wire a
   // <datalist> so the user gets autocomplete suggestions without losing the
   // ability to type a custom value (useful for preview-model names, etc).
-  const hasExamples = schema.examples && schema.examples.length > 0;
+  const examples = schema.examples ?? [];
+  const hasExamples = examples.length > 0;
   const listId = hasExamples
-    ? `datalist-${schema.examples!.slice(0, 3).join('-').replace(/[^a-zA-Z0-9-]/g, '')}`
+    ? `datalist-${examples.slice(0, 3).join('-').replace(/[^a-zA-Z0-9-]/g, '')}`
     : undefined;
   return (
     <>
@@ -526,7 +527,7 @@ function Field({ schema, value, onChange, disabledEnumValues }: { schema: Schema
       />
       {hasExamples && (
         <datalist id={listId}>
-          {schema.examples!.map(ex => <option key={ex} value={ex} />)}
+          {examples.map(ex => <option key={ex} value={ex} />)}
         </datalist>
       )}
     </>

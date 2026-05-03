@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Copy, Check, X, EyeOff } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
@@ -73,7 +73,7 @@ export function RecentErrorsWidget() {
     };
   }, [fetchErrors]);
 
-  const buckets = data?.buckets ?? [];
+  const buckets = useMemo(() => data?.buckets ?? [], [data?.buckets]);
   const totalCount = buckets.reduce((sum, b) => sum + b.count, 0);
   const hasApiError = Boolean(data?.error) || Boolean(fetchError);
   const backendErrorMessage = data?.error ?? fetchError ?? '';

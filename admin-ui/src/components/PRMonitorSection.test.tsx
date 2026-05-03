@@ -130,7 +130,8 @@ describe('PRMonitorSection', () => {
     // The row text shows the OpenPRTask.task_title (PR-shape title).
     const row = screen.getByText('PR-shape title').closest('button');
     expect(row).not.toBeNull();
-    await user.click(row!);
+    if (!row) throw new Error('test setup: expected button row');
+    await user.click(row);
 
     // onViewTask is called with the FULL Task object, not the OpenPRTask.
     expect(onViewTask).toHaveBeenCalledTimes(1);
@@ -198,7 +199,8 @@ describe('PRMonitorSection', () => {
     // Click the header chevron-button. Both this button and the refresh
     // button match /Open PRs/i (refresh has title="Refresh open PRs"),
     // so locate it via the h2 it wraps.
-    const header = screen.getByRole('heading', { name: 'Open PRs' }).closest('button')!;
+    const header = screen.getByRole('heading', { name: 'Open PRs' }).closest('button');
+    if (!header) throw new Error('test setup: expected header button');
     await user.click(header);
 
     // After collapse, the PR row is no longer rendered.
@@ -216,8 +218,9 @@ describe('PRMonitorSection', () => {
     );
     const anchor = container.querySelector('a[href="https://github.com/acme/repo/pull/77"]');
     expect(anchor).not.toBeNull();
-    expect(anchor!.getAttribute('target')).toBe('_blank');
-    const rel = anchor!.getAttribute('rel') ?? '';
+    if (!anchor) throw new Error('test setup: expected anchor element');
+    expect(anchor.getAttribute('target')).toBe('_blank');
+    const rel = anchor.getAttribute('rel') ?? '';
     expect(rel).toContain('noopener');
     expect(rel).toContain('noreferrer');
   });

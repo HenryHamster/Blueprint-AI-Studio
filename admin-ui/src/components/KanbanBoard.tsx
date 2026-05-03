@@ -42,6 +42,7 @@ export interface KanbanColumn {
 
 const STORAGE_KEY = 'kanban_card_order';
 const ARCHIVABLE_COLUMNS: TaskStatus[] = ['COMPLETED', 'CANCELLED', 'FAILED'];
+const EMPTY_PROJECTS: Project[] = [];
 const SORT_LABELS: Record<SortBy, string> = {
   newest: 'Newest first',
   oldest: 'Oldest first',
@@ -150,7 +151,7 @@ export function KanbanBoard({
   onDirectionClick,
 }: KanbanBoardProps) {
   const groupBy = 'status' as 'status' | 'type' | 'project';
-  const projects: Project[] = [];
+  const projects: Project[] = EMPTY_PROJECTS;
   const [columnOrder, setColumnOrder] = useState<Record<string, string[]>>(loadColumnOrder);
   const [activeTask, setActiveTask] = useState<Task | null>(null);
   const [collapsedColumns, setCollapsedColumns] = useState<Set<string>>(loadCollapsedColumns);
@@ -185,10 +186,11 @@ export function KanbanBoard({
     resizingRef.current = { colId, startX: e.clientX, startWidth: colEl.getBoundingClientRect().width };
 
     const onMouseMove = (ev: MouseEvent) => {
-      if (!resizingRef.current) return;
-      const delta = ev.clientX - resizingRef.current.startX;
-      const newWidth = Math.max(220, Math.min(700, resizingRef.current.startWidth + delta));
-      setColumnWidths(prev => ({ ...prev, [resizingRef.current!.colId]: newWidth }));
+      const r = resizingRef.current;
+      if (!r) return;
+      const delta = ev.clientX - r.startX;
+      const newWidth = Math.max(220, Math.min(700, r.startWidth + delta));
+      setColumnWidths(prev => ({ ...prev, [r.colId]: newWidth }));
     };
     const onMouseUp = () => {
       resizingRef.current = null;
@@ -225,8 +227,9 @@ export function KanbanBoard({
         const taskMap = new Map(sortedTasks.map(t => [t.id, t]));
         const ordered: Task[] = [];
         for (const id of savedOrder) {
-          if (taskMap.has(id)) {
-            ordered.push(taskMap.get(id)!);
+          const t = taskMap.get(id);
+          if (t) {
+            ordered.push(t);
             taskMap.delete(id);
           }
         }

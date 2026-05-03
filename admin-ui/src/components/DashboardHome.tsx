@@ -441,7 +441,7 @@ function buildIssues(
   }
 
   if (digest && (digest.daily_cost_ceiling_usd ?? 0) > 0) {
-    const ceiling = digest.daily_cost_ceiling_usd!;
+    const ceiling = digest.daily_cost_ceiling_usd ?? 0;
     const daily = digest.daily_cost_usd ?? 0;
     if (daily >= ceiling) {
       items.push({
@@ -658,7 +658,6 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
   // Initial + polling
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
     fetchData();
     const id = setInterval(fetchData, 30_000);
     return () => clearInterval(id);
@@ -773,7 +772,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               <div className="flex flex-wrap gap-1.5 items-center">
                 <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Taxonomy</span>
                 {TAXONOMY_ORDER.map(k => {
-                  const tax = digest.failure_taxonomy_distribution!;
+                  const tax = digest.failure_taxonomy_distribution;
+                  if (!tax) return null;
                   const cat = tax.categories[k];
                   if (!cat) return null;
                   const isDominant = tax.dominant_category === k;
@@ -908,7 +908,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             <section>
               <div className="flex flex-wrap gap-1.5 items-center">
                 <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Cost of Failures</span>
-                <span className="text-sm font-bold text-red-400">${(digest!.total_failed_cost_usd ?? 0).toFixed(2)}</span>
+                <span className="text-sm font-bold text-red-400">${(digest?.total_failed_cost_usd ?? 0).toFixed(2)}</span>
                 {Object.entries(digest?.cost_by_failure_class ?? {})
                   .sort((a, b) => b[1] - a[1])
                   .map(([cls, cost]) => {
@@ -1017,13 +1017,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           )}
 
           {/* Section 1g: Recurring Patterns */}
-          {(digest?.recurring_patterns ?? []).length > 0 && (
+          {(digest?.recurring_patterns ?? []).length > 0 && (() => {
+            const recurringPatterns = digest?.recurring_patterns ?? [];
+            return (
             <section>
               <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
-                Recurring Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {digest!.recurring_patterns!.length}</span>
+                Recurring Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {recurringPatterns.length}</span>
               </h2>
               <div className="flex flex-col gap-1">
-                {digest!.recurring_patterns!.slice(0, 5).map(pattern => {
+                {recurringPatterns.slice(0, 5).map(pattern => {
                   const statusStyles: Record<string, string> = {
                     fix_verified: 'bg-green-500/10 text-green-400 border-green-500/20',
                     fix_shipped: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
@@ -1070,7 +1072,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 })}
               </div>
             </section>
-          )}
+            );
+          })()}
 
           {/* Section 1h: Rejection Pattern Summary */}
           {(() => {

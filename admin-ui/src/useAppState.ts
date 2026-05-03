@@ -580,7 +580,7 @@ export function useAppState() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
         addToast(data.detail ? `Failed to approve task: ${data.detail}` : 'Failed to approve task', 'error');
         return;
       }
@@ -588,7 +588,7 @@ export function useAppState() {
       addToast('Task approved', 'success');
     } catch (error) {
       console.error('Failed to approve task:', error);
-      setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
       addToast('Failed to approve task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
@@ -629,7 +629,7 @@ export function useAppState() {
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
         addToast(data.detail ? `Failed to cancel task: ${data.detail}` : 'Failed to cancel task', 'error');
         return;
       }
@@ -637,7 +637,7 @@ export function useAppState() {
       addToast('Task cancelled', 'success');
     } catch (error) {
       console.error('Failed to cancel task:', error);
-      setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
       addToast('Failed to cancel task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
@@ -659,7 +659,7 @@ export function useAppState() {
       addToast('Task queued for retry', 'success');
     } catch (error) {
       console.error('Failed to retry task:', error);
-      setTasks(prev => prev.map(t => t.id === taskId ? original! : t));
+      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
       addToast('Failed to retry task', 'error');
     } finally {
       setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });

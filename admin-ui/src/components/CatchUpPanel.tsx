@@ -668,64 +668,64 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               <SkeletonRow />
               <SkeletonRow />
             </div>
-          ) : !hasActivity ? (
+          ) : !hasActivity || !digest ? (
             <div className="flex items-center gap-2 text-xs text-neutral-600 py-1">
               <CheckCircle className="w-3.5 h-3.5" />
               All clear — nothing to catch up on
             </div>
           ) : (
             <div className="flex flex-col gap-3">
-              {(digest!.narrative_summary || digest!.trend) && (
+              {(digest.narrative_summary || digest.trend) && (
                 <div className="flex items-start gap-2 mb-3">
-                  {digest!.narrative_summary && (
+                  {digest.narrative_summary && (
                     <p className="text-sm text-neutral-300 leading-relaxed flex-1">
-                      {activeWindow === 'last_visit' && digest!.window_hours && (
-                        <span className="text-neutral-400">Since you last checked ({digest!.window_hours}h ago): </span>
+                      {activeWindow === 'last_visit' && digest.window_hours && (
+                        <span className="text-neutral-400">Since you last checked ({digest.window_hours}h ago): </span>
                       )}
-                      {digest!.narrative_summary}
+                      {digest.narrative_summary}
                     </p>
                   )}
-                  {digest!.trend && (
+                  {digest.trend && (
                     <span
                       className={`shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                        digest!.trend === 'improving'
+                        digest.trend === 'improving'
                           ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
-                          : digest!.trend === 'declining'
+                          : digest.trend === 'declining'
                             ? 'bg-red-500/15 text-red-400 border-red-500/20'
                             : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30'
                       }`}
-                      aria-label={`Trend: ${digest!.trend === 'improving' ? 'Improving' : digest!.trend === 'declining' ? 'Declining' : 'Stable'}`}
+                      aria-label={`Trend: ${digest.trend === 'improving' ? 'Improving' : digest.trend === 'declining' ? 'Declining' : 'Stable'}`}
                     >
-                      {digest!.trend === 'improving' ? 'Improving' : digest!.trend === 'declining' ? 'Declining' : 'Stable'}
+                      {digest.trend === 'improving' ? 'Improving' : digest.trend === 'declining' ? 'Declining' : 'Stable'}
                     </span>
                   )}
                 </div>
               )}
-              {digest!.latest_cycle && (
+              {digest.latest_cycle && (
                 <div className="flex flex-col gap-1 p-2 rounded border border-neutral-800 bg-neutral-900/40">
                   <div className="flex items-center gap-2 text-[11px]">
                     <span className="font-semibold text-neutral-400">Latest strategic cycle</span>
-                    {digest!.latest_cycle.outcome && (
+                    {digest.latest_cycle.outcome && (
                       <span className="px-1.5 py-0.5 rounded border text-[10px] bg-neutral-800/60 text-neutral-300 border-neutral-700">
-                        {digest!.latest_cycle.outcome}
+                        {digest.latest_cycle.outcome}
                       </span>
                     )}
-                    {digest!.latest_cycle.completed_at && (
-                      <span className="text-[10px] text-neutral-600 font-mono">{timeAgo(digest!.latest_cycle.completed_at)}</span>
+                    {digest.latest_cycle.completed_at && (
+                      <span className="text-[10px] text-neutral-600 font-mono">{timeAgo(digest.latest_cycle.completed_at)}</span>
                     )}
                     <span className="text-[10px] text-neutral-500">
-                      +{digest!.latest_cycle.directions_created ?? 0} / −{digest!.latest_cycle.directions_retired ?? 0} directions
+                      +{digest.latest_cycle.directions_created ?? 0} / −{digest.latest_cycle.directions_retired ?? 0} directions
                     </span>
-                    {digest!.latest_cycle.vision_updated && (
+                    {digest.latest_cycle.vision_updated && (
                       <span className="text-[10px] text-cyan-400">vision updated</span>
                     )}
                   </div>
-                  {digest!.latest_cycle.summary_text && (
+                  {digest.latest_cycle.summary_text && (
                     <div className="text-[11px] text-neutral-400 leading-relaxed">
-                      {cycleSummaryExpanded || digest!.latest_cycle.summary_text.length <= 200
-                        ? digest!.latest_cycle.summary_text
-                        : digest!.latest_cycle.summary_text.slice(0, 200) + '…'}
-                      {digest!.latest_cycle.summary_text.length > 200 && (
+                      {cycleSummaryExpanded || digest.latest_cycle.summary_text.length <= 200
+                        ? digest.latest_cycle.summary_text
+                        : digest.latest_cycle.summary_text.slice(0, 200) + '…'}
+                      {digest.latest_cycle.summary_text.length > 200 && (
                         <button
                           type="button"
                           onClick={() => setCycleSummaryExpanded(v => !v)}
@@ -740,20 +740,20 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
               {/* Stats row */}
               <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">
-                {digest!.success_rate != null && (
+                {digest.success_rate != null && (
                   <span
-                    className={`flex items-center gap-1 ${digest!.success_rate >= 0.8 ? 'text-emerald-400' : digest!.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}
-                    aria-label={`Success rate: ${Math.round(digest!.success_rate * 100)}% (${digest!.success_rate >= 0.8 ? 'healthy' : digest!.success_rate >= 0.5 ? 'warning' : 'critical'})`}
+                    className={`flex items-center gap-1 ${digest.success_rate >= 0.8 ? 'text-emerald-400' : digest.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}
+                    aria-label={`Success rate: ${Math.round(digest.success_rate * 100)}% (${digest.success_rate >= 0.8 ? 'healthy' : digest.success_rate >= 0.5 ? 'warning' : 'critical'})`}
                   >
-                    {Math.round(digest!.success_rate * 100)}% success
-                    {digest!.success_rate_delta != null && (
-                      <span className={digest!.success_rate_delta > 0 ? 'text-emerald-400' : digest!.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
-                        {digest!.success_rate_delta > 0 ? '+' : ''}{Math.round(digest!.success_rate_delta * 100)}%
+                    {Math.round(digest.success_rate * 100)}% success
+                    {digest.success_rate_delta != null && (
+                      <span className={digest.success_rate_delta > 0 ? 'text-emerald-400' : digest.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
+                        {digest.success_rate_delta > 0 ? '+' : ''}{Math.round(digest.success_rate_delta * 100)}%
                       </span>
                     )}
-                    {digest!.trend_history && digest!.trend_history.length >= 3 && (
+                    {digest.trend_history && digest.trend_history.length >= 3 && (
                       <div className="flex items-end gap-px h-3 ml-1">
-                        {digest!.trend_history.map((p, i) => {
+                        {digest.trend_history.map((p, i) => {
                           const rate = p.success_rate ?? 0;
                           const color = rate >= 0.8 ? 'bg-emerald-400' : rate >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
                           const dateLabel = (() => {
@@ -775,8 +775,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     )}
                   </span>
                 )}
-                {digest!.first_attempt_success_rate && digest!.first_attempt_success_rate.sample_size >= 5 && (() => {
-                  const fas = digest!.first_attempt_success_rate!;
+                {digest.first_attempt_success_rate && digest.first_attempt_success_rate.sample_size >= 5 && (() => {
+                  const fas = digest.first_attempt_success_rate;
+                  if (!fas) return null;
                   const tone = (r: number | null) => r == null ? 'text-neutral-500' : r >= 0.8 ? 'text-emerald-400' : r >= 0.5 ? 'text-amber-400' : 'text-red-400';
                   const compareTone = (w: number | null, wo: number | null) =>
                     w == null || wo == null ? 'text-neutral-500' : w > wo ? 'text-emerald-400' : w < wo ? 'text-red-400' : 'text-amber-400';
@@ -812,7 +813,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       )}
                       {fas.by_scope && Object.keys(fas.by_scope).length > 0 && (() => {
                         const order = ['small', 'medium', 'large'];
-                        const entries = Object.entries(fas.by_scope!)
+                        const byScope = fas.by_scope;
+                        if (!byScope) return null;
+                        const entries = Object.entries(byScope)
                           .filter(([, v]) => typeof v === 'number')
                           .sort(([a], [b]) => {
                             const ai = order.indexOf(a); const bi = order.indexOf(b);
@@ -834,7 +837,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         );
                       })()}
                       {fas.first_attempt_by_review_category && Object.keys(fas.first_attempt_by_review_category).length > 0 && (() => {
-                        const entries = Object.entries(fas.first_attempt_by_review_category!)
+                        const fbrc = fas.first_attempt_by_review_category;
+                        if (!fbrc) return null;
+                        const entries = Object.entries(fbrc)
                           .filter(([, v]) => typeof v === 'number' && v > 0)
                           .sort((a, b) => b[1] - a[1])
                           .slice(0, 3);
@@ -859,8 +864,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </>
                   );
                 })()}
-                {digest!.pipeline_acceptance_rate != null && (() => {
-                  const pct = Math.round(digest!.pipeline_acceptance_rate! * 100);
+                {digest.pipeline_acceptance_rate != null && (() => {
+                  const par = digest.pipeline_acceptance_rate;
+                  if (par == null) return null;
+                  const pct = Math.round(par * 100);
                   const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
                   return (
                     <span className={tone} title="PRs merged / PRs decided (merged + rejected)">
@@ -868,8 +875,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   );
                 })()}
-                {digest!.pipeline_conversion_rate != null && (() => {
-                  const pct = Math.round(digest!.pipeline_conversion_rate! * 100);
+                {digest.pipeline_conversion_rate != null && (() => {
+                  const pcr = digest.pipeline_conversion_rate;
+                  if (pcr == null) return null;
+                  const pct = Math.round(pcr * 100);
                   const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
                   return (
                     <span className={tone} title="PRs merged / tasks created">
@@ -877,18 +886,20 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   );
                 })()}
-                {digest!.overall_product_ratio != null && (() => {
-                  const pct = Math.round(digest!.overall_product_ratio! * 100);
-                  const tone = digest!.overall_product_ratio! >= 0.6 ? 'text-emerald-400' : digest!.overall_product_ratio! >= 0.4 ? 'text-amber-400' : 'text-slate-400';
+                {digest.overall_product_ratio != null && (() => {
+                  const opr = digest.overall_product_ratio;
+                  if (opr == null) return null;
+                  const pct = Math.round(opr * 100);
+                  const tone = opr >= 0.6 ? 'text-emerald-400' : opr >= 0.4 ? 'text-amber-400' : 'text-slate-400';
                   return (
                     <span className={tone} title="Fraction of tasks targeting product features vs structural work">
                       {pct}% product focus
                     </span>
                   );
                 })()}
-                {digest!.overall_type_distribution && Object.keys(digest!.overall_type_distribution).length > 0 && (
+                {digest.overall_type_distribution && Object.keys(digest.overall_type_distribution).length > 0 && (
                   <span className="flex items-center gap-1" title="Task type distribution across all directions">
-                    {Object.entries(digest!.overall_type_distribution)
+                    {Object.entries(digest.overall_type_distribution)
                       .sort((a, b) => b[1] - a[1])
                       .map(([type, count]) => {
                         const style = TASK_TYPE_STYLES[type];
@@ -903,50 +914,50 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       })}
                   </span>
                 )}
-                {digest!.pending_approval_count > 0 && (
+                {digest.pending_approval_count > 0 && (
                   <span className="flex items-center gap-1">
                     <AlertTriangle className="w-3 h-3 text-amber-400" />
-                    {digest!.pending_approval_count} pending approval
+                    {digest.pending_approval_count} pending approval
                   </span>
                 )}
-                {digest!.completed_count > 0 && (
+                {digest.completed_count > 0 && (
                   <span className="flex items-center gap-1">
                     <CheckCircle className="w-3 h-3 text-emerald-500" />
-                    {digest!.completed_count} completed
-                    {digest!.completed_delta != null && digest!.completed_delta !== 0 && (
+                    {digest.completed_count} completed
+                    {digest.completed_delta != null && digest.completed_delta !== 0 && (
                       <span
-                        className={digest!.completed_delta > 0 ? 'text-emerald-400' : 'text-red-400'}
-                        title={digest!.prev_completed_count != null ? `was ${digest!.prev_completed_count} last period` : undefined}
+                        className={digest.completed_delta > 0 ? 'text-emerald-400' : 'text-red-400'}
+                        title={digest.prev_completed_count != null ? `was ${digest.prev_completed_count} last period` : undefined}
                       >
-                        {digest!.completed_delta > 0 ? '↑' : '↓'}
+                        {digest.completed_delta > 0 ? '↑' : '↓'}
                       </span>
                     )}
                   </span>
                 )}
-                {digest!.failed_count > 0 && (
+                {digest.failed_count > 0 && (
                   <span className="flex items-center gap-1">
                     <XCircle className="w-3 h-3 text-red-500" />
-                    {digest!.failed_count} failed
-                    {digest!.failed_delta != null && digest!.failed_delta !== 0 && (
+                    {digest.failed_count} failed
+                    {digest.failed_delta != null && digest.failed_delta !== 0 && (
                       <span
-                        className={digest!.failed_delta > 0 ? 'text-red-400' : 'text-emerald-400'}
-                        title={digest!.prev_failed_count != null ? `was ${digest!.prev_failed_count} last period` : undefined}
+                        className={digest.failed_delta > 0 ? 'text-red-400' : 'text-emerald-400'}
+                        title={digest.prev_failed_count != null ? `was ${digest.prev_failed_count} last period` : undefined}
                       >
-                        {digest!.failed_delta > 0 ? '↑' : '↓'}
+                        {digest.failed_delta > 0 ? '↑' : '↓'}
                       </span>
                     )}
-                    {digest!.total_failed_cost_usd != null && digest!.total_failed_cost_usd > 0 && (
+                    {digest.total_failed_cost_usd != null && digest.total_failed_cost_usd > 0 && (
                       <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono">
-                        ·<DollarSign className="w-2.5 h-2.5" />{digest!.total_failed_cost_usd.toFixed(2)} wasted
+                        ·<DollarSign className="w-2.5 h-2.5" />{digest.total_failed_cost_usd.toFixed(2)} wasted
                       </span>
                     )}
                   </span>
                 )}
-                {digest!.total_estimated_cost_usd != null && digest!.total_estimated_cost_usd > 0 && (
+                {digest.total_estimated_cost_usd != null && digest.total_estimated_cost_usd > 0 && (
                   <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono" title="Total estimated spend">
-                    <DollarSign className="w-2.5 h-2.5" />{digest!.total_estimated_cost_usd.toFixed(2)} total
+                    <DollarSign className="w-2.5 h-2.5" />{digest.total_estimated_cost_usd.toFixed(2)} total
                     {(() => {
-                      const costs = (digest!.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number);
+                      const costs = (digest.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number);
                       if (costs.length < 2) return null;
                       const curr = costs[costs.length - 1];
                       const prev = costs[costs.length - 2];
@@ -964,18 +975,18 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     })()}
                   </span>
                 )}
-                {(digest!.spot_cost_usd != null || digest!.on_demand_cost_usd != null) && (
-                  (digest!.spot_cost_usd ?? 0) + (digest!.on_demand_cost_usd ?? 0) > 0
+                {(digest.spot_cost_usd != null || digest.on_demand_cost_usd != null) && (
+                  (digest.spot_cost_usd ?? 0) + (digest.on_demand_cost_usd ?? 0) > 0
                 ) && (
                   <span
                     className="inline-flex items-center gap-0.5 text-neutral-500 font-mono"
                     title="Spot vs on-demand compute cost split"
                   >
-                    Spot: ${(digest!.spot_cost_usd ?? 0).toFixed(2)} / On-demand: ${(digest!.on_demand_cost_usd ?? 0).toFixed(2)}
+                    Spot: ${(digest.spot_cost_usd ?? 0).toFixed(2)} / On-demand: ${(digest.on_demand_cost_usd ?? 0).toFixed(2)}
                   </span>
                 )}
                 {(() => {
-                  const dps = digest!.direction_progress;
+                  const dps = digest.direction_progress;
                   if (!dps || dps.length === 0) return null;
                   const totals: Record<string, number> = {};
                   for (const dp of dps) {
@@ -1000,14 +1011,16 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   );
                 })()}
-                {digest!.provisioning_overhead_pct != null && digest!.provisioning_overhead_pct > 0 && (() => {
-                  const pctDisplay = digest!.provisioning_overhead_pct! * 100;
+                {digest.provisioning_overhead_pct != null && digest.provisioning_overhead_pct > 0 && (() => {
+                  const pop = digest.provisioning_overhead_pct;
+                  if (pop == null) return null;
+                  const pctDisplay = pop * 100;
                   const tone = pctDisplay < 10
                     ? 'text-emerald-500'
                     : pctDisplay <= 25
                       ? 'text-amber-500'
                       : 'text-red-500';
-                  const overheadUsd = digest!.provisioning_overhead_usd ?? 0;
+                  const overheadUsd = digest.provisioning_overhead_usd ?? 0;
                   return (
                     <span
                       className={`inline-flex items-center gap-0.5 font-mono ${tone}`}
@@ -1017,9 +1030,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   );
                 })()}
-                {digest!.daily_cost_usd != null && digest!.daily_cost_usd > 0 && (() => {
-                  const spent = digest!.daily_cost_usd!;
-                  const ceiling = digest!.daily_cost_ceiling_usd ?? 0;
+                {digest.daily_cost_usd != null && digest.daily_cost_usd > 0 && (() => {
+                  const spent = digest.daily_cost_usd;
+                  if (spent == null) return null;
+                  const ceiling = digest.daily_cost_ceiling_usd ?? 0;
                   const ratio = ceiling > 0 ? spent / ceiling : 0;
                   const tone = ceiling <= 0
                     ? 'text-neutral-500'
@@ -1038,26 +1052,27 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </span>
                   );
                 })()}
-                {digest!.research_cycles > 0 && (
-                  <span>{digest!.research_cycles} research cycle{digest!.research_cycles !== 1 ? 's' : ''}</span>
+                {digest.research_cycles > 0 && (
+                  <span>{digest.research_cycles} research cycle{digest.research_cycles !== 1 ? 's' : ''}</span>
                 )}
-                {digest!.prs_opened > 0 && (
-                  <span>{digest!.prs_opened} PR{digest!.prs_opened !== 1 ? 's' : ''} opened</span>
+                {digest.prs_opened > 0 && (
+                  <span>{digest.prs_opened} PR{digest.prs_opened !== 1 ? 's' : ''} opened</span>
                 )}
-                {digest!.running_count > 0 && (
+                {digest.running_count > 0 && (
                   <span className="flex items-center gap-1">
                     <Loader2 className="w-3 h-3 text-neutral-500 animate-spin" />
-                    {digest!.running_count} running
+                    {digest.running_count} running
                   </span>
                 )}
-                {digest!.queued_count > 0 && (
-                  <span>{digest!.queued_count} queued</span>
+                {digest.queued_count > 0 && (
+                  <span>{digest.queued_count} queued</span>
                 )}
               </div>
 
               {/* Pipeline filter funnel */}
-              {digest!.pipeline_filter_funnel && (digest!.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
-                const ff = digest!.pipeline_filter_funnel!;
+              {digest.pipeline_filter_funnel && (digest.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
+                const ff = digest.pipeline_filter_funnel;
+                if (!ff) return null;
                 const produced = ff.findings_produced ?? 0;
                 const created = ff.tasks_created ?? 0;
                 const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
@@ -1091,19 +1106,19 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               })()}
 
               {/* Direction progress */}
-              {digest!.direction_progress && digest!.direction_progress.length > 0 && (
+              {digest.direction_progress && digest.direction_progress.length > 0 && (
                 <ErrorBoundary level="widget">
-                  <DirectionProgressSection directions={digest!.direction_progress} medianCostPerMergedPr={digest!.median_cost_per_merged_pr} />
+                  <DirectionProgressSection directions={digest.direction_progress} medianCostPerMergedPr={digest.median_cost_per_merged_pr} />
                 </ErrorBoundary>
               )}
 
               {/* Needs attention */}
-              {(digest!.needs_attention ?? []).length > 0 && (() => {
-                const visibleItems = digest!.needs_attention.filter(item => !isHidden(item.task_id));
-                const hiddenItems = digest!.needs_attention.filter(item => isHidden(item.task_id));
+              {(digest.needs_attention ?? []).length > 0 && (() => {
+                const visibleItems = digest.needs_attention.filter(item => !isHidden(item.task_id));
+                const hiddenItems = digest.needs_attention.filter(item => isHidden(item.task_id));
                 const countLabel = hiddenItems.length > 0
-                  ? `${visibleItems.length} visible / ${digest!.needs_attention.length} total`
-                  : String(digest!.needs_attention.length);
+                  ? `${visibleItems.length} visible / ${digest.needs_attention.length} total`
+                  : String(digest.needs_attention.length);
                 return (
                   <div className="border border-amber-500/30 rounded-lg p-3 flex flex-col gap-2">
                     <div className="flex items-center gap-1.5 text-[11px] font-bold text-amber-400 uppercase tracking-widest">
@@ -1316,7 +1331,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               })()}
 
               {/* In progress */}
-              {digest!.active_count > 0 && (
+              {digest.active_count > 0 && (
                 <div>
                   <button
                     onClick={() => setActiveExpanded(v => !v)}
@@ -1325,11 +1340,11 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   >
                     {activeExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                     <Loader2 className="w-3 h-3 text-neutral-500" />
-                    In progress ({digest!.active_count})
+                    In progress ({digest.active_count})
                   </button>
                   {activeExpanded && (
                     <div className="flex flex-col gap-1.5">
-                      {(digest!.active_tasks ?? []).map(t => (
+                      {(digest.active_tasks ?? []).map(t => (
                         <div
                           key={t.task_id}
                           role="button"
@@ -1360,7 +1375,10 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             </span>
                           )}
                           {t.review_iteration != null && t.review_iteration > 0 && t.review_cap != null && t.review_cap > 0 && (() => {
-                            const ratio = t.review_iteration! / t.review_cap!;
+                            const reviewIter = t.review_iteration;
+                            const reviewCap = t.review_cap;
+                            if (reviewIter == null || reviewCap == null) return null;
+                            const ratio = reviewIter / reviewCap;
                             const colorCls = ratio > 0.9
                               ? "bg-red-500/10 text-red-400 border-red-500/20"
                               : ratio > 0.7
@@ -1389,9 +1407,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           )}
                         </div>
                       ))}
-                      {digest!.active_count > (digest!.active_tasks ?? []).length && (
+                      {digest.active_count > (digest.active_tasks ?? []).length && (
                         <div className="text-[10px] text-neutral-600 px-2">
-                          +{digest!.active_count - (digest!.active_tasks ?? []).length} more
+                          +{digest.active_count - (digest.active_tasks ?? []).length} more
                         </div>
                       )}
                     </div>
@@ -1400,10 +1418,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Failure taxonomy root-cause pills */}
-              {digest!.failure_taxonomy_distribution && digest!.failure_taxonomy_distribution.total_failures > 0 && (() => {
+              {digest.failure_taxonomy_distribution && digest.failure_taxonomy_distribution.total_failures > 0 && (() => {
+                const ftd = digest.failure_taxonomy_distribution;
+                if (!ftd) return null;
                 const costByTaxonomy: Record<string, number> = {};
-                const costByClass = digest!.cost_by_failure_class ?? {};
-                for (const g of digest!.failure_groups ?? []) {
+                const costByClass = digest.cost_by_failure_class ?? {};
+                for (const g of digest.failure_groups ?? []) {
                   const groupCost = costByClass[g.failure_class] ?? 0;
                   if (!groupCost || g.tasks.length === 0) continue;
                   const perTask = groupCost / g.tasks.length;
@@ -1412,7 +1432,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     costByTaxonomy[t.taxonomy] = (costByTaxonomy[t.taxonomy] ?? 0) + perTask;
                   }
                 }
-                const history = digest!.trend_history ?? [];
+                const history = digest.trend_history ?? [];
                 const trendFor = (cat: string): {arrow: string; color: string} => {
                   if (history.length < 4) return {arrow: '–', color: 'text-neutral-500'};
                   const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
@@ -1426,12 +1446,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
                     {TAXONOMY_ORDER.map(cat => {
-                      const entry = digest!.failure_taxonomy_distribution!.categories[cat];
+                      const entry = ftd.categories[cat];
                       if (!entry || entry.count === 0) return null;
                       const cost = costByTaxonomy[cat];
                       const trend = trendFor(cat);
                       const isActive = activeTaxonomyFilter === cat;
-                      const isDominant = digest!.failure_taxonomy_distribution!.dominant_category === cat;
+                      const isDominant = ftd.dominant_category === cat;
                       return (
                         <button
                           key={cat}
@@ -1471,14 +1491,17 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               })()}
 
               {/* Failure stage distribution pills */}
-              {digest!.failure_stage_distribution && digest!.failure_stage_distribution.total_classified > 0 && (
+              {digest.failure_stage_distribution && digest.failure_stage_distribution.total_classified > 0 && (() => {
+                const fsd = digest.failure_stage_distribution;
+                if (!fsd) return null;
+                return (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Pipeline stage</span>
                   {STAGE_ORDER.map(stage => {
-                    const count = digest!.failure_stage_distribution!.stages[stage];
+                    const count = fsd.stages[stage];
                     if (!count) return null;
                     const isActive = activeStageFilter === stage;
-                    const isDominant = digest!.failure_stage_distribution!.dominant_stage === stage;
+                    const isDominant = fsd.dominant_stage === stage;
                     return (
                       <button
                         key={stage}
@@ -1508,19 +1531,23 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </button>
                   )}
                 </div>
-              )}
+                );
+              })()}
 
               {/* Scope conversion rate pills */}
-              {digest!.scope_conversion_rates && Object.keys(digest!.scope_conversion_rates).length > 0 && (
+              {digest.scope_conversion_rates && Object.keys(digest.scope_conversion_rates).length > 0 && (() => {
+                const scr = digest.scope_conversion_rates;
+                if (!scr) return null;
+                return (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Scope conversion</span>
                   {['small', 'medium', 'large']
-                    .filter(s => digest!.scope_conversion_rates?.[s] != null)
+                    .filter(s => scr[s] != null)
                     .map(scope => {
-                      const { created, merged, calibrated_in = 0, calibrated_out = 0 } = digest!.scope_conversion_rates![scope];
+                      const { created, merged, calibrated_in = 0, calibrated_out = 0 } = scr[scope];
                       const recalCount = (calibrated_in || 0) + (calibrated_out || 0);
                       const rate = created > 0 ? merged / created : null;
-                      const prev = digest!.prev_scope_conversion_rates?.[scope];
+                      const prev = digest.prev_scope_conversion_rates?.[scope];
                       const prevRate = prev && prev.created > 0 ? prev.merged / prev.created : null;
                       let trend: 'improving' | 'declining' | 'stable' | null = null;
                       if (rate != null && prevRate != null) {
@@ -1547,30 +1574,31 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       );
                     })}
                 </div>
-              )}
+                );
+              })()}
 
               {/* Scope mismatch diagnostics */}
-              {digest!.scope_mismatch_summary && digest!.scope_mismatch_summary.total_calibrated > 0 && (
+              {digest.scope_mismatch_summary && digest.scope_mismatch_summary.total_calibrated > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Scope mismatch</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.scope_mismatch_summary.total_calibrated} calibrated
+                      {digest.scope_mismatch_summary.total_calibrated} calibrated
                     </span>
-                    {digest!.scope_mismatch_summary.calibrated_success_rate != null && (
+                    {digest.scope_mismatch_summary.calibrated_success_rate != null && (
                       <span className="text-[10px] text-neutral-500">
-                        · {Math.round(digest!.scope_mismatch_summary.calibrated_success_rate * 100)}% success
+                        · {Math.round(digest.scope_mismatch_summary.calibrated_success_rate * 100)}% success
                       </span>
                     )}
-                    {Object.entries(digest!.scope_mismatch_summary.by_original_scope).map(([orig, b]) => (
+                    {Object.entries(digest.scope_mismatch_summary.by_original_scope).map(([orig, b]) => (
                       <span key={orig} className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded">
                         {orig}: {b.total}
                       </span>
                     ))}
                   </div>
-                  {digest!.scope_mismatch_summary.top_directions.length > 0 && (
+                  {digest.scope_mismatch_summary.top_directions.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {digest!.scope_mismatch_summary.top_directions.map(d => (
+                      {digest.scope_mismatch_summary.top_directions.map(d => (
                         <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
                           · {(d.direction_text || d.direction_id).slice(0, 60)}{' '}
                           <span className="text-cyan-400">{d.calibrated_count}/{d.total_tasks} ({Math.round(d.calibration_rate * 100)}%)</span>
@@ -1582,7 +1610,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Rejection pattern summary */}
-              {digest!.rejection_pattern_summary && digest!.rejection_pattern_summary.total_rejected > 0 && (
+              {digest.rejection_pattern_summary && digest.rejection_pattern_summary.total_rejected > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Rejection patterns</span>
@@ -1592,12 +1620,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       className="text-[10px] text-neutral-400 hover:text-purple-300 underline decoration-dotted underline-offset-2"
                       title="Expand recent failures to find rejected tasks"
                     >
-                      {digest!.rejection_pattern_summary.total_rejected} rejected
+                      {digest.rejection_pattern_summary.total_rejected} rejected
                     </button>
                   </div>
-                  {digest!.rejection_pattern_summary.top_notes.length > 0 && (
+                  {digest.rejection_pattern_summary.top_notes.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {digest!.rejection_pattern_summary.top_notes.map((n) => (
+                      {digest.rejection_pattern_summary.top_notes.map((n) => (
                         <span key={n.snippet} className="text-[10px] text-neutral-500 truncate">
                           · {n.snippet.slice(0, 100)}{n.snippet.length > 100 ? '…' : ''}{' '}
                           <span className="text-purple-400">×{n.count}</span>
@@ -1609,20 +1637,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Systemic errors — clusters of failures with matching error fingerprints */}
-              {(digest!.recurring_error_clusters ?? []).length > 0 && (
+              {(digest.recurring_error_clusters ?? []).length > 0 && (() => {
+                const recurringClusters = digest.recurring_error_clusters ?? [];
+                return (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Systemic errors</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.recurring_error_clusters!.length} cluster{digest!.recurring_error_clusters!.length !== 1 ? 's' : ''}
+                      {recurringClusters.length} cluster{recurringClusters.length !== 1 ? 's' : ''}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 ml-1">
                     {(() => {
                       const dirTextById = new Map<string, string>(
-                        (digest!.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
+                        (digest.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
                       );
-                      return digest!.recurring_error_clusters!.map(cluster => {
+                      return recurringClusters.map(cluster => {
                         const snippet = cluster.error_snippet.length > 120
                           ? cluster.error_snippet.slice(0, 120) + '…'
                           : cluster.error_snippet;
@@ -1674,19 +1704,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     })()}
                   </div>
                 </div>
-              )}
+                );
+              })()}
 
               {/* Early warnings — failure-rate momentum pre-anomaly signals */}
-              {(digest!.early_warnings ?? []).length > 0 && (
+              {(digest.early_warnings ?? []).length > 0 && (() => {
+                const earlyWarnings = digest.early_warnings ?? [];
+                return (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-amber-400 uppercase tracking-widest">⚠ Early warnings</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.early_warnings!.length} rising trend{digest!.early_warnings!.length !== 1 ? 's' : ''}
+                      {earlyWarnings.length} rising trend{earlyWarnings.length !== 1 ? 's' : ''}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 ml-1">
-                    {digest!.early_warnings!.map((w, idx) => {
+                    {earlyWarnings.map((w, idx) => {
                       const progression = (w.rate_progression ?? [])
                         .map(r => `${Math.round(r * 100)}%`)
                         .join(' → ');
@@ -1724,19 +1757,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     })}
                   </div>
                 </div>
-              )}
+                );
+              })()}
 
               {/* Recurring pattern detection — detection-to-fix lifecycle */}
-              {(digest!.recurring_patterns ?? []).length > 0 && (
+              {(digest.recurring_patterns ?? []).length > 0 && (() => {
+                const recurringPatterns = digest.recurring_patterns ?? [];
+                return (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Recurring patterns</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.recurring_patterns!.length} pattern{digest!.recurring_patterns!.length !== 1 ? 's' : ''}
+                      {recurringPatterns.length} pattern{recurringPatterns.length !== 1 ? 's' : ''}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 ml-1">
-                    {digest!.recurring_patterns!.map(pattern => {
+                    {recurringPatterns.map(pattern => {
                       const statusStyles: Record<string, string> = {
                         fix_verified: 'bg-green-500/10 text-green-400 border-green-500/20',
                         fix_shipped: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
@@ -1781,39 +1817,40 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     })}
                   </div>
                 </div>
-              )}
+                );
+              })()}
 
               {/* Review cap exhaustion summary */}
-              {digest!.review_cap_exhaustion_summary && digest!.review_cap_exhaustion_summary.count > 0 && (
+              {digest.review_cap_exhaustion_summary && digest.review_cap_exhaustion_summary.count > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Review cap exhaustion</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.review_cap_exhaustion_summary.count} task{digest!.review_cap_exhaustion_summary.count !== 1 ? 's' : ''} hit cap
+                      {digest.review_cap_exhaustion_summary.count} task{digest.review_cap_exhaustion_summary.count !== 1 ? 's' : ''} hit cap
                     </span>
-                    {digest!.review_cap_exhaustion_summary.avg_iterations != null && (
+                    {digest.review_cap_exhaustion_summary.avg_iterations != null && (
                       <span className="text-[10px] text-neutral-500">
-                        · avg {digest!.review_cap_exhaustion_summary.avg_iterations.toFixed(1)} iter
+                        · avg {digest.review_cap_exhaustion_summary.avg_iterations.toFixed(1)} iter
                       </span>
                     )}
-                    {digest!.review_cap_exhaustion_summary.total_cost_usd > 0 && (
+                    {digest.review_cap_exhaustion_summary.total_cost_usd > 0 && (
                       <span className="text-[10px] text-red-400">
-                        · ${digest!.review_cap_exhaustion_summary.total_cost_usd.toFixed(2)} wasted
+                        · ${digest.review_cap_exhaustion_summary.total_cost_usd.toFixed(2)} wasted
                       </span>
                     )}
-                    {digest!.review_cap_exhaustion_summary.avg_cost_usd != null && (
+                    {digest.review_cap_exhaustion_summary.avg_cost_usd != null && (
                       <span className="text-[10px] text-neutral-500">
-                        · avg ${digest!.review_cap_exhaustion_summary.avg_cost_usd.toFixed(2)}/task
+                        · avg ${digest.review_cap_exhaustion_summary.avg_cost_usd.toFixed(2)}/task
                       </span>
                     )}
                   </div>
-                  {digest!.review_cap_exhaustion_summary.top_directions.length > 0 && (
+                  {digest.review_cap_exhaustion_summary.top_directions.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
                       {(() => {
                         const dirTextById = new Map<string, string>(
-                          (digest!.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
+                          (digest.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
                         );
-                        return digest!.review_cap_exhaustion_summary!.top_directions.map(d => {
+                        return (digest.review_cap_exhaustion_summary?.top_directions ?? []).map(d => {
                           const text = dirTextById.get(d.direction_id) ?? d.direction_id;
                           const label = text.length > 60 ? text.slice(0, 60) + '…' : text;
                           return (
@@ -1830,39 +1867,39 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Merge retries saved (early-exit efficiency) */}
-              {digest!.total_merge_retries_saved != null && digest!.total_merge_retries_saved > 0 && (
+              {digest.total_merge_retries_saved != null && digest.total_merge_retries_saved > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Early exit</span>
                   <span className="text-[10px] text-emerald-400 inline-flex items-center gap-0.5">
                     <CheckCircle className="w-2.5 h-2.5" />
-                    {digest!.total_merge_retries_saved} {digest!.total_merge_retries_saved === 1 ? 'retry' : 'retries'} saved
+                    {digest.total_merge_retries_saved} {digest.total_merge_retries_saved === 1 ? 'retry' : 'retries'} saved
                   </span>
-                  {digest!.merge_early_exit_count != null && digest!.merge_early_exit_count > 0 && (
+                  {digest.merge_early_exit_count != null && digest.merge_early_exit_count > 0 && (
                     <span className="text-[10px] text-neutral-500">
-                      · across {digest!.merge_early_exit_count} task{digest!.merge_early_exit_count === 1 ? '' : 's'}
+                      · across {digest.merge_early_exit_count} task{digest.merge_early_exit_count === 1 ? '' : 's'}
                     </span>
                   )}
                 </div>
               )}
 
               {/* Retry overhead cost */}
-              {digest!.retry_task_count != null && digest!.retry_task_count > 0 && (
+              {digest.retry_task_count != null && digest.retry_task_count > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry waste</span>
                   <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
-                    <DollarSign className="w-2.5 h-2.5" />{(digest!.retry_overhead_cost_usd ?? 0).toFixed(2)} wasted
+                    <DollarSign className="w-2.5 h-2.5" />{(digest.retry_overhead_cost_usd ?? 0).toFixed(2)} wasted
                   </span>
                   <span className="text-[10px] text-neutral-400">
-                    · {digest!.retry_task_count} over-retried task{digest!.retry_task_count === 1 ? '' : 's'}
+                    · {digest.retry_task_count} over-retried task{digest.retry_task_count === 1 ? '' : 's'}
                   </span>
-                  {digest!.avg_retries_before_failure != null && (
+                  {digest.avg_retries_before_failure != null && (
                     <span className="text-[10px] text-neutral-500">
-                      · avg {digest!.avg_retries_before_failure.toFixed(1)} attempts before failure
+                      · avg {digest.avg_retries_before_failure.toFixed(1)} attempts before failure
                     </span>
                   )}
-                  {digest!.retry_waste_by_direction && digest!.retry_waste_by_direction.length > 0 && (
+                  {digest.retry_waste_by_direction && digest.retry_waste_by_direction.length > 0 && (
                     <ul className="w-full flex flex-col gap-0.5 mt-0.5 ml-2">
-                      {digest!.retry_waste_by_direction.map((d) => (
+                      {digest.retry_waste_by_direction.map((d) => (
                         <li key={d.direction_id} className="text-[10px] text-neutral-400">
                           · <span className="text-neutral-300">{d.direction_text || d.direction_id}</span>
                           <span className="text-amber-400 ml-1">${d.retry_cost_usd.toFixed(2)}</span>
@@ -1875,65 +1912,65 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Retry effectiveness */}
-              {((digest!.retry_success_count ?? 0) > 0 || digest!.retry_wasted_rate != null) && (
+              {((digest.retry_success_count ?? 0) > 0 || digest.retry_wasted_rate != null) && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry effectiveness</span>
-                  {(digest!.retry_success_count ?? 0) > 0 && (
+                  {(digest.retry_success_count ?? 0) > 0 && (
                     <span className="text-[10px] text-emerald-400">
-                      {digest!.retry_success_count} recovered
+                      {digest.retry_success_count} recovered
                     </span>
                   )}
-                  {digest!.retry_wasted_rate != null && (
+                  {digest.retry_wasted_rate != null && (
                     <span className="text-[10px] text-amber-400">
-                      · {Math.round(digest!.retry_wasted_rate * 100)}% wasted
+                      · {Math.round(digest.retry_wasted_rate * 100)}% wasted
                     </span>
                   )}
-                  {(digest!.retry_recovery_cost_usd ?? 0) > 0 && (
+                  {(digest.retry_recovery_cost_usd ?? 0) > 0 && (
                     <span className="text-[10px] text-neutral-500 inline-flex items-center gap-0.5">
-                      · <DollarSign className="w-2.5 h-2.5" />{(digest!.retry_recovery_cost_usd ?? 0).toFixed(2)} recovery cost
+                      · <DollarSign className="w-2.5 h-2.5" />{(digest.retry_recovery_cost_usd ?? 0).toFixed(2)} recovery cost
                     </span>
                   )}
                 </div>
               )}
 
               {/* Resurrection outcomes */}
-              {digest!.resurrection_outcome_summary && digest!.resurrection_outcome_summary.total > 0 && (
+              {digest.resurrection_outcome_summary && digest.resurrection_outcome_summary.total > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Resurrection outcomes</span>
                   <span className="text-[10px] text-neutral-400">
-                    {digest!.resurrection_outcome_summary.total} attempted
+                    {digest.resurrection_outcome_summary.total} attempted
                   </span>
                   <span className="text-[10px] text-emerald-400">
-                    · {digest!.resurrection_outcome_summary.completed} succeeded
+                    · {digest.resurrection_outcome_summary.completed} succeeded
                   </span>
                   <span className="text-[10px] text-amber-400">
-                    · {digest!.resurrection_outcome_summary.failed_again} failed again
+                    · {digest.resurrection_outcome_summary.failed_again} failed again
                   </span>
-                  {digest!.resurrection_outcome_summary.success_rate != null && (
+                  {digest.resurrection_outcome_summary.success_rate != null && (
                     <span className="text-[10px] text-neutral-500">
-                      · {Math.round(digest!.resurrection_outcome_summary.success_rate * 100)}% success
+                      · {Math.round(digest.resurrection_outcome_summary.success_rate * 100)}% success
                     </span>
                   )}
                 </div>
               )}
 
               {/* Retry pattern summary */}
-              {digest!.retry_pattern_summary && digest!.retry_pattern_summary.total_multi_attempt_failures > 0 && (
+              {digest.retry_pattern_summary && digest.retry_pattern_summary.total_multi_attempt_failures > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry patterns</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.retry_pattern_summary.total_multi_attempt_failures} multi-attempt
+                      {digest.retry_pattern_summary.total_multi_attempt_failures} multi-attempt
                     </span>
-                    {digest!.retry_pattern_summary.total_multi_attempt_failures > 0 && (
+                    {digest.retry_pattern_summary.total_multi_attempt_failures > 0 && (
                       <span className="text-[10px] text-neutral-500">
-                        · {Math.round((digest!.retry_pattern_summary.repeat_class_count / digest!.retry_pattern_summary.total_multi_attempt_failures) * 100)}% same class
+                        · {Math.round((digest.retry_pattern_summary.repeat_class_count / digest.retry_pattern_summary.total_multi_attempt_failures) * 100)}% same class
                       </span>
                     )}
                   </div>
-                  {digest!.retry_pattern_summary.top_patterns.length > 0 && (
+                  {digest.retry_pattern_summary.top_patterns.length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {digest!.retry_pattern_summary.top_patterns.slice(0, 3).map((p) => (
+                      {digest.retry_pattern_summary.top_patterns.slice(0, 3).map((p) => (
                         <span key={p.sequence} className="text-[10px] text-neutral-500 truncate font-mono">
                           · {p.sequence}{' '}
                           <span className="text-amber-400">×{p.count}</span>
@@ -1945,18 +1982,18 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Analysis overflow summary */}
-              {digest!.analysis_overflow_summary && digest!.analysis_overflow_summary.total_count > 0 && (
+              {digest.analysis_overflow_summary && digest.analysis_overflow_summary.total_count > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Analysis overflow</span>
                   <span className="text-[10px] text-neutral-400">
-                    {digest!.analysis_overflow_summary.total_count} task{digest!.analysis_overflow_summary.total_count === 1 ? '' : 's'} hit planning gate
+                    {digest.analysis_overflow_summary.total_count} task{digest.analysis_overflow_summary.total_count === 1 ? '' : 's'} hit planning gate
                   </span>
-                  {digest!.analysis_overflow_summary.cost_usd > 0 && (
+                  {digest.analysis_overflow_summary.cost_usd > 0 && (
                     <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
-                      <DollarSign className="w-2.5 h-2.5" />{digest!.analysis_overflow_summary.cost_usd.toFixed(2)}
+                      <DollarSign className="w-2.5 h-2.5" />{digest.analysis_overflow_summary.cost_usd.toFixed(2)}
                     </span>
                   )}
-                  {Object.entries(digest!.analysis_overflow_summary.by_scope).map(([scope, count]) => (
+                  {Object.entries(digest.analysis_overflow_summary.by_scope).map(([scope, count]) => (
                     <span key={scope} className="text-[10px] text-neutral-500">
                       · {scope} ×{count}
                     </span>
@@ -1965,22 +2002,22 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Provision waste */}
-              {digest!.provision_waste_cost_usd != null && digest!.provision_waste_cost_usd > 0 && (
+              {digest.provision_waste_cost_usd != null && digest.provision_waste_cost_usd > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Provision waste</span>
                     <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
-                      <DollarSign className="w-2.5 h-2.5" />{digest!.provision_waste_cost_usd.toFixed(2)} burned
+                      <DollarSign className="w-2.5 h-2.5" />{digest.provision_waste_cost_usd.toFixed(2)} burned
                     </span>
-                    {digest!.provisioning_overhead_pct != null && (
+                    {digest.provisioning_overhead_pct != null && (
                       <span className="text-[10px] text-neutral-500">
-                        · {(digest!.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
+                        · {(digest.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
                       </span>
                     )}
                   </div>
-                  {digest!.provision_waste_by_direction && digest!.provision_waste_by_direction.length > 0 && (
+                  {digest.provision_waste_by_direction && digest.provision_waste_by_direction.length > 0 && (
                     <ul className="w-full flex flex-col gap-0.5 mt-0.5 ml-2">
-                      {digest!.provision_waste_by_direction.map((d) => (
+                      {digest.provision_waste_by_direction.map((d) => (
                         <li key={d.direction_id} className="text-[10px] text-neutral-400">
                           · <span className="text-neutral-300">{d.direction_text || d.direction_id}</span>
                           <span className="text-amber-400 ml-1">${d.provision_cost_usd.toFixed(2)}</span>
@@ -1993,39 +2030,39 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Provisioning overhead (standalone if no waste block) */}
-              {(digest!.provision_waste_cost_usd == null || digest!.provision_waste_cost_usd === 0) &&
-                digest!.provisioning_overhead_pct != null && digest!.provisioning_overhead_pct > 0 && (
+              {(digest.provision_waste_cost_usd == null || digest.provision_waste_cost_usd === 0) &&
+                digest.provisioning_overhead_pct != null && digest.provisioning_overhead_pct > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Provisioning overhead</span>
                   <span className="text-[10px] text-neutral-400">
-                    {(digest!.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
+                    {(digest.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
                   </span>
                 </div>
               )}
 
               {/* Escalation outcomes */}
-              {digest!.escalation_outcome_summary && digest!.escalation_outcome_summary.total_attempted > 0 && (
+              {digest.escalation_outcome_summary && digest.escalation_outcome_summary.total_attempted > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Escalation outcomes</span>
                     <span className="text-[10px] text-neutral-400">
-                      {digest!.escalation_outcome_summary.total_attempted} attempted
+                      {digest.escalation_outcome_summary.total_attempted} attempted
                     </span>
                     <span className="text-[10px] text-emerald-400">
-                      · {digest!.escalation_outcome_summary.total_merged} merged
+                      · {digest.escalation_outcome_summary.total_merged} merged
                     </span>
                     <span className="text-[10px] text-red-400">
-                      · {digest!.escalation_outcome_summary.total_failed} failed
+                      · {digest.escalation_outcome_summary.total_failed} failed
                     </span>
-                    {digest!.escalation_outcome_summary.overall_success_rate != null && (
+                    {digest.escalation_outcome_summary.overall_success_rate != null && (
                       <span className="text-[10px] text-neutral-500">
-                        · {Math.round(digest!.escalation_outcome_summary.overall_success_rate * 100)}% success
+                        · {Math.round(digest.escalation_outcome_summary.overall_success_rate * 100)}% success
                       </span>
                     )}
                   </div>
-                  {Object.entries(digest!.escalation_outcome_summary.by_path).length > 0 && (
+                  {Object.entries(digest.escalation_outcome_summary.by_path).length > 0 && (
                     <div className="flex flex-col gap-0.5 ml-1">
-                      {Object.entries(digest!.escalation_outcome_summary.by_path).map(([path, b]) => (
+                      {Object.entries(digest.escalation_outcome_summary.by_path).map(([path, b]) => (
                         <span key={path} className="text-[10px] text-neutral-500 truncate font-mono">
                           · {path} <span className="text-neutral-400">{b.merged}/{b.attempted}</span>
                           {b.success_rate != null && (
@@ -2039,13 +2076,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               )}
 
               {/* Retry success rate by class */}
-              {digest!.retry_success_rate_by_class && Object.keys(digest!.retry_success_rate_by_class).length > 0 && (
+              {digest.retry_success_rate_by_class && Object.keys(digest.retry_success_rate_by_class).length > 0 && (
                 <div className="flex flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry success by class</span>
                   </div>
                   <div className="flex flex-col gap-0.5 ml-1">
-                    {Object.entries(digest!.retry_success_rate_by_class)
+                    {Object.entries(digest.retry_success_rate_by_class)
                       .sort((a, b) => (b[1].merged + b[1].failed) - (a[1].merged + a[1].failed))
                       .map(([cls, b]) => (
                         <span key={cls} className="text-[10px] text-neutral-500 truncate font-mono">
@@ -2061,17 +2098,18 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
 
               {/* Review quality */}
               {(() => {
-                const sre = digest!.self_review_effectiveness;
-                const spa = digest!.self_review_prediction_accuracy;
-                const ra = digest!.review_accuracy;
-                const fra = digest!.first_review_approval_rate;
+                const sre = digest.self_review_effectiveness;
+                const spa = digest.self_review_prediction_accuracy;
+                const ra = digest.review_accuracy;
+                const fra = digest.first_review_approval_rate;
                 const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
                 const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
                 const hasRa = ra && (ra.precision != null || ra.recall != null);
                 const hasFra = fra && fra.overall != null && fra.sample_size >= 5;
                 if (!hasSre && !hasSpa && !hasRa && !hasFra) return null;
-                const fraColor = hasFra
-                  ? (fra!.overall! >= 0.8 ? 'text-emerald-400' : fra!.overall! >= 0.5 ? 'text-amber-400' : 'text-red-400')
+                const fraOverall = fra?.overall;
+                const fraColor = fraOverall != null
+                  ? (fraOverall >= 0.8 ? 'text-emerald-400' : fraOverall >= 0.5 ? 'text-amber-400' : 'text-red-400')
                   : 'text-neutral-300';
                 const pct = (v: number | null | undefined) => v == null ? null : `${Math.round(v * 100)}%`;
                 return (
@@ -2086,61 +2124,61 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </button>
                     {reviewQualityExpanded && (
                       <div className="flex flex-col gap-1 mt-1 ml-1">
-                        {hasSre && (
+                        {sre && hasSre && (
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Self-review</span>
-                            {sre!.with_self_review_approval_rate != null && (
+                            {sre.with_self_review_approval_rate != null && (
                               <span className="text-[10px] text-neutral-400">
-                                with <span className="text-emerald-400">{pct(sre!.with_self_review_approval_rate)}</span>
+                                with <span className="text-emerald-400">{pct(sre.with_self_review_approval_rate)}</span>
                               </span>
                             )}
-                            {sre!.without_self_review_approval_rate != null && (
+                            {sre.without_self_review_approval_rate != null && (
                               <span className="text-[10px] text-neutral-400">
-                                · without <span className="text-neutral-300">{pct(sre!.without_self_review_approval_rate)}</span>
+                                · without <span className="text-neutral-300">{pct(sre.without_self_review_approval_rate)}</span>
                               </span>
                             )}
-                            <span className="text-[10px] text-neutral-500">· n={sre!.sample_size}</span>
+                            <span className="text-[10px] text-neutral-500">· n={sre.sample_size}</span>
                           </div>
                         )}
-                        {hasSpa && (
+                        {spa && hasSpa && (
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction</span>
-                            {spa!.prediction_hit_rate != null && (
+                            {spa.prediction_hit_rate != null && (
                               <span className="text-[10px] text-neutral-400">
-                                hit <span className="text-emerald-400">{pct(spa!.prediction_hit_rate)}</span>
+                                hit <span className="text-emerald-400">{pct(spa.prediction_hit_rate)}</span>
                               </span>
                             )}
-                            {spa!.false_alarm_rate != null && (
+                            {spa.false_alarm_rate != null && (
                               <span className="text-[10px] text-neutral-400">
-                                · false alarm <span className="text-amber-400">{pct(spa!.false_alarm_rate)}</span>
+                                · false alarm <span className="text-amber-400">{pct(spa.false_alarm_rate)}</span>
                               </span>
                             )}
-                            <span className="text-[10px] text-neutral-500">· n={spa!.sample_size}</span>
+                            <span className="text-[10px] text-neutral-500">· n={spa.sample_size}</span>
                           </div>
                         )}
-                        {hasRa && (
+                        {ra && hasRa && (
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Review accuracy</span>
-                            {ra!.precision != null && (
+                            {ra.precision != null && (
                               <span className="text-[10px] text-neutral-400">
-                                precision <span className="text-emerald-400">{pct(ra!.precision)}</span>
+                                precision <span className="text-emerald-400">{pct(ra.precision)}</span>
                               </span>
                             )}
-                            {ra!.recall != null && (
+                            {ra.recall != null && (
                               <span className="text-[10px] text-neutral-400">
-                                · recall <span className="text-emerald-400">{pct(ra!.recall)}</span>
+                                · recall <span className="text-emerald-400">{pct(ra.recall)}</span>
                               </span>
                             )}
-                            <span className="text-[10px] text-neutral-500">· n={ra!.total_reviews}</span>
+                            <span className="text-[10px] text-neutral-500">· n={ra.total_reviews}</span>
                           </div>
                         )}
-                        {hasFra && (
+                        {fra && hasFra && (
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">First-review approval</span>
                             <span className="text-[10px] text-neutral-400">
-                              <span className={fraColor}>{pct(fra!.overall)}</span>
+                              <span className={fraColor}>{pct(fra.overall)}</span>
                             </span>
-                            <span className="text-[10px] text-neutral-500">· n={fra!.sample_size}</span>
+                            <span className="text-[10px] text-neutral-500">· n={fra.sample_size}</span>
                           </div>
                         )}
                       </div>
@@ -2190,7 +2228,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           : group.failure_class === 'RATE_LIMIT' || group.failure_class === 'EXTERNAL_API'
                           ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
                           : 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30';
-                        const classHistory = digest!.trend_history ?? [];
+                        const classHistory = digest.trend_history ?? [];
                         let classTrend: {arrow: string; color: string} = {arrow: '–', color: 'text-neutral-500'};
                         if (classHistory.length >= 4) {
                           const sumAt = (arr: typeof classHistory) => arr.reduce((a, p) => a + (p.failed_by_class?.[group.failure_class] ?? 0), 0);
@@ -2217,9 +2255,9 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               </span>
                               <span className="text-[11px] text-neutral-500">× {group.tasks.length}</span>
                               <span className={`text-[11px] font-bold ${classTrend.color}`} title="Trend: recent 2 periods vs prior 2 periods">{classTrend.arrow}</span>
-                              {digest!.cost_by_failure_class?.[group.failure_class] != null && digest!.cost_by_failure_class[group.failure_class] > 0 && (
+                              {digest.cost_by_failure_class?.[group.failure_class] != null && digest.cost_by_failure_class[group.failure_class] > 0 && (
                                 <span className="text-[10px] text-red-400/70 font-mono" title={`Cost of ${group.label} failures`}>
-                                  ${digest!.cost_by_failure_class[group.failure_class].toFixed(2)}
+                                  ${digest.cost_by_failure_class[group.failure_class].toFixed(2)}
                                 </span>
                               )}
                             </button>
@@ -2304,12 +2342,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               })()}
 
               {/* Remediation pipeline */}
-              {digest!.remediation_funnel && (
-                digest!.remediation_funnel.investigations_spawned > 0
-                || (digest!.remediation_funnel.ci_auto_remediation?.spawned ?? 0) > 0
-                || Object.keys(digest!.remediation_funnel.cumulative_merged_by_trigger_class ?? {}).length > 0
+              {digest.remediation_funnel && (
+                digest.remediation_funnel.investigations_spawned > 0
+                || (digest.remediation_funnel.ci_auto_remediation?.spawned ?? 0) > 0
+                || Object.keys(digest.remediation_funnel.cumulative_merged_by_trigger_class ?? {}).length > 0
               ) && (() => {
-                const rf = digest!.remediation_funnel!;
+                const rf = digest.remediation_funnel;
+                if (!rf) return null;
                 const successRate = rf.remediations_spawned > 0
                   ? rf.remediations_merged / rf.remediations_spawned
                   : null;
@@ -2417,7 +2456,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             <span key={k} className="inline-flex items-baseline gap-1"><span className={confColor[k]}>{k}</span><span className="font-mono text-neutral-300">{ibc[k]}</span></span>
                           )) });
                           if (rsbcEntries.length) rows.push({ key: 'rsbc', label: 'success/conf:', nodes: rsbcEntries.map(k => {
-                            const v = rsbc[k]!; const total = v.merged + v.failed; const pct = total > 0 ? Math.round((v.merged / total) * 100) : 0;
+                            const v = rsbc[k]; if (!v) return null;
+                            const total = v.merged + v.failed; const pct = total > 0 ? Math.round((v.merged / total) * 100) : 0;
                             return <span key={k} className="inline-flex items-baseline gap-1"><span className={confColor[k]}>{k}</span><span className="font-mono text-neutral-300">{pct}%</span><span className="text-neutral-600">({v.merged}/{total})</span></span>;
                           }) });
                           if (frbcEntries.length) rows.push({ key: 'frbc', label: 'failed class:', nodes: frbcEntries.map(([cls, count]) => (
@@ -2429,8 +2469,8 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           if (cmbcEntries.length) rows.push({ key: 'cmbc', label: 'all-time merged by class:', nodes: cmbcEntries.map(([cls, count]) => (
                             <span key={cls} className="inline-flex items-baseline gap-1"><span className={count >= 3 ? 'text-emerald-400' : 'text-amber-400'}>{cls}</span><span className="font-mono text-neutral-300">{count}</span>{count >= 3 && <span className="text-emerald-600 text-[9px]">✓</span>}</span>
                           )) });
-                          if (hasCar) rows.push({ key: 'car', label: 'ci auto-remediation:', nodes: (['spawned', 'merged', 'failed'] as const).map(k => (
-                            <span key={k} className="inline-flex items-baseline gap-1"><span className="text-neutral-500">{k}</span><span className={`font-mono ${k === 'merged' ? 'text-emerald-400' : k === 'failed' ? 'text-red-400' : 'text-neutral-300'}`}>{car![k]}</span></span>
+                          if (hasCar && car) rows.push({ key: 'car', label: 'ci auto-remediation:', nodes: (['spawned', 'merged', 'failed'] as const).map(k => (
+                            <span key={k} className="inline-flex items-baseline gap-1"><span className="text-neutral-500">{k}</span><span className={`font-mono ${k === 'merged' ? 'text-emerald-400' : k === 'failed' ? 'text-red-400' : 'text-neutral-300'}`}>{car[k]}</span></span>
                           )) });
                           if (dropOffEntries.length) rows.push({ key: 'drop', label: 'diagnosis drop-off:', nodes: dropOffEntries.map(([reason, count]) => (
                             <span key={reason} className="inline-flex items-baseline gap-1"><span className={reason === dropOffDominant ? 'text-amber-400' : 'text-neutral-400'}>{reason}</span><span className="font-mono text-neutral-300">{count}</span>{dropOffTotal > 0 && <span className="text-neutral-600">({Math.round((count / dropOffTotal) * 100)}%)</span>}</span>
@@ -2529,14 +2569,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               })()}
 
               {/* Recent completions */}
-              {(digest!.recent_completions ?? []).length > 0 && (() => {
-                const completions = digest!.recent_completions;
+              {(digest.recent_completions ?? []).length > 0 && (() => {
+                const completions = digest.recent_completions ?? [];
                 // Group by task_type, preserving insertion order
                 const groups = new Map<string, RecentCompletion[]>();
                 for (const c of completions) {
                   const key = c.task_type || 'other';
-                  if (!groups.has(key)) groups.set(key, []);
-                  groups.get(key)!.push(c);
+                  let bucket = groups.get(key);
+                  if (!bucket) { bucket = []; groups.set(key, bucket); }
+                  bucket.push(c);
                 }
                 const groupEntries = Array.from(groups.entries());
                 const allSameType = groupEntries.length === 1;

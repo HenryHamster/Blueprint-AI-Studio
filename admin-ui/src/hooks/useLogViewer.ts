@@ -279,7 +279,7 @@ export function useLogViewer({ fetchTasksRef, setDeployState }: UseLogViewerDeps
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);

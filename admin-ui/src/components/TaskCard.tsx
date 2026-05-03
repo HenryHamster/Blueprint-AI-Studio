@@ -353,7 +353,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       confirmIntervalRef.current = setInterval(() => {
         remaining -= 1;
         setConfirmCountdown(remaining);
-        if (remaining <= 0) clearInterval(confirmIntervalRef.current!);
+        if (remaining <= 0 && confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
       }, 1000);
       confirmTimeoutRef.current = setTimeout(() => {
         setConfirmAction(null);
@@ -549,7 +549,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
           <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
             <AlertTriangle className="w-3 h-3" />
-            Blocking {blockingCount} task{blockingCount! > 1 ? 's' : ''}
+            Blocking {blockingCount} task{(blockingCount ?? 0) > 1 ? 's' : ''}
           </span>
         )}
         {directionId && (

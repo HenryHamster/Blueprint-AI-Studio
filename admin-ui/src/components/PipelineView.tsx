@@ -5,6 +5,7 @@ import { TASK_TYPE_STYLES, useElapsedTime, getHeartbeatStatus } from './TaskCard
 import { parseTimestamp } from '../utils/time';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
+const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
 const STATUS_COLORS: Record<string, string> = {
   COMPLETED: 'bg-emerald-500',
@@ -65,10 +66,12 @@ function buildForest(tasks: Task[]): TreeNode[] {
   const orphanGroups = new Map<string, TreeNode[]>();
 
   for (const t of tasks) {
-    const node = nodeMap.get(t.id)!;
-    if (t.parent_task_id && nodeMap.has(t.parent_task_id)) {
-      nodeMap.get(t.parent_task_id)!.children.push(node);
-    } else if (t.parent_task_id && !nodeMap.has(t.parent_task_id)) {
+    const node = nodeMap.get(t.id);
+    if (!node) continue;
+    const parent = t.parent_task_id ? nodeMap.get(t.parent_task_id) : undefined;
+    if (parent) {
+      parent.children.push(node);
+    } else if (t.parent_task_id) {
       // Orphan: parent exists but is not on this page
       node.isOrphan = true;
       const group = orphanGroups.get(t.parent_task_id) || [];
@@ -153,18 +156,20 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
           page. Two actions: copy parent id (existing) + unarchive-parent
           (new) so users can pull an archived parent back into view without
           hunting for it in the Archive panel. */}
-      {isOrphan && task.parent_task_id && (
+      {isOrphan && task.parent_task_id && (() => {
+        const parentId = task.parent_task_id;
+        return (
         <>
           <button
-            onClick={e => { e.stopPropagation(); onNavigateToParent?.(task.parent_task_id!); }}
+            onClick={e => { e.stopPropagation(); onNavigateToParent?.(parentId); }}
             className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-            title={`Copy parent task ID: ${task.parent_task_id}`}
+            title={`Copy parent task ID: ${parentId}`}
           >
             ↑ Parent on another page
           </button>
           {onUnarchiveParent && (
             <button
-              onClick={e => { e.stopPropagation(); onUnarchiveParent(task.parent_task_id!); }}
+              onClick={e => { e.stopPropagation(); onUnarchiveParent(parentId); }}
               className="text-[9px] text-emerald-500/80 border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
               title="Unarchive parent task (idempotent if already unarchived)"
             >
@@ -172,7 +177,8 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
             </button>
           )}
         </>
-      )}
+        );
+      })()}
 
       {/* Type badge */}
       {style && Icon && (
@@ -269,9 +275,8 @@ function TreeBranch({
 }) {
   const depIds = node.task.depends_on || [];
   const depTasks = depIds
-    .filter(id => allTaskIds.has(id))
-    .map(id => taskMap.get(id)!)
-    .filter(Boolean);
+    .map(id => taskMap.get(id))
+    .filter((t): t is Task => !!t);
   const offPageDepIds = depIds.filter(id => !allTaskIds.has(id));
 
   // Find linked create task for review/fix tasks via PR number
@@ -484,15 +489,18 @@ function RootGroup({
               {root.task.title}
             </h3>
           </div>
-          {isSynthetic && root.task.parent_task_id && (
+          {isSynthetic && root.task.parent_task_id && (() => {
+            const parentId = root.task.parent_task_id;
+            return (
             <button
-              onClick={() => onNavigateToParent?.(root.task.parent_task_id!)}
+              onClick={() => onNavigateToParent?.(parentId)}
               className="text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
               title={`Copy parent task ID: ${root.task.parent_task_id}`}
             >
               ↑ Parent on another page
             </button>
-          )}
+            );
+          })()}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           {onArchiveGroup && runningInGroup === 0 && !isSynthetic && (
@@ -650,7 +658,6 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
   // Synthetic parents are orphan-groups whose real parent is archived or on
   // another page — if every visible child in the group is terminal, the
   // tree is done from the operator's view and should be archivable too.
-  const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
   const donePipelineIds = useMemo(() => {
     const ids: string[] = [];
     for (const root of forest) {
@@ -658,7 +665,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
       if (allIds.length === 0) continue;
       const allTerminal = allIds.every(id => {
         const t = taskMap.get(id);
-        return t && TERMINAL.includes(t.status);
+        return t && TERMINAL_STATUSES.includes(t.status);
       });
       if (allTerminal) ids.push(...allIds);
     }

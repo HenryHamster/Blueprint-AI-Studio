@@ -125,11 +125,12 @@ export default function App() {
   );
 
   // Fetch project members when panel opens or project changes
+  const { fetchProjectMembers } = s;
   useEffect(() => {
-    if (showProjectMembers && s.selectedProjectId) {
-      s.fetchProjectMembers(s.selectedProjectId);
+    if (showProjectMembers && selectedProjectId) {
+      fetchProjectMembers(selectedProjectId);
     }
-  }, [showProjectMembers, s.selectedProjectId, s.fetchProjectMembers]);
+  }, [showProjectMembers, selectedProjectId, fetchProjectMembers]);
 
   const handleViewTask = (taskId: string) => {
     const task = s.tasks.find(t => t.id === taskId);
@@ -205,8 +206,8 @@ export default function App() {
   const visibleColumns = useMemo(() => {
     return effectiveColumnPrefs
       .filter(pref => pref.visible)
-      .map(pref => COLUMNS.find(c => c.id === pref.id)!)
-      .filter(Boolean)
+      .map(pref => COLUMNS.find(c => c.id === pref.id))
+      .filter((c): c is typeof COLUMNS[number] => !!c)
       .filter(col => col.includes.some(status => s.statusFilter.includes(status)));
   }, [effectiveColumnPrefs, s.statusFilter]);
 
@@ -490,16 +491,19 @@ export default function App() {
         onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
       />
 
-      {showProjectMembers && s.selectedProjectId && selectedProject && (
+      {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
+        const projectId = s.selectedProjectId;
+        return (
         <ProjectMembers
-          projectId={s.selectedProjectId}
+          projectId={projectId}
           members={s.projectMembers}
           myRole={selectedProject.my_role || 'viewer'}
-          onAdd={(email, role) => s.addProjectMember(s.selectedProjectId!, email, role)}
-          onUpdateRole={(memberId, role) => s.updateProjectMemberRole(s.selectedProjectId!, memberId, role)}
-          onRemove={(memberId) => s.removeProjectMember(s.selectedProjectId!, memberId)}
+          onAdd={(email, role) => s.addProjectMember(projectId, email, role)}
+          onUpdateRole={(memberId, role) => s.updateProjectMemberRole(projectId, memberId, role)}
+          onRemove={(memberId) => s.removeProjectMember(projectId, memberId)}
         />
-      )}
+        );
+      })()}
 
       <VersionMismatchBanner />
 
@@ -737,7 +741,7 @@ export default function App() {
                     s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
                   });
                 }}
-                onClearWaveDeps={s.selectedProjectId ? () => s.handleClearWaveDeps(s.selectedProjectId!) : undefined}
+                onClearWaveDeps={s.selectedProjectId ? (() => { const pid = s.selectedProjectId; return pid ? () => s.handleClearWaveDeps(pid) : undefined; })() : undefined}
                 onArchiveGroup={(taskIds) => {
                   s.setConfirmDialog({
                     title: 'Archive this group?',

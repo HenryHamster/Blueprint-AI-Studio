@@ -156,8 +156,9 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                   <p className="text-[10px] text-red-400/80 mt-0.5 truncate">{acct.disabled_reason}</p>
                 )}
                 {acct.rate_limited_models.filter(m => m.cooldown_type === 'regression' && m.regression_stats).map(m => {
-                  const rs = m.regression_stats!;
-                  const modelLabel = m.model.includes('/') ? m.model.split('/').pop()! : m.model;
+                  const rs = m.regression_stats;
+                  if (!rs) return null;
+                  const modelLabel = m.model.includes('/') ? (m.model.split('/').pop() ?? m.model) : m.model;
                   return (
                     <p key={m.model} className="text-[10px] text-amber-400/80 mt-0.5">
                       regression on {modelLabel}: {Math.round(rs.account_rate * 100)}% vs project median {Math.round(rs.project_median * 100)}% (n={rs.sample_size} over {rs.distinct_accounts} accounts)
@@ -172,7 +173,7 @@ export function PoolAccountHealthPanel({ accounts, loading }: {
                     const badge = isQuota
                       ? 'bg-red-500/20 text-red-400 border-red-500/30'
                       : 'bg-amber-500/20 text-amber-400 border-amber-500/30';
-                    const modelLabel = m.model.includes('/') ? m.model.split('/').pop()! : m.model;
+                    const modelLabel = m.model.includes('/') ? (m.model.split('/').pop() ?? m.model) : m.model;
                     const durLabel = isQuota ? '24h quota' : `${Math.ceil(m.cooldown_seconds_remaining / 60)}m`;
                     return (
                       <span key={m.model} className={`text-[9px] font-mono px-1.5 py-0.5 rounded border ${badge}`}>

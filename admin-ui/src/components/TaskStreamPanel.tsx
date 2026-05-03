@@ -49,7 +49,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
     if (el && autoScroll) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [activeEntries.length, activeTab]);
+  }, [activeEntries.length, activeTab, autoScroll]);
 
   const handleScroll = () => {
     const el = scrollRef.current;

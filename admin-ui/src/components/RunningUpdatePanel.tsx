@@ -97,9 +97,9 @@ export default function RunningUpdatePanel({
             </p>
           </div>
         )}
-        {hasContent && (
+        {hasContent && document && (
           <div className="prose-sm max-w-none">
-            <MarkdownContent content={document!} />
+            <MarkdownContent content={document} />
           </div>
         )}
       </div>

@@ -239,7 +239,10 @@ describe('DirectionsPanel', () => {
     // Wait for form to appear
     const input = await screen.findByPlaceholderText('New direction...');
     // Add button is the only button in the same flex row as the input
-    const addBtn = input.parentElement!.querySelector('button')!;
+    const parent = input.parentElement;
+    if (!parent) throw new Error('test setup: expected input parent');
+    const addBtn = parent.querySelector('button');
+    if (!addBtn) throw new Error('test setup: expected add button');
     await user.click(addBtn);
     await waitFor(() => {
       expect(fetchSpy).toHaveBeenCalledWith(
@@ -251,7 +254,8 @@ describe('DirectionsPanel', () => {
       (c) => (c[1] as RequestInit | undefined)?.method === 'POST',
     );
     expect(postCall).toBeDefined();
-    const body = JSON.parse((postCall![1] as RequestInit).body as string);
+    if (!postCall) throw new Error('test setup: expected POST call');
+    const body = JSON.parse((postCall[1] as RequestInit).body as string);
     expect(body.completion_criteria).toBe('Done when merged');
   });
 

@@ -6,7 +6,9 @@ export function hasTransitiveCycle(startId: string, targetId: string, tasks: Tas
   const visited = new Set<string>();
   const queue: Array<{ id: string; depth: number }> = [{ id: targetId, depth: 0 }];
   while (queue.length > 0) {
-    const { id, depth } = queue.shift()!;
+    const next = queue.shift();
+    if (!next) break;
+    const { id, depth } = next;
     if (depth >= maxDepth) continue;
     if (visited.has(id)) continue;
     visited.add(id);
