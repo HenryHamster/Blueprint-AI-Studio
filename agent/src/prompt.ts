@@ -153,6 +153,43 @@ export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, stri
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
+// Project-specific override of the trained "lint failed → refactor source"
+// reflex. The size guardrails (backend/testing/module_size_limits.json,
+// admin-ui frontend equivalents) ARE meant to be bumped — the assertion
+// message itself walks the agent through the bump, but Claude defaults to
+// "fix the source" without explicit guidance. Without this override agents
+// burned multiple full retry cycles on irreducible diffs (e.g. JWT
+// revocation work that genuinely needed +10-15 lines in a file already at
+// the cap), failed every time, and triggered direction holds. See
+// audit_pipeline_2026_05_03.md for the cluster of CODE_ERROR failures this
+// addresses.
+export const SIZE_GUARDRAIL_GUIDANCE = `
+## Size Guardrails Are Advisory — Bump, Don't Refactor
+
+If a test fails with a message containing \`module_size_limits.json\` or
+\`size guardrail\`, the correct fix is **almost always** to bump the limit
+in that JSON file — NOT to refactor the source. The assertion message
+itself walks you through the bump procedure; follow it literally.
+
+Specifically:
+1. Read the failing assertion. It will tell you the file path, current
+   line count, and the limit it exceeded.
+2. Edit \`backend/testing/module_size_limits.json\` (for backend files) or
+   \`admin-ui/src/...\` size config (for frontend files). Bump the limit
+   for the offending file by enough headroom (current_size + 50-100 lines).
+3. Commit both the source change AND the JSON edit in the same PR.
+
+**Do NOT** refactor or extract code unless your task explicitly says to.
+Refactoring during a create/fix task is a strategic decision that belongs
+in its own PR; doing it inline causes import cycles, breaks unrelated
+tests, and burns retry attempts.
+
+The only time you should NOT bump is when the diff is genuinely bundling
+unrelated code that should be split — e.g. you accidentally edited
+something outside the task's scope. In that case, shrink the diff to only
+what the task asked for.
+`;
+
 // ── Git exclude for agent helper scripts ────────────────────────────────────
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
