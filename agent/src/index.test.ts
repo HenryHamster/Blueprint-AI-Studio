@@ -71,6 +71,7 @@ vi.mock('ws', () => ({
 // ── Imports (after mocks are registered) ─────────────────────────────────────
 import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
+import { MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -634,7 +635,7 @@ describe('lintFixLoop early exit on identical errors', () => {
 
     await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
     const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
-    expect(npmCalls).toBe(3);
+    expect(npmCalls).toBe(MAX_LINT_FIX_ATTEMPTS);  // tracks the constant rather than hardcoding 3
   });
 });
 
@@ -701,11 +702,11 @@ describe('testFixLoop early exit on identical errors', () => {
 
     await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
     // Count only test-run invocations, skipping the setup `npm ci` calls.
-    // MAX_TEST_FIX_ATTEMPTS = 2, loop runs 3 times when errors differ.
+    // testFixLoop runs maxFixAttempts + 1 = MAX_TEST_FIX_ATTEMPTS + 1 times when errors differ each iteration.
     const testRunCalls = vi.mocked(spawn).mock.calls.filter(
       c => c[0] === 'npm' && Array.isArray(c[1]) && c[1][0] === 'test',
     ).length;
-    expect(testRunCalls).toBe(3);
+    expect(testRunCalls).toBe(MAX_TEST_FIX_ATTEMPTS + 1);
   });
 });
 

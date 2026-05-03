@@ -44,8 +44,13 @@ export const PUSH_FORCE_WITH_LEASE_RETRY_DELAY = 1_000;
 // Conflict marker grep
 export const CONFLICT_CHECK_TIMEOUT = 10_000;
 
-// Lint fix loop
-export const MAX_LINT_FIX_ATTEMPTS = 3;
+// Lint fix loop. 2026-05-03: bumped 3 → 5 once within-task fix-iteration
+// history shipped (commit 02931339). Each retry now sees prior diff + failure
+// tail in its prompt, so additional attempts are much more likely to pivot
+// rather than repeat the same wrong fix. Cost of 2 extra attempts at worst is
+// ~3-5 min of Claude time, paid for by converting CODE_ERROR failures into
+// successes that don't need cross-VM remediation.
+export const MAX_LINT_FIX_ATTEMPTS = 5;
 
 // Frontend checks (admin-ui)
 export const FRONTEND_NPM_TIMEOUT = 120_000;
@@ -59,8 +64,10 @@ export const AGENT_TSC_TIMEOUT = 60_000;
 // Backend ruff checks
 export const RUFF_TIMEOUT = 60_000;
 
-// Test fix loop
-export const MAX_TEST_FIX_ATTEMPTS = 2;
+// Test fix loop. 2026-05-03: bumped 2 → 3 alongside MAX_LINT_FIX_ATTEMPTS.
+// Test failures are typically more semantically rich than lint, so the
+// iteration-history feedback should help even faster than for lint.
+export const MAX_TEST_FIX_ATTEMPTS = 3;
 export const TEST_RUNNER_TIMEOUT = 180_000;
 // Docker test runners (e.g. scripts/test-backend.sh --postgres) build the
 // image, start a Postgres sidecar, run alembic upgrade, then execute the
