@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from datetime import timedelta
 from typing import Any, Optional
 

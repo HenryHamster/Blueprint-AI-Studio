@@ -2,7 +2,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import Project, ProjectMember
+from app.models import Project
 from testing.factories import make_membership
 
 

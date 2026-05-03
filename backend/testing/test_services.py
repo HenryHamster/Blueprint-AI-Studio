@@ -11,7 +11,6 @@ Covers:
 Uses isolated in-memory SQLite DB (same pattern as test_pipeline_reliability.py).
 """
 import asyncio
-import uuid
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -644,7 +643,6 @@ async def test_gcp_cleanup_logs_partial_failures(gcp_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 
 from app.routers.agent_status import _check_daily_cost_ceiling
-from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 
 @pytest_asyncio.fixture()

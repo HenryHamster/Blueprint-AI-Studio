@@ -3,9 +3,9 @@ import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
   js.configs.recommended,
-  ...tseslint.configs.strictTypeChecked,
   {
     files: ['src/**/*.ts'],
+    extends: [...tseslint.configs.strictTypeChecked],
     languageOptions: {
       parserOptions: {
         project: './tsconfig.json',
@@ -20,6 +20,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['node_modules/', 'dist/'],
+    ignores: ['node_modules/', 'dist/', 'eslint.config.js'],
   }
 )

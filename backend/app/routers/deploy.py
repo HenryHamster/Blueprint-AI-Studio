@@ -2,17 +2,15 @@
 import asyncio
 import logging
 import os
-import uuid
 from collections import deque
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
-from app.models import DeploymentState, DeploymentStatus, Task, TaskStatus, TaskHistory, _utcnow
+from app.models import DeploymentState, DeploymentStatus
 from app.auth import get_current_user, require_admin
 from app.admin import build_deploy_state_payload
-from app.shared_state import circuit_breakers as _circuit_breakers
 
 logger = logging.getLogger(__name__)
 

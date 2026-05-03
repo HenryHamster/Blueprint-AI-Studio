@@ -1,5 +1,5 @@
 import pytest
-from app.models import Project, Task, Artifact, ProjectStatus, TaskStatus, ArtifactType
+from app.models import Artifact, ProjectStatus, TaskStatus, ArtifactType
 from testing.factories import make_project, make_task
 
 @pytest.mark.asyncio

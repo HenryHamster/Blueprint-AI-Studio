@@ -3,13 +3,13 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter
-from app.models import Project, ProjectMember, ProjectStatus, _utcnow
+from app.models import Project, ProjectMember, ProjectStatus
 from app.auth import get_current_user, require_admin
 from app.schemas import OnboardPayload
 
@@ -200,7 +200,7 @@ async def onboard_project(
         project.build_config = validated.model_dump(exclude_none=True)
     except Exception:
         # Detection + override produced invalid shape — store raw but log warning
-        logger.warning(f"[ONBOARD] build_config failed schema validation, storing raw")
+        logger.warning("[ONBOARD] build_config failed schema validation, storing raw")
         project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)

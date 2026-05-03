@@ -570,7 +570,6 @@ async def test_drift_history_series_returns_serialised_sparkline_data(db_session
 @pytest.mark.asyncio
 async def test_no_drift_creates_no_alert(db_session):
     """persist_drift_snapshot with no flags creates no Alert rows."""
-    from app.models import Alert
     project = Project(
         name="No Drift Alerts Project",
         user_id="test-user-123",
@@ -598,7 +597,6 @@ async def test_no_drift_creates_no_alert(db_session):
 @pytest.mark.asyncio
 async def test_over_claim_flag_creates_warning_alert(db_session):
     """A single over_claim_flag snapshot creates one WARNING Alert."""
-    from app.models import Alert, AlertSeverity
     project = Project(
         name="Over Claim Alert Project",
         user_id="test-user-123",
@@ -631,7 +629,6 @@ async def test_over_claim_flag_creates_warning_alert(db_session):
 @pytest.mark.asyncio
 async def test_repeated_drift_flag_no_duplicate_alert(db_session):
     """Persisting the same flagged signal twice yields only one Alert (dedup)."""
-    from app.models import Alert
     project = Project(
         name="Dedup Alert Project",
         user_id="test-user-123",
@@ -661,7 +658,6 @@ async def test_repeated_drift_flag_no_duplicate_alert(db_session):
 @pytest.mark.asyncio
 async def test_flag_cleared_no_new_alert(db_session):
     """After a flag fires once, a subsequent neutral snapshot creates no new Alert."""
-    from app.models import Alert
     project = Project(
         name="Flag Cleared Project",
         user_id="test-user-123",
@@ -696,7 +692,6 @@ async def test_flag_cleared_no_new_alert(db_session):
 @pytest.mark.asyncio
 async def test_stalled_flag_creates_warning_alert(db_session):
     """A stalled_despite_churn_flag snapshot creates a stalled-despite-churn Alert."""
-    from app.models import Alert, AlertSeverity
     project = Project(
         name="Stalled Alert Project",
         user_id="test-user-123",
@@ -728,7 +723,6 @@ async def test_stalled_flag_creates_warning_alert(db_session):
 @pytest.mark.asyncio
 async def test_both_flags_create_two_alerts(db_session):
     """When both over_claim_flag and stalled_despite_churn_flag are set, two Alerts are created."""
-    from app.models import Alert
     project = Project(
         name="Both Flags Project",
         user_id="test-user-123",

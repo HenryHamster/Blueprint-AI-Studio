@@ -14,7 +14,7 @@ Covers:
 import uuid
 import pytest
 from datetime import timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import app.shared_state as _ss
 from app.shared_state import (

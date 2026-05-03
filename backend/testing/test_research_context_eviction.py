@@ -3,7 +3,6 @@ Standalone tests for _build_research_context eviction preservation.
 No database required — pure function tests.
 """
 import re
-import pytest
 
 from app.research_context import (
     _build_research_context,

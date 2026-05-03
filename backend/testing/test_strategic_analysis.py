@@ -1,6 +1,4 @@
 """Tests for _build_outcome_evaluation and _compute_prediction_calibration_factor in app.strategic_analysis."""
-import pytest
-from unittest.mock import patch
 from app.strategic_analysis import (
     _build_outcome_evaluation as _real_build_outcome_evaluation,
     _compute_prediction_calibration_factor as _real_compute_prediction_calibration_factor,
@@ -580,7 +578,6 @@ def test_cost_estimate_per_direction_and_overall():
 
 def test_cost_budget_exceeded_flag():
     """budget_exceeded appears when estimated spend exceeds cost_budget_usd."""
-    from app.routers.admin_analytics import ON_DEMAND_RATE
     directions = [
         {
             "id": "dir-1", "status": "active",
@@ -598,7 +595,6 @@ def test_cost_budget_exceeded_flag():
 
 def test_cost_budget_not_exceeded():
     """budget_exceeded absent when spend is within cost_budget_usd."""
-    from app.routers.admin_analytics import ON_DEMAND_RATE
     directions = [
         {
             "id": "dir-1", "status": "active",
@@ -616,7 +612,6 @@ def test_cost_budget_not_exceeded():
 
 def test_cost_budget_absent_when_no_budget_set():
     """cost_budget_usd and budget_exceeded absent when direction has no budget."""
-    from app.routers.admin_analytics import ON_DEMAND_RATE
     directions = [
         {
             "id": "dir-1", "status": "active",
@@ -671,7 +666,6 @@ def test_high_cost_per_merge_flag_on_expensive_direction():
 
 def test_high_cost_per_merge_absent_with_single_direction():
     """high_cost_per_merge never set when only one direction has cost data."""
-    from app.routers.admin_analytics import ON_DEMAND_RATE
     directions = [
         {
             "id": "dir-1", "status": "active",
@@ -1179,7 +1173,6 @@ class TestAutonomousCPM:
 
     def test_cpm_absent_when_all_assisted_merges(self):
         """CPM is None when autonomous_prs_merged == 0 even if prs_merged > 0."""
-        from app.routers.admin_analytics import ON_DEMAND_RATE
         directions = [{
             "id": "dir-1", "status": "active",
             "research_history": [{

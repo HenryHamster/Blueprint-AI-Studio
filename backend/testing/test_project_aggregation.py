@@ -4,15 +4,13 @@ Tests for the 'Project State Aggregation' step in task_lifecycle.py.
 Verifies that parent/logical tasks (no vm_instance_id) receive a meaningful
 latest_status_message when their status is set to match the project outcome.
 """
-import uuid
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel, select
+from sqlmodel import SQLModel
 
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 

@@ -13,13 +13,12 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from sqlalchemy import select
 
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
-    ISSUE_CHURN_WINDOW,
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,

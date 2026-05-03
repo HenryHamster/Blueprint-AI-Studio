@@ -725,7 +725,7 @@ describe('handleReview — verdict file parsing', () => {
 
     const call = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0];
     expect(call[0]).toBe('task-1');
-    const status = call[1] as Record<string, unknown>;
+    const status = call[1];
     expect(status.status).toBe('COMPLETED');
     expect(status.verdict_json).toBe('{"verdict":"APPROVE","feedback":"looks good"}');
     expect(String(status.logs)).toContain('"verdict":"APPROVE"');
@@ -749,7 +749,7 @@ describe('handleReview — verdict file parsing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     const verdictJson = JSON.parse(String(status.verdict_json));
     expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
     expect(verdictJson.investigated_files).toEqual([
@@ -770,7 +770,7 @@ describe('handleReview — verdict file parsing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     expect(status.status).toBe('COMPLETED');
     expect(status.verdict_json).toBeUndefined();
     expect(String(status.logs)).toBe('last text');
@@ -788,7 +788,7 @@ describe('handleReview — verdict file parsing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     expect(status.verdict_json).toBeUndefined();
     expect(String(status.logs)).toBe('last');
   });
@@ -818,7 +818,7 @@ describe('handleReview — verdict file parsing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
     expect(status.status).toBe('FAILED');
     expect(status.failure_category).toBe('claude_code_failed');
     expect(status.artifact_type).toBe('ERROR_LOG');
@@ -1021,7 +1021,7 @@ describe('handleFix — stale-premise detection', () => {
 
     const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
     expect(statusCalls.length).toBeGreaterThanOrEqual(1);
-    const status = statusCalls[0][1] as Record<string, unknown>;
+    const status = statusCalls[0][1];
     expect(status.status).toBe('COMPLETED');
     expect(String(status.logs)).toContain('stale premise');
   });
@@ -1119,7 +1119,7 @@ describe('handleFix — post-rebase lint re-validation', () => {
     expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(true);
     // Task finalized as FAILED with lint_failed category.
     const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
-    const finalStatus = statusCalls[statusCalls.length - 1][1] as Record<string, unknown>;
+    const finalStatus = statusCalls[statusCalls.length - 1][1];
     expect(finalStatus.status).toBe('FAILED');
     expect(finalStatus.failure_category).toBe('lint_failed');
     expect(String(finalStatus.logs)).toContain('Post-rebase lint still failing');
@@ -1169,7 +1169,7 @@ describe('handleFix — conflict-marker retry failure', () => {
     );
 
     const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
-    const finalStatus = statusCalls[statusCalls.length - 1][1] as Record<string, unknown>;
+    const finalStatus = statusCalls[statusCalls.length - 1][1];
     expect(finalStatus.status).toBe('FAILED');
     expect(finalStatus.failure_category).toBe('unresolved_conflicts');
     expect(String(finalStatus.logs)).toContain('Conflict markers still present');

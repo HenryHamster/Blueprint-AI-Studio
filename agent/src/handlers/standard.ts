@@ -291,7 +291,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // Runs a read-only pass to map module interfaces and dependencies before coding.
   let analysisContext = '';
   const taskScope = strVal(ctx.scope);
-  const previousAnalysisPlan = strVal(ctx._previous_analysis_plan as unknown);
+  const previousAnalysisPlan = strVal(ctx._previous_analysis_plan);
   if (taskScope === 'medium' && previousAnalysisPlan) {
     // Retry with an existing plan: reuse it instead of burning another ~3-5 min
     // Claude Code session re-deriving the same analysis.
@@ -308,7 +308,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       (payload.related_files as string[] | undefined) ||
       (ctx.related_files as string[] | undefined) ||
       []
-    ) as string[];
+    );
 
     const analysisProjectCtx = task.project_context as Record<string, unknown> | undefined;
     const rawConcurrent = analysisProjectCtx?.direction_concurrent_files;
@@ -427,7 +427,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       (payload.related_files as string[] | undefined) ||
       (ctx.related_files as string[] | undefined) ||
       []
-    ) as string[];
+    );
     const callerNote = buildSmallScopeCallerNote(smallRelated);
     const callerSection = callerNote ? `\n\n${callerNote}` : '';
     analysisContext = `## Pre-Implementation Analysis\n\nBefore writing code: read the files relevant to this task, confirm the scope stays under ~50 lines across 1–3 files, and check for callers that import from files you will modify.${callerSection}\n\n`;
@@ -974,7 +974,7 @@ Return nothing — just write the files.`;
               parsedChecks = Object.keys(parsedCheckResults);
             }
             const failedCheckIds = Object.entries(parsedCheckResults)
-              .filter(([, r]) => r && r.passed === false)
+              .filter(([, r]) => r && !r.passed)
               .map(([id]) => id);
             if (failedCheckIds.length > 0 && parsedVerdict !== 'FAIL') {
               reviewCategories.push('verdict_check_mismatch');
@@ -1068,7 +1068,7 @@ Return nothing — just write the files.`;
         }
 
         selfReviewOutcome = {
-          issues_found: fixesApplied || (typeof parsed?.issues_found === 'number' && (parsed.issues_found as number) > 0),
+          issues_found: fixesApplied || (typeof parsed?.issues_found === 'number' && (parsed.issues_found) > 0),
           categories: reviewCategories,
           fixes_applied: fixesApplied,
           passes,
@@ -1151,11 +1151,11 @@ Return nothing — just write the files.`;
             const modelsChanged = !!changedFiles?.some(f => f === 'backend/app/models.py' || f.endsWith('/backend/app/models.py'));
             const mandatory = getMandatoryChecks(selfReviewTaskScope || undefined, !!selfReviewAnalysisPlan, modelsChanged, selfReviewIsDecomposed);
             const missingChecks = parsedChecks
-              ? mandatory.filter(m => !parsedChecks!.includes(m))
+              ? mandatory.filter(m => !parsedChecks.includes(m))
               : mandatory;
             const hadVerdictMismatch = reviewCategories.includes('verdict_check_mismatch');
             const failedCheckIds = parsedCheckResults
-              ? Object.entries(parsedCheckResults).filter(([, r]) => r && r.passed === false).map(([id]) => id)
+              ? Object.entries(parsedCheckResults).filter(([, r]) => r && !r.passed).map(([id]) => id)
               : [];
             const retryNoteParts: string[] = [];
             if (missingChecks.length > 0) {
@@ -1193,9 +1193,9 @@ Return nothing — just write the files.`;
                   // disagrees with its own check_results, the mismatch is
                   // already recorded in reviewCategories for humans to see.
                   if (retryCheckResults) {
-                    selfReviewOutcome!.check_results = retryCheckResults;
+                    selfReviewOutcome.check_results = retryCheckResults;
                   }
-                  if (retryVerdict !== undefined) selfReviewOutcome!.verdict = retryVerdict;
+                  if (retryVerdict !== undefined) selfReviewOutcome.verdict = retryVerdict;
                 }
               }
             }

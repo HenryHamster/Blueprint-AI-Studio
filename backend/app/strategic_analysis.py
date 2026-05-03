@@ -2,7 +2,6 @@
 
 Extracted from app.strategic_completion to keep that module under its line ceiling.
 """
-from datetime import datetime, timezone
 from app.time_utils import _utcnow
 
 # Directions whose cost_per_merged_pr exceeds median * multiplier are flagged

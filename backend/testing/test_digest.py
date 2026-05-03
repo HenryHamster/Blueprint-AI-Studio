@@ -5936,7 +5936,7 @@ async def test_drift_snapshot_no_flags_when_healthy(client: AsyncClient, db_sess
 @pytest.mark.asyncio
 async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, db_session):
     """Direction with many claims but zero merges appears in flagged_directions."""
-    from app.models import Artifact, ArtifactType, Task, TaskStatus
+    from app.models import Task, TaskStatus
     from app.time_utils import _utcnow as _now
     from datetime import timedelta
 
@@ -5989,7 +5989,7 @@ async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, 
 async def test_drift_snapshot_history_series_returned(client: AsyncClient, db_session):
     """Flagged direction includes history sparkline from stored DirectionDriftSnapshot rows."""
     from app.drift_detection import DirectionDriftSnapshot
-    from app.models import Task, TaskStatus
+    from app.models import TaskStatus
     from app.time_utils import _utcnow as _now
     from datetime import timedelta
 
@@ -6197,7 +6197,6 @@ async def test_cost_per_merge_by_type_threshold(client: AsyncClient, db_session)
     expensive outlier can exceed 3× median.  With create=10s, fix=20s, debug=1000s
     the median is 20 and 3× threshold is 60; debug (1000s) clearly exceeds it.
     """
-    from app.routers.admin_analytics import SPOT_RATE
 
     project = make_project()
     db_session.add(project)

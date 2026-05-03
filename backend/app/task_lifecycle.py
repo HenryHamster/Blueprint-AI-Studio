@@ -38,14 +38,12 @@ from app.notification_dispatch import (
 )
 from app.failure_classification import (
     classify_failure,
-    INFRA_CLASSES,
     _timeout_subtype_from_message,
     TIMEOUT_OOM,
     TIMEOUT_HEARTBEAT_LOST,
     TIMEOUT_ITERATION_LIMIT,
     TIMEOUT_CASCADE,
     TIMEOUT_PROCESS_CRASH,
-    TIMEOUT_EXECUTION,
 )
 from app.retry_budget import (
     CODE_ERROR_STAGE_GUIDANCE,

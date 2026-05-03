@@ -2,26 +2,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, R
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from typing import Optional, Dict, Any, List, TypedDict
+from typing import Optional, Dict, Any, List
 import os
-import re
 import uuid
 import json
-import httpx
 import logging
 import asyncio
-from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
-from app.shared_state import limiter, circuit_breakers as _circuit_breakers
-from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Artifact, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, ProjectMessage, MessageType, _utcnow
-from app.auth import get_current_user, require_admin
+from app.shared_state import limiter
+from app.models import Task, TaskStatus, TaskHistory, Project, ProjectMember, Artifact, ArtifactType, DeploymentState, DeploymentStatus, _utcnow
+from app.auth import get_current_user
 from app.task_locking import task_lock
 
-from app.github import generate_installation_access_token
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import TaskType, validate_internal_payload, validate_task_payload
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
@@ -1785,7 +1781,6 @@ def _get_zone_health_summary() -> dict:
 
 async def build_deploy_state_payload(session: AsyncSession) -> dict:
     """Assemble the deploy state payload. Used by both HTTP endpoint and WS broadcasts."""
-    import os
     from app.shared_state import deploy_monitoring, external_health, runtime_config
     import app.deploy_health as _deploy_health_module
 

@@ -7,7 +7,7 @@ failure and opens a fix PR.  Guard rails prevent runaway spawning.
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func as _func

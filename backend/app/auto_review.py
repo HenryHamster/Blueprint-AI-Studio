@@ -7,7 +7,7 @@ task.
 """
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession

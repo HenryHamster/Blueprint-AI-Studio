@@ -17,7 +17,7 @@ from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import record_pipeline_event, external_health as _external_health, resolve_retry_budget
 from app.failure_classification import classify_failure, persist_failure_category, INFRA_CLASSES
 from app.retry_budget import append_failure_class_history
-from app.time_utils import _utcnow, set_retry_after, parse_retry_after, RETRY_AFTER_MAX_MINUTES
+from app.time_utils import _utcnow, set_retry_after, RETRY_AFTER_MAX_MINUTES
 
 logger = logging.getLogger(__name__)
 

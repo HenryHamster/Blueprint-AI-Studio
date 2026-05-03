@@ -5,7 +5,7 @@ Run with: bash scripts/test-backend.sh testing/test_anomaly_proposals.py --stand
 """
 import uuid
 from datetime import timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

@@ -106,7 +106,7 @@ const STATUS_REF = () => ({ value: '' });
 
 /** Returns the first argument passed to runClaudeCode (the full prompt string). */
 function capturedPrompt(): string {
-  return vi.mocked(runClaudeCode).mock.calls[0][0] as string;
+  return vi.mocked(runClaudeCode).mock.calls[0][0];
 }
 
 // ── Overlap warning text generation ──────────────────────────────────────────
@@ -251,7 +251,7 @@ describe('handleCreate configuration', () => {
       .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // self-review pass1
     const task = { title: 'My Task', description: '', context: { issue_number: 42 } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Closes #42');
   });
 
@@ -264,7 +264,7 @@ describe('handleCreate configuration', () => {
       .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // self-review pass1
     const task = { title: 'My Task', description: '', context: { issue_number: 42, issue_url: 'https://github.com/owner/repo/issues/42' } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Closes https://github.com/owner/repo/issues/42');
   });
 
@@ -277,7 +277,7 @@ describe('handleCreate configuration', () => {
       .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' }); // self-review pass1
     const task = { title: 'My Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).not.toContain('Closes');
   });
 
@@ -290,7 +290,7 @@ describe('handleCreate configuration', () => {
       .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' });
     const task = { title: 'My Task', description: '', direction_context: { title: 'PR clarity' }, context: { direction_id: 'd-abc12345' } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('direction: PR clarity (`d-abc12345`)');
   });
 
@@ -303,7 +303,7 @@ describe('handleCreate configuration', () => {
       .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' });
     const task = { title: 'My Task', description: '', context: { direction_id: 'd-abc12345' } };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('direction:');
     expect(prBodyArg).toContain('d-abc12345');
   });
@@ -317,7 +317,7 @@ describe('handleCreate configuration', () => {
       .mockResolvedValueOnce({ exitCode: 0, allOutput: validJson, lastResultText: '' });
     const task = { title: 'My Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).not.toContain('direction:');
   });
 });
@@ -381,7 +381,7 @@ describe('module interface extraction', () => {
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
     // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).toContain('## Module Interfaces');
   });
 
@@ -408,7 +408,7 @@ describe('module interface extraction', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
     // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).toContain('## Module Interfaces');
   });
 
@@ -431,7 +431,7 @@ describe('affected consumer discovery', () => {
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
     // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).toContain('## Affected Consumers');
   });
 
@@ -458,7 +458,7 @@ describe('affected consumer discovery', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
     // For medium-scope tasks, call[0] is the analysis phase; call[1] is the main task prompt
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).toContain('## Affected Consumers');
   });
 
@@ -690,7 +690,7 @@ describe('self-review phase', () => {
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Self-Review');
     expect(prBodyArg).toContain('Issues found and auto-fixed');
   });
@@ -713,7 +713,7 @@ describe('self-review phase', () => {
       .mockReturnValue('');
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Self-Review');
     expect(prBodyArg).toContain('No critical issues found');
   });
@@ -731,10 +731,10 @@ describe('self-review phase', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     // self_review_outcome should be reported to backend with categories=['self_review_failed']
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { categories: string[]; passes: number };
+    const outcome = (statusCall![1]).self_review_outcome as { categories: string[]; passes: number };
     expect(outcome).toBeDefined();
     expect(outcome.categories).toContain('self_review_failed');
     expect(outcome.passes).toBe(1);
@@ -807,10 +807,10 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as { fixes_applied: boolean; passes: number; total_fixes: number };
+    const outcome = (statusCall![1]).self_review_outcome as { fixes_applied: boolean; passes: number; total_fixes: number };
     expect(outcome).toBeDefined();
     expect(outcome.fixes_applied).toBe(true);
     expect(outcome.passes).toBe(2);
@@ -836,10 +836,10 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.verdict).toBe('PASS');
     expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: true } });
@@ -873,10 +873,10 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(completedCall).toBeDefined();
-    const payload = completedCall![1] as Record<string, unknown>;
+    const payload = completedCall![1];
     const outcome = payload.self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
@@ -956,10 +956,10 @@ describe('self-review phase', () => {
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.feedback_categories_injected).toEqual(expect.arrayContaining(['type_safety', 'test_coverage']));
     expect((outcome.feedback_categories_injected as string[]).length).toBe(2);
@@ -984,10 +984,10 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.feedback_categories_injected).toBeUndefined();
   });
@@ -1060,10 +1060,10 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+      c => (c[1]).status === 'FAILED',
     );
     expect(failedCall).toBeDefined();
-    expect((failedCall![1] as Record<string, unknown>).failure_category).toBe('lint_failed_after_self_review');
+    expect((failedCall![1]).failure_category).toBe('lint_failed_after_self_review');
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
@@ -1085,7 +1085,7 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(completedCall).toBeDefined();
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
@@ -1159,9 +1159,9 @@ describe('self-review phase', () => {
     // No retry triggered — only main task call + single self-review call.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     const completed = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
-    const outcome = (completed![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (completed![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.verdict).toBe('PASS');
     expect(outcome.categories).toEqual(expect.arrayContaining(['verdict_check_mismatch']));
   });
@@ -1232,11 +1232,11 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+      c => (c[1]).status === 'FAILED',
     );
     expect(failedCall).toBeDefined();
-    expect((failedCall![1] as Record<string, unknown>).failure_category).toBe('test_failed_after_self_review');
-    expect((failedCall![1] as Record<string, unknown>).test_failure_summary).toBe('test_regression failed');
+    expect((failedCall![1]).failure_category).toBe('test_failed_after_self_review');
+    expect((failedCall![1]).test_failure_summary).toBe('test_regression failed');
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
@@ -1291,10 +1291,10 @@ describe('self-review phase', () => {
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     const injected = outcome.feedback_categories_injected as string[];
     expect(injected).toBeDefined();
@@ -1321,10 +1321,10 @@ describe('self-review phase', () => {
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.feedback_categories_injected).toBeUndefined();
   });
@@ -1354,10 +1354,10 @@ describe('self-review phase', () => {
     // 3 calls: main task + pass 1 + truncation retry
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3);
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).not.toContain('incomplete_review');
     expect(outcome.truncated_files_read).toEqual(['file1.ts', 'file2.ts']);
@@ -1387,10 +1387,10 @@ describe('self-review phase', () => {
     // PR should NOT be created — incomplete review now forces FAIL, blocking PR
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+      c => (c[1]).status === 'FAILED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).toContain('incomplete_review');
     expect(outcome.verdict).toBe('FAIL');
@@ -1419,9 +1419,9 @@ describe('self-review phase', () => {
     // Only 2 calls: main task + pass 1. No truncation retry because handleQA has failOnTestFailure=false.
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED',
+      c => (c[1]).status === 'COMPLETED',
     );
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).not.toContain('incomplete_review');
   });
@@ -1451,9 +1451,9 @@ describe('self-review phase', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(3); // retry did run
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'FAILED',
+      c => (c[1]).status === 'FAILED',
     );
-    const outcome = (statusCall![1] as Record<string, unknown>).self_review_outcome as Record<string, unknown>;
+    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).toContain('incomplete_review');
     expect(outcome.verdict).toBe('FAIL');
@@ -1663,7 +1663,7 @@ describe('two-phase analysis for medium-scope tasks', () => {
       project_context: {},
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).toContain('Pre-Implementation Analysis');
     expect(mainPrompt).toContain(analysisOutput);
   });
@@ -1679,7 +1679,7 @@ describe('two-phase analysis for medium-scope tasks', () => {
       project_context: {},
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).not.toContain('Pre-Implementation Analysis');
   });
 
@@ -1694,7 +1694,7 @@ describe('two-phase analysis for medium-scope tasks', () => {
       project_context: {},
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0] as string;
+    const mainPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(mainPrompt).not.toContain('Pre-Implementation Analysis');
   });
 
@@ -1916,11 +1916,11 @@ describe('analysis-phase scope feasibility gate', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
     const completedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      c => (c[1] as Record<string, unknown>).status === 'COMPLETED'
-        && (c[1] as Record<string, unknown>).artifact_type === 'PULL_REQUEST',
+      c => (c[1]).status === 'COMPLETED'
+        && (c[1]).artifact_type === 'PULL_REQUEST',
     );
     expect(completedCall).toBeDefined();
-    const body = completedCall![1] as Record<string, unknown>;
+    const body = completedCall![1];
     expect(typeof body.analysis_plan).toBe('string');
     expect(body.analysis_plan as string).toContain('Pre-Implementation Analysis');
     // Field must be analysis_plan (schema-defined), not analysis_summary (silently dropped)
@@ -2011,7 +2011,7 @@ describe('scope overflow warning (soft-mode)', () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Scope Overflow Warning');
     expect(prBodyArg).toContain('7 non-test files');
   });
@@ -2020,10 +2020,10 @@ describe('scope overflow warning (soft-mode)', () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
-      ([, body]) => (body as Record<string, unknown>).status === 'COMPLETED',
+      ([, body]) => (body).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const statusPayload = statusCall?.[1] as Record<string, unknown> | undefined;
+    const statusPayload = statusCall?.[1];
     const reviewOutcome = statusPayload?.self_review_outcome as Record<string, unknown> | undefined;
     const overflowCtx = reviewOutcome?.scope_overflow as Record<string, unknown> | undefined;
     expect(overflowCtx).toMatchObject({
@@ -2050,7 +2050,7 @@ describe('scope overflow warning (soft-mode)', () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).not.toContain('Scope Overflow Warning');
   });
 });
@@ -2152,7 +2152,7 @@ describe('scope overflow warning in PR body (post self-review)', () => {
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Scope Overflow Warning');
     expect(prBodyArg).toContain('11 non-test files');
   });
@@ -2163,7 +2163,7 @@ describe('scope overflow warning in PR body (post self-review)', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).not.toContain('Scope Overflow Warning');
   });
 
@@ -2177,7 +2177,7 @@ describe('scope overflow warning in PR body (post self-review)', () => {
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).toContain('Scope Overflow Warning');
   });
 
@@ -2193,7 +2193,7 @@ describe('scope overflow warning in PR body (post self-review)', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(pushAndCreatePR)).toHaveBeenCalled();
-    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6] as string;
+    const prBodyArg = vi.mocked(pushAndCreatePR).mock.calls[0][6];
     expect(prBodyArg).not.toContain('Scope Overflow Warning');
   });
 });
@@ -2223,7 +2223,7 @@ describe('buildSmallScopeCallerNote', () => {
         throw new Error('not found');
       }
       if (cmd === 'git') {
-        const pattern = (args || []).find(a => typeof a === 'string' && a.includes('import')) as string | undefined;
+        const pattern = (args || []).find(a => typeof a === 'string' && a.includes('import'));
         if (pattern?.includes('\\ba\\b')) return 'some/caller-a.ts\n' as unknown as Buffer;
         if (pattern?.includes('\\bb\\b')) return 'some/caller-b.ts\n' as unknown as Buffer;
         return '' as unknown as Buffer;
@@ -2386,7 +2386,7 @@ describe('migration auto-generation heartbeat', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const migrationCall = vi.mocked(sendHeartbeatSync).mock.calls.find(
-      c => c[2] !== undefined && 'migration_auto_generated' in (c[2] as Record<string, unknown>),
+      c => c[2] !== undefined && 'migration_auto_generated' in (c[2]),
     );
     expect(migrationCall).toBeDefined();
     expect((migrationCall![2] as Record<string, unknown>).migration_auto_generated).toBe(true);
@@ -2408,7 +2408,7 @@ describe('migration auto-generation heartbeat', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const migrationCall = vi.mocked(sendHeartbeatSync).mock.calls.find(
-      c => c[2] !== undefined && 'migration_auto_generated' in (c[2] as Record<string, unknown>),
+      c => c[2] !== undefined && 'migration_auto_generated' in (c[2]),
     );
     expect(migrationCall).toBeDefined();
     expect((migrationCall![2] as Record<string, unknown>).migration_auto_generated).toBe(false);

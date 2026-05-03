@@ -7,7 +7,7 @@ runaway spawning (rate limit, duplicate detection, concurrent limit).
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -244,7 +244,7 @@ def _build_issue_prompt(
     comments = issue_context.get("comments", [])
 
     sections = [
-        f"Implement the following GitHub issue.\n",
+        "Implement the following GitHub issue.\n",
         f"## Issue #{issue_number}: {issue_title}\n",
     ]
 
@@ -262,7 +262,7 @@ def _build_issue_prompt(
         comment_lines = []
         for c in comments:
             comment_lines.append(f"**@{c['user']}**: {c['body']}")
-        sections.append(f"### Discussion\n" + "\n\n".join(comment_lines) + "\n")
+        sections.append("### Discussion\n" + "\n\n".join(comment_lines) + "\n")
 
     sections.append(
         f"### Instructions\n"

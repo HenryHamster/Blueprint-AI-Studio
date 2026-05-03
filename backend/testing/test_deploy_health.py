@@ -12,7 +12,7 @@ import copy
 
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -1073,7 +1073,6 @@ async def test_full_recovery_pause_captures_target(dh_db):
 import os
 from datetime import datetime, timedelta, timezone
 from collections import deque
-import app.health_check_primitives as _hcp
 
 
 def _ts(minutes_ago: float) -> str:

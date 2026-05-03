@@ -1,5 +1,4 @@
 """Unit tests for research_completion.py pre-spawn scope-budget gate."""
-import pytest
 
 from app.spawn_calibration import (
     MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,

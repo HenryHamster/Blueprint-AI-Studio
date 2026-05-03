@@ -48,7 +48,6 @@ class TestSafetyConstants:
         provisioning can complete.
         """
         from app.compute import _MAX_GLOBAL_PROVISIONS
-        from app.shared_state import runtime_config
         max_concurrent_vms = int(os.getenv("MAX_CONCURRENT_VMS", "8"))
         assert _MAX_GLOBAL_PROVISIONS >= max_concurrent_vms, (
             f"MAX_PROVISION_SLOTS ({_MAX_GLOBAL_PROVISIONS}) < MAX_CONCURRENT_VMS ({max_concurrent_vms}) — "
@@ -273,7 +272,7 @@ class TestSchemaRevisionSync:
                     missing.append((table_name, col.name))
 
         assert not missing, (
-            f"Columns defined on models but missing from alembic migrations:\n"
+            "Columns defined on models but missing from alembic migrations:\n"
             + "\n".join(f"  - {t}.{c}" for t, c in missing)
             + "\n\nAdd a migration for each missing column, or the backend will "
             "crash on startup with UndefinedColumnError."

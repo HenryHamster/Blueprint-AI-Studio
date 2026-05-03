@@ -21,7 +21,7 @@ from app.failure_classification import classify_failure
 from app.routers.agent_status import record_task_result
 from app.main import should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
-from app.strategic_completion import _handle_strategic_completion, _check_direction_starvation
+from app.strategic_completion import _handle_strategic_completion
 from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _spawn_pipeline_task
 from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, DeploymentStatus
@@ -736,7 +736,6 @@ class TestTaskTypeRingBuffer:
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
 
     def test_record_includes_task_type(self):
-        from collections import deque
         import app.shared_state as ss
         from app.routers.agent_status import record_task_result, _recorded_task_ids
         _recorded_task_ids.clear()
@@ -748,7 +747,6 @@ class TestTaskTypeRingBuffer:
         assert entry[3] == "create"
 
     def test_record_failure_includes_task_type(self):
-        from collections import deque
         import app.shared_state as ss
         from app.routers.agent_status import record_task_result, _recorded_task_ids
         _recorded_task_ids.clear()
@@ -3178,7 +3176,6 @@ async def metrics_db(mocker):
 async def test_compute_pipeline_health_includes_first_attempt_rate(metrics_db):
     """compute_pipeline_health_summary returns first_attempt_success_rate field."""
     from app.routers.admin_digest import compute_pipeline_health_summary
-    from datetime import timezone
 
     project = Project(name="Test", user_id="u1")
     metrics_db.add(project)

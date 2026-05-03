@@ -976,7 +976,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
     }
-  })().catch(e => log(`Initial heartbeat outer error: ${String(e)}`));
+  })().catch(e => { log(`Initial heartbeat outer error: ${String(e)}`); });
 
   heartbeatTimer = setInterval(() => { (async () => {
     try {
@@ -1031,7 +1031,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         return;
       }
     }
-  })().catch(e => log(`Heartbeat outer error (W4/C1): ${String(e)}`)); }, HEARTBEAT_INTERVAL);
+  })().catch(e => { log(`Heartbeat outer error (W4/C1): ${String(e)}`); }); }, HEARTBEAT_INTERVAL);
 }
 
 function stopHeartbeat() {
@@ -1324,8 +1324,8 @@ export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): 
     const chunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     const proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    proc.stdout!.on('data', (d: Buffer) => chunks.push(d));
-    proc.stderr!.on('data', (d: Buffer) => errChunks.push(d));
+    proc.stdout.on('data', (d: Buffer) => chunks.push(d));
+    proc.stderr.on('data', (d: Buffer) => errChunks.push(d));
     const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error(`git ${args[0]} timed out after ${timeoutMs}ms`)); }, timeoutMs);
     proc.on('close', (code) => {
       clearTimeout(timer);
@@ -1530,19 +1530,19 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
         sendLog(ws, `Running install in ${dirPrefix}...\n`);
         sendHeartbeatSync(taskId, `${dir.install_cmd} (${dirPrefix})...`);
         const [cmd, ...args] = dir.install_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT, env: extraEnv as NodeJS.ProcessEnv });
+        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT, env: extraEnv });
       }
       if (dir.lint_cmd) {
         sendLog(ws, `Running lint in ${dirPrefix}...\n`);
         sendHeartbeatSync(taskId, `${dir.lint_cmd} (${dirPrefix})...`);
         const [cmd, ...args] = dir.lint_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv as NodeJS.ProcessEnv });
+        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv });
       }
       if (dir.build_cmd) {
         sendLog(ws, `Running build in ${dirPrefix}...\n`);
         sendHeartbeatSync(taskId, `${dir.build_cmd} (${dirPrefix})...`);
         const [cmd, ...args] = dir.build_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: extraEnv as NodeJS.ProcessEnv });
+        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: extraEnv });
       }
       sendLog(ws, `Checks passed for ${dirPrefix}.\n`);
     }

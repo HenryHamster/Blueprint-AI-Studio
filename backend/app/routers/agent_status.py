@@ -32,9 +32,7 @@ from app.broadcast import broadcast_to_project
 from app.routers.agent import verify_agent_token
 from app.max_plan_pool import (
     _max_plan_pool_lock,
-    _account_by_id,
     apply_task_llm_runtime_context,
-    clear_task_llm_runtime_context,
     release_max_plan_account,
     _account_available_for_model,
     _max_plan_pools,
@@ -1212,10 +1210,10 @@ async def update_agent_status(
                             elif earliest_recovery:
                                 minutes_until = (earliest_recovery - _utcnow()).total_seconds() / 60
                                 set_retry_after(task, minutes_until)
-                                task.latest_status_message = f"Rate Limited — all accounts exhausted, waiting for recovery"
+                                task.latest_status_message = "Rate Limited — all accounts exhausted, waiting for recovery"
                             else:
                                 set_retry_after(task, 5)
-                                task.latest_status_message = f"Rate Limited — all accounts exhausted, retrying in 5min"
+                                task.latest_status_message = "Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
                             task.retry_after_until = None  # audit W1: column source of truth
                         # Preserve llm_* runtime identity keys (provider/model/auth_mode/

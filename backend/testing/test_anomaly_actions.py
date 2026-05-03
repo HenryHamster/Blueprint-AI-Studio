@@ -18,7 +18,6 @@ from app.anomaly_detection import (
     _apply_anomaly_adjustments,
     _as_iso,
     _check_anomaly_restoration,
-    _check_fast_recovery,
     _check_max_duration_safeguard,
     _error_fingerprint,
     _expire_stale_anomalies,
@@ -38,7 +37,6 @@ from app.anomaly_detection import (
     _SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS,
 )
 from app.time_utils import _utcnow
-from collections import deque
 from datetime import datetime, timedelta, timezone
 
 

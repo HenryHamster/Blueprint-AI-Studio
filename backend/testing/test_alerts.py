@@ -4,7 +4,6 @@ Covers: failure alerts, circuit breaker alerts, auto-pause/resume alerts,
 and deduplication logic.
 """
 import pytest
-import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 

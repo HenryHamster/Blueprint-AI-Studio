@@ -2104,7 +2104,6 @@ class TestWarmVMSkipProvision:
         that persists the warm-field clear raises. On commit failure the
         rollback path leaves the warm fields intact, so a re-run of the
         dispatch loop can record the clear cleanly without double-counting."""
-        from sqlmodel import select as _select
 
         # Force the dispatch-time PROVISIONING commit to fail. We reach the
         # main commit path by having an account selected, then the commit

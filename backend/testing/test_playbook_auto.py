@@ -1,9 +1,6 @@
 """Tests for automatic playbook entry creation from recurring failure patterns."""
-import json
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -966,7 +963,7 @@ def test_archive_uses_rate_over_raw_count_when_enough_observations():
     low-performer is higher (closer to 0) than the score of the well-confirmed
     entry that lacks follow tracking (effectiveness = -confirmed).
     """
-    from app.playbook_learning import _archive_least_useful_entry, _MIN_FOLLOWED_FOR_RATE
+    from app.playbook_learning import _archive_least_useful_entry
 
     doc = {
         # Many raw confirmations but no follow tracking (old-style entry)
@@ -1055,7 +1052,7 @@ def test_record_playbook_confirmed_noop_for_missing_key():
 
 
 def test_retire_ineffective_patterns_retires_low_success_rate():
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED, _RETIRE_MAX_SUCCESS_RATE
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
 
     doc = {
         "playbook/bad": {
@@ -1074,7 +1071,7 @@ def test_retire_ineffective_patterns_retires_low_success_rate():
 
 
 def test_retire_ineffective_patterns_keeps_sufficient_success_rate():
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED, _RETIRE_MAX_SUCCESS_RATE
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
 
     doc = {
         "playbook/good": {
@@ -1136,7 +1133,6 @@ def test_maybe_archive_for_capacity_triggers_at_threshold():
             "updated_at": _utcnow().isoformat(),
         }
 
-    import json as _json
     from app.playbook_learning import _playbook_size_bytes
     current_size = _playbook_size_bytes(doc)
 

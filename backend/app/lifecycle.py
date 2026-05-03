@@ -9,7 +9,6 @@ import logging
 import os
 import warnings
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Dict
 
 from sqlalchemy import func as _func, text as _text

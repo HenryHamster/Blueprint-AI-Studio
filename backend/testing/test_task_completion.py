@@ -3216,7 +3216,6 @@ class TestClearDirectionDiagnosisFlag:
 
     @pytest.mark.asyncio
     async def test_project_not_found_is_noop(self, db_session):
-        import uuid
         # Don't add/commit — we want to assert the function noops on a missing
         # project. Committing would hit the FK constraint anyway.
         task = make_task(project_id=uuid.uuid4(), context={"direction_id": "dir-1"})
@@ -4677,7 +4676,7 @@ class TestHandleSelfAuditCompletion:
     @pytest.mark.asyncio
     async def test_audit_mode_clears_after_threshold_ship_assessments(self, db_session, mocker):
         """Direction in 'audit' (auto-set) clears after 2 consecutive 'ship' assessments."""
-        from app.models import SystemMaturity, RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        from app.models import RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
         direction = {
             "id": "dir-1",
             "system_id": "sys-1",
@@ -4788,7 +4787,7 @@ class TestHandleSelfAuditCompletion:
     @pytest.mark.asyncio
     async def test_non_ship_mode_resets_consecutive_count(self, db_session, mocker):
         """A non-ship audit finding resets the consecutive ship counter."""
-        from app.models import SystemMaturity, RECOMMENDED_MODE_META_KEY, RECOMMENDED_MODE_SOURCE_SELF_AUDIT
+        from app.models import SystemMaturity
         project = make_project(directions=[])
         db_session.add(project)
         await db_session.commit()

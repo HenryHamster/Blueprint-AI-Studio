@@ -54,7 +54,7 @@ vi.mock('child_process', () => ({
     _opts: unknown,
     cb: (err: Error | null, stdout: string, stderr: string) => void,
   ) => {
-    Promise.resolve().then(() => cb(null, '', ''));
+    Promise.resolve().then(() => { cb(null, '', ''); });
   },
 }));
 
@@ -593,7 +593,7 @@ describe('lintFixLoop early exit on identical errors', () => {
       const proc = {
         pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
         on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => cb(0));
+          if (event === 'close') setImmediate(() => { cb(0); });
         }),
         kill: vi.fn(),
       };
@@ -1390,7 +1390,7 @@ describe('failure category classification', () => {
         stderr: { on: vi.fn() },
         stdout: { on: vi.fn() },
         on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => cb(0));
+          if (event === 'close') setImmediate(() => { cb(0); });
         }),
         kill: vi.fn(),
       };

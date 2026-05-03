@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
-from typing import Any, Iterable, Mapping, Optional
+from datetime import timedelta
+from typing import Any, Mapping, Optional
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession

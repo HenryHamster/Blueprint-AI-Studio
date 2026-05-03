@@ -1001,7 +1001,6 @@ class TestResidualStore:
 
         t = self._task_with_id("AttributeError: some-fp error text", "task-reactivate")
         # Seed the store with the existing fingerprint so the update path runs
-        import time
         fp = fc._fingerprint_message("AttributeError: some-fp error text") or '<empty>'
         fc._mark_residual_case_closed(fp)
         record_residual_fingerprint(t)

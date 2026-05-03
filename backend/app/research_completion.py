@@ -22,7 +22,6 @@ from app.models import (
     ArtifactType,
     Project,
     Task,
-    TaskHistory,
     TaskStatus,
 )
 from app.cochange_decomposition import (

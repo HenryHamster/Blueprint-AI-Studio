@@ -5,12 +5,10 @@ exposes which VMs are heartbeating, which task each is running, queued
 warm-pinned tasks per VM, and the warm-pin clear-rate (a leading indicator
 of warm-VM instability).
 """
-import uuid
 from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.main import app
 from app.models import Project, Task, TaskStatus

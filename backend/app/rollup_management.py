@@ -11,7 +11,7 @@ and preserve test-patchability.
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 

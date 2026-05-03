@@ -848,7 +848,6 @@ async def test_pr_merge_negative_cache_skips_refetch(mocker):
     """_verify_pr_merged called twice within the negative-TTL should only
     fetch the PR once — the second call returns False from the cache."""
     import uuid as _uuid
-    import time as _time
     from unittest.mock import AsyncMock as _AM, MagicMock
     import app.shared_state as _ss
     from app import rollup_management as rm

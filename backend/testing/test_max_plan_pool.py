@@ -11,8 +11,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.max_plan_pool import (
-    QUARANTINE_CONFIDENCE_THRESHOLD,
-    QUARANTINE_CONSECUTIVE_N,
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
     _LATENCY_MIN_SAMPLES,
@@ -34,7 +32,6 @@ from app.max_plan_pool import (
     _normalize_rl_model,
     _prune_health_events,
     _serialize_disabled_model_info,
-    _SUCCESS_RATE_DEPRIORITIZE_MARGIN,
     cascade_disabled_models,
     describe_pool_blockage,
     disable_account_model,

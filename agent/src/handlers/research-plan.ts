@@ -82,7 +82,7 @@ export function aggregateDirectionStats(
     const fb = h.filter_breakdown as Record<string, number> | undefined;
     if (!fb || typeof fb !== 'object') continue;
     for (const k of filterKeys) {
-      const v = (fb[k] as number) || 0;
+      const v = (fb[k]) || 0;
       if (v > 0) filterAgg[k] = (filterAgg[k] || 0) + v;
     }
   }
@@ -290,8 +290,8 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
         created: 0, merged: 0, cplxMSum: 0, cplxMN: 0, cplxFSum: 0, cplxFN: 0, expSum: 0, expN: 0, calIn: 0, calOut: 0,
       };
       const a = aggScope[scope];
-      a.created += (counts.created as number) || 0;
-      a.merged += (counts.merged as number) || 0;
+      a.created += (counts.created) || 0;
+      a.merged += (counts.merged) || 0;
       if (typeof counts.avg_complexity_merged === 'number') { a.cplxMSum += counts.avg_complexity_merged; a.cplxMN += 1; }
       if (typeof counts.avg_complexity_failed === 'number') { a.cplxFSum += counts.avg_complexity_failed; a.cplxFN += 1; }
       if (typeof counts.avg_expansion_ratio === 'number') { a.expSum += counts.avg_expansion_ratio; a.expN += 1; }
@@ -578,15 +578,15 @@ export function buildPortfolioComposition(
   const systemCounts: Record<string, number> = {};
   const ageFlags: string[] = [];
   for (const d of activeDirections) {
-    const rawCat = typeof d.category === 'string' ? (d.category as string) : '';
+    const rawCat = typeof d.category === 'string' ? (d.category) : '';
     const cat = ['product', 'structural', 'mixed'].includes(rawCat) ? rawCat : 'uncategorized';
     catCounts[cat] = (catCounts[cat] || 0) + 1;
-    const sys = typeof d.system_id === 'string' ? (d.system_id as string) : '';
+    const sys = typeof d.system_id === 'string' ? (d.system_id) : '';
     if (sys) systemCounts[sys] = (systemCounts[sys] || 0) + 1;
-    const cycles = typeof d.total_cycles === 'number' ? (d.total_cycles as number) : 0;
+    const cycles = typeof d.total_cycles === 'number' ? (d.total_cycles) : 0;
     if (cycles >= 10) {
-      const id = typeof d.id === 'string' ? (d.id as string) : '?';
-      const text = typeof d.text === 'string' ? (d.text as string).slice(0, 60) : '';
+      const id = typeof d.id === 'string' ? (d.id) : '?';
+      const text = typeof d.text === 'string' ? (d.text).slice(0, 60) : '';
       ageFlags.push(`${id} (${cycles} cycles): ${text}`);
     }
   }
@@ -603,7 +603,7 @@ export function buildPortfolioComposition(
   const mappedSystems = new Set(Object.keys(systemCounts));
   const allSystems = systems.filter(s => typeof s.id === 'string').map(s => ({
     id: s.id as string,
-    name: typeof s.name === 'string' ? (s.name as string) : (s.id as string),
+    name: typeof s.name === 'string' ? (s.name) : (s.id as string),
   }));
   const uncovered = allSystems.filter(s => !mappedSystems.has(s.id));
   if (allSystems.length > 0) {
@@ -879,8 +879,8 @@ ${hotspotsSection}
         // Show failed approaches and open questions in full (high-signal steering).
         // Summarize established findings as a count to inform without anchoring scope.
         let researchCtx = '';
-        if (typeof d.research_context === 'string' && (d.research_context as string).length > 0) {
-          const sections = parseResearchContext(d.research_context as string);
+        if (typeof d.research_context === 'string' && (d.research_context).length > 0) {
+          const sections = parseResearchContext(d.research_context);
           const ctxParts: string[] = [];
           if (sections.established.length > 0) {
             const merged = sections.established.filter(s => /\(merged\)/i.test(s));
@@ -1119,7 +1119,7 @@ ${hotspotsSection}
       }
       if (overall) {
         const sr = typeof overall.success_rate === 'number' ? Math.round(overall.success_rate * 100) : '?';
-        const productRatioStr = typeof overall.product_ratio === 'number' ? `, product ratio: ${Math.round((overall.product_ratio as number) * 100)}%` : '';
+        const productRatioStr = typeof overall.product_ratio === 'number' ? `, product ratio: ${Math.round((overall.product_ratio) * 100)}%` : '';
         lines.push(`Overall: ${overall.cycles || 0} cycles, ${overall.merged || 0} merged, ${overall.failed || 0} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')}${productRatioStr})`);
       }
 
@@ -1145,7 +1145,7 @@ ${hotspotsSection}
           const typeDist = d.type_distribution as Record<string, number> | undefined;
           if (typeDist && Object.keys(typeDist).length > 0) {
             const typeParts = Object.entries(typeDist).sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c} ${t}`);
-            const productRatio = typeof d.product_ratio === 'number' ? ` (${Math.round((d.product_ratio as number) * 100)}% product)` : '';
+            const productRatio = typeof d.product_ratio === 'number' ? ` (${Math.round((d.product_ratio) * 100)}% product)` : '';
             lines.push(`Type mix: ${typeParts.join(', ')}${productRatio}`);
           }
 
@@ -1188,7 +1188,7 @@ ${hotspotsSection}
         ? recentInterventions.per_direction_delta as Array<Record<string, unknown>>
         : [];
       const hoursSinceLast = typeof recentInterventions.hours_since_last_strategic === 'number'
-        ? recentInterventions.hours_since_last_strategic as number
+        ? recentInterventions.hours_since_last_strategic
         : null;
 
       // Clock header: answer "since I last ran, what's happened?" before anything else.
@@ -1200,7 +1200,7 @@ ${hotspotsSection}
         const finishedSince = typeof sinceLast.finished === 'number' ? sinceLast.finished
           : typeof sinceLast.created === 'number' ? sinceLast.created : 0;
         const spawnedSince = typeof sinceLast.spawned === 'number' ? sinceLast.spawned : null;
-        const rateSince = typeof sinceLast.merge_rate === 'number' ? `${Math.round((sinceLast.merge_rate as number) * 100)}%` : 'n/a';
+        const rateSince = typeof sinceLast.merge_rate === 'number' ? `${Math.round((sinceLast.merge_rate) * 100)}%` : 'n/a';
         const spawnNote = spawnedSince != null && spawnedSince !== finishedSince
           ? ` (${spawnedSince} spawned, some still in flight)`
           : '';
@@ -1244,7 +1244,7 @@ ${hotspotsSection}
               : typeof r.created === 'number' ? r.created : 0;
             const merged = typeof r.merged === 'number' ? r.merged : 0;
             const spawned = typeof r.spawned === 'number' ? r.spawned : null;
-            const rate = typeof r.merge_rate === 'number' ? `${Math.round((r.merge_rate as number) * 100)}%` : 'n/a';
+            const rate = typeof r.merge_rate === 'number' ? `${Math.round((r.merge_rate) * 100)}%` : 'n/a';
             const spawnTail = spawned != null && spawned !== finished ? `, ${spawned} spawned` : '';
             lines.push(`  ${w}: ${merged}/${finished} merged (${rate}${spawnTail})`);
           }
@@ -1362,8 +1362,8 @@ ${hotspotsSection}
 
           // Research context: show established findings count, failed approaches, open questions
           let ctxSection = '';
-          if (typeof d.research_context === 'string' && (d.research_context as string).length > 0) {
-            const sections = parseResearchContext(d.research_context as string);
+          if (typeof d.research_context === 'string' && (d.research_context).length > 0) {
+            const sections = parseResearchContext(d.research_context);
             const ctxParts: string[] = [];
             if (sections.established.length > 0) {
               const confirmed = sections.established.filter(s => s.includes('(confirmed)'));
@@ -1573,7 +1573,7 @@ echo ""
 
     // ── Running context from prior cycles (design doc notes/strategic-context) ──
     const strategicContext = designDoc
-      ? strVal((designDoc as Record<string, unknown>)['notes/strategic-context'])
+      ? strVal((designDoc)['notes/strategic-context'])
       : '';
 
     // ── Problem model + running update + self-reflection rendering ──
@@ -1585,7 +1585,7 @@ echo ""
       : '';
 
     const runningUpdateDoc = typeof payload.running_update === 'string'
-      ? payload.running_update as string
+      ? payload.running_update
       : '';
     const runningUpdateAckAt = strVal(payload.running_update_acknowledged_at);
     const userLastActiveAt = strVal(payload.user_last_active_at);

@@ -369,7 +369,6 @@ class TestZoneHealthRestoreDeque:
     def _restore_zone_health(self, zone_health_state: dict) -> None:
         """Simulate the startup restore logic from main.py lifespan."""
         from collections import deque as _deque
-        from datetime import timezone as tz
 
         compute._zone_health.clear()
         for zone, data in zone_health_state.items():

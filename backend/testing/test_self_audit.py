@@ -16,7 +16,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
-    Project, ProjectMember, SystemMaturity, Task, TaskStatus,
+    ProjectMember, SystemMaturity, Task, TaskStatus,
 )
 from app.self_audit_dispatch import _should_dispatch_self_audit
 from app.task_completion import (

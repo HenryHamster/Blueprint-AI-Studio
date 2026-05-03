@@ -1,35 +1,29 @@
-import copy
-import hashlib
 import hmac
-import ipaddress
 import json
 import logging
 import os
-import random
 import re
 import time
 import uuid
 import asyncio
-from collections import OrderedDict, deque
-from datetime import datetime, timedelta, timezone
+from collections import deque
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Literal, Optional
-from fastapi import FastAPI, Depends, HTTPException, Header, BackgroundTasks, Request, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
+from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func as _func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
-from app.database import init_db, get_session, AsyncSessionLocal, engine
-from app.models import Project, ProjectMember, Task, Artifact, TaskHistory, ProjectStatus, TaskStatus, ArtifactType, UserIntegration, AllowedUser, MaxPlanAccount, DeploymentState, DeploymentStatus, Alert, AlertSeverity, ProjectMessage, MessageType
-from app.compute import provision_agent_vm, delete_agent_vm, cleanup_orphaned_vms, get_provision_error, get_vm_zone, reconcile_orphaned_secrets, any_zone_available, soonest_zone_recovery
-from app.storage import upload_json_payload
-from app.secrets_manager import store_user_secret, get_user_secret
-from app.auth import get_current_user, verify_agent_jwt, create_agent_token, create_ws_ticket, verify_ws_ticket
+from app.database import get_session, AsyncSessionLocal, engine
+from app.models import Project, Task, TaskStatus, DeploymentState, DeploymentStatus, Alert, AlertSeverity, ProjectMessage, MessageType
+from app.compute import delete_agent_vm
+from app.auth import get_current_user, verify_agent_jwt
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
@@ -38,7 +32,7 @@ from app.routers.admin_debug import router as admin_debug_router
 from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
 from app.routers.admin_project_config import router as admin_project_config_router
 from app.routers.agent import router as agent_router
-from app.routers.agent import verify_agent_token, get_github_token_for_task, invalidate_github_token_cache, _github_token_cache, _has_local_cycle
+from app.routers.agent import verify_agent_token
 from app.routers.agent_credentials import router as agent_credentials_router
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
@@ -54,32 +48,11 @@ from app.routers.admin_orchestrator_errors import router as admin_orchestrator_e
 from app.routers.admin_scope_measurement import router as admin_scope_measurement_router
 from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
-from app.security import scan_pr_for_injection
-from app.github import (
-    validate_fine_grained_pat,
-    generate_installation_access_token,
-    GITHUB_WEBHOOK_SECRET,
-    GITHUB_CLIENT_ID,
-    exchange_oauth_code,
-    get_user_installations,
-    get_github_user,
-    create_pr_comment,
-    create_branch,
-    get_branch_sha,
-    delete_branch,
-    create_pull_request,
-    merge_pull_request,
-    get_pull_request,
-    get_pr_files,
-    close_github_client,
-)
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
-from app.task_lifecycle import _process_post_commit
-from app.rollup_management import _check_and_trigger_rollup
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -115,7 +88,6 @@ from app.strategic_constants import (  # noqa: E402
     STRATEGIC_NOTES_HISTORY_MAX,
     STRATEGIC_MESSAGE_CONTENT_MAX,
     STRATEGIC_RESOLUTION_MAX,
-    STATUS_LATEST_MESSAGE_MAX,
 )
 
 # Expected schema revision — must match the latest alembic migration.
@@ -135,18 +107,9 @@ _GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
 # Pool state and logic extracted to max_plan_pool.py. Re-exported here for
 # backward compatibility with callers that import from app.main.
 from app.max_plan_pool import (  # noqa: E402
-    _max_plan_pools,
     _account_by_id,
     _max_plan_pool_lock,
-    _pending_rl_persists,
-    RATE_LIMIT_PATTERNS,
     _all_accounts,
-    load_max_plan_pool,
-    _account_available_for_model,
-    _extract_task_model,
-    select_max_plan_account,
-    release_max_plan_account,
-    recheck_disabled_accounts,
 )
 
 # --- Deployment State Management ---
@@ -1391,10 +1354,6 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
 )
 
-from app.schemas import (
-    DeployPayload,
-    AgentStatusPayload,
-)
 
 @app.get("/")
 def read_root():
@@ -1479,64 +1438,14 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     finally:
         manager.remove_ip(websocket)
 
-from app.task_completion import (  # noqa: E402 — re-exports for backward compatibility
-    _parse_plan_output,
-    _extract_json_array,
-    _validate_plan_dependencies,
-    _log_file_overlaps,
-    _inject_file_overlap_deps,
-    _ensure_branch,
-    _handle_plan_completion,
-    _handle_security_audit_completion,
-    _handle_perf_completion,
-    _handle_investigation_completion,
-    _handle_design_doc_completion,
-    _compute_first_attempt_succeeded,
-    TASK_PRIORITY_MAP,
-)
 
-from app.anomaly_detection import (  # noqa: E402
-    _normalize_error_message,
-    _error_fingerprint,
-    _compute_research_anomalies,
-    _check_anomaly_proposals,
-    _expire_stale_proposals,
-)
 
-from app.research_completion import (  # noqa: E402
-    _compute_momentum_factor,
-    _update_cycle_history,
-    _compute_saturation,
-    _parse_research_findings,
-    _parse_research_insights,
-    _handle_research_completion,
-)
 
-from app.research_context import (  # noqa: E402
-    _parse_research_context,
-    _parse_eviction_counts,
-    _format_eviction_body,
-    _build_research_context,
-)
 
 from app.strategic_completion import (  # noqa: E402
-    _check_direction_health,
-    _check_direction_completion,
-    _is_direction_duplicate,
-    _handle_strategic_completion,
     _normalize_recommended_mode,
 )
 
-from app.deploy_health import (  # noqa: E402 — re-exports for backward compatibility
-    should_rollback,
-    _get_deploy_state_for_update,
-    _check_monitoring_window,
-    _check_external_health,
-    _create_auto_pause_alerts,
-    _create_auto_resume_alerts,
-    _check_pause_mode,
-    broadcast_deploy_state,
-)
 
 from app.task_locking import lock_project_or_429 as _lock_project_or_429  # noqa: E402, F401
 # Backward-compat re-export. Canonical home is ``app.task_locking`` (Phase A1).

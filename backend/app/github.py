@@ -671,7 +671,6 @@ async def create_check_run(
     Uses the Checks API (POST /repos/{owner}/{repo}/check-runs).
     Requires a GitHub App token with checks:write permission.
     """
-    import datetime as _dt
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -721,7 +720,6 @@ async def update_check_run(
         path, start_line, end_line, annotation_level ('notice'|'warning'|'failure'),
         message.  GitHub caps annotations at 50 per request.
     """
-    import datetime as _dt
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -1321,7 +1319,7 @@ async def create_pull_request(
         logger.error(f"Failed to create pull request (401 Unauthorized): {response.text}")
         raise HTTPException(
             status_code=401,
-            detail=f"GitHub authentication failed (401 Unauthorized) — token may be expired or revoked"
+            detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked"
         )
     logger.error(f"Failed to create pull request ({response.status_code}): {response.text}")
     raise HTTPException(
@@ -1345,7 +1343,7 @@ async def get_pull_request(
         headers, project_id=project_id,
     )
     if response.status_code == 401:
-        raise HTTPException(status_code=401, detail=f"GitHub authentication failed (401 Unauthorized) — token may be expired or revoked")
+        raise HTTPException(status_code=401, detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked")
     if response.status_code in (404, 410):
         raise HTTPException(status_code=response.status_code, detail=f"PR #{pr_number} not found or repo gone")
     if response.status_code != 200:

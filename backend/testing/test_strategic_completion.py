@@ -35,7 +35,7 @@ from app.strategic_completion import (
     _RETIRED_NOTE_PREFIX,
 )
 from app.strategic_spawning import _build_previous_decision_outcomes
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1545,7 +1545,6 @@ async def test_direction_create_rejected_when_success_evidence_missing(db_sessio
 @pytest.mark.asyncio
 async def test_legacy_direction_without_structured_fields_loads(db_session, mocker):
     """Directions that pre-date structured fields (no context key) still load and read correctly."""
-    from app.strategic_completion import _handle_strategic_completion
 
     legacy_dir = {
         "id": "d-legacy01",

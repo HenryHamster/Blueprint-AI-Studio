@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 

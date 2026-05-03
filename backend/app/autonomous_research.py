@@ -53,7 +53,6 @@ from app.self_audit_dispatch import (  # noqa: E402, F401 — re-export
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert
-    from app.task_lifecycle import _increment_research_spawn_count
     from app.research_completion import _compute_momentum_factor, _compute_productivity_score, _compute_acceptance_rate
     from app.direction_metrics import _compute_direction_quality_score, _compute_difficulty_index
     from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions
@@ -1656,8 +1655,8 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
     Returns the number of tasks spawned (0 or 1).
     """
     from app.failure_classification import get_top_residual_fingerprints
-    from app.models import ResidualCaseStatus, ResidualRemediationCase, ResidualRemediationCaseStatus
-    from sqlalchemy import func, select
+    from app.models import ResidualCaseStatus, ResidualRemediationCase
+    from sqlalchemy import select
 
     fingerprints = get_top_residual_fingerprints(window_seconds=86400, top_n=10)
     if not fingerprints:

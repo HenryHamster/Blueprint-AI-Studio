@@ -27,9 +27,7 @@ from app.models import (
     DIAGNOSIS_IN_PROGRESS_KEY,
     DIAGNOSIS_STARTED_AT_KEY,
     DIAGNOSIS_TASK_ID_KEY,
-    MessageType,
     Project,
-    ProjectMessage,
     RECOMMENDED_MODE_META_KEY,
     RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
     RECOMMENDED_MODE_SOURCE_STRATEGIC,
@@ -40,11 +38,6 @@ from app.models import (
 )
 from app.plan_completion import (
     TASK_PRIORITY_MAP,
-    _handle_plan_completion,
-    _inject_file_overlap_deps,
-    _log_file_overlaps,
-    _parse_plan_output,
-    _validate_plan_dependencies,
 )
 from app.research_context import _build_research_context
 from app.routers.agent import get_github_token_for_task

@@ -1054,7 +1054,6 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(db_session:
 async def test_merged_preserves_recovery_attempts_for_future_backoff(db_session: AsyncSession):
     """Merging an auto-fix must not reset recovery_attempts; the next suspension
     cycle needs the prior attempt count so exponential backoff escalates."""
-    from sqlalchemy.orm.attributes import flag_modified
     from app.notification_dispatch import post_auto_fix_result_message
 
     # Branch was suspended, auto-recovered once (recovery_attempts=1), fix just merged.

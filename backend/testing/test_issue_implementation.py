@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import Project, ProjectMessage, Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.issue_implementation import (
     _handle_issue_implementation_inner,
     _extract_issue_context,

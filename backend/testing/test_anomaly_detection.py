@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.anomaly_detection import _compute_research_anomalies
 from app.failure_classification import classify_failure
-from app.models import Task, TaskStatus, Project
+from app.models import TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
 

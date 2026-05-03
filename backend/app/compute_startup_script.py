@@ -61,7 +61,7 @@ def build_agent_startup_script(
         # previous stage's stderr (e.g. a curl -v or an oauth refresh
         # rejection) could otherwise embed a Bearer token, an Anthropic
         # API key, or an unrelated JWT in the heartbeat payload.
-        err_excerpt="$(printf '%s' "$LAST_STAGE_STDERR" | tr '\n' ' ' | tr '"' "'" | sed -E -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]+/Authorization: [REDACTED]/g' -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9._-]+/Bearer [REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED-ANT-KEY]/g' -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' | head -c 400)"
+        err_excerpt="$(printf '%s' "$LAST_STAGE_STDERR" | tr '\n' ' ' | tr '"' "'" | sed -E -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]+/Authorization: [REDACTED]/g' -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9._-]+/Bearer [REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED-ANT-KEY]/g' -e 's/eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' | head -c 400)"
         # Sanitize cmd + stack for JSON: strip quotes/newlines, cap length.
         local cmd_clean stack_clean
         cmd_clean="$(printf '%s' "$cmd" | tr '\n\t' '  ' | tr '"' "'" | head -c 200)"
@@ -279,7 +279,7 @@ def build_agent_startup_script(
       echo "Agent service did not stay healthy through the 45s settle window — capturing journal for diagnostics"
       # Same scrub as _report_failure — agent-side accidental log of a
       # bearer token / API key would otherwise land in the heartbeat.
-      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | sed -E -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]+/Authorization: [REDACTED]/g' -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9._-]+/Bearer [REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED-ANT-KEY]/g' -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' | tail -c 3000 || echo 'no journal')"
+      SERVICE_LOG="$(journalctl -u blueprint-agent --no-pager -n 50 2>/dev/null | tr '"' "'" | tr '\\n' ' ' | sed -E -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]]+/Authorization: [REDACTED]/g' -e 's/[Bb]earer[[:space:]]+[A-Za-z0-9._-]+/Bearer [REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED-ANT-KEY]/g' -e 's/eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/[REDACTED-JWT]/g' | tail -c 3000 || echo 'no journal')"
       EXIT_STATUS="$(systemctl show blueprint-agent --property=ExecMainStatus --value 2>/dev/null || echo '?')"
       EXIT_CODE="$(systemctl show blueprint-agent --property=ExecMainCode --value 2>/dev/null || echo '?')"
       curl -sf -X POST "$ORCH_URL/api/agent/heartbeat" \

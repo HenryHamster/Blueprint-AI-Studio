@@ -7,11 +7,9 @@ import pytest
 
 import app.notification_dispatch as nd
 from app.notification_dispatch import (
-    _PERMANENT_FAILURE_CODES,
     _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
     _RETRY_DELAYS,
     _RetryEntry,
-    _retry_queue,
     dispatch_external_notification,
     get_notification_stats,
     is_residual_remediation_task,

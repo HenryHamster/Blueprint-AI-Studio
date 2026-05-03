@@ -9,11 +9,11 @@ Run with: bash scripts/test-backend.sh testing/test_pipeline_health.py
 import uuid
 import pytest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from app.routers.admin_digest import compute_pipeline_health_summary
 from app.routers.admin_scope_measurement import _compute_scope_baselines, _compute_medium_scope_measurement, _compute_first_attempt_measurement
-from app.models import Task, TaskStatus, Project
+from app.models import TaskStatus
 from testing.factories import make_task, make_project, _utcnow
 
 
@@ -1615,7 +1615,6 @@ def test_scope_baselines_lookback_days_preserved_in_response():
 
 def test_scope_baselines_week_key_is_monday():
     """The 'week' key in each series entry corresponds to the Monday of that ISO week."""
-    from datetime import date as _date
     now = _utcnow()
     project_id = uuid.uuid4()
     # Use a known date: find the Monday of the current week

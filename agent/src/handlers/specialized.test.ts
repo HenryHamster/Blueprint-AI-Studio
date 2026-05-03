@@ -123,7 +123,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(JSON.stringify(findings));
     expect(call.artifact_type).toBe('SECURITY_REPORT');
   });
@@ -135,7 +135,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(lastResultText);
   });
 
@@ -147,7 +147,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(jsonBlock);
   });
 
@@ -161,7 +161,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe('plain text result');
   });
 
@@ -175,7 +175,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe('no json content');
   });
 
@@ -185,7 +185,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('SECURITY_REPORT');
   });
@@ -196,7 +196,7 @@ describe('handleSecurityAudit — JSON extraction fallback', () => {
 
     await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
@@ -215,7 +215,7 @@ describe('handlePerf — JSON extraction fallback', () => {
 
     await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(JSON.stringify(findings));
     expect(call.artifact_type).toBe('PERF_REPORT');
   });
@@ -227,7 +227,7 @@ describe('handlePerf — JSON extraction fallback', () => {
 
     await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(lastResultText);
   });
 
@@ -239,7 +239,7 @@ describe('handlePerf — JSON extraction fallback', () => {
 
     await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.logs).toBe(jsonBlock);
   });
 
@@ -248,7 +248,7 @@ describe('handlePerf — JSON extraction fallback', () => {
 
     await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('PERF_REPORT');
   });
@@ -259,7 +259,7 @@ describe('handlePerf — JSON extraction fallback', () => {
 
     await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
@@ -278,7 +278,7 @@ describe('handleSmoketest — URL health checks', () => {
 
     await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
   });
@@ -289,7 +289,7 @@ describe('handleSmoketest — URL health checks', () => {
 
     await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
   });
@@ -306,7 +306,7 @@ describe('handleSmoketest — URL health checks', () => {
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     const stored = JSON.parse(call.logs as string) as { passed: boolean; tests: Array<{ name: string; status: string }> };
     expect(stored.passed).toBe(true);
     expect(stored.tests).toHaveLength(1);
@@ -334,7 +334,7 @@ describe('handleSmoketest — URL health checks', () => {
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     const stored = JSON.parse(call.logs as string) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> };
     expect(stored.passed).toBe(false);
     expect(stored.tests[0].status).toBe('fail');
@@ -347,7 +347,7 @@ describe('handleSmoketest — URL health checks', () => {
 
     await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
@@ -371,7 +371,7 @@ describe('handleDebug — report reading and status mapping', () => {
 
     await handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('DEBUG_RESULT');
     expect(call.logs).toBe(JSON.stringify(debugResult));
@@ -383,7 +383,7 @@ describe('handleDebug — report reading and status mapping', () => {
 
     await handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
@@ -409,7 +409,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
     expect(call.logs).toBe(JSON.stringify(investigationResult));
@@ -421,7 +421,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('parse_failed');
   });
@@ -444,7 +444,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
     expect(call.logs).toBe(JSON.stringify(recovered));
@@ -469,7 +469,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('INVESTIGATION_REPORT');
     expect(call.logs).toBe(JSON.stringify(recovered));
@@ -490,7 +490,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('parse_failed');
   });
@@ -506,7 +506,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('parse_failed');
   });
@@ -517,7 +517,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
 
     await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
@@ -553,7 +553,7 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('PULL_REQUEST');
     expect(call.pr_url).toBe('https://github.com/owner/repo/pull/99');
@@ -593,7 +593,7 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
 
     // Must not have pushed --delete when refusing
     const deleteCall = vi.mocked(git).mock.calls.find(c => {
-      const a = c[0] as string[];
+      const a = c[0];
       return a[0] === 'push' && a.includes('--delete');
     });
     expect(deleteCall).toBeUndefined();
@@ -614,12 +614,12 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
     );
 
     const deleteCall = vi.mocked(git).mock.calls.find(c => {
-      const a = c[0] as string[];
+      const a = c[0];
       return a[0] === 'push' && a.includes('--delete');
     });
     expect(deleteCall).toBeDefined();
     // No changes were generated (default git mock returns '') → COMPLETED with "no changes" message
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.logs).toBe('No migration changes generated.');
   });
@@ -635,7 +635,7 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('claude_code_failed');
@@ -654,7 +654,7 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
       { ...BASE_PAYLOAD, prompt: 'Add column' },
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
-    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0] as string;
+    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(promptArg).toContain('EXPECTED_SCHEMA_REVISION');
     expect(promptArg).toContain('app/main.py');
   });
@@ -748,7 +748,7 @@ describe('handleSelfAudit — findings ingestion', () => {
 
     await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('SELF_AUDIT_REPORT');
     expect(call.logs).toBe(JSON.stringify(findings));
@@ -762,7 +762,7 @@ describe('handleSelfAudit — findings ingestion', () => {
 
     await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     // We re-stringify after parsing, so just verify the resulting JSON has the same shape
     const stored = JSON.parse(call.logs as string);
     expect(stored.findings).toHaveLength(1);
@@ -779,7 +779,7 @@ describe('handleSelfAudit — findings ingestion', () => {
 
     await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     const stored = JSON.parse(call.logs as string);
     expect(stored.findings).toHaveLength(1);
     expect(stored.findings[0].system_id).toBe('sys-y');
@@ -791,7 +791,7 @@ describe('handleSelfAudit — findings ingestion', () => {
 
     await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1] as Record<string, unknown>;
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
     expect(call.failure_category).toBe('claude_code_failed');
@@ -806,7 +806,7 @@ describe('handleSelfAudit — findings ingestion', () => {
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0] as string;
+    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(promptArg).toContain('sys-auth');
     expect(promptArg).toContain('sys-billing');
     expect(promptArg).toContain('Audit ONLY these systems');

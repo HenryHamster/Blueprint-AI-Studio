@@ -160,7 +160,7 @@ async def github_oauth_callback(
             # Can't even trust the state for a redirect URL here, use fallback
             fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
             return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
-        
+
         firebase_user_id = state_payload["sub"]
         admin_url = state_payload.get("admin_url") or os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
     except pyjwt.ExpiredSignatureError:
@@ -191,14 +191,14 @@ async def github_oauth_callback(
                 app_slug = app_info.get("slug")
                 if app_slug:
                     # Redirect to the app installation page
-                    # We pass the state along so the user might eventually come back? 
+                    # We pass the state along so the user might eventually come back?
                     # Actually GitHub App installation doesn't support state param in this way,
                     # but it will redirect back to the "Setup URL" configured in the App settings.
                     logger.info(f"[GITHUB OAUTH] No installations for user {firebase_user_id}, redirecting to app install: {app_slug}")
                     return RedirectResponse(url=f"https://github.com/apps/{app_slug}/installations/new")
             except Exception as app_err:
                 logger.warning(f"Failed to fetch app info for installation redirect: {app_err}")
-            
+
             return RedirectResponse(url=f"{admin_url}?github_error=no_installations")
 
         # Store the first installation ID; collect all account names for display.

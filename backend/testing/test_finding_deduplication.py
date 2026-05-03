@@ -3,7 +3,6 @@ import hashlib
 import uuid
 from datetime import datetime, timedelta
 
-import pytest
 
 from app.finding_deduplication import (
     CODE_ERROR_COOLDOWN,

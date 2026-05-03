@@ -8,7 +8,7 @@ and reset circuit breakers.
 import os
 import uuid
 import logging
-from typing import Optional, Dict, Any, List, TypedDict
+from typing import Optional, Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException

@@ -714,8 +714,8 @@ IMPORTANT:
     if (lastResultText && lastResultText.includes('"root_cause"')) {
       try {
         const res = extractJsonObjectDetailed(lastResultText, 'root_cause', 'recommended_fix');
-        if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
-          investigationResult = res.value as Record<string, unknown>;
+        if (res.ok && requiredFields.every(k => k in (res.value))) {
+          investigationResult = res.value;
           sendLog(ws, `[WARNING] Investigation JSON recovered from lastResultText transcript rather than file.\n`);
         }
       } catch (e) {
@@ -729,8 +729,8 @@ IMPORTANT:
     if (investigationResult === null) {
       try {
         const res = extractJsonObjectDetailed(allOutput, 'root_cause', 'recommended_fix');
-        if (res.ok && requiredFields.every(k => k in (res.value as Record<string, unknown>))) {
-          investigationResult = res.value as Record<string, unknown>;
+        if (res.ok && requiredFields.every(k => k in (res.value))) {
+          investigationResult = res.value;
           sendLog(ws, `[WARNING] Investigation JSON recovered from allOutput transcript rather than file.\n`);
         }
       } catch (e) {
@@ -791,7 +791,7 @@ export async function handleSelfAudit(
   const focusSystemsRaw = Array.isArray(payload.focus_systems) ? (payload.focus_systems as unknown[]) : [];
   const focusSystems = focusSystemsRaw.filter((s): s is string => typeof s === 'string' && s.length > 0);
   const maxSystemsRaw = typeof payload.max_systems === 'number' && Number.isFinite(payload.max_systems)
-    ? Math.floor(payload.max_systems as number)
+    ? Math.floor(payload.max_systems)
     : 3;
   const maxSystems = Math.max(1, Math.min(maxSystemsRaw, 10));
 
@@ -878,7 +878,7 @@ Rules:
     logs = sanitize(JSON.stringify(handlerOutput));
   } else {
     const haystack = (allOutput || '') + '\n' + (lastResultText || '');
-    const objExtract = extractJsonObjectDetailed<{ findings?: unknown[] }>(haystack, 'findings', 'system_id');
+    const objExtract = extractJsonObjectDetailed(haystack, 'findings', 'system_id');
     if (objExtract.ok) {
       logs = sanitize(JSON.stringify(objExtract.value));
     } else {

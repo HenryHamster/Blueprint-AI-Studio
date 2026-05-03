@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 from sqlalchemy import select
 from sqlalchemy.orm import load_only
 
-from app.models import Project, Task, TaskStatus
+from app.models import Task, TaskStatus
 from app.orchestrator import ACTIVE_TASKS_LIGHT_COLUMNS
 from app.orchestrator_filters import filter_migration_serialization
 from testing.factories import make_project, make_task

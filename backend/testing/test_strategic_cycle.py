@@ -5,8 +5,7 @@ real table.
 """
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 from sqlmodel import select

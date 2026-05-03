@@ -1,5 +1,5 @@
 """Tests for admin_orchestrator_errors recent-orchestrator-errors endpoint."""
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
