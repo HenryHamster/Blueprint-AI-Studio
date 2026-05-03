@@ -3,16 +3,16 @@ import fs from 'fs';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ./index.js entirely so that importing prompt.ts does NOT trigger main().
-vi.mock('./index.js', () => ({
-  sendLog: vi.fn(),
-  WORKSPACE: '/tmp/workspace',
-  // prompt.ts has its own local strVal; this export is only needed by callers
-  // that import strVal from index — not by prompt.ts itself.
-  strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
-  getAgentToken: vi.fn().mockReturnValue(''),
-  git: vi.fn().mockReturnValue(''),
-  sanitize: (s: string) => s,
-}));
+vi.mock('./index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./index.js')>();
+  return {
+    ...actual,
+    WORKSPACE: '/tmp/workspace',
+    sendLog: vi.fn(),
+    getAgentToken: vi.fn().mockReturnValue(''),
+    git: vi.fn().mockReturnValue(''),
+  };
+});
 
 vi.mock('fs', () => ({
   default: {
@@ -28,6 +28,7 @@ vi.mock('fs', () => ({
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  execFile: vi.fn(),
   spawn: vi.fn().mockReturnValue({
     stderr: { on: vi.fn() },
     stdout: { on: vi.fn() },

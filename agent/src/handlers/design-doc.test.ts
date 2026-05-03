@@ -1,33 +1,38 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
-vi.mock('../index.js', () => ({
-  WORKSPACE: '/tmp/workspace',
-  strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
-  sendLog: vi.fn(),
-  apiGet: vi.fn(),
-  persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
-  validateBranchName: vi.fn((b: string, _label: string) => b),
-  runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-  cloneWithRetry: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../index.js')>();
+  return {
+    ...actual,
+    WORKSPACE: '/tmp/workspace',
+    sendLog: vi.fn(),
+    apiGet: vi.fn(),
+    persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+    validateBranchName: vi.fn((b: string, _label: string) => b),
+    runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+    cloneWithRetry: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../prompt.js', () => ({
-  DEFAULT_TOOL_GUIDANCE: '',
-  FIRST_TASK_GUIDANCE: '',
-  readClaudeMd: vi.fn().mockReturnValue(''),
-  buildContextPrefix: vi.fn().mockReturnValue(''),
-  buildFileTree: vi.fn().mockReturnValue(''),
-  configureAgentPermissions: vi.fn().mockReturnValue([]),
-  writePlaybookHelper: vi.fn(),
-  writeMessagesHelper: vi.fn(),
-  excludeAgentHelpers: vi.fn(),
-  buildRetryContext: vi.fn().mockReturnValue(''),
-}));
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return {
+    ...actual,
+    readClaudeMd: vi.fn().mockReturnValue(''),
+    buildContextPrefix: vi.fn().mockReturnValue(''),
+    buildFileTree: vi.fn().mockReturnValue(''),
+    configureAgentPermissions: vi.fn().mockReturnValue([]),
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
+    excludeAgentHelpers: vi.fn(),
+    buildRetryContext: vi.fn().mockReturnValue(''),
+  };
+});
 
 vi.mock('fs', () => ({
   default: {
@@ -40,6 +45,7 @@ vi.mock('fs', () => ({
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  execFile: vi.fn(),
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────

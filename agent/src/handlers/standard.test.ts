@@ -1,63 +1,62 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
-vi.mock('../index.js', () => ({
-  WORKSPACE: '/tmp/workspace',
-  strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
-  sanitize: (s: string) => s,
-  sendLog: vi.fn(),
-  log: vi.fn(),
-  getAgentToken: vi.fn().mockReturnValue(''),
-  apiPost: vi.fn(),
-  apiGet: vi.fn(),
-  persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
-  readHandlerOutput: vi.fn(),
-  validateBranchName: vi.fn((b: string, _label: string) => b),
-  git: vi.fn().mockReturnValue(''),
-  gitCommit: vi.fn().mockReturnValue(true),
-  setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
-  pushAndCreatePR: vi.fn().mockResolvedValue('https://github.com/owner/repo/pull/1'),
-  runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-  matchesRateLimit: vi.fn().mockReturnValue(false),
-  lintFixLoop: vi.fn().mockResolvedValue(true),
-  testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
-  captureTestBaseline: vi.fn().mockResolvedValue(null),
-  condensedAnalysisSections: vi.fn((s: string) => s),
-  runProjectLintChecks: vi.fn(),
-  cloneWithRetry: vi.fn(),
-  sendHeartbeatSync: vi.fn(),
-  getProviderRunner: vi.fn().mockReturnValue({ displayName: 'Claude Code' }),
-}));
+vi.mock('../index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../index.js')>();
+  return {
+    ...actual,
+    WORKSPACE: '/tmp/workspace',
+    sanitize: (s: string) => s,
+    sendLog: vi.fn(),
+    log: vi.fn(),
+    getAgentToken: vi.fn().mockReturnValue(''),
+    apiPost: vi.fn(),
+    apiGet: vi.fn(),
+    persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+    readHandlerOutput: vi.fn(),
+    validateBranchName: vi.fn((b: string, _label: string) => b),
+    git: vi.fn().mockReturnValue(''),
+    gitCommit: vi.fn().mockReturnValue(true),
+    setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
+    pushAndCreatePR: vi.fn().mockResolvedValue('https://github.com/owner/repo/pull/1'),
+    runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+    matchesRateLimit: vi.fn().mockReturnValue(false),
+    lintFixLoop: vi.fn().mockResolvedValue(true),
+    testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
+    captureTestBaseline: vi.fn().mockResolvedValue(null),
+    condensedAnalysisSections: vi.fn((s: string) => s),
+    runProjectLintChecks: vi.fn(),
+    cloneWithRetry: vi.fn(),
+    sendHeartbeatSync: vi.fn(),
+    getProviderRunner: vi.fn().mockReturnValue({ displayName: 'Claude Code' }),
+  };
+});
 
-vi.mock('../prompt.js', () => ({
-  TASK_TYPE_HINTS: {},
-  getTaskTypeHints: vi.fn().mockReturnValue({}),
-  DEFAULT_TOOL_GUIDANCE: '',
-  PLAYBOOK_GUIDANCE: '',
-  FIRST_TASK_GUIDANCE: '',
-  SIZE_GUARDRAIL_GUIDANCE: '',
-  READ_THE_FAILURE_MESSAGE: '',
-  PRIOR_ATTEMPT_DIVERGENCE: '',
-  BEYOND_SCOPE_REPORTING: '',
-  readClaudeMd: vi.fn().mockReturnValue(''),
-  buildContextPrefix: vi.fn().mockReturnValue(''),
-  buildFileTree: vi.fn().mockReturnValue(''),
-  discoverRelatedTests: vi.fn().mockReturnValue(''),
-  discoverModuleInterfaces: vi.fn().mockReturnValue(''),
-  configureAgentPermissions: vi.fn().mockReturnValue([]),
-  writePlaybookHelper: vi.fn(),
-  writeMessagesHelper: vi.fn(),
-  formatPlaybook: vi.fn().mockReturnValue(''),
-  buildRetryContext: vi.fn().mockReturnValue(''),
-  buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
-  buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
-  parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
-  parseAnalysisPlanTestFiles: vi.fn().mockReturnValue([]),
-  parseAnalysisPlanVerifyFiles: vi.fn().mockReturnValue([]),
-  extractModuleInterfaces: vi.fn().mockReturnValue(''),
-  discoverAffectedConsumers: vi.fn().mockReturnValue(''),
-  getMandatoryChecks: vi.fn().mockReturnValue([]),
-}));
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return {
+    ...actual,
+    getTaskTypeHints: vi.fn().mockReturnValue({}),
+    readClaudeMd: vi.fn().mockReturnValue(''),
+    buildContextPrefix: vi.fn().mockReturnValue(''),
+    buildFileTree: vi.fn().mockReturnValue(''),
+    discoverRelatedTests: vi.fn().mockReturnValue(''),
+    discoverModuleInterfaces: vi.fn().mockReturnValue(''),
+    configureAgentPermissions: vi.fn().mockReturnValue([]),
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
+    formatPlaybook: vi.fn().mockReturnValue(''),
+    buildRetryContext: vi.fn().mockReturnValue(''),
+    buildSelfReviewPrompt: vi.fn().mockReturnValue('self-review-prompt'),
+    buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
+    parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
+    parseAnalysisPlanTestFiles: vi.fn().mockReturnValue([]),
+    parseAnalysisPlanVerifyFiles: vi.fn().mockReturnValue([]),
+    extractModuleInterfaces: vi.fn().mockReturnValue(''),
+    discoverAffectedConsumers: vi.fn().mockReturnValue(''),
+    getMandatoryChecks: vi.fn().mockReturnValue([]),
+  };
+});
 
 vi.mock('../build-config.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../build-config.js')>();
@@ -78,6 +77,8 @@ vi.mock('fs', () => ({
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  execFile: vi.fn(),
+  execSync: vi.fn().mockReturnValue(''),
   spawn: vi.fn().mockReturnValue({
     stderr: { on: vi.fn() },
     stdout: { on: vi.fn() },

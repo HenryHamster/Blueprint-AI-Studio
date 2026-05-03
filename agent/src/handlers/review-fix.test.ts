@@ -37,25 +37,22 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../prompt.js', () => ({
-  getTaskTypeHints: vi.fn().mockReturnValue({}),
-  PLAYBOOK_GUIDANCE: '',
-  FIRST_TASK_GUIDANCE: '',
-  DEFAULT_TOOL_GUIDANCE: '',
-  SIZE_GUARDRAIL_GUIDANCE: '',
-  READ_THE_FAILURE_MESSAGE: '',
-  PRIOR_ATTEMPT_DIVERGENCE: '',
-  BEYOND_SCOPE_REPORTING: '',
-  readClaudeMd: vi.fn().mockReturnValue(''),
-  formatProjectContext: vi.fn().mockReturnValue(''),
-  configureAgentPermissions: vi.fn().mockReturnValue([]),
-  writePlaybookHelper: vi.fn(),
-  writeMessagesHelper: vi.fn(),
-  formatPlaybook: vi.fn().mockReturnValue(''),
-  buildRetryContext: vi.fn().mockReturnValue(''),
-  discoverRelatedTests: vi.fn().mockReturnValue(''),
-  formatSelfReviewBlindSpots: vi.fn().mockReturnValue(''),
-}));
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return {
+    ...actual,
+    getTaskTypeHints: vi.fn().mockReturnValue({}),
+    readClaudeMd: vi.fn().mockReturnValue(''),
+    formatProjectContext: vi.fn().mockReturnValue(''),
+    configureAgentPermissions: vi.fn().mockReturnValue([]),
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
+    formatPlaybook: vi.fn().mockReturnValue(''),
+    buildRetryContext: vi.fn().mockReturnValue(''),
+    discoverRelatedTests: vi.fn().mockReturnValue(''),
+    formatSelfReviewBlindSpots: vi.fn().mockReturnValue(''),
+  };
+});
 
 vi.mock('../build-config.js', () => ({
   resolveBuildConfig: vi.fn().mockReturnValue({}),

@@ -3,27 +3,29 @@ import { vi, describe, it, expect } from 'vitest';
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ../index.js (the main agent runner) to prevent main() from executing
 // and to supply the named exports that handler files import at module level.
-vi.mock('../index.js', () => ({
-  WORKSPACE: '/tmp/workspace',
-  strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
-  sanitize: (s: string) => s,
-  sendLog: vi.fn(),
-  log: vi.fn(),
-  getAgentToken: vi.fn().mockReturnValue(''),
-  apiPost: vi.fn(),
-  apiGet: vi.fn(),
-  persistAndPostStatus: vi.fn(),
-  readHandlerOutput: vi.fn(),
-  validateBranchName: vi.fn((b: string, _label: string) => b),
-  git: vi.fn().mockReturnValue(''),
-  setupWorkspace: vi.fn(),
-  pushAndCreatePR: vi.fn(),
-  runClaudeCode: vi.fn(),
-  lintFixLoop: vi.fn(),
-  testFixLoop: vi.fn(),
-  cloneWithRetry: vi.fn(),
-  sendHeartbeatSync: vi.fn(),
-}));
+vi.mock('../index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../index.js')>();
+  return {
+    ...actual,
+    WORKSPACE: '/tmp/workspace',
+    sendLog: vi.fn(),
+    log: vi.fn(),
+    getAgentToken: vi.fn().mockReturnValue(''),
+    apiPost: vi.fn(),
+    apiGet: vi.fn(),
+    persistAndPostStatus: vi.fn(),
+    readHandlerOutput: vi.fn(),
+    validateBranchName: vi.fn((b: string, _label: string) => b),
+    git: vi.fn().mockReturnValue(''),
+    setupWorkspace: vi.fn(),
+    pushAndCreatePR: vi.fn(),
+    runClaudeCode: vi.fn(),
+    lintFixLoop: vi.fn(),
+    testFixLoop: vi.fn(),
+    cloneWithRetry: vi.fn(),
+    sendHeartbeatSync: vi.fn(),
+  };
+});
 
 vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
@@ -45,6 +47,7 @@ vi.mock('fs', () => ({
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  execFile: vi.fn(),
   spawn: vi.fn().mockReturnValue({
     stderr: { on: vi.fn() },
     stdout: { on: vi.fn() },
