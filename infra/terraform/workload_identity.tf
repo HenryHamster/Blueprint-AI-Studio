@@ -77,6 +77,19 @@ resource "google_project_iam_member" "github_actions_secret_accessor" {
   member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
 
+# List secrets — separate from secretAccessor (which only grants reading
+# values). The deploy.yml's "Verify GCP permissions" step calls
+# `gcloud secrets list` which requires `secretmanager.secrets.list`,
+# delivered by `roles/secretmanager.viewer`. Without this, the deploy
+# workflow fails at the permission-verification gate before any actual
+# deploy work runs.
+resource "google_project_iam_member" "github_actions_secret_viewer" {
+  count   = var.enable_cicd ? 1 : 0
+  project = var.project_id
+  role    = "roles/secretmanager.viewer"
+  member  = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
+}
+
 # Deploy to Firebase Hosting
 resource "google_project_iam_member" "github_actions_firebase_hosting" {
   count   = var.enable_cicd ? 1 : 0
