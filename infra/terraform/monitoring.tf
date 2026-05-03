@@ -241,7 +241,11 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
   conditions {
     display_name = "Any backup-failure event in 5 min"
     condition_threshold {
-      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.cloud_sql_backup_failure[0].name}\""
+      # Cloud Monitoring requires a `resource.type` restriction in the alert
+      # filter (the underlying log-based metric at `cloud_sql_backup_failure`
+      # already filters resource.type=cloudsql_database, so we mirror that
+      # restriction here to satisfy the API).
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.cloud_sql_backup_failure[0].name}\" AND resource.type=\"cloudsql_database\""
       duration        = "300s"
       comparison      = "COMPARISON_GT"
       threshold_value = 0
@@ -256,18 +260,19 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
   notification_channels = [google_monitoring_notification_channel.email[0].id]
 
   # R5-W3-C (audit 2026-04-30, audit-D M1): defense-in-depth against
-  # alert-burst spam. Even with the narrowed ERROR-only filter, a
-  # transient backup engine outage can emit several failure events in
-  # quick succession; without rate-limiting, each one re-pages the
-  # on-call. `auto_close` (30 min) ensures stale incidents close
+  # alert-burst spam. `auto_close` (30 min) ensures stale incidents close
   # automatically once the metric stops firing, so re-firing represents
-  # a NEW incident. `notification_rate_limit` (5 min) caps re-pages to
-  # one per 5-minute window per incident.
+  # a NEW incident.
+  #
+  # Note: notification_rate_limit was removed because GCP rejects it on
+  # non-log-based alert policies ("only log-based alert policies may
+  # specify a notification rate limit"). The rate limit was intended to
+  # cap re-pages during a transient backup-engine outage; in its absence,
+  # each ERROR event will fire a separate notification. Acceptable since
+  # backup failures are rare and the auto_close window keeps stale
+  # incidents from accumulating.
   alert_strategy {
     auto_close = "1800s"
-    notification_rate_limit {
-      period = "300s"
-    }
   }
 
   documentation {

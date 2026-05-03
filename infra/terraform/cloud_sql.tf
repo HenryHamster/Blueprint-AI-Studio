@@ -21,6 +21,14 @@ resource "random_password" "cloud_sql_db_password" {
   length           = 24
   special          = true
   override_special = "_-#"
+  # Cloud SQL's password_validation_policy requires all 4 character classes.
+  # Without these min_* enforcements, the random generator probabilistically
+  # produces all 4 at length=24 but not deterministically — when it doesn't,
+  # `google_sql_user.postgres` create fails with INVALID_PASSWORD.
+  min_lower   = 2
+  min_upper   = 2
+  min_numeric = 2
+  min_special = 2
 }
 
 resource "google_sql_database_instance" "default" {

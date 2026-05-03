@@ -324,7 +324,17 @@ urlencode() {
   # python process lifetime, visible to any local user with /proc read
   # access. Reading from stdin keeps the secret off argv entirely.
   # `rstrip("\n")` strips the trailing newline that bash <<< adds.
-  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().rstrip("\n"), safe=""))' <<< "$1"
+  #
+  # Use whichever python is available — on Windows `python3` doesn't
+  # exist by default; the binary is just `python`. Falls back through
+  # the common names so this works on Linux + Mac + Git-Bash.
+  local py_bin
+  if command -v python3 >/dev/null 2>&1; then py_bin=python3
+  elif command -v python >/dev/null 2>&1; then py_bin=python
+  elif command -v py >/dev/null 2>&1; then py_bin=py
+  else fail "No python interpreter found (tried python3, python, py)"
+  fi
+  "$py_bin" -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().rstrip("\n"), safe=""))' <<< "$1"
 }
 
 DB_PASSWORD=$(gcloud secrets versions access latest --secret="$DB_PW_SECRET" --project="$PROJECT_ID")
@@ -381,8 +391,15 @@ prompt_secret_or_skip() {
     read -r -p "  $name (or Enter to skip): " value
   fi
   if [[ -z "$value" ]]; then
-    echo -e "  ${YELLOW}Skipped: $name not created. Cloud Run boot will fail loudly when GitHub features are exercised.${NC}"
-    echo -e "  ${DIM}Re-run './setup.sh --phase2' to populate all GitHub secrets at once.${NC}"
+    # Cloud Run --set-secrets on cloudbuild.yaml validates that every named
+    # secret exists at deploy time. If we leave $name uncreated, the next
+    # `gcloud builds submit` step fails. Create a placeholder so deploy
+    # validates; orchestrator code will fail loudly at runtime when GitHub
+    # features are exercised, surfacing the unset state explicitly. Phase 2
+    # overwrites with the real value via gcloud secrets versions add.
+    echo -n "PLACEHOLDER_REPLACE_IN_PHASE2" | gcloud secrets create "$name" --data-file=- --project="$PROJECT_ID" --quiet
+    echo -e "  ${YELLOW}Skipped: $name set to placeholder. Cloud Run boot will fail loudly when GitHub features are exercised.${NC}"
+    echo -e "  ${DIM}Re-run './setup.sh --phase2' to populate all GitHub secrets with real values.${NC}"
     return 0
   fi
   echo -n "$value" | gcloud secrets create "$name" --data-file=- --project="$PROJECT_ID" --quiet
@@ -399,20 +416,19 @@ prompt_secret_or_skip "GITHUB_CLIENT_SECRET"  "GitHub OAuth client secret (Gener
 prompt_secret_or_skip "GITHUB_PRIVATE_KEY"    "GitHub App private key (paste full PEM contents)" "true"
 prompt_secret_or_skip "GITHUB_WEBHOOK_SECRET" "GitHub webhook secret (the value you set on the App)" "true"
 
-# ─── Build & Deploy Backend ─────────────────────────────────────────────────
-
-info "Building and deploying backend to Cloud Run..."
-cd backend
-# Wave F4 M6: pass _INITIAL_ADMIN_EMAIL through to cloudbuild.yaml so
-# orchestrator boot-seed code reads the operator email instead of a
-# hardcoded value.
-gcloud builds submit --config=cloudbuild.yaml \
-  --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
-  --project="$PROJECT_ID" --quiet
-cd ..
-ok "Backend deployed"
-
-# ─── Run Migrations ─────────────────────────────────────────────────────────
+# ─── Build → Migrate → Deploy ───────────────────────────────────────────────
+#
+# Order matters here. The orchestrator's lifespan startup queries AllowedUser
+# in `_seed_initial_admin` (see backend/app/lifecycle.py:28). If the table
+# doesn't exist, the container crashes before binding port 8080, so the
+# Cloud Run deploy times out with "container failed to start." Running
+# alembic migrations BEFORE the first deploy creates the schema so startup
+# succeeds.
+#
+# The cloudbuild.yaml file bundles build + push + deploy in one submit (used
+# by CI workflows where migrations aren't part of the deploy path). For the
+# initial-setup case here we split: build+push first (so the image exists for
+# the migration job), then migrate, then deploy.
 
 # Sanity check region
 if ! echo "$REGION" | grep -qE '^[a-z]+-[a-z]+[0-9]+$'; then
@@ -421,14 +437,20 @@ if ! echo "$REGION" | grep -qE '^[a-z]+-[a-z]+[0-9]+$'; then
   ZONE="${REGION}-a"
 fi
 
-info "Running database migrations (region: $REGION)..."
-MIGRATION_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/blueprint-repo/blueprint-orchestrator:latest"
+IMAGE_TAG="${REGION}-docker.pkg.dev/${PROJECT_ID}/blueprint-repo/blueprint-orchestrator:latest"
 
+info "Building and pushing backend image (no deploy yet)..."
+cd backend
+gcloud builds submit --tag="$IMAGE_TAG" --project="$PROJECT_ID" --quiet
+cd ..
+ok "Image built: $IMAGE_TAG"
+
+info "Running database migrations (region: $REGION)..."
 if gcloud run jobs describe run-migrations --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
-  gcloud run jobs update run-migrations --image="$MIGRATION_IMAGE" --region="$REGION" --project="$PROJECT_ID" --quiet
+  gcloud run jobs update run-migrations --image="$IMAGE_TAG" --region="$REGION" --project="$PROJECT_ID" --quiet
 else
   gcloud run jobs create run-migrations \
-    --image="$MIGRATION_IMAGE" --region="$REGION" \
+    --image="$IMAGE_TAG" --region="$REGION" \
     --service-account="$ORCHESTRATOR_SA" \
     --set-secrets="DATABASE_URL=DATABASE_URL:latest" \
     --vpc-egress=all-traffic --network=agent-sandbox-vpc --subnet=agent-sandbox-subnet \
@@ -438,6 +460,22 @@ fi
 
 gcloud run jobs execute run-migrations --region="$REGION" --project="$PROJECT_ID" --wait --quiet
 ok "Migrations complete"
+
+info "Deploying backend to Cloud Run..."
+# Mirrors cloudbuild.yaml's deploy step (kept inline so the bootstrap order
+# is build → migrate → deploy). Drift risk: if cloudbuild.yaml's env-var or
+# secret list changes, this needs updating too. Watchpoint: anyone who edits
+# cloudbuild.yaml should grep for "VM_PROVISIONING_MODEL" here.
+gcloud run deploy blueprint-orchestrator \
+  --image="$IMAGE_TAG" \
+  --region="$REGION" \
+  --service-account="$ORCHESTRATOR_SA" \
+  --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=${ZONE},VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@${PROJECT_ID}.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=${PROJECT_ID}-agent-artifacts,ALLOWED_ORIGINS=*,ORCHESTRATOR_URL=${ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-},VM_PROVISIONING_MODEL=SPOT,DISABLED_REGIONS=us-east1;us-east4;us-west1" \
+  --set-secrets="DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest" \
+  --no-cpu-throttling --cpu-boost \
+  --vpc-egress=all-traffic --network=agent-sandbox-vpc --subnet=agent-sandbox-subnet \
+  --project="$PROJECT_ID" --quiet
+ok "Backend deployed"
 
 # ─── Packer Agent Image ────────────────────────────────────────────────────
 

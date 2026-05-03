@@ -25,8 +25,13 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 target_metadata = SQLModel.metadata
 
-# Overwrite the sqlalchemy.url from alembic.ini with the one from the app
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+# Overwrite the sqlalchemy.url from alembic.ini with the one from the app.
+# Escape `%` → `%%` because configparser performs string interpolation when
+# the value is read back via get_main_option(). URL-encoded passwords (e.g.
+# `%23` for `#`) would otherwise raise "invalid interpolation syntax". This
+# is symmetric — get_main_option's interpolation pass collapses `%%` back to
+# `%`, so the engine sees the original URL unchanged.
+config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.

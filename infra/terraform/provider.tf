@@ -36,4 +36,11 @@ provider "google" {
   project = var.project_id
   region  = var.region
   zone    = var.zone
+
+  # Some Google APIs (Cloud Billing Budgets, Service Networking, others) reject
+  # ADC requests that don't specify a quota/billing project. user_project_override
+  # tells the provider to attribute every API call to var.project_id for quota
+  # purposes, fixing 403 "API requires a quota project" errors at apply time.
+  user_project_override = true
+  billing_project       = var.project_id
 }
