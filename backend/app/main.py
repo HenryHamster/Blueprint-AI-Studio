@@ -22,7 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session, AsyncSessionLocal, engine
 from app.models import Project, Task, TaskStatus, DeploymentState, DeploymentStatus, Alert, AlertSeverity, ProjectMessage, MessageType
-from app.compute import delete_agent_vm
+from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
 from app.auth import get_current_user, verify_agent_jwt
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
@@ -106,11 +106,22 @@ _GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
 
 # --- Max Plan Account Pool ---
 # Pool state and logic extracted to max_plan_pool.py. Re-exported here for
-# backward compatibility with callers that import from app.main.
-from app.max_plan_pool import (  # noqa: E402
+# backward compatibility with callers (orchestrator, tests) that import from
+# app.main. The 2026-05-03 ruff --fix sweep removed the public-API helpers
+# below as "unused" because main.py doesn't call them directly — but tests
+# patch them via app.main.X (see test_pipeline_reliability.py:105+) and
+# orchestrator code imports them via the same path. noqa: F401 pins them so
+# a future --fix can't repeat the regression.
+from app.max_plan_pool import (  # noqa: E402,F401
     _account_by_id,
     _max_plan_pool_lock,
     _all_accounts,
+    _max_plan_pools,
+    load_max_plan_pool,
+    _extract_task_model,
+    select_max_plan_account,
+    release_max_plan_account,
+    recheck_disabled_accounts,
 )
 
 # --- Deployment State Management ---

@@ -924,8 +924,18 @@ async def _process_direction_lifecycle(
                 # Spawn diagnosis research so the agent can investigate the failure
                 # pattern before the 48h cooldown elapses — skipped on auto-retire
                 # since a retired direction is terminal and has no future cycles.
+                #
+                # IMPORTANT: this is the AUTONOMOUS_RESEARCH version (research task,
+                # `research_mode=diagnosis`), NOT the local code-failure investigate
+                # variant defined at the top of this module. The two functions share
+                # the name `_spawn_direction_diagnosis` but spawn different task
+                # types (research vs investigate). 2026-05-03: a ruff --fix sweep
+                # removed the function-local import as F823 (shadowing) without
+                # noticing the override was load-bearing. Alias it locally to a
+                # different name to dodge F823 and keep the override clear.
                 try:
-                    if await _spawn_direction_diagnosis(project, d, pause_reason, session):
+                    from app.autonomous_research import _spawn_direction_diagnosis as _spawn_diagnosis_research
+                    if await _spawn_diagnosis_research(project, d, pause_reason, session):
                         d["diagnosis_spawned_at"] = _utcnow().isoformat()
                         directions_modified = True
                 except Exception as _e:
