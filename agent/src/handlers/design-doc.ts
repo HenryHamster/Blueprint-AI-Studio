@@ -71,8 +71,8 @@ export async function handleDesignDocUpdate(
     : [];
   const openMessagesText = openMessages.length > 0
     ? openMessages.map(m => {
-        const age = m.created_at ? (() => {
-          const d = parseBackendTimestamp(String(m.created_at));
+        const age = typeof m.created_at === 'string' ? (() => {
+          const d = parseBackendTimestamp(m.created_at);
           if (!d) return '?';
           const ms = Date.now() - d.getTime();
           const h = Math.floor(ms / 3600000);
@@ -119,48 +119,48 @@ export async function handleDesignDocUpdate(
 #   ./design-doc list                     — list all section keys
 
 OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
-KEY="\$2"
-VALUE="\$3"
+KEY="$2"
+VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
 CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
 
-if [ "\$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "\$TASK" | \\
-    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+if [ "$OP" = "list" ]; then
+  printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
+    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
       -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: \$TOKEN" \\
+      -H "X-Agent-Token: $TOKEN" \\
       --data-binary @-
-elif [ "\$OP" = "get" ]; then
-  if [ -z "\$KEY" ]; then
+elif [ "$OP" = "get" ]; then
+  if [ -z "$KEY" ]; then
     echo "Error: get requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"get","key":"%s"}' "\$TASK" "\$KEY" | \\
-    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | \\
+    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
       -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: \$TOKEN" \\
+      -H "X-Agent-Token: $TOKEN" \\
       --data-binary @-
-elif [ "\$OP" = "set" ]; then
-  if [ -z "\$KEY" ] || [ -z "\$VALUE" ]; then
+elif [ "$OP" = "set" ]; then
+  if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "\$TASK" "\$KEY" "\$VALUE" | \\
-    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE" | \\
+    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
       -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: \$TOKEN" \\
+      -H "X-Agent-Token: $TOKEN" \\
       --data-binary @-
-elif [ "\$OP" = "delete" ]; then
-  if [ -z "\$KEY" ]; then
+elif [ "$OP" = "delete" ]; then
+  if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"delete","key":"%s"}' "\$TASK" "\$KEY" | \\
-    curl \$CURL_OPTS -X POST "\$API/api/agent/design-doc" \\
+  printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY" | \\
+    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
       -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: \$TOKEN" \\
+      -H "X-Agent-Token: $TOKEN" \\
       --data-binary @-
 else
-  echo "Unknown op: \$OP. Use get, set, delete, or list." >&2; exit 1
+  echo "Unknown op: $OP. Use get, set, delete, or list." >&2; exit 1
 fi
 echo ""
 `;
@@ -252,7 +252,7 @@ Skip full re-analysis of systems with no files in the manifest.
       exitCode = retryResult.exitCode;
     }
   } catch (e) {
-    sendLog(ws, `[WARNING] Could not verify design doc API calls: ${e}\n`);
+    sendLog(ws, `[WARNING] Could not verify design doc API calls: ${String(e)}\n`);
   }
 
   // Completion — design doc was updated incrementally via API.

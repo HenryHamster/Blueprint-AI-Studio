@@ -22,8 +22,8 @@ import { parseBackendTimestamp } from '../utils/time.js';
 // ── Pure data transformation helpers (exported for testing) ─────────────────
 
 export function calcMessageAge(m: Record<string, unknown>): string {
-  if (!m.created_at) return '?';
-  const d = parseBackendTimestamp(String(m.created_at));
+  if (typeof m.created_at !== 'string') return '?';
+  const d = parseBackendTimestamp(m.created_at);
   if (!d) return '?';
   const ms = Date.now() - d.getTime();
   const h = Math.floor(ms / 3600000);
@@ -100,13 +100,13 @@ export function aggregateDirectionStats(
   // whether certain scopes/types land more reliably than others.
   const typeAgg: Record<string, {created: number; merged: number}> = {};
   for (const h of recent) {
-    const sb = h.scope_breakdown as Record<string, {created?: number; merged?: number}> | undefined;
+    const sb = h.scope_breakdown as Record<string, {created?: number; merged?: number} | undefined> | undefined;
     if (!sb || typeof sb !== 'object') continue;
     for (const [k, v] of Object.entries(sb)) {
       if (!v || typeof v !== 'object') continue;
-      if (!typeAgg[k]) typeAgg[k] = { created: 0, merged: 0 };
-      typeAgg[k].created += (v.created as number) || 0;
-      typeAgg[k].merged += (v.merged as number) || 0;
+      const agg = typeAgg[k] ?? (typeAgg[k] = { created: 0, merged: 0 });
+      agg.created += (v.created ?? 0);
+      agg.merged += (v.merged ?? 0);
     }
   }
   const typeKeys = Object.keys(typeAgg).filter(k => typeAgg[k].created > 0);
@@ -168,7 +168,7 @@ export function buildStrategicCompletionLogs(
 
 /** Maps raw agent-reported failure_category to a high-level failure class. */
 export function classifyFailureCategory(rawCat: string): string {
-  const CODE_ERROR_CATS: Record<string, true> = {
+  const CODE_ERROR_CATS: Record<string, true | undefined> = {
     build_failed: true, test_failed: true, lint_failed: true,
     claude_code_failed: true, parse_failed: true, fatal: true,
   };
@@ -281,15 +281,15 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
     expSum: number; expN: number;
     calIn: number; calOut: number;
   };
-  const aggScope: Record<string, ScopeAgg> = {};
+  const aggScope: Record<string, ScopeAgg | undefined> = {};
   for (const h of recent) {
-    const sb = h.scope_breakdown as Record<string, Record<string, number>> | undefined;
+    const sb = h.scope_breakdown as Record<string, Record<string, number> | undefined> | undefined;
     if (!sb || typeof sb !== 'object') continue;
     for (const [scope, counts] of Object.entries(sb)) {
-      if (!aggScope[scope]) aggScope[scope] = {
+      if (!counts) continue;
+      const a = aggScope[scope] ?? (aggScope[scope] = {
         created: 0, merged: 0, cplxMSum: 0, cplxMN: 0, cplxFSum: 0, cplxFN: 0, expSum: 0, expN: 0, calIn: 0, calOut: 0,
-      };
-      const a = aggScope[scope];
+      });
       a.created += (counts.created) || 0;
       a.merged += (counts.merged) || 0;
       if (typeof counts.avg_complexity_merged === 'number') { a.cplxMSum += counts.avg_complexity_merged; a.cplxMN += 1; }
@@ -777,7 +777,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
       ...(planProgress ? { analysis_plan: planProgress.slice(0, 5000) } : {}),
     });
   } catch (e) {
-    sendLog(ws, `[ERROR] Failed to post plan completion status: ${e}\n`);
+    sendLog(ws, `[ERROR] Failed to post plan completion status: ${String(e)}\n`);
   }
 }
 
@@ -976,7 +976,7 @@ ${hotspotsSection}
   let pipelineScopeRatesSection = '';
   const pipelineHealthForScope = projectCtx?.pipeline_health as Record<string, unknown> | null | undefined;
   const scopeConversionRates = pipelineHealthForScope?.scope_conversion_rates as
-    | Record<string, { current_rate: number | null; prev_rate: number | null; delta: number | null; trend: string | null }>
+    | Record<string, { current_rate: number | null; prev_rate: number | null; delta: number | null; trend: string | null } | undefined>
     | null
     | undefined;
   if (scopeConversionRates && Object.keys(scopeConversionRates).length > 0) {
@@ -1081,6 +1081,13 @@ ${hotspotsSection}
       systemMaturitySection = lines.join('\n');
     }
 
+    // Format an unknown scalar (number/string/bool) for embedding into a template literal.
+    const fmtScalar = (v: unknown, fallback = '?'): string => {
+      if (v === undefined || v === null) return fallback;
+      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+      return JSON.stringify(v);
+    };
+
     let driftSection = '';
     if (driftSignals) {
       const byDir = driftSignals.by_direction as Record<string, Record<string, unknown>> | undefined;
@@ -1093,11 +1100,11 @@ ${hotspotsSection}
         lines.push('Directions or systems where claimed changes significantly exceed merged PRs — a signal of over-optimistic task output or stalled work.');
         for (const [did, sig] of flaggedDirs) {
           const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
-          lines.push(`- Direction ${did}: claimed=${sig.claimed_changes_count}, merged=${sig.actually_merged_prs}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
+          lines.push(`- Direction ${did}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
         }
         for (const [sid, sig] of flaggedSys) {
           const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
-          lines.push(`- System ${sid}: claimed=${sig.claimed_changes_count}, merged=${sig.actually_merged_prs}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
+          lines.push(`- System ${sid}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
         }
         driftSection = lines.join('\n');
       }
@@ -1114,13 +1121,13 @@ ${hotspotsSection}
 
       const lines: string[] = [];
       if (window) {
-        lines.push(`# Outcome evaluation (since vision rev ${window.vision_revision || 0})`);
+        lines.push(`# Outcome evaluation (since vision rev ${fmtScalar(window.vision_revision, '0')})`);
         lines.push(`Window: ${strVal(window.from as string, '?')} to ${strVal(window.to as string, '?')}`);
       }
       if (overall) {
         const sr = typeof overall.success_rate === 'number' ? Math.round(overall.success_rate * 100) : '?';
         const productRatioStr = typeof overall.product_ratio === 'number' ? `, product ratio: ${Math.round((overall.product_ratio) * 100)}%` : '';
-        lines.push(`Overall: ${overall.cycles || 0} cycles, ${overall.merged || 0} merged, ${overall.failed || 0} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')}${productRatioStr})`);
+        lines.push(`Overall: ${fmtScalar(overall.cycles, '0')} cycles, ${fmtScalar(overall.merged, '0')} merged, ${fmtScalar(overall.failed, '0')} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')}${productRatioStr})`);
       }
 
       if (systems.length > 0) {
@@ -1129,7 +1136,7 @@ ${hotspotsSection}
         lines.push('Each vision system compared against actual direction outcomes:');
         for (const sys of systems) {
           const gap = (sys.directions_count as number) === 0 ? ' [NO DIRECTIONS MAPPED]' : '';
-          lines.push(`- ${strVal(sys.name as string)} (${strVal(sys.id as string)}): planned=${strVal(sys.planned_status as string)}, ${sys.directions_count || 0} directions, ${sys.merged || 0} merged, ${sys.failed || 0} failed${gap}`);
+          lines.push(`- ${strVal(sys.name as string)} (${strVal(sys.id as string)}): planned=${strVal(sys.planned_status as string)}, ${fmtScalar(sys.directions_count, '0')} directions, ${fmtScalar(sys.merged, '0')} merged, ${fmtScalar(sys.failed, '0')} failed${gap}`);
         }
       }
 
@@ -1140,7 +1147,7 @@ ${hotspotsSection}
         for (const d of dirOutcomes) {
           const sysTag = d.system_id ? ` (system: ${strVal(d.system_id as string)})` : '';
           lines.push(`\n### ${strVal(d.text as string)} (${strVal(d.id as string)})${sysTag} [${strVal(d.status as string)}]`);
-          lines.push(`Stats: ${d.cycles || 0} cycles, ${d.merged || 0} merged, ${d.failed || 0} failed`);
+          lines.push(`Stats: ${fmtScalar(d.cycles, '0')} cycles, ${fmtScalar(d.merged, '0')} merged, ${fmtScalar(d.failed, '0')} failed`);
 
           const typeDist = d.type_distribution as Record<string, number> | undefined;
           if (typeDist && Object.keys(typeDist).length > 0) {
@@ -1183,7 +1190,7 @@ ${hotspotsSection}
       const merges = Array.isArray(recentInterventions.merges)
         ? recentInterventions.merges as Array<Record<string, unknown>>
         : [];
-      const rollingRates = recentInterventions.rolling_rates as Record<string, Record<string, unknown>> | undefined;
+      const rollingRates = recentInterventions.rolling_rates as Record<string, Record<string, unknown> | undefined> | undefined;
       const perDirectionDelta = Array.isArray(recentInterventions.per_direction_delta)
         ? recentInterventions.per_direction_delta as Array<Record<string, unknown>>
         : [];
@@ -1279,7 +1286,7 @@ ${hotspotsSection}
           lines.push('\nRecent merges (newest first, with body when informative):');
           for (const m of merges) {
             const title = strVal(m.pr_title, '?').slice(0, 120);
-            const pr = m.pr_number ? `#${m.pr_number}` : '';
+            const pr = typeof m.pr_number === 'number' || typeof m.pr_number === 'string' ? `#${m.pr_number}` : '';
             const hoursAgo = typeof m.hours_ago === 'number' ? `${m.hours_ago}h ago` : '?';
             const dirText = strVal(m.direction_text, '').slice(0, 80);
             const dirTag = dirText ? ` [direction: ${dirText}]` : ' [no direction]';
@@ -1339,11 +1346,11 @@ ${hotspotsSection}
 
     const dirSummaryText = directionsSummary.length > 0
       ? directionsSummary.map((d, i) => {
-          const parts = [`${d.total_cycles || 0} cycles`];
-          if (d.prs_merged) parts.push(`${d.prs_merged} merged`);
+          const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
+          if (d.prs_merged) parts.push(`${fmtScalar(d.prs_merged)} merged`);
           if (d.tasks_failed) {
             const infraFailed = (d.tasks_failed_infra as number) || 0;
-            parts.push(infraFailed > 0 ? `${d.tasks_failed} failed (${infraFailed} infra)` : `${d.tasks_failed} failed`);
+            parts.push(infraFailed > 0 ? `${fmtScalar(d.tasks_failed)} failed (${infraFailed} infra)` : `${fmtScalar(d.tasks_failed)} failed`);
           }
           const satNote = d.possibly_saturated ? ' [SATURATED]' : '';
           const catNote = d.category ? ` [${strVal(d.category)}]` : '';
@@ -1420,47 +1427,47 @@ shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${taskId}"
-DATA="\$1"
+DATA="$1"
 
 _call() {
   local attempt=0
-  while [ \$attempt -lt 3 ]; do
+  while [ $attempt -lt 3 ]; do
     local response
-    response=\$(printf '{"task_id":"%s","op":"%s","data":%s}' "\$TASK" "\$1" "\$DATA" | \\
+    response=$(printf '{"task_id":"%s","op":"%s","data":%s}' "$TASK" "$1" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
-        -X POST "\$API/api/agent/strategic" \\
+        -X POST "$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
-        -H "X-Agent-Token: \$TOKEN" \\
+        -H "X-Agent-Token: $TOKEN" \\
         --data-binary @- \\
         -w '\n%{http_code}')
     local http_code
-    http_code=\$(printf '%s' "\$response" | tail -n1)
+    http_code=$(printf '%s' "$response" | tail -n1)
     local body
-    body=\$(printf '%s' "\$response" | head -n -1)
-    if [ "\$http_code" -ge 200 ] && [ "\$http_code" -lt 300 ]; then
-      printf '%s' "\$body"
+    body=$(printf '%s' "$response" | head -n -1)
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      printf '%s' "$body"
       return 0
     fi
-    if [ "\$http_code" -eq 409 ]; then
-      printf '%s' "\$body"
-      echo "[CONSTRAINT] \$1 rejected (HTTP 409)" >&2
+    if [ "$http_code" -eq 409 ]; then
+      printf '%s' "$body"
+      echo "[CONSTRAINT] $1 rejected (HTTP 409)" >&2
       return 0
     fi
-    attempt=\$((attempt + 1))
-    [ \$attempt -lt 3 ] && echo "[RETRY \$attempt/3] \$1 failed (HTTP \$http_code), retrying in 5s..." >&2 && sleep 5
+    attempt=$((attempt + 1))
+    [ $attempt -lt 3 ] && echo "[RETRY $attempt/3] $1 failed (HTTP $http_code), retrying in 5s..." >&2 && sleep 5
   done
-  echo "[ERROR] \$1 failed after 3 attempts" >&2
+  echo "[ERROR] $1 failed after 3 attempts" >&2
   return 1
 }
 
-case "\$OP" in
+case "$OP" in
   set-problem-model)    _call "set_problem_model" ;;
   set-running-update)
     # DATA is a path to the markdown file written by the Thinker. Wrap
     # the file contents as {markdown: "..."} before the usual body build.
-    FILE="\$DATA"
-    [ -f "\$FILE" ] || { echo "[ERROR] set-running-update: file not found: \$FILE" >&2; exit 1; }
-    DATA=\$(jq -Rs '{markdown: .}' < "\$FILE")
+    FILE="$DATA"
+    [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
+    DATA=$(jq -Rs '{markdown: .}' < "$FILE")
     _call "set_running_update"
     ;;
   reflect)              _call "reflect" ;;
@@ -1472,7 +1479,7 @@ case "\$OP" in
   create-message)       _call "create_message" ;;
   resolve-message)      _call "resolve_message" ;;
   spawn-task)           _call "spawn_task" ;;
-  *) echo "Unknown op: \$OP" >&2; exit 1 ;;
+  *) echo "Unknown op: $OP" >&2; exit 1 ;;
 esac
 echo ""
 `;
@@ -1495,18 +1502,18 @@ ID="\${2:?Usage: fetch direction|playbook|gap <id>}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${fetchProjectId}"
-[ -n "\$PROJECT" ] || { echo "[ERROR] no project_id available; fetch is only usable in strategic-mode tasks" >&2; exit 1; }
+[ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; fetch is only usable in strategic-mode tasks" >&2; exit 1; }
 
-case "\$KIND" in
-  direction)  PATH_SUFFIX="directions/\$ID" ;;
-  playbook)   PATH_SUFFIX="playbook/\$ID" ;;
-  gap)        PATH_SUFFIX="gaps/\$ID" ;;
-  *) echo "Unknown kind: \$KIND (use direction|playbook|gap)" >&2; exit 1 ;;
+case "$KIND" in
+  direction)  PATH_SUFFIX="directions/$ID" ;;
+  playbook)   PATH_SUFFIX="playbook/$ID" ;;
+  gap)        PATH_SUFFIX="gaps/$ID" ;;
+  *) echo "Unknown kind: $KIND (use direction|playbook|gap)" >&2; exit 1 ;;
 esac
 
 curl -sS --max-time 20 --connect-timeout 10 \\
-  -X GET "\$API/api/agent/projects/\$PROJECT/\$PATH_SUFFIX" \\
-  -H "X-Agent-Token: \$TOKEN"
+  -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
+  -H "X-Agent-Token: $TOKEN"
 echo ""
 `;
     fs.writeFileSync(`${WORKSPACE}/fetch`, fetchHelper, { mode: 0o755 });
@@ -1517,16 +1524,16 @@ echo ""
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
-KEY="\$2"
-VALUE="\$3"
-if [ "\$OP" = "list" ]; then
-  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
-elif [ "\$OP" = "get" ]; then
-  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"get\\", \\"key\\": \\"\$KEY\\"}"
-elif [ "\$OP" = "set" ]; then
-  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"\$KEY\\", \\"value\\": \$VALUE}"
-elif [ "\$OP" = "delete" ]; then
-  curl -f -X POST "\$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: \$TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"\$KEY\\"}"
+KEY="$2"
+VALUE="$3"
+if [ "$OP" = "list" ]; then
+  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
+elif [ "$OP" = "get" ]; then
+  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"get\\", \\"key\\": \\"$KEY\\"}"
+elif [ "$OP" = "set" ]; then
+  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"$KEY\\", \\"value\\": $VALUE}"
+elif [ "$OP" = "delete" ]; then
+  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"$KEY\\"}"
 fi
 echo ""
 `;
@@ -2016,7 +2023,7 @@ ${analysisText.slice(0, 50_000)}
         lastResultText = retryResult.lastResultText || lastResultText;
       }
     } catch (e) {
-      sendLog(ws, `[WARNING] Could not verify strategic required calls: ${e}\n`);
+      sendLog(ws, `[WARNING] Could not verify strategic required calls: ${String(e)}\n`);
     }
 
     // Post-check: verify direction operations were executed if thinker recommended them
@@ -2051,7 +2058,7 @@ ${analysisText.slice(0, 50_000)}
         lastResultText = retryResult.lastResultText || lastResultText;
       }
     } catch (e) {
-      sendLog(ws, `[WARNING] Could not verify strategic direction ops: ${e}\n`);
+      sendLog(ws, `[WARNING] Could not verify strategic direction ops: ${String(e)}\n`);
     }
 
     // Legacy: try to read /tmp output file when present (backward compat).
@@ -2080,7 +2087,7 @@ ${analysisText.slice(0, 50_000)}
         ...(strategicProgress ? { analysis_plan: strategicProgress.slice(0, 5000) } : {}),
       });
     } catch (e) {
-      sendLog(ws, `[ERROR] Failed to post strategic completion status: ${e}\n`);
+      sendLog(ws, `[ERROR] Failed to post strategic completion status: ${String(e)}\n`);
     }
     return;
   }
@@ -2128,7 +2135,9 @@ ${analysisText.slice(0, 50_000)}
   // Design doc: only include key listing + playbook. Full sections available via ./design-doc get <key>.
   let designDocSection = '';
   if (tacticalDesignDoc && Object.keys(tacticalDesignDoc).length > 0) {
-    const docKeys = (tacticalDesignDoc._keys as string[]) || Object.keys(tacticalDesignDoc).filter(k => !k.startsWith('_') && !k.startsWith('playbook/'));
+    const docKeys = Array.isArray(tacticalDesignDoc._keys)
+      ? tacticalDesignDoc._keys as string[]
+      : Object.keys(tacticalDesignDoc).filter(k => !k.startsWith('_') && !k.startsWith('playbook/'));
     const playbookEntries = Object.entries(tacticalDesignDoc)
       .filter(([k]) => k.startsWith('playbook/'))
       .map(([k, v]) => `- **${k.replace('playbook/', '')}**: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
@@ -2327,6 +2336,6 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
       ...(researchProgress ? { analysis_plan: researchProgress.slice(0, 5000) } : {}),
     });
   } catch (e) {
-    sendLog(ws, `[ERROR] Failed to post research completion status: ${e}\n`);
+    sendLog(ws, `[ERROR] Failed to post research completion status: ${String(e)}\n`);
   }
 }

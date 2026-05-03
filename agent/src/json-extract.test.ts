@@ -10,7 +10,7 @@ import {
 
 describe('extractJsonObject', () => {
   it('extracts a simple object with required keys', () => {
-    const result = extractJsonObject<{ a: number; b: string }>('{"a": 1, "b": "x"}', 'a', 'b');
+    const result = extractJsonObject('{"a": 1, "b": "x"}', 'a', 'b') as { a: number; b: string } | null;
     expect(result).toEqual({ a: 1, b: 'x' });
   });
 
@@ -30,7 +30,7 @@ describe('extractJsonObject', () => {
 
   it('tries the next candidate when the first contains required keys but is invalid JSON', () => {
     const text = '{"key": invalid} {"key": "good"}';
-    expect(extractJsonObject<{ key: string }>(text, 'key')).toEqual({ key: 'good' });
+    expect(extractJsonObject(text, 'key')).toEqual({ key: 'good' });
   });
 
   it('throws when required-key candidates are present but none parse', () => {
@@ -39,13 +39,13 @@ describe('extractJsonObject', () => {
 
   it('handles braces inside string values (code snippets)', () => {
     const text = '{"code": "if (x) { return y; }", "type": "snippet"}';
-    expect(extractJsonObject<{ code: string; type: string }>(text, 'code', 'type'))
+    expect(extractJsonObject(text, 'code', 'type'))
       .toEqual({ code: 'if (x) { return y; }', type: 'snippet' });
   });
 
   it('handles escaped quotes inside string values', () => {
     const text = '{"msg": "he said \\"hi\\"", "id": 1}';
-    expect(extractJsonObject<{ msg: string; id: number }>(text, 'msg'))
+    expect(extractJsonObject(text, 'msg'))
       .toEqual({ msg: 'he said "hi"', id: 1 });
   });
 
@@ -84,7 +84,7 @@ describe('extractJsonObject', () => {
 
   it('returns the first valid candidate when multiple objects contain the key', () => {
     const text = '{"key": "first"} {"key": "second"}';
-    expect(extractJsonObject<{ key: string }>(text, 'key')).toEqual({ key: 'first' });
+    expect(extractJsonObject(text, 'key')).toEqual({ key: 'first' });
   });
 });
 
@@ -131,7 +131,7 @@ describe('extractJsonArray', () => {
 
   it('handles brackets inside string values', () => {
     const text = '[{"code": "arr[0] = [1,2]", "id": 1}]';
-    expect(extractJsonArray<Array<{ code: string; id: number }>>(text, 'code'))
+    expect(extractJsonArray(text, 'code'))
       .toEqual([{ code: 'arr[0] = [1,2]', id: 1 }]);
   });
 

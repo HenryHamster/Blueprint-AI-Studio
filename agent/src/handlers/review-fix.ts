@@ -145,7 +145,7 @@ export function annotateResolvedIssues(history: ReviewHistoryEntry[]): Annotated
   const sorted = [...history].sort((a, b) => a.iteration - b.iteration);
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
   return sorted.map((entry, idx) => {
-    const next = sorted[idx + 1];
+    const next = sorted.at(idx + 1);
     if (!next || !entry.issues || entry.issues.length === 0) return entry;
     const nextIssues = next.issues || [];
     const nextDescs = new Set(nextIssues.map(i => norm(i.description)));
@@ -209,7 +209,7 @@ export function verifyStepsOk(entry: Record<string, unknown>): boolean {
 // alongside REQUEST_CHANGES — the load-bearing signal for cases like PR #3435
 // where iter 1 was approved but the test changes got lost in iter 2's rebase.
 export function formatTrajectorySection(history: ReviewHistoryEntry[]): string {
-  if (!history || history.length === 0) return '';
+  if (history.length === 0) return '';
   const hasVerdicts = history.some(e => e.verdict === 'APPROVE' || e.verdict === 'REQUEST_CHANGES');
   if (!hasVerdicts) return '';
   const sorted = [...history].sort((a, b) => a.iteration - b.iteration);
@@ -824,7 +824,7 @@ IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (N
         // Also append to logs for backwards compatibility
         const reviewText = sanitize(lastResultText || allOutput.slice(-50_000));
         logs = reviewText + '\n\n' + augmented;
-        sendLog(ws, `Verdict read from file: ${parsed.verdict}\n`);
+        sendLog(ws, `Verdict read from file: ${typeof parsed.verdict === 'string' ? parsed.verdict : JSON.stringify(parsed.verdict)}\n`);
       }
     }
   } catch { /* fall through to output parsing */ }
@@ -1247,7 +1247,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     if (fs.existsSync(fixResponsesPath)) {
       const raw = fs.readFileSync(fixResponsesPath, 'utf-8').trim();
       if (raw.length > 0) {
-        const parsed = JSON.parse(raw);
+        const parsed: unknown = JSON.parse(raw);
         if (Array.isArray(parsed)) {
           // Cap 5 to match backend AgentStatusPayload max_length=5; trim
           // verify lists to 10 to bound payload size.

@@ -114,6 +114,12 @@ function capturedPrompt(): string {
   return vi.mocked(runClaudeCode).mock.calls[0][0];
 }
 
+/** Asserts a value is defined and returns it (narrowed). Replaces unsafe `x!` in tests. */
+function defined<T>(v: T | undefined, msg = 'expected value to be defined'): T {
+  if (v === undefined) throw new Error(msg);
+  return v;
+}
+
 // ── Overlap warning text generation ──────────────────────────────────────────
 describe('overlap warning text generation', () => {
   beforeEach(() => {
@@ -739,7 +745,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as { categories: string[]; passes: number };
+    const outcome = (defined(statusCall)[1]).self_review_outcome as { categories: string[]; passes: number };
     expect(outcome).toBeDefined();
     expect(outcome.categories).toContain('self_review_failed');
     expect(outcome.passes).toBe(1);
@@ -815,7 +821,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as { fixes_applied: boolean; passes: number; total_fixes: number };
+    const outcome = (defined(statusCall)[1]).self_review_outcome as { fixes_applied: boolean; passes: number; total_fixes: number };
     expect(outcome).toBeDefined();
     expect(outcome.fixes_applied).toBe(true);
     expect(outcome.passes).toBe(2);
@@ -844,7 +850,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.verdict).toBe('PASS');
     expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: true } });
@@ -881,7 +887,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(completedCall).toBeDefined();
-    const payload = completedCall![1];
+    const payload = defined(completedCall)[1];
     const outcome = payload.self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.check_results).toEqual({ test_coverage: { passed: true }, type_safety: { passed: false, issue: 'Missing type annotation' } });
@@ -964,7 +970,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.feedback_categories_injected).toEqual(expect.arrayContaining(['type_safety', 'test_coverage']));
     expect((outcome.feedback_categories_injected as string[]).length).toBe(2);
@@ -992,7 +998,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.feedback_categories_injected).toBeUndefined();
   });
@@ -1068,7 +1074,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'FAILED',
     );
     expect(failedCall).toBeDefined();
-    expect((failedCall![1]).failure_category).toBe('lint_failed_after_self_review');
+    expect((defined(failedCall)[1]).failure_category).toBe('lint_failed_after_self_review');
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
@@ -1166,7 +1172,7 @@ describe('self-review phase', () => {
     const completed = vi.mocked(persistAndPostStatus).mock.calls.find(
       c => (c[1]).status === 'COMPLETED',
     );
-    const outcome = (completed![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(completed)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.verdict).toBe('PASS');
     expect(outcome.categories).toEqual(expect.arrayContaining(['verdict_check_mismatch']));
   });
@@ -1240,8 +1246,8 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'FAILED',
     );
     expect(failedCall).toBeDefined();
-    expect((failedCall![1]).failure_category).toBe('test_failed_after_self_review');
-    expect((failedCall![1]).test_failure_summary).toBe('test_regression failed');
+    expect((defined(failedCall)[1]).failure_category).toBe('test_failed_after_self_review');
+    expect((defined(failedCall)[1]).test_failure_summary).toBe('test_regression failed');
     expect(vi.mocked(pushAndCreatePR)).not.toHaveBeenCalled();
   });
 
@@ -1299,7 +1305,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     const injected = outcome.feedback_categories_injected as string[];
     expect(injected).toBeDefined();
@@ -1329,7 +1335,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome).toBeDefined();
     expect(outcome.feedback_categories_injected).toBeUndefined();
   });
@@ -1362,7 +1368,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'COMPLETED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).not.toContain('incomplete_review');
     expect(outcome.truncated_files_read).toEqual(['file1.ts', 'file2.ts']);
@@ -1395,7 +1401,7 @@ describe('self-review phase', () => {
       c => (c[1]).status === 'FAILED',
     );
     expect(statusCall).toBeDefined();
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).toContain('incomplete_review');
     expect(outcome.verdict).toBe('FAIL');
@@ -1426,7 +1432,7 @@ describe('self-review phase', () => {
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
       c => (c[1]).status === 'COMPLETED',
     );
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).not.toContain('incomplete_review');
   });
@@ -1458,7 +1464,7 @@ describe('self-review phase', () => {
     const statusCall = vi.mocked(persistAndPostStatus).mock.calls.find(
       c => (c[1]).status === 'FAILED',
     );
-    const outcome = (statusCall![1]).self_review_outcome as Record<string, unknown>;
+    const outcome = (defined(statusCall)[1]).self_review_outcome as Record<string, unknown>;
     expect(outcome.categories).toContain('truncation_not_verified');
     expect(outcome.categories).toContain('incomplete_review');
     expect(outcome.verdict).toBe('FAIL');
@@ -1925,7 +1931,7 @@ describe('analysis-phase scope feasibility gate', () => {
         && (c[1]).artifact_type === 'PULL_REQUEST',
     );
     expect(completedCall).toBeDefined();
-    const body = completedCall![1];
+    const body = defined(completedCall)[1];
     expect(typeof body.analysis_plan).toBe('string');
     expect(body.analysis_plan as string).toContain('Pre-Implementation Analysis');
     // Field must be analysis_plan (schema-defined), not analysis_summary (silently dropped)
@@ -2039,7 +2045,7 @@ describe('scope overflow warning (soft-mode)', () => {
       auto_approve_allowed: false,
     });
     expect(vi.mocked(buildSelfReviewPrompt)).toHaveBeenCalledWith(expect.objectContaining({
-      scopeOverflowWarning: expect.stringContaining('scope sprawl'),
+      scopeOverflowWarning: expect.stringContaining('scope sprawl') as unknown as string,
     }));
   });
 
@@ -2394,7 +2400,7 @@ describe('migration auto-generation heartbeat', () => {
       c => c[2] !== undefined && 'migration_auto_generated' in (c[2]),
     );
     expect(migrationCall).toBeDefined();
-    expect((migrationCall![2] as Record<string, unknown>).migration_auto_generated).toBe(true);
+    expect((defined(migrationCall)[2] as Record<string, unknown>).migration_auto_generated).toBe(true);
   });
 
   it('sends heartbeat with migration_auto_generated:false when the migration pass exits non-zero', async () => {
@@ -2403,7 +2409,7 @@ describe('migration auto-generation heartbeat', () => {
       if (args[0] === 'rev-parse') return 'basecommit';
       return '';
     });
-    vi.mocked(runClaudeCode).mockImplementation(async (prompt: string) => ({
+    vi.mocked(runClaudeCode).mockImplementation((prompt: string) => Promise.resolve({
       exitCode: prompt.includes('did NOT add an alembic migration') ? 1 : 0,
       allOutput: '',
       lastResultText: '',
@@ -2416,6 +2422,6 @@ describe('migration auto-generation heartbeat', () => {
       c => c[2] !== undefined && 'migration_auto_generated' in (c[2]),
     );
     expect(migrationCall).toBeDefined();
-    expect((migrationCall![2] as Record<string, unknown>).migration_auto_generated).toBe(false);
+    expect((defined(migrationCall)[2] as Record<string, unknown>).migration_auto_generated).toBe(false);
   });
 });

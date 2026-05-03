@@ -80,6 +80,12 @@ import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTO
 
 const statusRef = () => ({ value: '' });
 
+/** Asserts a value is defined and returns it (narrowed). Replaces unsafe `x!` in tests. */
+function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
+  if (v === undefined || v === null) throw new Error(msg);
+  return v;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fs.existsSync).mockReturnValue(false);
@@ -96,7 +102,7 @@ beforeEach(() => {
   // fetch is used by handleReview for PR metadata
   global.fetch = vi.fn().mockResolvedValue({
     ok: true,
-    json: async () => ({ title: 'PR title', body: 'PR body' }),
+    json: () => Promise.resolve({ title: 'PR title', body: 'PR body' }),
   }) as unknown as typeof fetch;
 });
 
@@ -181,9 +187,10 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
         { severity: 'major', description: 'missing null check', file: 'a.ts' },
       ] },
     ]);
-    const it1 = result.find(e => e.iteration === 1)!;
-    const nullCheck = it1.issues!.find(i => i.description === 'missing null check')!;
-    const unused = it1.issues!.find(i => i.description === 'unused import')!;
+    const it1 = defined(result.find(e => e.iteration === 1));
+    const issues1 = defined(it1.issues);
+    const nullCheck = defined(issues1.find(i => i.description === 'missing null check'));
+    const unused = defined(issues1.find(i => i.description === 'unused import'));
     expect(nullCheck.resolvedInIteration).toBeUndefined();
     expect(unused.resolvedInIteration).toBe(2);
   });
@@ -193,8 +200,8 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
       { iteration: 1, feedback: '', issues: [{ severity: 'major', description: 'x' }] },
       { iteration: 2, feedback: '', issues: [{ severity: 'major', description: 'y' }] },
     ]);
-    const it2 = result.find(e => e.iteration === 2)!;
-    expect(it2.issues![0].resolvedInIteration).toBeUndefined();
+    const it2 = defined(result.find(e => e.iteration === 2));
+    expect(defined(it2.issues)[0].resolvedInIteration).toBeUndefined();
   });
 
   it('normalizes whitespace/case when matching descriptions', () => {
@@ -202,8 +209,8 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
       { iteration: 1, feedback: '', issues: [{ severity: 'major', description: 'Missing  NULL check' }] },
       { iteration: 2, feedback: '', issues: [{ severity: 'major', description: 'missing null check' }] },
     ]);
-    const it1 = result.find(e => e.iteration === 1)!;
-    expect(it1.issues![0].resolvedInIteration).toBeUndefined();
+    const it1 = defined(result.find(e => e.iteration === 1));
+    expect(defined(it1.issues)[0].resolvedInIteration).toBeUndefined();
   });
 
   it('leaves feedback-only (no issues) entries untouched', () => {
@@ -224,8 +231,8 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
         { severity: 'major', description: 'null check not present' },
       ] },
     ]);
-    const it1 = result.find(e => e.iteration === 1)!;
-    expect(it1.issues![0].resolvedInIteration).toBeUndefined();
+    const it1 = defined(result.find(e => e.iteration === 1));
+    expect(defined(it1.issues)[0].resolvedInIteration).toBeUndefined();
   });
 
   it('treats reordered/rephrased multi-word issues as still-present', () => {
@@ -237,8 +244,8 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
         { severity: 'major', description: 'Handler lacks null check' },
       ] },
     ]);
-    const it1 = result.find(e => e.iteration === 1)!;
-    expect(it1.issues![0].resolvedInIteration).toBeUndefined();
+    const it1 = defined(result.find(e => e.iteration === 1));
+    expect(defined(it1.issues)[0].resolvedInIteration).toBeUndefined();
   });
 
   it('still marks unrelated issues as resolved when next iteration has different problems', () => {
@@ -250,8 +257,8 @@ describe('annotateResolvedIssues — marks issues not re-flagged by next iterati
         { severity: 'minor', description: 'add unit tests for parser' },
       ] },
     ]);
-    const it1 = result.find(e => e.iteration === 1)!;
-    expect(it1.issues![0].resolvedInIteration).toBe(2);
+    const it1 = defined(result.find(e => e.iteration === 1));
+    expect(defined(it1.issues)[0].resolvedInIteration).toBe(2);
   });
 });
 
@@ -342,7 +349,7 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     // Overflow note present
     expect(prompt).toContain('exceeds the typical range for a small-scope change');
     expect(prompt).toContain('review ALL checklist sections thoroughly');
@@ -365,7 +372,7 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('Security and performance sections are lower priority');
     expect(prompt).not.toContain('exceeds the typical range');
   });
@@ -384,7 +391,7 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('exceeds the typical range for a medium-scope change');
   });
 });
@@ -457,7 +464,7 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
       { context: { scope: 'medium' } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('confined to agent/');
     expect(prompt).toContain('deprioritize SQL injection');
   });
@@ -476,7 +483,7 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
       { context: { scope: 'medium' } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).not.toContain('confined to agent/');
     expect(prompt).not.toContain('confined to admin-ui/');
     expect(prompt).not.toContain('confined to backend/');
@@ -498,7 +505,7 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
       { context: { scope: 'small' } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).not.toContain('confined to agent/');
     // small-scope still gets its own hint
     expect(prompt).toContain('small-scope change');
@@ -533,7 +540,7 @@ describe('handleReview — self-review blind-spots surfacing', () => {
       outcome,
       ['agent/src/prompt.ts', 'agent/src/handlers/review-fix.ts'],
     );
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('SELF_REVIEW_BLIND_SPOTS_MARKER');
   });
 
@@ -627,7 +634,7 @@ describe('handleReview — unplanned-file four-category classifier', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     // Old harsh phrasing must be gone.
     expect(prompt).not.toContain('flag them as MAJOR unless they are directly necessary to fix a listed review issue');
     // All four categories must appear so the reviewer can classify.
@@ -656,7 +663,7 @@ describe('handleReview — unplanned-file four-category classifier', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('All non-test changed files are in the original plan');
     expect(prompt).not.toContain('Classify each unplanned non-test file');
   });
@@ -676,7 +683,7 @@ describe('handleReview — unplanned-file four-category classifier', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).not.toContain('Planned files from the original analysis plan');
     expect(prompt).not.toContain('Classify each unplanned non-test file');
   });
@@ -696,7 +703,7 @@ describe('handleReview — unplanned-file four-category classifier', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     // Test files are explicitly excluded from the unplanned-non-test list, so the
     // classifier section should not fire on this PR.
     expect(prompt).toContain('All non-test changed files are in the original plan');
@@ -754,7 +761,7 @@ describe('handleReview — verdict file parsing', () => {
     );
 
     const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
-    const verdictJson = JSON.parse(String(status.verdict_json));
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; investigated_files: string[] };
     expect(verdictJson.verdict).toBe('REQUEST_CHANGES');
     expect(verdictJson.investigated_files).toEqual([
       'admin-ui/src/components/DirectionCard.tsx',
@@ -850,7 +857,7 @@ describe('handleFix — conflict marker detection', () => {
     // Claude was invoked at least once with the marker-enriched prompt.
     const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
     expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
-    const prompt = String(firstCall[0]);
+    const prompt = firstCall[0];
     expect(prompt).toContain('CONFLICT MARKERS FOUND');
     expect(prompt).toContain('backend/app/foo.py');
     expect(prompt).toContain('agent/src/bar.ts');
@@ -934,7 +941,7 @@ describe('handleFix — reviewer working set propagation', () => {
 
     const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
     expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
-    const prompt = String(firstCall[0]);
+    const prompt = firstCall[0];
     expect(prompt).toContain("Reviewer's Working Set");
     expect(prompt).toContain('admin-ui/src/components/DirectionCard.tsx');
     expect(prompt).toContain('admin-ui/src/components/DirectionCard.test.tsx');
@@ -949,7 +956,7 @@ describe('handleFix — reviewer working set propagation', () => {
     );
 
     const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
-    const prompt = String(firstCall[0]);
+    const prompt = firstCall[0];
     expect(prompt).not.toContain("Reviewer's Working Set");
   });
 });
@@ -988,7 +995,7 @@ describe('handleFix — stale-premise detection', () => {
 
     const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
     expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
-    const prompt = String(firstCall[0]);
+    const prompt = firstCall[0];
     expect(prompt).toContain('Stale-premise notice');
     expect(prompt).toContain('ci/backend-tests');
     expect(prompt).toContain('ci/frontend-build');
@@ -1055,7 +1062,7 @@ describe('handleFix — stale-premise detection', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('Stale-premise notice');
     expect(prompt).toContain('GitHub still reports');
     expect(prompt).toContain('mergeable=false');
@@ -1082,7 +1089,7 @@ describe('handleFix — stale-premise detection', () => {
     const curlCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'curl');
     expect(curlCalls.length).toBe(0);
 
-    const prompt = String(vi.mocked(indexMod.runClaudeCode).mock.calls[0][0]);
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).not.toContain('Stale-premise notice');
   });
 });
@@ -1119,7 +1126,7 @@ describe('handleFix — post-rebase lint re-validation', () => {
 
     // Initial post-rebase lint check + re-validation after Claude's fix attempt.
     expect(lintCalls).toBe(2);
-    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
+    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => c[1]);
     expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(true);
     // Task finalized as FAILED with lint_failed category.
     const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
@@ -1148,7 +1155,7 @@ describe('handleFix — post-rebase lint re-validation', () => {
     );
 
     expect(lintCalls).toBe(2);
-    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1]));
+    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => c[1]);
     expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(false);
   });
 });
@@ -1283,7 +1290,7 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
     // 1 initial + 2 retries = 3 total push attempts.
     expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(3);
     // Logged attempt numbers for observability.
-    const logs = vi.mocked(indexMod.sendLog).mock.calls.map(c => String(c[1])).join('\n');
+    const logs = vi.mocked(indexMod.sendLog).mock.calls.map(c => c[1]).join('\n');
     expect(logs).toContain('Retry attempt 1/2');
     expect(logs).toContain('Retry attempt 2/2');
   });
@@ -1452,9 +1459,9 @@ describe('handleFix — PR body annotation after push', () => {
     global.fetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
       fetchCalls.push(`${opts?.method ?? 'GET'} ${url}`);
       if ((opts?.method ?? 'GET') === 'GET' || opts?.method === undefined) {
-        return Promise.resolve({ ok: true, json: async () => ({ body: 'existing body' }) });
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ body: 'existing body' }) });
       }
-      return Promise.resolve({ ok: true, json: async () => ({}) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
     }) as unknown as typeof fetch;
 
     await handleFix(
@@ -1482,7 +1489,7 @@ describe('handleFix — PR body annotation after push', () => {
     const fetchCalls: string[] = [];
     global.fetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
       fetchCalls.push(`${opts?.method ?? 'GET'} ${url}`);
-      return Promise.resolve({ ok: true, json: async () => ({ title: 'PR title', body: 'body' }) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ title: 'PR title', body: 'body' }) });
     }) as unknown as typeof fetch;
 
     await handleFix(

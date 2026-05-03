@@ -142,8 +142,8 @@ export function extractJsonObjectDetailed<T = Record<string, unknown>>(
   };
 }
 
-export function extractJsonObject<T = Record<string, unknown>>(text: string, ...requiredKeys: string[]): T | null {
-  const result = extractJsonObjectDetailed<T>(text, ...requiredKeys);
+export function extractJsonObject(text: string, ...requiredKeys: string[]): Record<string, unknown> | null {
+  const result = extractJsonObjectDetailed(text, ...requiredKeys);
   return result.ok ? result.value : null;
 }
 
@@ -224,7 +224,7 @@ export function extractJsonArrayDetailed<T = unknown[]>(
   };
 }
 
-export function extractJsonArray<T = unknown[]>(text: string, ...requiredKeys: string[]): T | null {
-  const result = extractJsonArrayDetailed<T>(text, ...requiredKeys);
+export function extractJsonArray(text: string, ...requiredKeys: string[]): unknown[] | null {
+  const result = extractJsonArrayDetailed(text, ...requiredKeys);
   return result.ok ? result.value : null;
 }

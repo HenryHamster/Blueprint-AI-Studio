@@ -127,7 +127,7 @@ export interface StandardHandlerOpts {
  * nothing useful can be derived.
  */
 export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
-  if (!relatedFiles || relatedFiles.length === 0) return '';
+  if (relatedFiles.length === 0) return '';
 
   const MAX_FILES = 3;
   const targets = relatedFiles.slice(0, MAX_FILES).filter(t => t && !t.includes('..'));
@@ -974,7 +974,7 @@ Return nothing — just write the files.`;
               parsedChecks = Object.keys(parsedCheckResults);
             }
             const failedCheckIds = Object.entries(parsedCheckResults)
-              .filter(([, r]) => r && !r.passed)
+              .filter(([, r]) => !r.passed)
               .map(([id]) => id);
             if (failedCheckIds.length > 0 && parsedVerdict !== 'FAIL') {
               reviewCategories.push('verdict_check_mismatch');
@@ -988,7 +988,8 @@ Return nothing — just write the files.`;
             reviewCategories.push('self_review_failed', 'validation_failed');
             parseFailed = true;
           } else {
-            const missing = mandatory.filter(m => !parsedChecks!.includes(m));
+            const checks = parsedChecks;
+            const missing = mandatory.filter(m => !checks.includes(m));
             if (missing.length > 0) {
               reviewCategories.push('self_review_failed', 'validation_failed');
               parseFailed = true;
@@ -1026,7 +1027,7 @@ Return nothing — just write the files.`;
                 : (changedFiles && changedFiles.length > 0
                   ? changedFiles.map(f => `- ${f}`).join('\n')
                   : '(no file list available — use `git diff --name-only` to find changed files)');
-              const gapDesc = (parsedTruncatedFiles && parsedTruncatedFiles.length > 0)
+              const gapDesc = parsedTruncatedFiles.length > 0
                 ? `${missingFiles.length} of ${changedFiles?.length ?? '?'} file(s) unread`
                 : 'no files were read';
               sendLog(ws, `\nSelf-review: diff truncated and ${gapDesc} — retrying with explicit file-read guidance...\n`);
@@ -1043,7 +1044,7 @@ Return nothing — just write the files.`;
                   if (retryTruncatedFiles.length > 0) {
                     // Union with pass-1 reads so the agent can't shrink coverage by
                     // omitting previously-listed files from the retry response.
-                    const merged = Array.from(new Set([...(parsedTruncatedFiles ?? []), ...retryTruncatedFiles]));
+                    const merged = Array.from(new Set([...parsedTruncatedFiles, ...retryTruncatedFiles]));
                     parsedTruncatedFiles = merged;
                     const retryVerdict = typeof truncRetryParsed.verdict === 'string' ? truncRetryParsed.verdict : undefined;
                     if (retryVerdict !== undefined) parsedVerdict = retryVerdict;
@@ -1155,7 +1156,7 @@ Return nothing — just write the files.`;
               : mandatory;
             const hadVerdictMismatch = reviewCategories.includes('verdict_check_mismatch');
             const failedCheckIds = parsedCheckResults
-              ? Object.entries(parsedCheckResults).filter(([, r]) => r && !r.passed).map(([id]) => id)
+              ? Object.entries(parsedCheckResults).filter(([, r]) => !r.passed).map(([id]) => id)
               : [];
             const retryNoteParts: string[] = [];
             if (missingChecks.length > 0) {
@@ -1212,7 +1213,7 @@ Return nothing — just write the files.`;
             }
           }
           // FAIL verdict gate: block PR when agent identifies unresolvable issues
-          if (selfReviewOutcome?.verdict === 'FAIL') {
+          if (selfReviewOutcome.verdict === 'FAIL') {
             sendLog(ws, '\nSelf-review FAIL verdict — blocking PR creation.\n');
             await persistAndPostStatus(taskId, {
               task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
@@ -1227,7 +1228,7 @@ Return nothing — just write the files.`;
         }
       }
 
-      if (scopeOverflowContext && selfReviewOutcome) {
+      if (scopeOverflowContext) {
         selfReviewOutcome.scope_overflow = scopeOverflowContext;
       }
     }
@@ -1393,7 +1394,7 @@ export async function handleCreate(
   const issueNumber = taskCtx?.issue_number as number | undefined;
   const issueUrl = taskCtx?.issue_url as string | undefined;
   const issueReference = issueNumber != null
-    ? `Closes ${issueUrl || ('#' + issueNumber)}`
+    ? `Closes ${issueUrl || `#${issueNumber}`}`
     : undefined;
 
   const projectCtx = task.project_context as Record<string, unknown> | undefined;

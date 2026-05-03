@@ -261,7 +261,9 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         .map((d) => {
           const did = strVal(d.direction_id).slice(-8);
           const sat = d.possibly_saturated ? ', saturated' : '';
-          const cvr = d.conversion_rate != null ? String(d.conversion_rate) : 'n/a';
+          const cvr = typeof d.conversion_rate === 'number' || typeof d.conversion_rate === 'string'
+            ? String(d.conversion_rate)
+            : 'n/a';
           return `d-${did} cvr ${cvr} (${String(d.cycles)} cycles${sat})`;
         })
         .join(', ');

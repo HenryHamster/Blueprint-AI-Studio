@@ -94,7 +94,7 @@ export const MAX_OUTPUT_BYTES = 10_000_000;
 // Effort-scaled subprocess timeout. Low-effort tasks that hang waste less VM
 // time; max-effort deep analysis gets more room. Unknown/unset effort falls
 // back to CLAUDE_TIMEOUT_MS.
-export const CLAUDE_TIMEOUT_MS_BY_EFFORT: Record<string, number> = {
+export const CLAUDE_TIMEOUT_MS_BY_EFFORT: Record<string, number | undefined> = {
   low: 20 * 60 * 1000,
   medium: 35 * 60 * 1000,
   high: 45 * 60 * 1000,
@@ -102,8 +102,9 @@ export const CLAUDE_TIMEOUT_MS_BY_EFFORT: Record<string, number> = {
 };
 
 export function claudeTimeoutForEffort(effort?: string): number {
-  if (effort && CLAUDE_TIMEOUT_MS_BY_EFFORT[effort] !== undefined) {
-    return CLAUDE_TIMEOUT_MS_BY_EFFORT[effort];
+  if (effort) {
+    const v = CLAUDE_TIMEOUT_MS_BY_EFFORT[effort];
+    if (v !== undefined) return v;
   }
   return CLAUDE_TIMEOUT_MS;
 }

@@ -54,7 +54,7 @@ vi.mock('child_process', () => ({
     _opts: unknown,
     cb: (err: Error | null, stdout: string, stderr: string) => void,
   ) => {
-    Promise.resolve().then(() => { cb(null, '', ''); });
+    void Promise.resolve().then(() => { cb(null, '', ''); });
   },
 }));
 
@@ -69,11 +69,17 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _getWarmStartForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _getHandlerDurationForTesting, getAgentHeaders, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
+
+/** Asserts a value is defined and returns it (narrowed). Replaces unsafe `x!` in tests. */
+function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
+  if (v === undefined || v === null) throw new Error(msg);
+  return v;
+}
 
 // ── strVal ───────────────────────────────────────────────────────────────────
 describe('strVal', () => {
@@ -283,11 +289,11 @@ describe('readHandlerOutput', () => {
     const raw =
       'Some prefix text here\n[{"id": 1, "name": "item"}]\nSome trailing text';
     mockReadFileSync.mockReturnValue(raw);
-    const result = readHandlerOutput<Array<{ id: number; name: string }>>(
+    const result = readHandlerOutput(
       'task-3',
       'output',
       null,
-    );
+    ) as Array<{ id: number; name: string }> | null;
     expect(result).toEqual([{ id: 1, name: 'item' }]);
   });
 
@@ -299,14 +305,15 @@ describe('readHandlerOutput', () => {
       '{"vision": "build great things", "direction_operations": []}';
     const raw = `Preamble text with no JSON arrays\n${strategicObj}`;
     mockReadFileSync.mockReturnValue(raw);
-    const result = readHandlerOutput<{ vision: string; direction_operations: unknown[] }>(
+    const result = readHandlerOutput(
       'task-4',
       'strategic_output',
       null,
-    );
+    ) as { vision: string; direction_operations: unknown[] } | null;
     expect(result).not.toBeNull();
-    expect(result!.vision).toBe('build great things');
-    expect(Array.isArray(result!.direction_operations)).toBe(true);
+    if (!result) throw new Error('expected result');
+    expect(result.vision).toBe('build great things');
+    expect(Array.isArray(result.direction_operations)).toBe(true);
   });
 
   it('returns null when file is not found (ENOENT)', () => {
@@ -337,8 +344,7 @@ describe('runProjectLintChecks', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Return empty string (not Buffer) so sendLog/sanitize don't receive a Buffer
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (vi.mocked(execFileSync) as any).mockReturnValue('');
+    (vi.mocked(execFileSync) as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('');
   });
 
   it('uses dynamic lint_cmd when buildConfig is provided with a touched directory', () => {
@@ -346,7 +352,7 @@ describe('runProjectLintChecks', () => {
       directories: [{ path: 'frontend', type: 'node', lint_cmd: 'npm run lint' }],
     });
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['run', 'lint'], expect.objectContaining({ cwd: expect.stringContaining('frontend') }),
+      'npm', ['run', 'lint'], expect.objectContaining({ cwd: expect.stringContaining('frontend') as unknown as string }),
     );
   });
 
@@ -355,7 +361,7 @@ describe('runProjectLintChecks', () => {
       directories: [{ path: 'myapp', type: 'node', build_cmd: 'npm run build' }],
     });
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['run', 'build'], expect.objectContaining({ cwd: expect.stringContaining('myapp') }),
+      'npm', ['run', 'build'], expect.objectContaining({ cwd: expect.stringContaining('myapp') as unknown as string }),
     );
   });
 
@@ -493,7 +499,7 @@ describe('testFixLoop failureSummary', () => {
     expect(result.failureSummary).toMatch(/npm ci failed/);
     // Claude MUST NOT be invoked for setup failures — check that no
     // `claude` spawn happened even though a runner was configured.
-    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => String(c[0]).includes('claude')).length;
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
     expect(claudeCalls).toBe(0);
   });
 
@@ -856,29 +862,29 @@ describe('provider runner prompt transport', () => {
     // Sandbox disabled via env var since Gemini's approval-mode and
     // sandbox are separate knobs (YOLO auto-enables docker sandbox
     // unless GEMINI_SANDBOX=false pins it off).
-    expect(command.env?.GEMINI_SANDBOX).toBe('false');
+    expect(command.env.GEMINI_SANDBOX).toBe('false');
     // Trust gate opt-out — ephemeral VM is the isolation boundary.
-    expect(command.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+    expect(command.env.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
   });
 
   it('sets GEMINI_CLI_TRUST_WORKSPACE=true on Gemini buildRunCommand (service_account)', () => {
     const runner = getProviderRunner('gemini', 'service_account');
     const command = runner.buildRunCommand('Some prompt', 'gemini-2.5-pro');
-    expect(command.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+    expect(command.env.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
   });
 
   it('sets GEMINI_CLI_TRUST_WORKSPACE=true on Gemini buildValidationCommand (api_key)', () => {
     const runner = getProviderRunner('gemini', 'api_key');
     const command = runner.buildValidationCommand('gemini-2.5-pro');
     expect(command).not.toBeNull();
-    expect(command!.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+    expect(defined(command).env.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
   });
 
   it('sets GEMINI_CLI_TRUST_WORKSPACE=true on Gemini buildValidationCommand (service_account)', () => {
     const runner = getProviderRunner('gemini', 'service_account');
     const command = runner.buildValidationCommand('gemini-2.5-pro');
     expect(command).not.toBeNull();
-    expect(command!.env?.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+    expect(defined(command).env.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
   });
 });
 
@@ -906,22 +912,20 @@ describe('parseLLMCliTranslation', () => {
       prompt_fragments: ['Plan carefully.'],
       unsupported: ['advisor.enabled (fallback: prompt fragment only)'],
     });
-    const parsed = parseLLMCliTranslation();
-    expect(parsed).not.toBeNull();
-    expect(parsed!.args).toEqual(['--model', 'claude-opus-4-7', '--effort', 'high']);
-    expect(parsed!.env).toEqual({ FOO: 'bar' });
-    expect(parsed!.prompt_fragments).toEqual(['Plan carefully.']);
-    expect(parsed!.unsupported[0]).toMatch(/advisor/);
+    const parsed = defined(parseLLMCliTranslation());
+    expect(parsed.args).toEqual(['--model', 'claude-opus-4-7', '--effort', 'high']);
+    expect(parsed.env).toEqual({ FOO: 'bar' });
+    expect(parsed.prompt_fragments).toEqual(['Plan carefully.']);
+    expect(parsed.unsupported[0]).toMatch(/advisor/);
   });
 
   it('tolerates missing fields with safe defaults', () => {
     process.env.LLM_CLI_TRANSLATION = JSON.stringify({ args: ['-m', 'gpt-5'] });
-    const parsed = parseLLMCliTranslation();
-    expect(parsed).not.toBeNull();
-    expect(parsed!.args).toEqual(['-m', 'gpt-5']);
-    expect(parsed!.env).toEqual({});
-    expect(parsed!.prompt_fragments).toEqual([]);
-    expect(parsed!.unsupported).toEqual([]);
+    const parsed = defined(parseLLMCliTranslation());
+    expect(parsed.args).toEqual(['-m', 'gpt-5']);
+    expect(parsed.env).toEqual({});
+    expect(parsed.prompt_fragments).toEqual([]);
+    expect(parsed.unsupported).toEqual([]);
   });
 
   it('returns null on malformed JSON (fail-safe to legacy dispatch)', () => {
@@ -949,7 +953,7 @@ describe('captureTestBaseline timeout selection', () => {
     await captureTestBaseline(null, { value: '' }, buildConfig);
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    expect((bashCall![2] as { timeout: number }).timeout).toBe(600_000);
+    expect((defined(bashCall)[2] as { timeout: number }).timeout).toBe(600_000);
   });
 
   it('uses TEST_BASELINE_DOCKER_TIMEOUT (10min) for runners with docker in args', async () => {
@@ -959,7 +963,7 @@ describe('captureTestBaseline timeout selection', () => {
     await captureTestBaseline(null, { value: '' }, buildConfig);
     const dockerCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'docker');
     expect(dockerCall).toBeDefined();
-    expect((dockerCall![2] as { timeout: number }).timeout).toBe(600_000);
+    expect((defined(dockerCall)[2] as { timeout: number }).timeout).toBe(600_000);
   });
 
   it('uses the passed timeoutMs (60s default) for non-Docker runners', async () => {
@@ -969,7 +973,7 @@ describe('captureTestBaseline timeout selection', () => {
     await captureTestBaseline(null, { value: '' }, buildConfig);
     const npmCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'npm');
     expect(npmCall).toBeDefined();
-    expect((npmCall![2] as { timeout: number }).timeout).toBe(60_000);
+    expect((defined(npmCall)[2] as { timeout: number }).timeout).toBe(60_000);
   });
 });
 
@@ -1007,7 +1011,7 @@ describe('detectTestRunners auto-detect postgres flag', () => {
     await captureTestBaseline(null, { value: '' });
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    const args = bashCall![1] as string[];
+    const args = defined(bashCall)[1] as string[];
     expect(args).toContain('scripts/test-backend.sh');
     expect(args).toContain('--postgres');
     expect(args).not.toContain('--no-postgres');
@@ -1018,7 +1022,7 @@ describe('detectTestRunners auto-detect postgres flag', () => {
     await testFixLoop(null, { value: '' });
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    const args = bashCall![1] as string[];
+    const args = defined(bashCall)[1] as string[];
     expect(args).toContain('scripts/test-backend.sh');
     expect(args).toContain('--postgres');
     expect(args).not.toContain('--no-postgres');
@@ -1065,7 +1069,7 @@ describe('detectTestRunners auto-detect postgres flag', () => {
 
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    expect(bashCall![1]).toEqual([
+    expect(defined(bashCall)[1]).toEqual([
       'scripts/test-backend.sh',
       '--postgres',
       'testing/test_models.py::test_create',
@@ -1079,7 +1083,7 @@ describe('detectTestRunners auto-detect postgres flag', () => {
     await captureTestBaseline(null, { value: '' });
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    const args = bashCall![1] as string[];
+    const args = defined(bashCall)[1] as string[];
     expect(args).toContain('scripts/test-backend.sh');
     expect(args).toContain('--no-postgres');
     expect(args).not.toContain('--postgres');
@@ -1091,7 +1095,7 @@ describe('detectTestRunners auto-detect postgres flag', () => {
     await testFixLoop(null, { value: '' });
     const bashCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'bash');
     expect(bashCall).toBeDefined();
-    const args = bashCall![1] as string[];
+    const args = defined(bashCall)[1] as string[];
     expect(args).toContain('scripts/test-backend.sh');
     expect(args).toContain('--no-postgres');
     expect(args).not.toContain('--postgres');
@@ -1303,24 +1307,24 @@ describe('stale result retry envelopes', () => {
       }
       return '';
     });
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
-      const url = String(input);
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
       if (url.includes('/api/agent/credentials/rotate')) {
-        return {
+        return Promise.resolve({
           ok: false,
           status: 400,
           text: () => Promise.resolve('revoked token'),
           json: () => Promise.resolve({}),
           headers: { get: () => null },
-        } as unknown as Response;
+        } as unknown as Response);
       }
-      return {
+      return Promise.resolve({
         ok: true,
         status: 200,
         text: () => Promise.resolve(''),
         json: () => Promise.resolve({ status: 'ok' }),
         headers: { get: () => null },
-      } as unknown as Response;
+      } as unknown as Response);
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -1336,9 +1340,14 @@ describe('stale result retry envelopes', () => {
       process.env.AUTH_MODE = oldAuthMode;
     }
 
-    const statusCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/agent/status'));
+    const statusCall = fetchMock.mock.calls.find(([url]) => {
+      const u = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+      return u.includes('/api/agent/status');
+    });
     expect(statusCall).toBeTruthy();
-    const body = JSON.parse(String(statusCall?.[1]?.body)) as Record<string, unknown>;
+    const rawBody = statusCall?.[1]?.body;
+    const bodyStr = typeof rawBody === 'string' ? rawBody : '';
+    const body = JSON.parse(bodyStr) as Record<string, unknown>;
     expect(body.status).toBe('FAILED');
     expect(body.oauth_rotation_failed).toBe(true);
     expect(body.failure_category).toBe('oauth_rotation_failed');
@@ -1370,7 +1379,7 @@ describe('failure category classification', () => {
 
     let caughtError: unknown;
     const promise = setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' })
-      .catch(e => { caughtError = e; });
+      .catch((e: unknown) => { caughtError = e; });
 
     // Advance past all retry delays (CLONE_MAX_RETRIES=3: 5s + 10s = 15s total)
     await vi.runAllTimersAsync();
@@ -1400,12 +1409,12 @@ describe('failure category classification', () => {
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ data: { token: 'fresh-token' } }),
+        json: () => Promise.resolve({ data: { token: 'fresh-token' } }),
       })
       .mockResolvedValueOnce({
         ok: false,
         status: 403,
-        text: async () => 'Forbidden',
+        text: () => Promise.resolve('Forbidden'),
       }),
     );
 
@@ -1898,7 +1907,7 @@ describe('persistAndPostStatus telemetry enrichment', () => {
     await persistAndPostStatus('task-X', { task_id: 'task-X', status: 'COMPLETED' });
     expect(fetchMock).toHaveBeenCalled();
     const body = JSON.parse(
-      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+      (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { setup_secs?: number; warm_start?: boolean; prior_role_vm_id?: string | null };
     expect(body.setup_secs).toBe(12.5);
   });
@@ -1907,7 +1916,7 @@ describe('persistAndPostStatus telemetry enrichment', () => {
     _setRoleClaimTimestampForTesting(2_000_000);
     await persistAndPostStatus('task-cold', { task_id: 'task-cold', status: 'COMPLETED' });
     const body = JSON.parse(
-      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+      (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { warm_start?: boolean; prior_role_vm_id?: string | null };
     expect(body.warm_start).toBe(false);
     expect(body.prior_role_vm_id).toBeNull();
@@ -1921,7 +1930,7 @@ describe('persistAndPostStatus telemetry enrichment', () => {
       _setWarmStartForTesting(true);
       await persistAndPostStatus('task-warm', { task_id: 'task-warm', status: 'COMPLETED' });
       const body = JSON.parse(
-        (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+        (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
       ) as { warm_start?: boolean; prior_role_vm_id?: string | null };
       expect(body.warm_start).toBe(true);
       expect(body.prior_role_vm_id).toBe('agent-vm-warm-7');
@@ -1936,7 +1945,7 @@ describe('persistAndPostStatus telemetry enrichment', () => {
     // No recordToolUse call — firstToolUseAt stays null.
     await persistAndPostStatus('task-quiet', { task_id: 'task-quiet', status: 'COMPLETED' });
     const body = JSON.parse(
-      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+      (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { setup_secs?: number };
     expect(body.setup_secs).toBeUndefined();
   });
@@ -1949,7 +1958,7 @@ describe('persistAndPostStatus telemetry enrichment', () => {
     _setHandlerDurationForTesting(87.3);
     await persistAndPostStatus('task-h', { task_id: 'task-h', status: 'COMPLETED' });
     const body = JSON.parse(
-      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+      (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { handler_duration_secs?: number };
     expect(body.handler_duration_secs).toBe(87.3);
   });
@@ -1958,7 +1967,7 @@ describe('persistAndPostStatus telemetry enrichment', () => {
     // Default state — _setHandlerDurationForTesting(null) in beforeEach.
     await persistAndPostStatus('task-q', { task_id: 'task-q', status: 'COMPLETED' });
     const body = JSON.parse(
-      (fetchMock.mock.calls[0][1] as { body?: string })?.body ?? '{}',
+      (fetchMock.mock.calls[0][1] as { body?: string }).body ?? '{}',
     ) as { handler_duration_secs?: number };
     expect(body.handler_duration_secs).toBeUndefined();
   });

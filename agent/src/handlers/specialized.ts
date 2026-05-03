@@ -372,7 +372,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
   const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
-  const smoketestResult = readHandlerOutput<{ passed: boolean; tests: Array<{ name: string; status: string; message: string }> }>(taskId, 'smoketest_result', ws);
+  const smoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null;
 
   if (exitCode === 0 && smoketestResult) {
     // Live endpoint checks
@@ -524,7 +524,7 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
   statusRef.value = 'Analyzing failure...';
   const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
-  const debugResult = readHandlerOutput<{ root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string }>(taskId, 'debug_report', ws);
+  const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
 
   if (debugResult) {
     sendLog(ws, `\nDebug analysis complete (confidence: ${debugResult.confidence})\n`);
@@ -805,9 +805,14 @@ export async function handleSelfAudit(
   if (driftCtxRaw && typeof driftCtxRaw === 'object') {
     const entries = Object.entries(driftCtxRaw as Record<string, unknown>);
     if (entries.length > 0) {
+      const fmt = (v: unknown, fallback: string): string => {
+        if (v === undefined || v === null) return fallback;
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+        return JSON.stringify(v);
+      };
       const lines = entries.map(([sid, sig]) => {
         const s = sig as Record<string, unknown>;
-        return `  - ${sid}: claimed=${s.claimed_changes_count ?? '?'}, merged=${s.actually_merged_prs ?? '?'}, consistency=${s.claim_shipped_consistency ?? '?'}, over_claim=${s.over_claim_flag ?? false}, stalled=${s.stalled_despite_churn_flag ?? false}`;
+        return `  - ${sid}: claimed=${fmt(s.claimed_changes_count, '?')}, merged=${fmt(s.actually_merged_prs, '?')}, consistency=${fmt(s.claim_shipped_consistency, '?')}, over_claim=${fmt(s.over_claim_flag, 'false')}, stalled=${fmt(s.stalled_despite_churn_flag, 'false')}`;
       });
       driftSection = `## Drift Scanner Findings\nThe following systems were flagged by the drift scanner before this audit was dispatched. For each, reconcile what the pipeline *claimed* to ship vs what was *actually merged*:\n${lines.join('\n')}\n\n`;
     }
@@ -872,7 +877,7 @@ Rules:
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).
-  const handlerOutput = readHandlerOutput<{ findings?: unknown[] } | unknown[]>(taskId, 'self_audit_findings', ws);
+  const handlerOutput = readHandlerOutput(taskId, 'self_audit_findings', ws) as { findings?: unknown[] } | unknown[] | null;
   let logs = '';
   if (handlerOutput !== null) {
     logs = sanitize(JSON.stringify(handlerOutput));

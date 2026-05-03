@@ -764,7 +764,7 @@ describe('handleSelfAudit — findings ingestion', () => {
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     // We re-stringify after parsing, so just verify the resulting JSON has the same shape
-    const stored = JSON.parse(call.logs as string);
+    const stored = JSON.parse(call.logs as string) as { findings: Array<{ system_id: string }> };
     expect(stored.findings).toHaveLength(1);
     expect(stored.findings[0].system_id).toBe('sys-x');
     expect(call.artifact_type).toBe('SELF_AUDIT_REPORT');
@@ -780,7 +780,7 @@ describe('handleSelfAudit — findings ingestion', () => {
     await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    const stored = JSON.parse(call.logs as string);
+    const stored = JSON.parse(call.logs as string) as { findings: Array<{ system_id: string }> };
     expect(stored.findings).toHaveLength(1);
     expect(stored.findings[0].system_id).toBe('sys-y');
   });

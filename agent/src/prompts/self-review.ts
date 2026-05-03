@@ -112,7 +112,7 @@ export function buildSelfReviewPrompt(opts: {
           .join(', ');
         const trendingUp = reviewEffCats
           ? Object.entries(reviewEffCats)
-              .filter(([, v]) => v?.trend === 'increasing')
+              .filter(([, v]) => v.trend === 'increasing')
               .map(([cat]) => cat)
           : [];
         const warning = trendingUp.length > 0

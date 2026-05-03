@@ -914,7 +914,7 @@ export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
     const m = entry.input_preview.match(/"(?:file_path|path)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/);
     if (!m) continue;
     let p: string;
-    try { p = JSON.parse(`"${m[1]}"`); } catch { p = m[1]; }
+    try { p = JSON.parse(`"${m[1]}"`) as string; } catch { p = m[1]; }
     p = p.replace(/\\/g, '/').trim();
     if (p.startsWith(`${WORKSPACE}/`)) p = p.slice(WORKSPACE.length + 1);
     if (p.startsWith('/tmp/workspace/')) p = p.slice('/tmp/workspace/'.length);
@@ -976,7 +976,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
     }
-  })().catch(e => { log(`Initial heartbeat outer error: ${String(e)}`); });
+  })().catch((e: unknown) => { log(`Initial heartbeat outer error: ${String(e)}`); });
 
   heartbeatTimer = setInterval(() => { (async () => {
     try {
@@ -1031,7 +1031,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         return;
       }
     }
-  })().catch(e => { log(`Heartbeat outer error (W4/C1): ${String(e)}`); }); }, HEARTBEAT_INTERVAL);
+  })().catch((e: unknown) => { log(`Heartbeat outer error (W4/C1): ${String(e)}`); }); }, HEARTBEAT_INTERVAL);
 }
 
 function stopHeartbeat() {
@@ -1143,11 +1143,11 @@ export function sanitize(text: string): string {
     .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
 }
 
-export function readHandlerOutput<T = unknown>(
+export function readHandlerOutput(
   taskId: string,
   outputType: string,
   ws: WebSocket | null,
-): T | null {
+): unknown {
   const filePath = `/tmp/${outputType}_${taskId}.json`;
   let raw: string;
   try {
@@ -1157,18 +1157,18 @@ export function readHandlerOutput<T = unknown>(
     return null;
   }
   try {
-    return JSON.parse(raw) as T;
+    return JSON.parse(raw) as unknown;
   } catch (err: unknown) {
     sendLog(ws, `[WARNING] Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
     // Try extracting a JSON array (research findings, plans)
     // Only accept non-empty arrays; empty arrays (e.g. `[]` embedded inside an
     // object like `"direction_operations": []`) would otherwise shadow the
     // subsequent object extraction.
-    const arrayResult = extractJsonArray<T>(raw);
-    if (arrayResult && Array.isArray(arrayResult) && (arrayResult as unknown[]).length > 0) return arrayResult;
+    const arrayResult = extractJsonArray(raw);
+    if (arrayResult && Array.isArray(arrayResult) && arrayResult.length > 0) return arrayResult;
     // Try extracting a JSON object (strategic output)
     try {
-      const objResult = extractJsonObject<T>(raw, 'vision', 'direction_operations');
+      const objResult = extractJsonObject(raw, 'vision', 'direction_operations');
       if (objResult) return objResult;
     } catch (extractErr: unknown) {
       if (extractErr instanceof JsonExtractionError) {
@@ -1232,8 +1232,9 @@ export function execFileAsync(
     if (typeof proc.pid === 'number') {
       registerChildPid(proc.pid);
     }
-    proc.stdout!.on('data', (d: Buffer) => stdoutChunks.push(d));
-    proc.stderr!.on('data', (d: Buffer) => stderrChunks.push(d));
+    if (!proc.stdout || !proc.stderr) throw new Error('spawn returned no stdio streams');
+    proc.stdout.on('data', (d: Buffer) => stdoutChunks.push(d));
+    proc.stderr.on('data', (d: Buffer) => stderrChunks.push(d));
     let timedOut = false;
     let killTimer: NodeJS.Timeout | null = null;
     const originalPid = proc.pid;
@@ -1677,7 +1678,10 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   }
 
   // --- Auto-detection (only if buildConfig produced no runners) ---
-  if (runners.length === 0) {
+  // TS doesn't track .push() mutations, so use a Boolean accessor that always reads the
+  // current length to avoid spurious "always-true" narrowing on the literal-empty array.
+  const noRunners = (): boolean => runners.length === 0;
+  if (noRunners()) {
     const pkgPath = `${WORKSPACE}/package.json`;
     const pytestIniPath = `${WORKSPACE}/pytest.ini`;
     const pyprojectPath = `${WORKSPACE}/pyproject.toml`;
@@ -1692,7 +1696,7 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
       } catch { /* malformed package.json — skip */ }
     }
 
-    if (runners.length === 0) {
+    if (noRunners()) {
       if (existsSync(pytestIniPath)) {
         runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
       } else if (existsSync(pyprojectPath)) {
@@ -1704,12 +1708,12 @@ function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
       }
     }
 
-    if (runners.length === 0 && existsSync(cargoPath)) {
+    if (noRunners() && existsSync(cargoPath)) {
       runners.push({ cmd: 'cargo', args: ['test'], cwd: WORKSPACE, label: 'cargo test (root)' });
     }
 
     // --- Subdirectory detection (only if no root-level runner found) ---
-    if (runners.length === 0) {
+    if (noRunners()) {
       const backendPytestIni = `${WORKSPACE}/backend/pytest.ini`;
       const backendPyproject = `${WORKSPACE}/backend/pyproject.toml`;
       const backendTestScript = `${WORKSPACE}/scripts/test-backend.sh`;
@@ -2438,7 +2442,8 @@ function buildBaseCliEnv(): Record<string, string> {
     'ORCHESTRATOR_URL',
     'TASK_ID',
   ]) {
-    if (process.env[key]) env[key] = process.env[key]!;
+    const v = process.env[key];
+    if (v !== undefined) env[key] = v;
   }
   if (AGENT_TOKEN) env.AGENT_API_TOKEN = AGENT_TOKEN;
   // Merge provider-settings translation env last so it can't overwrite auth
@@ -2457,7 +2462,7 @@ function withExecutionModePrompt(prompt: string): string {
   // Settings-bag prompt fragments (from backend translator) — these carry
   // fallback instructions for knobs the CLI can't express natively, like
   // the advisor tool on non-opus executors.
-  if (LLM_CLI_TRANSLATION?.prompt_fragments?.length) {
+  if (LLM_CLI_TRANSLATION?.prompt_fragments.length) {
     fragments.push(...LLM_CLI_TRANSLATION.prompt_fragments);
   }
   // Legacy advisor mode path — retained for back-compat during rollout of
@@ -2686,8 +2691,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
-  let timedOut = false;
-  let providerKilledByOOM = false;
+  // Wrap mutable flags in an object so TS doesn't narrow them to `false` after
+  // the Promise resolves — the close/timeout callbacks mutate them inside the
+  // Promise scope, and TS's flow analysis can't see across the await boundary.
+  const flags: { timedOut: boolean; providerKilledByOOM: boolean } = { timedOut: false, providerKilledByOOM: false };
 
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
@@ -2710,14 +2717,14 @@ PAGE=""
 SEVERITY=""
 
 while [ $# -gt 0 ]; do
-  case "\$1" in
-    --page) PAGE="\$2"; shift 2 ;;
-    --severity) SEVERITY="\$2"; shift 2 ;;
-    *) CONTENT="\${CONTENT:+\$CONTENT }\$1"; shift ;;
+  case "$1" in
+    --page) PAGE="$2"; shift 2 ;;
+    --severity) SEVERITY="$2"; shift 2 ;;
+    *) CONTENT="\${CONTENT:+$CONTENT }$1"; shift ;;
   esac
 done
 
-if [ -z "\$CONTENT" ]; then
+if [ -z "$CONTENT" ]; then
   echo "Error: content is required" >&2; exit 1
 fi
 
@@ -2727,15 +2734,15 @@ TASK="\${TASK_ID:?TASK_ID not set}"
 CURL_OPTS="-f -sS --max-time 15 --connect-timeout 10"
 
 # Build JSON with printf to avoid shell expansion issues
-JSON="{\\"task_id\\":\\"\$TASK\\",\\"annotation_type\\":\\"\$TYPE\\",\\"content\\":\\"\$(echo "\$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
-[ -n "\$PAGE" ] && JSON="\${JSON},\\"target_page\\":\\"\$PAGE\\""
-[ -n "\$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"\$SEVERITY\\""
+JSON="{\\"task_id\\":\\"$TASK\\",\\"annotation_type\\":\\"$TYPE\\",\\"content\\":\\"$(echo "$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
+[ -n "$PAGE" ] && JSON="\${JSON},\\"target_page\\":\\"$PAGE\\""
+[ -n "$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"$SEVERITY\\""
 JSON="\${JSON}}"
 
-printf '%s' "\$JSON" | \\
-  curl \$CURL_OPTS -X POST "\$API/api/agent/annotate" \\
+printf '%s' "$JSON" | \\
+  curl $CURL_OPTS -X POST "$API/api/agent/annotate" \\
     -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: \$TOKEN" \\
+    -H "X-Agent-Token: $TOKEN" \\
     --data-binary @-
 echo ""
 `;
@@ -2792,13 +2799,13 @@ echo ""
     const originalPid = child.pid;
     const processGroupStillOwned = () =>
       originalPid !== undefined
-      && child?.pid === originalPid
+      && child.pid === originalPid
       && child.exitCode === null
       && child.signalCode === null;
     const killTimer = setTimeout(() => {
       log(`${runCommand.displayName} process timed out after ${timeoutMinutes} minutes — killing process group`);
       sendLog(ws, `\n[TIMEOUT] ${runCommand.displayName} exceeded ${timeoutMinutes}-minute time limit\n`);
-      timedOut = true;
+      flags.timedOut = true;
       const pid = originalPid;
       if (pid !== undefined && processGroupStillOwned()) {
         try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
@@ -2809,7 +2816,10 @@ echo ""
       }
     }, timeoutMs);
 
-    child.stdout!.on('data', (data: Buffer) => {
+    if (!child.stdout || !child.stderr) {
+      throw new Error('spawn returned no stdio streams');
+    }
+    child.stdout.on('data', (data: Buffer) => {
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (runCommand.outputMode === 'claude-stream-json') {
@@ -2828,7 +2838,7 @@ echo ""
           // with the WRONG result text. Now an error-type message captures
           // the error into stderr buffer so downstream classification sees it.
           const objType = (obj as { type?: string } | null)?.type;
-          if (objType === 'assistant' && obj?.message?.content) {
+          if (objType === 'assistant' && obj.message?.content) {
             for (const block of obj.message.content) {
               if (block.type === 'text') {
                 sendLog(ws, (block.text ?? '') + '\n');
@@ -2871,7 +2881,7 @@ echo ""
       }
     });
 
-    child.stderr!.on('data', (data: Buffer) => {
+    child.stderr.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       stderrBuffer = appendBoundedTail(stderrBuffer, text, STDERR_TAIL_BYTES);
@@ -2896,8 +2906,8 @@ echo ""
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
-      if (closeSignal === 'SIGKILL' && !timedOut) {
-        providerKilledByOOM = true;
+      if (closeSignal === 'SIGKILL' && !flags.timedOut) {
+        flags.providerKilledByOOM = true;
         const oomLine = `EOOM: ${runCommand.displayName} process received external SIGKILL before agent timeout; likely cgroup OOM\n`;
         stderrBuffer = appendBoundedTail(stderrBuffer, oomLine, STDERR_TAIL_BYTES);
         if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += oomLine;
@@ -2913,10 +2923,10 @@ echo ""
 
   sendLog(ws, `\n--- ${runner.displayName} exited (code: ${exitCode}) ---\n`);
 
-  if (timedOut) {
+  if (flags.timedOut) {
     throw new ClaudeTimeoutError(`${runner.displayName} exceeded ${runCommand.timeoutMs / 60000}-minute time limit`);
   }
-  if (providerKilledByOOM) {
+  if (flags.providerKilledByOOM) {
     const err = new ClaudeTimeoutError(`EOOM: ${runner.displayName} received external SIGKILL before agent timeout; likely cgroup OOM`);
     (err as Error & { code?: string }).code = 'EOOM';
     throw err;
