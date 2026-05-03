@@ -651,6 +651,13 @@ export async function handleInvestigate(
   const rawBaseBranch = strVal(payload.base_branch, 'main');
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
+  // Match handleMigrate (line 133): a missing prompt produces a malformed
+  // template "Issue to investigate:\n\nInstructions:..." that Claude can't
+  // act on, leading to a 3-second silent failure (status PROVISIONING →
+  // IN_PROGRESS → FAILED with "no JSON object with root_cause found in
+  // transcript"). Fail loud instead so the orchestrator surfaces a real
+  // diagnosis rather than retrying the same empty prompt 3×.
+  if (!userPrompt) throw new Error('No prompt found in task payloads (investigate)');
 
   statusRef.value = `Cloning ${owner}/${repo} for investigation...`;
   sendLog(ws, `Starting investigation...\n`);
@@ -740,11 +747,24 @@ IMPORTANT:
     }
 
     if (investigationResult === null) {
+      // Surface the real Claude exit code + transcript tail so the orchestrator
+      // can distinguish "Claude crashed" (3-second deaths with empty allOutput)
+      // from "Claude ran but didn't write the report" (exitCode 0, transcript
+      // exists, just no JSON). The bare "Failed to read investigation report"
+      // message previously hid both modes.
+      const tail = (allOutput || '').slice(-2000);
+      const lastResultTail = (lastResultText || '').slice(-500);
       await persistAndPostStatus(taskId, {
         task_id: taskId,
         status: 'FAILED',
         artifact_type: 'ERROR_LOG',
-        logs: `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; no JSON object with root_cause found in transcript`,
+        logs:
+          `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; ` +
+          `no JSON object with root_cause found in transcript ` +
+          `(exitCode=${exitCode}, allOutput=${(allOutput || '').length}b, ` +
+          `lastResultText=${(lastResultText || '').length}b)\n` +
+          `--- lastResultText tail ---\n${lastResultTail}\n` +
+          `--- allOutput tail ---\n${tail}`,
         failure_category: 'parse_failed',
       });
       return;

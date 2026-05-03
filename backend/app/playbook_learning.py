@@ -190,6 +190,69 @@ def _playbook_size_bytes(doc: dict) -> int:
     return len(json.dumps(playbook_subset).encode())
 
 
+async def finalize_pending_playbook_entries(
+    task: Task, session: AsyncSession, *, succeeded: bool,
+) -> int:
+    """Resolve playbook entries left ``pending_source=<task.id>`` by *task*.
+
+    Anti-poisoning: agents may call ``./playbook set`` while their task is
+    still IN_PROGRESS. Those writes carry a ``pending_source`` field stamped
+    by ``main.update_playbook`` so peers can't see them yet. This helper
+    runs at terminal status and:
+
+    * ``succeeded=True`` (task COMPLETED) — clears ``pending_source`` from
+      every entry whose source is *task*, making them visible to peers.
+    * ``succeeded=False`` (task FAILED / CANCELLED) — deletes those entries
+      entirely, so a task that never landed code can't leave a lie behind
+      claiming "X exists in the codebase."
+
+    Returns the number of entries finalised (cleared or removed). No-op when
+    the project has no design_doc or no matching pending entries.
+    """
+    project = await session.get(Project, task.project_id)
+    if project is None or not project.design_doc:
+        return 0
+
+    doc = dict(project.design_doc)
+    my_id = str(task.id)
+    changed = 0
+    to_delete: list[str] = []
+
+    for k, v in list(doc.items()):
+        if not k.startswith("playbook/") or not isinstance(v, dict):
+            continue
+        if v.get("pending_source") != my_id:
+            continue
+        if succeeded:
+            new_entry = dict(v)
+            new_entry.pop("pending_source", None)
+            doc[k] = new_entry
+        else:
+            to_delete.append(k)
+        changed += 1
+
+    for k in to_delete:
+        doc.pop(k, None)
+
+    if changed:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = (
+            "playbook-finalize-success" if succeeded else "playbook-finalize-failure"
+        )
+        doc["_meta"] = meta
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        logger.info(
+            "[PLAYBOOK] %s %d pending entr%s for terminal task %s (succeeded=%s)",
+            "Finalised" if succeeded else "Removed",
+            changed, "y" if changed == 1 else "ies", task.id, succeeded,
+        )
+    return changed
+
+
 def _archive_least_useful_entry(doc: dict) -> dict:
     """Move the least-useful playbook entry to ``playbook_archive`` in *doc*.
 

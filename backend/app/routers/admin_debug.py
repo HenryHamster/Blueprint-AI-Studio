@@ -870,6 +870,9 @@ async def get_global_diagnostics(
             Task.last_heartbeat, Task.vm_provisioned_at, Task.started_at,
             Task.attempt_count, Task.latest_status_message,
             Task.context, Task.status_log, Task.depends_on,
+            # payloads is read by classify_failure → _classify_stuck_failure;
+            # omitting it here triggers MissingGreenlet on lazy-load.
+            Task.payloads,
         ))
         .where(
             Task.status.in_(active_statuses),

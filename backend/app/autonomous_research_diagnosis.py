@@ -99,10 +99,15 @@ async def _spawn_direction_diagnosis(
             taxonomy_counts[category] = taxonomy_counts.get(category, 0) + 1
 
     # Pull playbook entries (operational knowledge) for the agent to reference.
+    # Filter out pending_source entries — those are mid-flight writes from
+    # tasks that haven't completed yet; surfacing them poisons peers when the
+    # writing task ultimately fails (see main.py update_playbook).
     doc = project.design_doc or {}
     playbook_entries: dict[str, str] = {}
     for k, v in doc.items():
         if k.startswith("playbook/") and isinstance(v, dict):
+            if v.get("pending_source"):
+                continue
             content = v.get("content") or ""
             if content:
                 playbook_entries[k] = content[:2000]

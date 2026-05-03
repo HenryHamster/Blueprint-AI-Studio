@@ -889,6 +889,9 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
     for key, entry in doc.items():
         if not key.startswith("playbook/") or not isinstance(entry, dict):
             continue
+        # Skip pending entries (mid-flight writes from non-completed tasks).
+        if entry.get("pending_source"):
+            continue
         source = entry.get("source") or ""
         content = entry.get("content") or ""
         content_lower = content.lower()

@@ -1272,6 +1272,21 @@ async def _process_post_commit(
                     exc_info=True,
                 )
 
+        # Anti-poisoning: resolve playbook entries the task wrote while
+        # IN_PROGRESS. On COMPLETED, clear pending_source so peers can see
+        # them. On FAILED/CANCELLED, drop them entirely so a task that
+        # never landed its code can't leave a "X exists" lie in the
+        # playbook. Must run before commit so the design_doc mutation
+        # is persisted alongside the rest of the post-commit work.
+        if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            try:
+                from app.playbook_learning import finalize_pending_playbook_entries
+                await finalize_pending_playbook_entries(
+                    task, session, succeeded=(payload.status == TaskStatus.COMPLETED),
+                )
+            except Exception:
+                logger.exception("[PLAYBOOK] Failed to finalise pending entries for task %s", task.id)
+
         # Audit 2026-04-25 A7/A12: release the FOR UPDATE row lock before the
         # review pipeline runs its slow GitHub calls (PR fetch, check-runs,
         # PR review submission, merge attempts — each can hit GitHub rate

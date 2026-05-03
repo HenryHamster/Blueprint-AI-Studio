@@ -548,7 +548,10 @@ def cmd_activity(args):
     for i, a in enumerate(args):
         if a == '--limit' and i + 1 < len(args):
             limit = int(args[i + 1])
-    events = api("GET", f"/api/admin/activity?limit={limit}")
+    resp = api("GET", f"/api/admin/activity?limit={limit}")
+    # Endpoint returns {"events": [...], "total": N}; tolerate older list-shaped
+    # responses too in case the server is mid-deploy.
+    events = resp.get("events", []) if isinstance(resp, dict) else (resp or [])
     if not events:
         print("No recent activity.")
         return

@@ -1292,8 +1292,18 @@ async def claim_task(
             for f in _task_related_files
             if isinstance(_file_to_system.get(f), str) and _file_to_system.get(f)
         }
+        _my_task_id = str(task.id)
         for k, v in (project_for_playbook.design_doc or {}).items():
             if k.startswith("playbook/") and isinstance(v, dict):
+                # Anti-poisoning: skip entries that are pending writes from
+                # OTHER non-completed tasks. The source task can still see
+                # its own pending entries; peers see them only after the
+                # source task COMPLETES (pending_source cleared) or skip
+                # them entirely if the source FAILED (entry removed). See
+                # main.py update_playbook for the rationale.
+                pending_source = v.get("pending_source")
+                if pending_source and pending_source != _my_task_id:
+                    continue
                 applicable_types = v.get("applicable_types")
                 if applicable_types is not None:
                     if task_type not in applicable_types:

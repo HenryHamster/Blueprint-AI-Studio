@@ -744,9 +744,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         design_doc_summary: dict = {
             "_keys": [k for k in doc if not k.startswith("_") and not k.startswith("playbook/")],
         }
-        # Include playbook entries (small, operationally critical)
+        # Include playbook entries (small, operationally critical).
+        # Skip pending_source entries — those are mid-flight writes whose
+        # source task hasn't completed yet. See main.py update_playbook for
+        # the anti-poisoning rationale.
         for k, v in doc.items():
             if k.startswith("playbook/") and isinstance(v, dict):
+                if v.get("pending_source"):
+                    continue
                 design_doc_summary[k] = v.get("content", "")
 
         research_payload: dict = {

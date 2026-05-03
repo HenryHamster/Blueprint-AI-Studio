@@ -1606,15 +1606,31 @@ async def update_playbook(
     if op == "list":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        keys = [k[len("playbook/"):] for k in doc if k.startswith("playbook/")]
+        my_id = str(task.id)
+        keys = []
+        for k, v in doc.items():
+            if not k.startswith("playbook/"):
+                continue
+            if isinstance(v, dict):
+                pending_source = v.get("pending_source")
+                if pending_source and pending_source != my_id:
+                    continue
+            keys.append(k[len("playbook/"):])
         return {"status": "ok", "op": op, "keys": keys}
 
     if op == "get":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
         entries = {}
+        my_id = str(task.id)
         for k, v in doc.items():
             if k.startswith("playbook/") and isinstance(v, dict):
+                # Hide pending entries written by OTHER non-completed tasks —
+                # only the source task can see its own un-finalised entries.
+                # Prevents a failed task's lies from poisoning peers' prompts.
+                pending_source = v.get("pending_source")
+                if pending_source and pending_source != my_id:
+                    continue
                 short_key = k[len("playbook/"):]
                 entries[short_key] = {
                     "content": v.get("content", ""),
@@ -1656,6 +1672,15 @@ async def update_playbook(
         }
         if payload.applicable_types is not None:
             entry["applicable_types"] = payload.applicable_types
+        # Anti-poisoning: until the source task transitions to COMPLETED,
+        # the entry is invisible to other tasks (filtered in the get/list
+        # paths above and in prompt builders that surface playbook entries).
+        # On COMPLETED, task_lifecycle clears the pending_source field; on
+        # FAILED/CANCELLED, the entry is removed entirely. Prevents a task
+        # that mid-flight claims "X exists" from poisoning peers' prompts
+        # when the task ultimately fails to land the code.
+        if task.status != TaskStatus.COMPLETED:
+            entry["pending_source"] = str(task.id)
         doc[playbook_key] = entry
         # Size check: all playbook/* keys combined max 30KB
         playbook_total = sum(
