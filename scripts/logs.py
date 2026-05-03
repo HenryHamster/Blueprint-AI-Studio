@@ -17,7 +17,7 @@ import urllib.error
 import subprocess
 from datetime import datetime, timezone, timedelta
 
-GCP_PROJECT = "friction-logging-489102"
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
 SERVICE_NAME = "blueprint-orchestrator"
 
 # gcloud path — use the binary directly, avoid .cmd wrapper issues on Windows
