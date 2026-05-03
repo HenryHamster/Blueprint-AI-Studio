@@ -383,6 +383,32 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         (strategic_frequency > 0 and research_spawn_count > 0 and research_spawn_count % strategic_frequency == 0)
         or force_strategic
     )
+    # 2026-05-03: gate strategic spawn on no-active-strategic.
+    # _spawn_strategic_review/_spawn_design_doc_update internally dedup
+    # against active tasks and return False on conflict. Without this
+    # check, the counter stays at the same multiple-of-N (modulo trigger),
+    # next tick re-enters the spawn branch, calls the spawner, gets False
+    # again, loops indefinitely. User-visible: a stream of back-to-back
+    # strategic_review spawn-attempts every minute.
+    if is_strategic:
+        from sqlalchemy import func as _strat_func
+        has_active_strategic = (await session.execute(
+            select(_strat_func.count()).select_from(Task).where(
+                Task.project_id == project.id,
+                Task.payloads[0]["type"].as_string().in_(["strategic_review", "design_doc_update"]),
+                Task.status.in_([
+                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+                ]),
+            )
+        )).scalar() or 0
+        if has_active_strategic > 0:
+            logger.debug(
+                f"[STRATEGIC] Skipping strategic spawn — {has_active_strategic} active "
+                f"strategic task(s) exist for project {project.id}; falling through to tactical"
+            )
+            is_strategic = False  # skip the spawn block; tactical research below may still fire
+
     if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
         # Architecture stabilizes faster than strategy, so it runs less frequently.
@@ -445,6 +471,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                               "_strategic_cycle_count": strategic_cycle_count}
             flag_modified(project, "vision")
             session.add(project)
+            # 2026-05-03: commit BEFORE the tactical-research early-returns
+            # below. Without this, when a tactical-research cap (max_parallel
+            # / max_total / global rate-limit) fires, the function returns
+            # without committing the strategic-counter increment. Next tick
+            # reads the OLD count, sees count % strategic_frequency == 0
+            # again, fires another strategic spawn. Even with the
+            # has_active_strategic guard above, eventually that strategic
+            # task completes and the next tick re-fires immediately.
+            await session.commit()
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
