@@ -500,6 +500,13 @@ async def _build_recent_interventions(
         .options(load_only(
             Task.id, Task.status, Task.created_at, Task.updated_at,
             Task.context, Task.payloads, Task.parent_task_id, Task.status_log,
+            # title + description are read by _build_recent_interventions
+            # (lines ~613, 629, 638) when constructing the merge summary the
+            # strategic agent consumes. Excluding them caused MissingGreenlet
+            # at lazy-load time when this function ran from
+            # task_completion._handle_design_doc_completion → spawn fails
+            # silently and the strategic cycle stalls.
+            Task.title, Task.description,
         ))
         .order_by(Task.created_at.desc())
         .limit(500)
