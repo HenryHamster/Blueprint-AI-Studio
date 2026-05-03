@@ -1197,6 +1197,18 @@ async def health_check():
     """Unauthenticated health endpoint for external monitoring (Cloud Function, load balancer)."""
     from app.shared_state import external_health
 
+    # Non-leader instances don't run the orchestrator — they're healthy HTTP servers
+    # but should be clearly distinguished from a leader with a stale/missing cycle.
+    if not _shared_state.is_leader:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "healthy",
+                "is_leader": False,
+                "revision": _current_revision,
+            },
+        )
+
     orchestrator_alive = _orch._orchestrator_last_cycle is not None
     cycle_age = None
     if _orch._orchestrator_last_cycle:
@@ -1226,6 +1238,7 @@ async def health_check():
         status_code=status_code,
         content={
             "status": status,
+            "is_leader": True,
             "revision": _current_revision,
             "orchestrator_alive": orchestrator_alive,
             "orchestrator_cycle_age_seconds": cycle_age,

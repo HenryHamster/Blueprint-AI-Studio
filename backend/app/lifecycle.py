@@ -4,6 +4,7 @@ Extracted from app.main to reduce module size.
 """
 
 import asyncio
+import ctypes
 import logging
 import os
 import warnings
@@ -11,13 +12,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict
 
-from sqlalchemy import func as _func
+from sqlalchemy import func as _func, text as _text
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal, init_db
 from app.models import AllowedUser, Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
+
+# Session-scoped advisory lock ID for background-leader election.
+# Stored as signed int64 (PostgreSQL bigint) via two's-complement conversion.
+_BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
 
 logger = logging.getLogger("blueprint")
 
@@ -104,40 +110,68 @@ async def lifespan(app):
     # Check deployment state (detect new deploy, rollback, or normal restart)
     await _init_deployment_state()
 
-    # TODO(R6-W2-CRIT, audit 2026-04-30): Add Postgres advisory-lock leader
-    # election around the background services below before bumping
-    # infra/terraform/cloud_run.tf max_instance_count above 1. Today these
-    # services have NO leader election — per-row safety holds via
-    # task_lock(skip_locked=True) and FOR UPDATE, but side effects are not
-    # per-row: GitHub/GCP API polls multiply Nx, _provision_coroutines is a
-    # per-instance dict racing _get_actual_gcp_vm_count, stale-branch cleanup
-    # and image pruner issue N redundant deletes. Cloud Run is currently
-    # capped at max=1 as defense-in-depth so this is dormant, but the cap
-    # blocks horizontal scale.
-    #
-    # Sketch of the fix (use a dedicated session that's never closed so the
-    # session-level lock auto-releases only when the lifespan ends):
-    #
-    #     from sqlalchemy import text
-    #     BACKGROUND_LOCK_ID = 0xB1EB1EB1EB1EB1EB  # arbitrary 64-bit constant
-    #     leader_session = AsyncSessionLocal()
-    #     await leader_session.__aenter__()
-    #     result = await leader_session.execute(
-    #         text("SELECT pg_try_advisory_lock(:lock_id)"),
-    #         {"lock_id": BACKGROUND_LOCK_ID},
-    #     )
-    #     is_leader = result.scalar()
-    #     if not is_leader:
-    #         await leader_session.close()
-    #         logger.info("[STARTUP] Not background-leader; skipping background services")
-    #         yield
-    #         return
-    #     # Otherwise: own the lock for the lifespan, spawn services, release
-    #     # in shutdown via leader_session.close() (advisory locks are released
-    #     # automatically when the session/connection closes).
-    #
-    # The non-leader branch must still serve HTTP traffic (FastAPI request
-    # routes, /health, etc.) — only background services are leader-gated.
+    # --- Leader election via pg_try_advisory_lock (session-scoped) ---
+    # Only one Cloud Run instance should run the leader-only background services.
+    # We hold a dedicated session open for the entire lifespan; the lock is released
+    # automatically when the session/connection closes at shutdown.
+    leader_session = AsyncSessionLocal()
+    await leader_session.__aenter__()
+    try:
+        _result = await leader_session.execute(
+            _text("SELECT pg_try_advisory_lock(:lock_id)"),
+            {"lock_id": _BACKGROUND_LOCK_ID},
+        )
+        is_leader = bool(_result.scalar())
+    except Exception:
+        # Non-Postgres dialect (SQLite in tests) — default to leader so all
+        # services start normally; close the dummy session immediately.
+        is_leader = True
+        await leader_session.aclose()
+        leader_session = None
+
+    _shared_state.is_leader = is_leader
+
+    if not is_leader:
+        logger.info("[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)")
+        # Per-instance services still run on non-leader instances.
+        config_sync_task = asyncio.create_task(runtime_config_sync_service())
+        from app.shared_state import background_tasks as _bg_tasks_nl
+        _bg_tasks_nl["config_sync"] = config_sync_task
+
+        # Minimal watchdog: restart per-instance services if they crash.
+        async def _monitor_non_leader():
+            while True:
+                try:
+                    await asyncio.sleep(30)
+                    if config_sync_task.done():
+                        exc = config_sync_task.exception() if not config_sync_task.cancelled() else None
+                        logger.error(f"[MONITOR] config_sync DIED on non-leader (exc={exc}); restarting")
+                        _bg_tasks_nl["config_sync"] = asyncio.create_task(runtime_config_sync_service())
+                except asyncio.CancelledError:
+                    break
+                except Exception as _e:
+                    logger.warning(f"[MONITOR] Non-leader watchdog error: {_e}")
+                    await asyncio.sleep(10)
+
+        nl_monitor_task = asyncio.create_task(_monitor_non_leader())
+
+        yield
+
+        nl_monitor_task.cancel()
+        config_sync_task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(nl_monitor_task, config_sync_task, return_exceptions=True),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[SHUTDOWN] Non-leader tasks didn't finish within 10s")
+        await close_github_client()
+        from app.redis_client import close_redis
+        await close_redis()
+        return
+
+    # This instance owns the background-leader lock — start all background services.
 
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
@@ -336,3 +370,9 @@ async def lifespan(app):
     await close_github_client()
     from app.redis_client import close_redis
     await close_redis()
+    # Release the session-scoped advisory lock by closing the dedicated session.
+    if leader_session is not None:
+        try:
+            await leader_session.aclose()
+        except Exception:
+            pass

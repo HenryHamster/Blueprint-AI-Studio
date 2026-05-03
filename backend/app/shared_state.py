@@ -767,6 +767,11 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
 background_tasks: Dict[str, asyncio.Task] = {}  # name -> asyncio.Task
 
+# --- Leader Election State ---
+# True on the instance that won the pg_try_advisory_lock; False on followers.
+# Defaults to True so non-Postgres environments (tests, local dev without PG) behave normally.
+is_leader: bool = True
+
 # --- Deployment Monitoring (Phase A: detect + alert) ---
 deploy_monitoring: Dict = {
     "window_start": None,           # datetime when monitoring began for current deploy
