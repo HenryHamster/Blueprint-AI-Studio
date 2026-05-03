@@ -446,10 +446,10 @@ cd ..
 ok "Image built: $IMAGE_TAG"
 
 info "Running database migrations (region: $REGION)..."
-if gcloud run jobs describe run-migrations --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
-  gcloud run jobs update run-migrations --image="$IMAGE_TAG" --region="$REGION" --project="$PROJECT_ID" --quiet
+if gcloud run jobs describe blueprint-migrate --region="$REGION" --project="$PROJECT_ID" &>/dev/null; then
+  gcloud run jobs update blueprint-migrate --image="$IMAGE_TAG" --region="$REGION" --project="$PROJECT_ID" --quiet
 else
-  gcloud run jobs create run-migrations \
+  gcloud run jobs create blueprint-migrate \
     --image="$IMAGE_TAG" --region="$REGION" \
     --service-account="$ORCHESTRATOR_SA" \
     --set-secrets="DATABASE_URL=DATABASE_URL:latest" \
@@ -458,7 +458,7 @@ else
     --project="$PROJECT_ID" --quiet
 fi
 
-gcloud run jobs execute run-migrations --region="$REGION" --project="$PROJECT_ID" --wait --quiet
+gcloud run jobs execute blueprint-migrate --region="$REGION" --project="$PROJECT_ID" --wait --quiet
 ok "Migrations complete"
 
 info "Deploying backend to Cloud Run..."

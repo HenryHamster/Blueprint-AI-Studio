@@ -373,7 +373,11 @@ class TestZoneHealth:
     def test_get_zone_health_summary_shape(self, clean_zone_state):
         """get_zone_health_summary() returns exactly the expected keys."""
         summary = get_zone_health_summary()
-        assert set(summary.keys()) == {"total_zones", "available", "exhausted", "cooldown_recovery", "zone_success_rates"}
+        assert set(summary.keys()) == {
+            "total_zones", "active_zones", "disabled", "available",
+            "exhausted", "cooldown_recovery", "zone_success_rates",
+        }
+        assert isinstance(summary["disabled"], list)
         assert isinstance(summary["exhausted"], list)
         assert isinstance(summary["cooldown_recovery"], dict)
         assert isinstance(summary["zone_success_rates"], dict)
