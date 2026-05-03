@@ -153,16 +153,67 @@ export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, stri
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
-// Project-specific override of the trained "lint failed → refactor source"
-// reflex. The size guardrails (backend/testing/module_size_limits.json,
-// admin-ui frontend equivalents) ARE meant to be bumped — the assertion
-// message itself walks the agent through the bump, but Claude defaults to
-// "fix the source" without explicit guidance. Without this override agents
-// burned multiple full retry cycles on irreducible diffs (e.g. JWT
-// revocation work that genuinely needed +10-15 lines in a file already at
-// the cap), failed every time, and triggered direction holds. See
-// audit_pipeline_2026_05_03.md for the cluster of CODE_ERROR failures this
-// addresses.
+// Generalized override of the trained "lint failed → refactor source"
+// reflex for project-specific assertion messages that encode policy. The
+// 2026-05-03 dogfood run lost a full strategic cycle because investigation
+// agents read the size_breach assertion message (which TELLS the agent to
+// bump the JSON), correctly diagnosed the size-cap as root cause, but
+// prescribed an extract-helpers refactor anyway because Claude's training
+// bias dominated the assertion's literal instructions. The same pattern
+// will recur on any project-specific convention encoded in assertion text:
+// alembic migration patterns, release-relock pattern, playbook system, etc.
+export const READ_THE_FAILURE_MESSAGE = `
+## Read The Failure Message Literally
+
+When a test, lint, or build check fails, **read the full assertion or
+error message before deciding what to change**. Project-specific
+assertion messages often encode operational policy that overrides the
+generic "fix the source" reflex.
+
+If the failure message includes a remediation procedure — e.g.
+\`POST /api/agent/...\`, \`edit file X\`, \`follow the Y protocol\`,
+\`bump the limit in <config>\`, \`run script Z\` — **follow it literally**.
+The procedure is what the project owner wants you to do; ignoring it to
+"fix the source" creates churn and burns retry attempts.
+
+Examples of remediation procedures encoded in assertions:
+- Size guardrails (\`module_size_limits.json\`): bump the limit, do NOT refactor
+- Migration conflicts: chain a new migration, do NOT modify existing ones
+- Playbook patterns: use \`./playbook set\` to record discoveries
+- Schema revision drift: bump \`EXPECTED_SCHEMA_REVISION\` to match alembic head
+
+Default reflex is "fix the source." Override that reflex when the
+assertion is telling you to fix the test config, the migration chain,
+or any other piece of project infrastructure.
+`;
+
+export const PRIOR_ATTEMPT_DIVERGENCE = `
+## If You're Retrying — Try A Different Angle
+
+If your task context indicates this is a fix iteration or a remediation
+of a previously-failed attempt, **the same approach won't work twice**.
+
+Before writing code: ask yourself what the previous attempt assumed
+about the root cause. If it tried "edit source X to make test Y pass"
+and failed, consider:
+- Maybe Y is meant to fail unless the test config is bumped (size guardrail, etc.)
+- Maybe X isn't the right file — the test is actually validating Z
+- Maybe the failure is in a place the previous attempt never read
+
+Common wrong-direction patterns to avoid on retry:
+1. **Re-running the same lint fix that already failed** — output won't change
+2. **Adding more code when the previous attempt's lint failure was "file too long"** — the answer is bump the limit, not condense the diff
+3. **Refactoring the source when the test is asking you to update test config** — read the assertion message, follow its remediation literally
+4. **Making the test pass by weakening assertions** — that's not allowed; either the source needs to be different or the test/policy needs to change
+
+The diagnosis system fingerprints failures and stores them as
+\`ResidualRemediationCase\`. If your task includes prior_diagnosis or
+diagnosis_root_cause in its context, that is your hint about what
+**previously didn't work** — pivot away from that, do not repeat it.
+`;
+
+// Per-task SIZE-specific guidance — kept distinct from READ_THE_FAILURE_MESSAGE
+// because it includes an explicit step-by-step procedure.
 export const SIZE_GUARDRAIL_GUIDANCE = `
 ## Size Guardrails Are Advisory — Bump, Don't Refactor
 

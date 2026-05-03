@@ -1219,6 +1219,45 @@ async def _spawn_task_failure_investigation(
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
 
+    # Investigation-recursion depth cap. The 2026-05-03 dogfood run showed
+    # multi-level investigation chains burning compute without converging:
+    #   original_task fails (depth 0) →
+    #     investigation_1 (depth 1) → remediation_1 (depth 1) →
+    #       investigation_2 (depth 2) → remediation_2 (depth 2) →
+    #         investigation_3 (depth 3) → ...
+    # Each investigation costs an agent VM (~$0.50-1.00 + tokens) and the
+    # marginal value drops fast — by depth 3 the diagnoses tend to converge
+    # on operator-judgment-required outcomes anyway. Cap at depth 2: failures
+    # of deeper-level remediations skip the spawn and surface to operator
+    # review via project message instead.
+    MAX_INVESTIGATION_DEPTH = 2
+    source_depth = int(ctx.get("investigation_depth") or 0)
+    next_depth = source_depth + 1
+    if next_depth > MAX_INVESTIGATION_DEPTH:
+        logger.warning(
+            f"[TASK FAILURE INVESTIGATION] Skip spawn for task {task.id} "
+            f"(direction {direction_id}): investigation_depth would be "
+            f"{next_depth} > MAX={MAX_INVESTIGATION_DEPTH}. Marking for "
+            f"operator review."
+        )
+        try:
+            from app.models import ProjectMessage, MessageType
+            session.add(ProjectMessage(
+                project_id=task.project_id,
+                message_type=MessageType.NOTE,
+                from_type="orchestrator",
+                content=(
+                    f"Investigation chain depth limit ({MAX_INVESTIGATION_DEPTH}) "
+                    f"reached for direction {direction_id or 'undirected'}. "
+                    f"Failed task: {task.id} ({(task.title or '?')[:80]}). "
+                    f"Auto-remediation has tried multiple times without converging — "
+                    f"operator review is needed before spawning further investigations."
+                ),
+            ))
+        except Exception as _msg_exc:
+            logger.warning(f"[TASK FAILURE INVESTIGATION] Failed to post depth-cap message: {_msg_exc}")
+        return False
+
     if is_review_quality:
         # Frequency gate: fire once this direction shows a review-quality
         # pattern in its recent failures. Use a sliding window over the
@@ -1392,6 +1431,7 @@ async def _spawn_task_failure_investigation(
             "last_failure_class": last_failure_class,
             "failure_taxonomy": failure_taxonomy,
             "failure_fingerprints": [prev_fp] if prev_fp else [],
+            "investigation_depth": next_depth,
             **({"diagnosis_fingerprint": prev_fp, "error_fingerprint": prev_fp} if prev_fp else {}),
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -1796,18 +1836,40 @@ async def _spawn_residual_fingerprint_remediation(project: Project, session: Asy
             "autonomous_research:residual_fingerprint_remediation",
         )
         primary_sample = sample_messages[0] if sample_messages else ""
+        # Compute investigation_depth for the remediation. We look up the
+        # max depth among task_ids (the failed tasks that contributed to
+        # this fingerprint) and add 1. If the deepest source was at depth 1
+        # (already a remediation that failed), the new remediation lands at
+        # depth 2 — and a subsequent failure won't trigger investigation #3
+        # (gated by MAX_INVESTIGATION_DEPTH=2 in _spawn_task_failure_investigation).
+        source_max_depth = 0
+        if task_ids:
+            try:
+                rows = (await session.execute(
+                    select(Task.context).where(
+                        Task.id.in_([uuid.UUID(t) if isinstance(t, str) else t for t in task_ids[:5]])
+                    )
+                )).all()
+                for (rc,) in rows:
+                    d = int((rc or {}).get("investigation_depth") or 0)
+                    if d > source_max_depth:
+                        source_max_depth = d
+            except Exception as _depth_exc:
+                logger.debug(f"[AUTO REMEDIATION] depth lookup failed for {fp[:32]}: {_depth_exc}")
+        remediation_context = {
+            "auto_remediation": True,
+            "spawned_by": "residual_fingerprint_remediation",
+            "error_fingerprint": fp,
+            "sample_message": primary_sample[:500],
+            "task_ids": task_ids,
+            "investigation_depth": source_max_depth + 1,
+        }
         new_task = Task(
             project_id=project.id,
             title=f"Remediate residual fingerprint: {fp[:60]}",
             description=f"Auto-spawned remediation for residual CODE_ERROR fingerprint {fp[:40]}",
             payloads=[payload],
-            context={
-                "auto_remediation": True,
-                "spawned_by": "residual_fingerprint_remediation",
-                "error_fingerprint": fp,
-                "sample_message": primary_sample[:500],
-                "task_ids": task_ids,
-            },
+            context=remediation_context,
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
