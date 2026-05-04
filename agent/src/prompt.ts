@@ -445,12 +445,12 @@ export function formatPlaybook(
       return `### ${key}\n${caveat}${content}`;
     })
     .join('\n\n');
-  return `## Operational Playbook (knowledge from past agents)\n\nThese notes were left by previous agents working on this codebase. Trust and follow them — they represent hard-won operational knowledge.\n\n${lines}\n\n`;
+  return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, update or delete it (\`./playbook set\` to overwrite, \`./playbook delete <key>\` to remove). The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
 }
 
 export const PLAYBOOK_GUIDANCE = `
-## Operational Playbook — Save What You Learn
-The playbook persists operational knowledge across all agent tasks in this project. Use \`./playbook set <key> <value>\` to save reusable knowledge. Use \`./playbook get\` to review existing entries.
+## Operational Playbook — Active Collective Memory
+The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, \`./playbook get\` to review, and \`./playbook delete <key>\` to remove an entry that turned out to be wrong, stale, or contradicted by the code you just read. If an existing entry led you astray, fixing or removing it helps the next agent more than adding a new one alongside it.
 
 **When to save (trigger conditions):**
 - After fixing a lint, build, or test error: save the root cause pattern and fix
