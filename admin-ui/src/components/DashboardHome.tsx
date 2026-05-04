@@ -28,6 +28,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
+import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
@@ -216,6 +217,7 @@ interface DigestData {
     false_alarm_rate?: number | null;
     sample_size?: number | null;
   } | null;
+  self_review_prediction_accuracy_trends?: SrTrendData | null;
   median_cost_per_merged_pr?: number | null;
   prediction_calibration_factor?: number | null;
   prediction_calibration_note?: string | null;
@@ -843,7 +845,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null) && (
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null) && (
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
               <div className="flex flex-wrap gap-3">
@@ -899,6 +901,10 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                     )}
                   </div>
                 )}
+                <SrTrendBreakdown
+                  trends={digest?.self_review_prediction_accuracy_trends}
+                  variant="card"
+                />
               </div>
             </section>
           )}

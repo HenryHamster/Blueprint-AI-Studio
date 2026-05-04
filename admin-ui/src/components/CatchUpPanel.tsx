@@ -20,6 +20,7 @@ import {
 } from './catchupHelpers';
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
 import { WaitingBadge, CompletionRow, SkeletonRow } from './catchupRows';
+import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
 
 interface NeedsAttentionItem {
   task_id: string;
@@ -236,6 +237,7 @@ interface DigestData {
     false_alarm_rate: number | null;
     sample_size: number;
   } | null;
+  self_review_prediction_accuracy_trends?: SrTrendData | null;
   first_review_approval_rate?: {
     overall: number | null;
     sample_size: number;
@@ -2100,13 +2102,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
               {(() => {
                 const sre = digest.self_review_effectiveness;
                 const spa = digest.self_review_prediction_accuracy;
+                const spaTrends = digest.self_review_prediction_accuracy_trends;
                 const ra = digest.review_accuracy;
                 const fra = digest.first_review_approval_rate;
                 const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
                 const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
+                const hasSpaTrends = !!(spaTrends && spaTrends.categories && Object.keys(spaTrends.categories).length > 0);
                 const hasRa = ra && (ra.precision != null || ra.recall != null);
                 const hasFra = fra && fra.overall != null && fra.sample_size >= 5;
-                if (!hasSre && !hasSpa && !hasRa && !hasFra) return null;
+                if (!hasSre && !hasSpa && !hasSpaTrends && !hasRa && !hasFra) return null;
                 const fraOverall = fra?.overall;
                 const fraColor = fraOverall != null
                   ? (fraOverall >= 0.8 ? 'text-emerald-400' : fraOverall >= 0.5 ? 'text-amber-400' : 'text-red-400')
@@ -2154,6 +2158,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               </span>
                             )}
                             <span className="text-[10px] text-neutral-500">· n={spa.sample_size}</span>
+                          </div>
+                        )}
+                        {hasSpaTrends && (
+                          <div className="flex flex-col gap-0.5">
+                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction by category</span>
+                            <SrTrendBreakdown trends={spaTrends} variant="inline" />
                           </div>
                         )}
                         {ra && hasRa && (
