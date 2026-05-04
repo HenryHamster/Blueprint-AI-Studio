@@ -3502,3 +3502,42 @@ describe('formatSelfReviewBlindSpots', () => {
     expect(out).not.toContain('Files NOT verified by self-review');
   });
 });
+
+describe('writeCodeChangeHelpers — self-review fallback', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('generates ./done script with soft-fallback self-review handling', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // Verify that the script checks for self-review file (with interpolated task ID)
+    expect(doneScript).toContain('SELF_REVIEW_FILE="/tmp/self_review_test-task-123.json"');
+
+    // Verify that it uses fallback when file is missing
+    expect(doneScript).toContain('self-review skipped — investigate');
+
+    // Verify that it uses fallback when file is invalid JSON
+    expect(doneScript).toContain('self-review JSON parsing failed');
+
+    // Verify that it always includes self_review_outcome in payload
+    expect(doneScript).toContain('{self_review_outcome: $self_review}');
+  });
+});
