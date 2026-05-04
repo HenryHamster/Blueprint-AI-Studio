@@ -2947,84 +2947,114 @@ echo ""
     if (!child.stdout || !child.stderr) {
       throw new Error('spawn returned no stdio streams');
     }
+    // Stream-json chunks are processed via a serial async queue with event-
+    // loop yields between chunks. Earlier this work was synchronous inside
+    // the data callback, which on heavy bursts (e.g. test-backend.sh emitting
+    // dozens of large stream-json events back-to-back) saturated the agent's
+    // main thread with JSON.parse work. setInterval timers (heartbeat, stall
+    // watchdogs) couldn't fire, the reaper then killed the VM as silent-
+    // death even though the agent was still making progress. The fix: push
+    // chunks to a queue, drain serially with `await setImmediate` between
+    // each so timers get a chance to fire.
+    const pendingJsonChunks: string[] = [];
+    let drainingJsonChunks = false;
+    const drainJsonChunks = async () => {
+      if (drainingJsonChunks) return;
+      drainingJsonChunks = true;
+      try {
+        while (pendingJsonChunks.length > 0) {
+          const chunk = pendingJsonChunks.shift();
+          if (chunk === undefined) break;
+          for (const line of chunk.split('\n').filter(Boolean)) {
+            let obj: ClaudeOutput | null = null;
+            try {
+              obj = JSON.parse(line) as ClaudeOutput;
+            } catch {
+              sendLog(ws, chunk);
+              continue;
+            }
+            // Audit 2026-04-25 (W4/C3): explicit type dispatch instead of
+            // silent fall-through. Previously a `type: 'error'` message was
+            // logged as raw text and then dropped — `lastResultText` stayed
+            // stale from earlier output and the handler would return success
+            // with the WRONG result text. Now an error-type message captures
+            // the error into stderr buffer so downstream classification sees it.
+            const objType = (obj as { type?: string } | null)?.type;
+            if (objType === 'assistant' && obj.message?.content) {
+              for (const block of obj.message.content) {
+                if (block.type === 'text') {
+                  sendLog(ws, (block.text ?? '') + '\n');
+                  statusRef.value = (block.text ?? '').slice(0, 100);
+                } else if (block.type === 'tool_use') {
+                  sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
+                  statusRef.value = `Using tool: ${strVal(block.name)}`;
+                  recordToolUse(strVal(block.name), block.input);
+                  toolInFlight = true;
+                  lastToolUseAt = Date.now();
+                }
+              }
+            } else if (objType === 'result') {
+              lastResultText = (obj as { result?: string }).result ?? '';
+              sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
+              // Arm the post-result grace timer so a hung subprocess doesn't
+              // burn the wall-clock budget. Only set it once — extra result
+              // events (defensive — Claude Code shouldn't emit multiple) don't
+              // reset the timer.
+              if (resultGraceTimer === null && processGroupStillOwned()) {
+                resultGraceTimer = setTimeout(() => {
+                  if (!processGroupStillOwned()) return;
+                  sendLog(
+                    ws,
+                    `\n[runtime] result event received >${CLAUDE_RESULT_GRACE_MS / 1000}s ago without process exit — `
+                      + `sending SIGTERM so wrapper can proceed to commit/push.\n`,
+                  );
+                  const pid = originalPid;
+                  if (pid !== undefined) {
+                    try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+                    forceKillTimer = setTimeout(() => {
+                      if (!processGroupStillOwned()) return;
+                      try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+                    }, PROCESS_KILL_GRACE_MS);
+                  }
+                }, CLAUDE_RESULT_GRACE_MS);
+              }
+            } else if (objType === 'error') {
+              // Surface explicit error messages from the runner so failure
+              // classification & status reporting see them.
+              const errMsg = (obj as { message?: string; error?: string }).message
+                || (obj as { error?: string }).error
+                || JSON.stringify(obj);
+              const errLine = `[claude-stream error] ${errMsg}\n`;
+              sendLog(ws, errLine);
+              // Push into stderr buffers (analogous to the stderr handler below)
+              // so combined-output classification picks it up.
+              if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += errLine;
+              stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
+            } else if (objType === 'system' || objType === 'user') {
+              // user event carries tool results back to the model — tool is no longer in-flight.
+              if (objType === 'user') toolInFlight = false;
+            } else if (objType) {
+              // Unknown type: log so we don't silently drop information.
+              sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
+            }
+          }
+          // Yield to the event loop after each chunk so heartbeat / stall-
+          // watchdog timers get a chance to fire between bursts.
+          await new Promise(r => setImmediate(r));
+        }
+      } finally {
+        drainingJsonChunks = false;
+      }
+    };
     child.stdout.on('data', (data: Buffer) => {
       resetStallWatchdog();
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (runCommand.outputMode === 'claude-stream-json') {
-        for (const line of text.split('\n').filter(Boolean)) {
-          let obj: ClaudeOutput | null = null;
-          try {
-            obj = JSON.parse(line) as ClaudeOutput;
-          } catch {
-            sendLog(ws, text);
-            continue;
-          }
-          // Audit 2026-04-25 (W4/C3): explicit type dispatch instead of
-          // silent fall-through. Previously a `type: 'error'` message was
-          // logged as raw text and then dropped — `lastResultText` stayed
-          // stale from earlier output and the handler would return success
-          // with the WRONG result text. Now an error-type message captures
-          // the error into stderr buffer so downstream classification sees it.
-          const objType = (obj as { type?: string } | null)?.type;
-          if (objType === 'assistant' && obj.message?.content) {
-            for (const block of obj.message.content) {
-              if (block.type === 'text') {
-                sendLog(ws, (block.text ?? '') + '\n');
-                statusRef.value = (block.text ?? '').slice(0, 100);
-              } else if (block.type === 'tool_use') {
-                sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
-                statusRef.value = `Using tool: ${strVal(block.name)}`;
-                recordToolUse(strVal(block.name), block.input);
-                toolInFlight = true;
-                lastToolUseAt = Date.now();
-              }
-            }
-          } else if (objType === 'result') {
-            lastResultText = (obj as { result?: string }).result ?? '';
-            sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
-            // Arm the post-result grace timer so a hung subprocess doesn't
-            // burn the wall-clock budget. Only set it once — extra result
-            // events (defensive — Claude Code shouldn't emit multiple) don't
-            // reset the timer.
-            if (resultGraceTimer === null && processGroupStillOwned()) {
-              resultGraceTimer = setTimeout(() => {
-                if (!processGroupStillOwned()) return;
-                sendLog(
-                  ws,
-                  `\n[runtime] result event received >${CLAUDE_RESULT_GRACE_MS / 1000}s ago without process exit — `
-                    + `sending SIGTERM so wrapper can proceed to commit/push.\n`,
-                );
-                const pid = originalPid;
-                if (pid !== undefined) {
-                  try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
-                  forceKillTimer = setTimeout(() => {
-                    if (!processGroupStillOwned()) return;
-                    try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
-                  }, PROCESS_KILL_GRACE_MS);
-                }
-              }, CLAUDE_RESULT_GRACE_MS);
-            }
-          } else if (objType === 'error') {
-            // Surface explicit error messages from the runner so failure
-            // classification & status reporting see them.
-            const errMsg = (obj as { message?: string; error?: string }).message
-              || (obj as { error?: string }).error
-              || JSON.stringify(obj);
-            const errLine = `[claude-stream error] ${errMsg}\n`;
-            sendLog(ws, errLine);
-            // Push into stderr buffers (analogous to the stderr handler below)
-            // so combined-output classification picks it up.
-            if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += errLine;
-            stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
-          } else if (objType === 'system' || objType === 'user') {
-            // user event carries tool results back to the model — tool is no longer in-flight.
-            if (objType === 'user') toolInFlight = false;
-          } else if (objType) {
-            // Unknown type: log so we don't silently drop information.
-            sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
-          }
-        }
+        pendingJsonChunks.push(text);
+        drainJsonChunks().catch((e: unknown) => {
+          sendLog(ws, `[runtime] drainJsonChunks error: ${String(e)}\n`);
+        });
       } else {
         sendLog(ws, text);
         const trimmed = text.trim();
@@ -3042,6 +3072,20 @@ echo ""
       sendLog(ws, `[stderr] ${text}`);
     });
 
+    // Wait for any pending stream-json chunks to drain before resolving so a
+    // final `result`/`error` event in the queue isn't silently lost — the
+    // serial drainer yields between chunks via setImmediate, and the close
+    // event can fire before the drainer finishes the last chunk.
+    const drainPendingThenResolve = async (resolveValue: number) => {
+      try {
+        if (pendingJsonChunks.length > 0 || drainingJsonChunks) {
+          await drainJsonChunks();
+        }
+      } catch (e) {
+        sendLog(ws, `[runtime] final drain error: ${String(e)}\n`);
+      }
+      resolve(resolveValue);
+    };
     child.on('error', (err) => {
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
@@ -3052,7 +3096,7 @@ echo ""
         unregisterChildPid(originalPid);
       }
       sendLog(ws, `[error] ${err.message}\n`);
-      resolve(1);
+      void drainPendingThenResolve(1);
     });
     child.on('close', (code, signal) => {
       const closeSignal = signal ?? null;
@@ -3077,7 +3121,7 @@ echo ""
         try { fs.unlinkSync(promptFile); } catch { /* ignore */ }
       }
       log(`${runCommand.displayName} exited with code ${code ?? 'null'}${closeSignal ? ` signal ${closeSignal}` : ''}`);
-      resolve(code ?? 1);
+      void drainPendingThenResolve(code ?? 1);
     });
   });
 
