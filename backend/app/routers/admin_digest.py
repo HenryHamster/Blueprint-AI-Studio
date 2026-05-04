@@ -1002,6 +1002,10 @@ async def get_residual_fingerprints(
         .options(load_only(
             Task.id, Task.project_id, Task.latest_status_message,
             Task.context, Task.created_at,
+            # Task.status is read by classify_failure → record_residual_fingerprint's
+            # status-gate (added in fc071105). Without it the attribute access
+            # triggers async lazy-load and raises MissingGreenlet under FastAPI.
+            Task.status, Task.status_log,
         ))
         .limit(2000)
     )

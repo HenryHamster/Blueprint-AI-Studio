@@ -5552,7 +5552,10 @@ async def test_residual_fingerprints_case_status_no_case(client: AsyncClient, db
     db_session.add(make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        latest_status_message="syntax error at token unexpected end of file",
+        # Use structural error shape per fc071105's tightened regex
+        # patterns (`^\s*(error|fail(ed)?)\s*:`); plain prose like
+        # "syntax error at token..." no longer matches.
+        latest_status_message="SyntaxError: unexpected end of file",
     ))
     await db_session.commit()
 
@@ -5573,14 +5576,17 @@ async def test_residual_fingerprints_case_status_branches(client: AsyncClient, d
     await db_session.commit()
     await db_session.refresh(project)
 
-    # One failed task per status variant so each gets its own fingerprint cluster
+    # One failed task per status variant so each gets its own fingerprint cluster.
+    # Messages must match the structural error patterns added in fc071105
+    # (`^\s*(error|fail(ed)?)\s*:` or exception-class line-start) — bare prose
+    # like "test failure: active case assertion failed" no longer qualifies.
     messages = {
-        ResidualCaseStatus.ACTIVE:      "test failure: active case assertion failed",
-        ResidualCaseStatus.REMEDIATING: "test failure: remediating case import error",
-        ResidualCaseStatus.SUSPENDED:   "test failure: suspended case type mismatch",
-        ResidualCaseStatus.MERGED:      "test failure: merged case unexpected none",
-        ResidualCaseStatus.FAILED:      "test failure: failed case key error raised",
-        ResidualCaseStatus.IGNORED:     "test failure: ignored case attribute missing",
+        ResidualCaseStatus.ACTIVE:      "AssertionError: active case 1 == 2 failed",
+        ResidualCaseStatus.REMEDIATING: "ImportError: remediating module not found",
+        ResidualCaseStatus.SUSPENDED:   "TypeError: suspended case got int, expected str",
+        ResidualCaseStatus.MERGED:      "ValueError: merged case got unexpected None",
+        ResidualCaseStatus.FAILED:      "KeyError: 'failed_case_lookup_key'",
+        ResidualCaseStatus.IGNORED:     "AttributeError: ignored case 'foo' missing 'bar'",
     }
     fps = {status: _error_fingerprint(msg) for status, msg in messages.items()}
 
@@ -5644,7 +5650,7 @@ async def test_residual_fingerprints_case_status_project_scoped(client: AsyncCli
     await db_session.refresh(project_a)
     await db_session.refresh(project_b)
 
-    msg = "test failure: type error in cross project test"
+    msg = "TypeError: cross-project test got int, expected str"
     fp = _error_fingerprint(msg)
 
     db_session.add(make_task(
@@ -5680,7 +5686,7 @@ async def test_residual_fingerprints_includes_audit_deferral_fields(client: Asyn
     await db_session.commit()
     await db_session.refresh(project)
 
-    msg = "runtime error: nil pointer dereference in module core"
+    msg = "RuntimeError: nil pointer dereference in module core"
     fp = _error_fingerprint(msg)
     db_session.add(make_task(
         project_id=project.id,
