@@ -5,6 +5,9 @@ import fs from 'fs';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
+import {
+  startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
+} from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole } from './reset.js';
 import {
@@ -962,6 +965,15 @@ function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: n
   return { rss_mb, heap_used_mb, cgroup_mb, cgroup_limit_mb };
 }
 
+// Mutex to prevent overlapping heartbeat HTTP calls. Without this, a slow
+// heartbeat (apiPost 30s timeout × 5 retries with backoffs = up to ~3min) lets
+// subsequent setInterval ticks queue up async invocations behind it. They
+// can't deliver until the previous one settles, but they hold microtask state
+// and add pressure on the event loop. With the mutex the next tick simply
+// skips and logs — last_heartbeat at the orchestrator stays correct because
+// the previous in-flight call still finishes and reports.
+let heartbeatInFlight = false;
+
 function startHeartbeat(taskId: string, getMessage: () => string) {
   // Fire first heartbeat immediately — don't wait 30s.
   // If the agent crashes in the first 30s, at least one heartbeat is recorded.
@@ -972,6 +984,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
   // unhandledRejection event, the agent just goes silent until the orchestrator
   // reaper kills it minutes later with no forensic record.
   (async () => {
+    const start = Date.now();
     try {
       const metrics = collectMetrics();
       await apiPost('/api/agent/heartbeat', {
@@ -980,12 +993,21 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
         tool_trace: snapshotToolTrace(),
       });
+      traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
+      traceHeartbeat('initial', start, Date.now(), 'err', String(e));
     }
   })().catch((e: unknown) => { log(`Initial heartbeat outer error: ${String(e)}`); });
 
   heartbeatTimer = setInterval(() => { (async () => {
+    if (heartbeatInFlight) {
+      traceHeartbeat('periodic', Date.now(), Date.now(), 'skip-in-flight');
+      log('Heartbeat skipped — previous still in flight');
+      return;
+    }
+    heartbeatInFlight = true;
+    const start = Date.now();
     try {
       const metrics = collectMetrics();
       // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
@@ -1001,8 +1023,10 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
         tool_trace: snapshotToolTrace(),
       });
+      traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
       log(`Heartbeat failed: ${String(e)}`);
+      traceHeartbeat('periodic', start, Date.now(), 'err', String(e));
       // 409 = row temporarily locked (skip_locked) — retry once after 5s.
       // Silently dropping heartbeats can let last_heartbeat go stale if the
       // status endpoint holds its FOR UPDATE lock for multiple heartbeat cycles.
@@ -1012,6 +1036,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
           const delay = 5000 * (retry + 1);
           log(`Heartbeat skipped (row locked), retrying in ${delay / 1000}s (attempt ${retry + 1}/2)`);
           await new Promise(r => setTimeout(r, delay));
+          const retryStart = Date.now();
           try {
             const retryMetrics = collectMetrics();
             await apiPost('/api/agent/heartbeat', {
@@ -1021,9 +1046,11 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               tool_trace: snapshotToolTrace(),
             });
             log('Heartbeat retry succeeded');
+            traceHeartbeat('retry-409', retryStart, Date.now(), 'ok');
             return;
           } catch (retryErr: unknown) {
             log(`Heartbeat retry ${retry + 1}/2 failed: ${String(retryErr)}`);
+            traceHeartbeat('retry-409', retryStart, Date.now(), 'err', String(retryErr));
           }
         }
         return;
@@ -1037,6 +1064,8 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         setTimeout(() => process.exit(0), 5000);
         return;
       }
+    } finally {
+      heartbeatInFlight = false;
     }
   })().catch((e: unknown) => { log(`Heartbeat outer error (W4/C1): ${String(e)}`); }); }, HEARTBEAT_INTERVAL);
 }
@@ -1048,6 +1077,7 @@ function stopHeartbeat() {
 /** Synchronous heartbeat — use between blocking execFileSync calls to prevent reaper from killing us.
  *  Fires curl in a child process (sync) so the event loop doesn't need to be free. */
 export function sendHeartbeatSync(taskId: string, statusMessage: string, extras?: Record<string, unknown>) {
+  const start = Date.now();
   try {
     const metrics = collectMetrics();
     const payload = JSON.stringify({
@@ -1056,15 +1086,21 @@ export function sendHeartbeatSync(taskId: string, statusMessage: string, extras?
       metrics,
       ...(extras || {}),
     });
+    // 3s timeout: this runs from signal handlers (SIGTERM, uncaughtException)
+    // where we have ~30s before SIGKILL. A 10s blocking curl chews 1/3 of the
+    // grace window for one best-effort flush; if the network is slow that's
+    // a lot. 3s is enough for healthy networks, fails fast on partition.
     execFileSync('curl', [
       '-sf', '-X', 'POST',
       `${ORCHESTRATOR_URL}/api/agent/heartbeat`,
       '-H', 'Content-Type: application/json',
       '-H', `X-Agent-Token: ${AGENT_TOKEN}`,
       '-d', payload,
-    ], { timeout: 10_000, stdio: 'ignore' });
+    ], { timeout: 3_000, stdio: 'ignore' });
+    traceHeartbeat('sync', start, Date.now(), 'ok');
   } catch (e) {
     log(`Sync heartbeat failed: ${e instanceof Error ? e.message : String(e)} (non-fatal)`);
+    traceHeartbeat('sync', start, Date.now(), 'err', e instanceof Error ? e.message : String(e));
   }
 }
 
@@ -2958,6 +2994,13 @@ echo ""
     // each so timers get a chance to fire.
     const pendingJsonChunks: string[] = [];
     let drainingJsonChunks = false;
+    // Yield every WITHIN_CHUNK_YIELD_LINES parsed lines OR every
+    // WITHIN_CHUNK_YIELD_MS of wall time, whichever fires first. The original
+    // 50aca46d fix yielded only between chunks; a single 1MB chunk from
+    // test-backend.sh can carry 500+ stream-json lines and parse synchronously
+    // for 30+ seconds, blocking the heartbeat setInterval and SIGTERM handler.
+    const WITHIN_CHUNK_YIELD_LINES = 50;
+    const WITHIN_CHUNK_YIELD_MS = 50;
     const drainJsonChunks = async () => {
       if (drainingJsonChunks) return;
       drainingJsonChunks = true;
@@ -2965,6 +3008,8 @@ echo ""
         while (pendingJsonChunks.length > 0) {
           const chunk = pendingJsonChunks.shift();
           if (chunk === undefined) break;
+          let linesSinceYield = 0;
+          let lastYieldAt = Date.now();
           for (const line of chunk.split('\n').filter(Boolean)) {
             let obj: ClaudeOutput | null = null;
             try {
@@ -3036,6 +3081,13 @@ echo ""
             } else if (objType) {
               // Unknown type: log so we don't silently drop information.
               sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
+            }
+            linesSinceYield++;
+            if (linesSinceYield >= WITHIN_CHUNK_YIELD_LINES
+                || Date.now() - lastYieldAt >= WITHIN_CHUNK_YIELD_MS) {
+              await new Promise(r => setImmediate(r));
+              linesSinceYield = 0;
+              lastYieldAt = Date.now();
             }
           }
           // Yield to the event loop after each chunk so heartbeat / stall-
@@ -3152,6 +3204,12 @@ echo ""
 
 // ── Main ────────────────────────────────────────────────────────────────────
 async function main() {
+  // Start forensic instrumentation as early as possible. The lag monitor + exit
+  // markers don't depend on auth or task claim, so we want them recording from
+  // the moment node starts so a pre-claim death still leaves /tmp logs.
+  startEventLoopLagMonitor();
+  installExitMarkers();
+
   const runner = getProviderRunner();
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
@@ -3561,6 +3619,11 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 // looks identical: heartbeats stop, task stays IN_PROGRESS, no evidence.
 function _crashReport(label: string, detail: string, exitCode: number) {
   console.error(`[FATAL] ${label}: ${detail}`);
+  // Local file marker before any network attempt — survives even if the
+  // sendHeartbeatSync curl times out or the network is partitioned. Combined
+  // with serial-console capture (plan task 25075953), we get the agent's
+  // last words even when the heartbeat never lands.
+  recordFinalState(`crash:${label}`, detail);
   // Synchronous curl — fire-and-forget fetch() couldn't guarantee the write
   // flushed before process.exit, so crashes would show up as silent heartbeat
   // timeouts instead of explained failures. sendHeartbeatSync blocks on curl

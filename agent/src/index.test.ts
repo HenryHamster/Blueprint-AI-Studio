@@ -2882,3 +2882,121 @@ describe('runProviderAgent stream-stall watchdog', () => {
     killSpy.mockRestore();
   });
 });
+
+// ── drainJsonChunks within-chunk yielding (silent-death v2) ───────────────────
+// Verifies that drainJsonChunks yields to the event loop multiple times while
+// processing a single large stream-json chunk, not just once per chunk. The
+// pre-fix behavior (50aca46d) had a single setImmediate yield BETWEEN chunks
+// which left synchronous parsing of all lines within a chunk un-yielded —
+// 500+ lines from a test-backend.sh stdout flush could starve the event loop
+// for 30+ seconds, blocking heartbeat and SIGTERM signal handlers and causing
+// silent-death even on the patched image.
+describe('drainJsonChunks within-chunk yielding', () => {
+  type StdoutHandler = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    let stdoutHandler: StdoutHandler | null = null;
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, handler: StdoutHandler) => {
+          if (event === 'data') stdoutHandler = handler;
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+    };
+    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
+  }
+
+  beforeEach(() => {
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    clearPidRegistry();
+  });
+
+  it('yields multiple times within a single 200-line chunk', async () => {
+    const { fakeChild, childHandlers, emitData } = makeChild(8001);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Spy AFTER spawn so we don't count any setImmediate calls from runner setup.
+    const setImmediateSpy = vi.spyOn(global, 'setImmediate');
+
+    // Emit a single chunk with 200 stream-json lines as one big buffer — exactly
+    // the test-backend.sh-flooding-stdout shape we hit in production.
+    const lines: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
+    }
+    emitData(Buffer.from(lines.join('\n') + '\n'));
+
+    // Drain all queued microtasks/immediates. Without within-chunk yielding,
+    // drainJsonChunks would parse all 200 lines synchronously and only call
+    // setImmediate once at the end of the chunk.
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setImmediate(r));
+    }
+
+    // With WITHIN_CHUNK_YIELD_LINES=50 we expect 200 / 50 = 4 within-chunk yields,
+    // plus 1 between-chunk yield = 5 from drainJsonChunks. Pre-fix would be 1.
+    // Use a conservative lower bound (≥3) to keep the test robust against
+    // setImmediate calls from elsewhere being undercounted by the spy.
+    const callsFromSpy = setImmediateSpy.mock.calls.length;
+    expect(callsFromSpy).toBeGreaterThanOrEqual(3);
+
+    childHandlers.close?.(0, null);
+    await promise.catch(() => undefined);
+    setImmediateSpy.mockRestore();
+  });
+
+  it('still completes parsing all lines correctly with within-chunk yielding', async () => {
+    const { fakeChild, childHandlers, emitData } = makeChild(8002);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Mix of types so we exercise the dispatch branches, including a 'result'
+    // event that updates lastResultText (the only output that the caller
+    // actually consumes).
+    const lines: string[] = [];
+    for (let i = 0; i < 120; i++) {
+      lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
+    }
+    lines.push(JSON.stringify({ type: 'result', result: 'final-result-after-120-ticks' }));
+    emitData(Buffer.from(lines.join('\n') + '\n'));
+
+    // Drain microtasks
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setImmediate(r));
+    }
+
+    childHandlers.close?.(0, null);
+    const result = await promise.catch(() => undefined);
+
+    expect(result).toBeDefined();
+    expect(result?.lastResultText).toBe('final-result-after-120-ticks');
+  });
+});
