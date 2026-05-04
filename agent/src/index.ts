@@ -3012,6 +3012,13 @@ echo ""
     // a 1-2 MB tool_use payload. Adversarial review 2026-05-04: post-parse
     // yield was bounded by `single_line_parse_time × N`, not by wall time —
     // a pathological huge line could block past the bound.
+    // Force a yield before parsing if a chunk is byte-fat — even a single huge
+    // line (e.g. a tool_use/tool_result event with a 1-2 MB inline payload, the
+    // worst-case shape stream-json can deliver) must not block past the wall-
+    // time bound on its first parse. Without this, the per-chunk first-line
+    // case bypasses the line/wall-time bounds (linesSinceYield=0, lastYieldAt=
+    // now). Adversarial review 2026-05-04 R3.
+    const HEAVY_CHUNK_BYTES = 256 * 1024;
     const drainJsonChunks = async () => {
       if (drainingJsonChunks) return;
       drainingJsonChunks = true;
@@ -3019,6 +3026,9 @@ echo ""
         while (pendingJsonChunks.length > 0) {
           const chunk = pendingJsonChunks.shift();
           if (chunk === undefined) break;
+          if (chunk.length >= HEAVY_CHUNK_BYTES) {
+            await new Promise(r => setImmediate(r));
+          }
           let linesSinceYield = 0;
           let lastYieldAt = Date.now();
           for (const line of chunk.split('\n').filter(Boolean)) {

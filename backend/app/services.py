@@ -1142,7 +1142,18 @@ async def _check_evaluating_timeouts():
     # cascade-killed during operator-intervention windows. Runtime knob
     # `evaluating_fail_hours` lets us drop it back once the recurrence rate
     # for silent-death + reaper sweeps comes down.
-    EVALUATING_FAIL_SECONDS = int(_runtime_config.get("evaluating_fail_hours", 48)) * 3600
+    # Defensive read: the PATCH endpoint validates 1..168, but a corrupted
+    # runtime_config_json on disk could surface a non-int / out-of-range value
+    # which would raise ValueError on `int(...)` and abort the whole sweep
+    # cycle silently — no EVALUATING cleanup until someone PATCHes a fix.
+    try:
+        _eval_hours_raw = _runtime_config.get("evaluating_fail_hours", 48)
+        _eval_hours = int(_eval_hours_raw)
+        if not (1 <= _eval_hours <= 168):
+            _eval_hours = 48
+    except (ValueError, TypeError):
+        _eval_hours = 48
+    EVALUATING_FAIL_SECONDS = _eval_hours * 3600
     # Hard kill for CI-waiting tasks. Tunable so multi-iteration review/fix
     # cycles (each ~5-15 min, plus pipeline-cap queueing) don't trigger a
     # premature kill that cancels in-flight children. 60 min is the default
