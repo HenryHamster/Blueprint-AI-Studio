@@ -238,6 +238,10 @@ async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     must be set to CANCELLED with an appropriate status message."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    # Pin the backstop to 6h for this test (production default is 48h while
+    # silent-death stabilizes; tests still validate the 6h boundary behavior).
+    from app.shared_state import runtime_config as _rc
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Cascade Cancel Test", user_id="user1")
     eval_db.add(project)
