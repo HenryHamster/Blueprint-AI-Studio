@@ -638,7 +638,7 @@ Steps to follow:
    - Or pytest, cargo test, go test, etc.
    - If tests fail, identify which dependency update caused the failure and revert just that package to its previous version, then re-run tests.
 
-5. Once tests pass, the dependency files should already be modified. Do NOT commit — the agent harness will handle the commit.
+5. Once tests pass, run \`./check\` to confirm lint/build, then \`./pr open --title "deps: ..." --body "Summary of bumps"\` to ship and \`./done\`.
 
 IMPORTANT: Only update minor/patch versions. If a package would require a major version bump to get any update, skip it. Focus on security patches and bug fixes.`,
     commitPrefix: 'chore',

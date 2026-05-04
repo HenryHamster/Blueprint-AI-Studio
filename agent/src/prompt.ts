@@ -609,7 +609,27 @@ if [ "$COMMITS_AHEAD" = "0" ]; then
   exit 1
 fi
 
-# 3. Push (with retry — concurrent-push handling)
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+# 3. Refresh GitHub token + remote URL right before push. The clone-time token
+#    is per-task ephemeral and may be near expiry by the time Claude ships.
+TOKEN_RESP=$(curl -f -sS --max-time 30 \\
+  -H "X-Agent-Token: $TOKEN" \\
+  "$API/api/agent/github/token?task_id=$TASK") || {
+  echo "[pr] Failed to fetch fresh GitHub token from orchestrator" >&2
+  exit 1
+}
+GH_PUSH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
+if [ -z "$GH_PUSH_TOKEN" ]; then
+  echo "[pr] orchestrator returned no token: $TOKEN_RESP" >&2
+  exit 1
+fi
+git remote set-url origin "https://x-access-token:$GH_PUSH_TOKEN@github.com/${cfg.owner}/${cfg.repo}.git"
+unset GH_PUSH_TOKEN  # only needed for the remote URL above
+
+# 4. Push (with retry — concurrent-push handling)
 PUSH_OK=0
 for attempt in 1 2 3; do
   if git push --force-with-lease origin "${cfg.workBranch}" 2>/tmp/pr_push.log; then
@@ -629,38 +649,56 @@ if [ "$PUSH_OK" = "0" ]; then
   exit 1
 fi
 
-# 4. Create or update PR
+# 5. Create or update PR via orchestrator-mediated endpoint.
+#    Why the orchestrator endpoint instead of \`gh pr create\`:
+#    - gh CLI is not installed on agent VMs, and GH_TOKEN isn't in Claude's env.
+#    - The endpoint already handles idempotency (returns existing PR if open).
+#    - It writes a PULL_REQUEST Artifact row immediately on creation so the
+#      reaper can route reaped mid-run tasks to EVALUATING instead of
+#      retrying-from-scratch (orphan-PR recovery).
 ${cfg.existingPrNumber !== undefined ? `
-# Existing PR (#${cfg.existingPrNumber}) — just pushed updates, no creation needed.
+# Existing PR (#${cfg.existingPrNumber}) — review-fix path. Just pushed
+# updates; no creation needed. The PULL_REQUEST artifact already exists from
+# the original create task, so we don't need to call the endpoint here.
 PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/${cfg.existingPrNumber}"
 echo "[pr] Pushed updates to existing PR #${cfg.existingPrNumber}"
 ` : `
-# Create a new PR (or no-op if one already exists for this branch — gh handles it).
-export GH_TOKEN="\${GITHUB_TOKEN:-\${GH_TOKEN:-}}"
-[ -z "$GH_TOKEN" ] && { echo "[pr] GITHUB_TOKEN not set — cannot create PR" >&2; exit 1; }
-
-EXISTING_PR=$(gh pr list --head "${cfg.workBranch}" --state open --json number --jq '.[0].number' 2>/dev/null || true)
-if [ -n "$EXISTING_PR" ]; then
-  PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/$EXISTING_PR"
-  echo "[pr] PR already exists for ${cfg.workBranch}: $PR_URL — pushed updates"
-else
-  BODY_FILE=$(mktemp)
-  printf '%s' "$BODY" > "$BODY_FILE"
-  # Keep stderr separate so the captured PR_URL is the URL alone, not URL +
-  # any deprecation/warning lines gh might emit on stderr.
-  PR_ERR=$(mktemp)
-  PR_URL=$(gh pr create --base "${cfg.baseBranch}" --head "${cfg.workBranch}" --title "$TITLE" --body-file "$BODY_FILE" 2>"$PR_ERR") || {
-    echo "[pr] gh pr create failed:" >&2
-    cat "$PR_ERR" >&2
-    rm -f "$BODY_FILE" "$PR_ERR"
-    exit 1
-  }
-  rm -f "$BODY_FILE" "$PR_ERR"
+PR_PAYLOAD=$(jq -n --arg tid "$TASK" --arg owner "${cfg.owner}" --arg repo "${cfg.repo}" \\
+  --arg title "$TITLE" --arg head "${cfg.workBranch}" --arg base "${cfg.baseBranch}" --arg body "$BODY" \\
+  '{task_id: $tid, owner: $owner, repo: $repo, title: $title, head: $head, base: $base, body: $body}')
+PR_RESP=""
+PR_OK=0
+for attempt in 1 2 3 4 5; do
+  PR_HTTP=$(printf '%s' "$PR_PAYLOAD" | curl -sS -o /tmp/pr_create_resp_${cfg.taskId} -w '%{http_code}' --max-time 90 \\
+    -X POST "$API/api/agent/github/pull-requests" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || PR_HTTP="000"
+  if [ "$PR_HTTP" = "200" ] || [ "$PR_HTTP" = "201" ] || [ "$PR_HTTP" = "202" ]; then
+    PR_RESP=$(cat /tmp/pr_create_resp_${cfg.taskId})
+    PR_OK=1; break
+  fi
+  if [ "$PR_HTTP" = "429" ] || [ "\${PR_HTTP:0:1}" = "5" ] || [ "$PR_HTTP" = "000" ]; then
+    BACKOFF=$((attempt * 3))
+    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — retrying in \${BACKOFF}s..." >&2
+    sleep "$BACKOFF"; continue
+  fi
+  echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP (permanent failure):" >&2
+  cat /tmp/pr_create_resp_${cfg.taskId} >&2
+  rm -f /tmp/pr_create_resp_${cfg.taskId}
+  exit 1
+done
+rm -f /tmp/pr_create_resp_${cfg.taskId}
+if [ "$PR_OK" = "0" ]; then
+  echo "[pr] PR creation failed after 5 retries — orchestrator unreachable" >&2
+  exit 1
 fi
-unset GH_TOKEN
+PR_URL=$(printf '%s' "$PR_RESP" | jq -r '.data.html_url // empty')
+if [ -z "$PR_URL" ]; then
+  echo "[pr] orchestrator response had no html_url: $PR_RESP" >&2
+  exit 1
+fi
 `}
 
-# 5. Persist PR URL for ./done + wrapper detection
+# 6. Persist PR URL for ./done + wrapper detection
 echo "$PR_URL" > /tmp/pr_url_${cfg.taskId}
 echo ""
 echo "[pr] OK — $PR_URL"
@@ -849,35 +887,42 @@ does NOT auto-commit or auto-push your work. Use these helpers (already in
 the workspace, executable):
 
 - \`./check\` — runs lint/build for the stacks your changes touched
-  (admin-ui eslint+build, agent tsc+eslint, backend ruff). Fast — run it
-  every time you make a non-trivial edit. Exits non-zero on failure with
-  the actual error tail; fix and re-run until green.
-- \`./check test\` — same plus the Docker backend test suite (slower,
-  ~5-8min). Run before \`./pr open\` for any task on a main branch.
+  (admin-ui eslint+build, agent tsc+eslint, backend ruff). Fast. Exits
+  non-zero on failure with the actual error tail; fix and re-run until
+  green. If your changes don't touch admin-ui/, agent/, or backend/,
+  \`./check\` returns PASS without running anything — that's expected
+  for pure-docs tasks.
+- \`./check test\` — same plus the Docker backend test suite (~5-8min).
+  Run this before \`./pr open\` for any task that touches backend code on
+  a main branch — migrations, model changes, business-logic changes all
+  must pass tests before shipping.
 - \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
   commits any pending changes, pushes to the work branch (force-with-lease
   retry built in), creates a PR (or pushes updates to an existing one for
-  fix tasks). On success writes /tmp/pr_url_<task_id> with the URL.
-  Exits non-zero with a clear message on failure (lint failed, push
-  rejected, etc.) — fix and call again.
+  fix tasks) via the orchestrator endpoint. On success writes
+  /tmp/pr_url_<task_id> with the URL. Pass \`--with-tests\` to run
+  \`./check test\` instead of just \`./check\` as the gate. Exits non-zero
+  with a clear message on failure — fix and call again.
 - \`./done\` — marks the task COMPLETED with the PR URL. Requires
-  \`./pr open\` to have run first.
+  \`./pr open\` to have run first. Idempotent (safe to re-run).
 - \`./fail "<reason>"\` — marks the task FAILED. Use ONLY when the task
   fundamentally can't be completed: scope is wrong, blocker found,
   conflicting requirements. Don't use for transient lint/test failures —
   keep iterating with \`./check\` instead.
 
-Required exit pattern:
+Required exit pattern (every code-change task):
   edit -> ./check -> (if green) ./pr open --title ... --body ... -> ./done
 
-If you exit without calling \`./done\` or \`./fail\`, the wrapper will try
-to finalise on your behalf based on whether you opened a PR — but this is
-the fallback path, not the happy path. Always call \`./done\` or \`./fail\`
-explicitly so the orchestrator gets a clean terminal status.
+ALWAYS call \`./done\` or \`./fail\` explicitly. The wrapper has only one
+fallback: if you opened a PR via \`./pr open\` but didn't call \`./done\`,
+it posts COMPLETED on your behalf using the PR URL marker. Otherwise it
+posts FAILED with no useful reason — which is bad for the operator and
+bad for downstream investigation. Don't rely on the fallback.
 
-DO use \`git add\`, \`git status\`, \`git diff\` to inspect your work.
-DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — those
-operations belong inside \`./pr open\` so the lint/build gate fires.
+DO use \`git status\`, \`git diff\` to inspect your work.
+DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — use
+\`./pr open\` so the lint/build gate fires and the orchestrator records
+the PR atomically.
 `;
 
 export const PLAYBOOK_GUIDANCE = `

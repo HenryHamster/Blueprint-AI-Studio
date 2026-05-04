@@ -212,7 +212,7 @@ Follow these steps precisely:
 
 7. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
 
-8. Once migration applies cleanly, run \`./check\` to verify lint/build, then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
+8. Once migration applies cleanly, run \`./check test\` (NOT just \`./check\` — migrations always touch backend, so the Docker pytest suite must pass before shipping). Then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
 
 CRITICAL RULES:
 - Never delete or modify existing migration files in \`${alembicVersionsPath}\` (except the one you just generated)
