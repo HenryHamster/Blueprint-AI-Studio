@@ -1129,7 +1129,7 @@ async def _check_evaluating_timeouts():
 
     - If all children are terminal but parent is still EVALUATING → trigger missed rollup.
     - If evaluating >2h with non-terminal children → WARNING alert.
-    - If evaluating >6h → FAIL with ERROR alert.
+    - If evaluating >evaluating_fail_hours (default 48h) → FAIL with ERROR alert.
     - Skips CI-waiting tasks (they have their own 20-min escalation timeout).
     """
     from app.main import _maybe_create_failure_alert
@@ -1151,7 +1151,8 @@ async def _check_evaluating_timeouts():
     CI_BACKSTOP_SECONDS = int(_runtime_config.get("ci_backstop_timeout_minutes", 60)) * 60
     # Approval-gate companion timeout: parents flagged requires_approval can
     # otherwise stall indefinitely when _chain_has_active_pipeline_work defers
-    # the 6h backstop. 2h gives operators a reasonable window to approve/deny.
+    # the EVALUATING_FAIL backstop. 2h gives operators a reasonable window
+    # to approve/deny independent of the configured wall-clock.
     APPROVAL_GATE_FAIL_SECONDS = 2 * 3600
     TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
@@ -1202,9 +1203,10 @@ async def _check_evaluating_timeouts():
                 ctx = task.context or {}
 
                 # Approval-gate hard timeout. Parents with requires_approval=True
-                # remain in EVALUATING waiting for human approval; the 6h backstop
-                # can be deferred by an active pipeline chain, so approval-gated
-                # parents need their own shorter companion timeout.
+                # remain in EVALUATING waiting for human approval; the
+                # evaluating_fail_hours backstop can be deferred by an active
+                # pipeline chain, so approval-gated parents need their own
+                # shorter companion timeout.
                 if task.requires_approval:
                     approval_set_at = ctx.get("_approval_set_at")
                     if not approval_set_at:
@@ -1482,7 +1484,8 @@ async def _check_evaluating_timeouts():
                     # still doing real work — defer to next sweep.
                     if await _chain_has_active_pipeline_work(task, session):
                         logger.info(
-                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past 6h hard timeout but "
+                            f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
+                            f"{EVALUATING_FAIL_SECONDS // 3600}h hard timeout but "
                             f"chain has fresh review/fix heartbeat — skipping kill"
                         )
                         continue
@@ -1515,7 +1518,8 @@ async def _check_evaluating_timeouts():
                                 defer_elapsed = 0.0
                             if defer_elapsed <= EVAL_DEFER_WINDOW_HOURS * 3600:
                                 logger.info(
-                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past 6h but chain "
+                                    f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
+                                    f"{EVALUATING_FAIL_SECONDS // 3600}h but chain "
                                     f"has recoverable FAILED children — deferring "
                                     f"({round(defer_elapsed/3600, 1)}h into "
                                     f"{EVAL_DEFER_WINDOW_HOURS}h window)"
@@ -1533,14 +1537,16 @@ async def _check_evaluating_timeouts():
                             flag_modified(task, "context")
                             session.add(task)
                             logger.warning(
-                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past 6h with "
+                                f"[EVAL TIMEOUT] Task {str(task.id)[:8]} past "
+                                f"{EVALUATING_FAIL_SECONDS // 3600}h with "
                                 f"recoverable FAILED children — deferring cascade-cancel "
                                 f"for up to {EVAL_DEFER_WINDOW_HOURS}h"
                             )
                             await _maybe_create_failure_alert(
                                 task, session,
-                                f"Evaluation past 6h with recoverable infra failures in chain — "
-                                f"deferring cascade-cancel for up to {EVAL_DEFER_WINDOW_HOURS}h",
+                                f"Evaluation past {EVALUATING_FAIL_SECONDS // 3600}h with "
+                                f"recoverable infra failures in chain — deferring "
+                                f"cascade-cancel for up to {EVAL_DEFER_WINDOW_HOURS}h",
                             )
                             await session.commit()
                             continue
@@ -1552,7 +1558,8 @@ async def _check_evaluating_timeouts():
                     )
                     task.status = TaskStatus.FAILED
                     task.latest_status_message = (
-                        "Evaluation timeout — children did not complete within 6 hours"
+                        f"Evaluation timeout — children did not complete "
+                        f"within {EVALUATING_FAIL_SECONDS // 3600} hours"
                     )
                     from app.failure_classification import classify_failure, persist_failure_category
                     from app.routers.agent_status import record_task_result

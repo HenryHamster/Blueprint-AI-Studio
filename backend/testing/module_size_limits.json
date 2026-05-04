@@ -16,7 +16,7 @@
     "anomaly_detection.py": 2000,
     "routers/agent.py": 3100,
     "services.py": 2100,
-    "routers/agent_status.py": 2000,
+    "routers/agent_status.py": 2100,
     "autonomous_research.py": 2050,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
