@@ -2005,7 +2005,19 @@ async def _recover_orphaned_tasks():
                 if any((payloads or [{}])[0].get("type") == "review" for payloads in child_payloads_list):
                     continue
 
-                # Lock row to prevent race with reaper/dispatcher
+                # ── Site 3 lock-during-IO fix ──
+                # Previously this loop held FOR UPDATE on `task` across
+                # `_spawn_pipeline_task`, which acquires
+                # `pg_advisory_xact_lock(pr_number)` via
+                # `acquire_pr_spawn_lock` (task_locking.py:223). If a
+                # peer worker was mid-spawn for the same PR, this
+                # iteration would block on the advisory lock with the
+                # task FOR UPDATE held — starving any other writer
+                # touching this row. Fix: hold the task FOR UPDATE only
+                # for the COMPLETED transition, commit to release it,
+                # then call `_spawn_pipeline_task` (the advisory lock is
+                # per-PR and self-coordinating). The spawn-and-alert
+                # commit follows on a fresh transaction.
                 locked = (await session.execute(
                     select(Task).where(Task.id == task.id).with_for_update(skip_locked=True)
                 )).scalars().first()
@@ -2017,28 +2029,46 @@ async def _recover_orphaned_tasks():
                 short_id = str(locked.id).replace('-', '')[:8]
                 type_prefix = {"docs": "docs", "deps": "deps", "migrate": "migrate", "refactor": "refactor"}.get(task_type, "task")
                 branch = f"blueprint/{type_prefix}-{short_id}"
+                original_prompt = locked.first_payload.get("prompt", locked.description or "")
+                project_id_local = locked.project_id
+                task_id_local = locked.id
 
                 locked.status = TaskStatus.COMPLETED
                 locked.latest_status_message = f"Auto-completed: PR #{pr_number} found after reap recovery"
                 session.add(locked)
+                # Commit-release the task FOR UPDATE before invoking the
+                # spawn (which acquires the per-PR advisory lock). The
+                # task is now COMPLETED and persisted; the spawn can
+                # proceed on a fresh transaction without holding the
+                # task row lock across the advisory-lock acquire.
+                await session.commit()
 
-                original_prompt = locked.first_payload.get("prompt", locked.description or "")
+                # Re-fetch a fresh, unlocked instance for the spawn. The
+                # spawn path reads source_task fields (context, payloads,
+                # title) and writes back ``latest_status_message`` /
+                # ``context`` markers; using the same `locked` object
+                # without re-attach risks DetachedInstanceError after the
+                # commit released the SQLA identity for some attributes.
+                refreshed = await session.get(Task, task_id_local)
+                if refreshed is None:
+                    logger.warning(f"[RECOVERY] Task {short_id} disappeared after release-commit — skipping spawn")
+                    continue
                 review_task, _ = await _spawn_pipeline_task(
-                    locked, "review", session, pr_number, branch, base_branch,
-                    original_prompt=original_prompt, original_task_id=str(locked.id)
+                    refreshed, "review", session, pr_number, branch, base_branch,
+                    original_prompt=original_prompt, original_task_id=str(task_id_local)
                 )
 
                 alert = Alert(
-                    project_id=locked.project_id,
+                    project_id=project_id_local,
                     severity=AlertSeverity.WARNING,
                     title=f"Auto-recovered reaped task with PR #{pr_number}",
                     message=f"Task {short_id} was reaped after creating PR #{pr_number}. Auto-completed and review spawned.",
-                    task_id=locked.id,
+                    task_id=task_id_local,
                 )
                 session.add(alert)
                 await session.commit()
 
-                await broadcast_to_project(str(locked.project_id), "alert_created",
+                await broadcast_to_project(str(project_id_local), "alert_created",
                     {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title})
                 logger.warning(f"[RECOVERY] Auto-completed reaped task {short_id} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}")
     except Exception as e:

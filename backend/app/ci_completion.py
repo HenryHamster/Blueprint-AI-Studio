@@ -349,7 +349,16 @@ async def _attempt_merge_with_retry_and_escalation(
     # summary comment) BEFORE re-acquiring the lock. We use the cached, stale
     # ``task`` instance for _post_merge_summary's read-only field access; the
     # post-relock task assignment will pick up any peer mutation if it happened.
-    if merge_result.get("merged"):
+    #
+    # Idempotency gate (security audit MEDIUM-1, 2026-05-04): two concurrent
+    # merge sweeps (e.g. webhook + CI poll) can both observe merged=True from
+    # GitHub (idempotent on the second caller) and would otherwise BOTH post
+    # the cosmetic comment + summary, producing duplicates on the PR. Gate on
+    # task.context["_merge_comment_posted"] — set inside the relock window
+    # below — so the second caller skips. Best-effort; if the relock fails
+    # before flagging, a duplicate is still possible but the next caller's
+    # gate will catch the third.
+    if merge_result.get("merged") and not (task.context or {}).get("_merge_comment_posted"):
         try:
             await create_pr_comment(gh_token, owner, repo, ci_pr_number,
                 "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
@@ -402,6 +411,10 @@ async def _attempt_merge_with_retry_and_escalation(
         # GitHub artefacts already posted (above). Apply DB state under the lock.
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = f"CI passed + review approved, PR #{ci_pr_number} merged ({source})"
+        # Idempotency flag for the cosmetic comment post — guards a concurrent
+        # merge sweep from posting duplicates (security audit MEDIUM-1).
+        task.context = {**(task.context or {}), "_merge_comment_posted": True}
+        flag_modified(task, "context")
         if ci_orig_id:
             try:
                 orig = await session.get(Task, uuid.UUID(ci_orig_id))

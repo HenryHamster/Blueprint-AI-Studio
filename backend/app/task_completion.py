@@ -1677,9 +1677,10 @@ async def _ensure_branch(
     # the failure path (mark FAILED). Content snapshot replaces
     # updated_at. To bypass the identity-map cache, ``session.expire``
     # the in-memory instance AND set ``populate_existing=True`` on the
-    # SELECT (mirrors reaper.py:382: populate_existing alone is
-    # unreliable with ``with_for_update(skip_locked=True)`` on async
-    # sessions).
+    # SELECT (the canonical reference is now
+    # ``rollup_management._relock_parent``, ~line 155 — populate_existing
+    # alone is unreliable with ``with_for_update(skip_locked=True)`` on
+    # async sessions).
     session.expire(task)
     fresh_stmt = (
         select(Task)

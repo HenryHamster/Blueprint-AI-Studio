@@ -187,11 +187,13 @@ async def _relock_parent(
     released-but-cached ``parent`` instance via ``parent_in_session`` so
     we ``session.expire`` it before the re-SELECT. ``populate_existing``
     alone has been observed to be unreliable under async +
-    ``with_for_update(skip_locked=True)`` (reaper.py:382 documents this);
-    expiring the cached instance first guarantees the re-SELECT cannot
-    return stale identity-map attributes. Mirrors the
-    ``session.expire(task)`` pattern at task_completion.py:1671 and
-    ci_completion.py.
+    ``with_for_update(skip_locked=True)`` — expiring the cached instance
+    first guarantees the re-SELECT cannot return stale identity-map
+    attributes. Mirrors the ``session.expire(task)`` pattern at
+    ``task_completion.py:1671`` and ``ci_completion._relock_merge_task``.
+    (Earlier docs cited reaper.py:382 as the original documentation site;
+    the bug-doc comment has since rotated and `_relock_parent` is now the
+    canonical reference for the pattern.)
 
     Mirrors the early-commit pattern in routers/agent_status.py:1694: release
     the lock around long-running I/O, then resume on a fresh row read.
@@ -664,10 +666,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         pipeline_active = True
         break
 
-    # Check all non-cancelled create children are done with PRs merged
+    # Tally non-IO statuses first so we can decide whether the GitHub-backed
+    # PR-merge verification loop is even necessary. ``all_done`` starts True
+    # and gets cleared by FAILED/active children below; the verify loop also
+    # clears it for any unmerged COMPLETED child (mirrors original semantics).
     all_done = True
     cancelled_count = 0
     active_count = 0
+    completed_children: list[Task] = []
     for c in children:
         if c.status == TaskStatus.CANCELLED:
             cancelled_count += 1
@@ -679,9 +685,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         if c.status == TaskStatus.FAILED:
             all_done = False
             continue
-        # COMPLETED — check pr_merged for create tasks
-        if not await _verify_pr_merged(c, session):
-            all_done = False
+        if c.status == TaskStatus.COMPLETED:
+            completed_children.append(c)
 
     # Don't rollup if there are still active tasks or active review/fix pipeline
     if active_count > 0 or pipeline_active:
@@ -689,6 +694,52 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             parent.latest_status_message = "Fix/review pipeline running — waiting for PR to merge"
             session.add(parent)
             await session.commit()
+        return
+
+    # ── Phase B3 lock-window break (Site 1: _verify_pr_merged) ──
+    # _verify_pr_merged calls get_pull_request + get_github_token_for_task per
+    # COMPLETED child. With 5-10 unmerged children x 30s GH the worst-case
+    # held-lock window is 150-300s on the parent + N children. Release the
+    # parent lock (and the children FOR UPDATE locks, which share this
+    # session's transaction) around the verification loop and re-acquire the
+    # parent afterwards so concurrent sibling heartbeats and admin writes
+    # don't queue behind us. The verification only READS PR state from
+    # GitHub and updates in-memory + DB via _verify_pr_merged's own
+    # write_session, not the caller's session.
+    parent_id_local = parent.id
+    pre_verify_snapshot = await _release_parent_lock(parent, session)
+
+    # Run the GitHub round-trips with no DB locks held. _verify_pr_merged
+    # mutates the cached child's in-memory `task.status` (PR closed unmerged
+    # → FAILED) and `task.context["pr_merged"]`, and commits the persisted
+    # write via its own AsyncSessionLocal. The cached `children` list
+    # objects retain those in-memory mutations across the lock-window break
+    # (expire_on_commit=False), preserving original semantics: a child
+    # whose verify-call returned True keeps the verify branch's
+    # all_done contribution at True, even if the call also flipped its
+    # status to FAILED. Downstream branches (the
+    # `failed_count == len(children)` guard at line ~927 and the
+    # rollup-prep loop) re-derive failed/completed_merged from `c.status`
+    # on the same cached list and handle the post-verify FAILED case.
+    for c in completed_children:
+        if not await _verify_pr_merged(c, session):
+            all_done = False
+
+    # ── Re-acquire parent lock for downstream mutations ──
+    # We deliberately do NOT re-fetch the children rows nor re-derive
+    # all_done from the cached list: original behavior was that a verify
+    # call returning True meant "child resolved" regardless of any
+    # status side-effect (e.g. PR-closed-unmerged → FAILED), and the
+    # downstream `completed_count == 0 and failed_count > 0` guard
+    # finalizes the parent. Preserving this contract by carrying
+    # `all_done` from the verify loop forward to the existing dispatch.
+    parent = await _relock_parent(
+        session, parent_id_local, pre_verify_snapshot,
+        parent_in_session=parent,
+    )
+    if parent is None:
+        return
+    if parent.status != TaskStatus.EVALUATING:
         return
 
     # All children terminal but not all succeeded — finalize immediately instead of waiting 6 hours

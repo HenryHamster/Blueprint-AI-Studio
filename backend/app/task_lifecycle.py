@@ -1864,57 +1864,81 @@ async def _process_post_commit(
                                 _attempt_merge_with_retry_and_escalation,
                             )
                             from app.routers.agent import get_github_token_for_task
-                            # Phase A1: skip_locked + bounded retry. If the parent
-                            # task row is held by a peer, defer the handoff —
-                            # the parent's own poll will pick up review_approved
-                            # on the next iteration once the lock clears.
-                            _orig = None
-                            for _attempt in range(3):
-                                _orig_q = select(Task).where(
+                            # ── Site 2 lock-during-IO fix ──
+                            # Previously we acquired FOR UPDATE on `_orig`
+                            # unconditionally, then only the
+                            # `if _orig and _orig_loop.get("ci_waiting"):` branch
+                            # consumed the lock. The fall-through (review
+                            # task's own merge cluster: get_pull_request,
+                            # create_pr_comment, get_check_runs, get_pr_files,
+                            # merge_pull_request, delete_branch — 60-120s) ran
+                            # with `_orig`'s row lock still held by this
+                            # session, blocking concurrent CI/heartbeat writes
+                            # on the rollup parent. Fix: do a non-locking read
+                            # to peek at ci_waiting first, and only acquire
+                            # FOR UPDATE when we're committing to the rollup-
+                            # handoff branch.
+                            _orig_peek = (await session.execute(
+                                select(Task.context).where(
                                     Task.id == uuid.UUID(original_task_id)
-                                ).with_for_update(skip_locked=True)
-                                _orig = (await session.execute(_orig_q)).scalars().first()
-                                if _orig is not None:
-                                    break
-                                _orig_exists = (await session.execute(
-                                    select(Task.id).where(Task.id == uuid.UUID(original_task_id))
-                                )).first()
-                                if _orig_exists is None:
-                                    break  # Genuinely missing
-                                await asyncio.sleep(0.5 * (_attempt + 1))
-                            _orig_loop = (_orig.context or {}).get("review_loop", {}) if _orig else {}
-                            if _orig and _orig_loop.get("ci_waiting"):
-                                _orig_loop["review_approved"] = True
-                                _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
-                                flag_modified(_orig, "context")
-                                session.add(_orig)
-                                task.status = TaskStatus.COMPLETED
-                                task.latest_status_message = (
-                                    f"Review approved for rollup PR #{pr_number} — handed off to CI gate"
                                 )
-                                session.add(task)
+                            )).scalars().first()
+                            _orig_peek_loop = (_orig_peek or {}).get("review_loop", {}) if _orig_peek else {}
+                            if _orig_peek_loop.get("ci_waiting"):
+                                # Phase A1: skip_locked + bounded retry. If the parent
+                                # task row is held by a peer, defer the handoff —
+                                # the parent's own poll will pick up review_approved
+                                # on the next iteration once the lock clears.
+                                _orig = None
+                                for _attempt in range(3):
+                                    _orig_q = select(Task).where(
+                                        Task.id == uuid.UUID(original_task_id)
+                                    ).with_for_update(skip_locked=True)
+                                    _orig = (await session.execute(_orig_q)).scalars().first()
+                                    if _orig is not None:
+                                        break
+                                    _orig_exists = (await session.execute(
+                                        select(Task.id).where(Task.id == uuid.UUID(original_task_id))
+                                    )).first()
+                                    if _orig_exists is None:
+                                        break  # Genuinely missing
+                                    await asyncio.sleep(0.5 * (_attempt + 1))
+                                # Re-read the loop from the locked row — peer may
+                                # have flipped ci_waiting in the gap between the
+                                # peek and the lock acquisition.
+                                _orig_loop = (_orig.context or {}).get("review_loop", {}) if _orig else {}
+                                if _orig and _orig_loop.get("ci_waiting"):
+                                    _orig_loop["review_approved"] = True
+                                    _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
+                                    flag_modified(_orig, "context")
+                                    session.add(_orig)
+                                    task.status = TaskStatus.COMPLETED
+                                    task.latest_status_message = (
+                                        f"Review approved for rollup PR #{pr_number} — handed off to CI gate"
+                                    )
+                                    session.add(task)
 
-                                if _orig_loop.get("ci_passed"):
-                                    try:
-                                        _gh, _own, _rep = await get_github_token_for_task(_orig.id, session)
-                                        await _attempt_merge_with_retry_and_escalation(
-                                            _orig, _gh, _own, _rep, session, source="review_approval",
-                                        )
-                                    except Exception as _gate_e:
-                                        logger.error(
-                                            f"[REVIEW PIPELINE] Gate merge failed for rollup PR #{pr_number}: {_gate_e}",
-                                            exc_info=True,
-                                        )
+                                    if _orig_loop.get("ci_passed"):
+                                        try:
+                                            _gh, _own, _rep = await get_github_token_for_task(_orig.id, session)
+                                            await _attempt_merge_with_retry_and_escalation(
+                                                _orig, _gh, _own, _rep, session, source="review_approval",
+                                            )
+                                        except Exception as _gate_e:
+                                            logger.error(
+                                                f"[REVIEW PIPELINE] Gate merge failed for rollup PR #{pr_number}: {_gate_e}",
+                                                exc_info=True,
+                                            )
 
-                                await session.commit()
-                                await broadcast_to_project(
-                                    str(_orig.project_id), "task_updated",
-                                    {"task_id": str(_orig.id), "status": _orig.status},
-                                )
-                                logger.info(
-                                    f"[REVIEW PIPELINE] Rollup PR #{pr_number}: review approved, handed to CI gate (parent {_orig.id})"
-                                )
-                                return {"status": "accepted"}
+                                    await session.commit()
+                                    await broadcast_to_project(
+                                        str(_orig.project_id), "task_updated",
+                                        {"task_id": str(_orig.id), "status": _orig.status},
+                                    )
+                                    logger.info(
+                                        f"[REVIEW PIPELINE] Rollup PR #{pr_number}: review approved, handed to CI gate (parent {_orig.id})"
+                                    )
+                                    return {"status": "accepted"}
                         except Exception as _rollup_e:
                             logger.warning(
                                 f"[REVIEW PIPELINE] Rollup gate handoff failed for PR #{pr_number}: {_rollup_e}",

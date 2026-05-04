@@ -1083,16 +1083,17 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
         context={"pr_merged": True},
     )
 
-    # Fail the marker commit inside _check_and_trigger_rollup. Phase B3
-    # added two lock-window-break commits ahead of the marker commit:
-    #   1. _release_parent_lock before get_open_pull_requests (read cluster)
-    #   2. _release_parent_lock before create_pull_request
-    #   3. The marker commit itself (the bug-target — failure here orphans the PR)
-    # We let the first two commits succeed and only fail the marker so the
+    # Fail the marker commit inside _check_and_trigger_rollup. Lock-window-break
+    # commits ahead of the marker commit (current state):
+    #   1. _release_parent_lock before _verify_pr_merged loop (R5 audit fix)
+    #   2. _release_parent_lock before get_open_pull_requests (read cluster)
+    #   3. _release_parent_lock before create_pull_request
+    #   4. The marker commit itself (the bug-target — failure here orphans the PR)
+    # We let the first three commits succeed and only fail the marker so the
     # rescue path is what we observe.
     real_commit = cleanup_db.commit
     commit_calls = {"n": 0}
-    MARKER_COMMIT_INDEX = 3
+    MARKER_COMMIT_INDEX = 4
 
     async def flaky_commit(*args, **kwargs):
         commit_calls["n"] += 1
@@ -1175,8 +1176,9 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
 
     real_commit = cleanup_db.commit
     commit_calls = {"n": 0}
-    # See companion test for the commit-index numbering after Phase B3.
-    MARKER_COMMIT_INDEX = 3
+    # See companion test for the commit-index numbering after Phase B3 + R5
+    # _verify_pr_merged lock-window-break.
+    MARKER_COMMIT_INDEX = 4
 
     async def flaky_commit(*args, **kwargs):
         commit_calls["n"] += 1

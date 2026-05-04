@@ -117,19 +117,39 @@ _GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
 # closes with the worker.
 _orchestrator_deleted_vms: Dict[str, tuple[float, str]] = {}
 _ORCHESTRATOR_DELETE_TTL: float = 1800.0  # 30 minutes
+# Hard cap so a write-faster-than-read pattern (e.g. reaper paused while
+# many deletes happen) cannot grow this dict unboundedly. At ~80 bytes/entry
+# this caps memory at ~400 KB. Pruning is by oldest-first when over the cap,
+# preserving the most-recently-deleted entries that the reaper is most
+# likely to consult next.
+_ORCHESTRATOR_DELETE_MAX_ENTRIES: int = 5000
 
 
 def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     """Return (True, reason) if `vm_id` was deleted by the orchestrator
     within the last _ORCHESTRATOR_DELETE_TTL seconds.
 
-    Side-effect: prunes expired entries on every call. Module-level state
-    so the reaper can import it without a circular dep on `_ensure_vm_deleted`.
+    Side-effect: prunes expired entries on every call AND enforces the size
+    cap. Module-level state so the reaper can import it without a circular
+    dep on `_ensure_vm_deleted`.
     """
     now = time.time()
     expired = [k for k, (ts, _) in _orchestrator_deleted_vms.items() if now - ts > _ORCHESTRATOR_DELETE_TTL]
     for k in expired:
         _orchestrator_deleted_vms.pop(k, None)
+    # Hard-cap eviction: oldest entries first. Defensive — if the dict still
+    # has more than the cap after TTL pruning, we drop the oldest until it
+    # fits. Logged so operators see the eviction and can investigate why
+    # writes outpaced reads.
+    if len(_orchestrator_deleted_vms) > _ORCHESTRATOR_DELETE_MAX_ENTRIES:
+        sorted_by_ts = sorted(_orchestrator_deleted_vms.items(), key=lambda kv: kv[1][0])
+        excess = len(_orchestrator_deleted_vms) - _ORCHESTRATOR_DELETE_MAX_ENTRIES
+        for k, _ in sorted_by_ts[:excess]:
+            _orchestrator_deleted_vms.pop(k, None)
+        logger.warning(
+            "[VM TRACK] _orchestrator_deleted_vms exceeded %d entries — evicted %d oldest",
+            _ORCHESTRATOR_DELETE_MAX_ENTRIES, excess,
+        )
     entry = _orchestrator_deleted_vms.get(vm_id)
     if entry is None:
         return False, None
@@ -1312,6 +1332,38 @@ async def prometheus_metrics(request: Request):
             lines.append(f'blueprint_circuit_breaker_open{{project_id="{project_id}"}} {is_open}')
 
     gauge("blueprint_autonomous_consecutive_failures", "Consecutive autonomous task failures", consecutive_failures)
+
+    # DB pool invalidation telemetry (handle_error event listener in
+    # database.py). Gives us a direct signal whether the cutover-safe
+    # connection-eject pattern is firing — lets a future Cloud Run rollout
+    # be measured against the 2026-05-04 cascade baseline.
+    try:
+        from app.database import get_db_pool_invalidation_stats
+        _db_stats = get_db_pool_invalidation_stats()
+        counter(
+            "blueprint_db_pool_invalidations_total",
+            "Cumulative pool connection invalidations from handle_error listener",
+            _db_stats.get("invalidate_total", 0),
+        )
+        gauge(
+            "blueprint_db_pool_invalidate_consecutive_failures",
+            "Consecutive failures of connection.invalidate() calls (escalates to pool.dispose at threshold)",
+            _db_stats.get("invalidate_consecutive_failures", 0),
+        )
+    except Exception:
+        # Metrics endpoint must not raise on stat collection failure.
+        pass
+
+    # _orchestrator_deleted_vms tracker size — observability into the in-memory
+    # delete-tracker that drives reaper preemption-classification correctness.
+    try:
+        gauge(
+            "blueprint_orchestrator_deleted_vms_size",
+            "Number of entries in the orchestrator-initiated VM delete tracker",
+            len(_orchestrator_deleted_vms),
+        )
+    except Exception:
+        pass
 
     body = "\n".join(lines) + "\n"
     from fastapi.responses import PlainTextResponse

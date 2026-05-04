@@ -2,11 +2,29 @@ import logging
 import os
 from typing import cast
 from sqlalchemy import event
-from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncEngine, AsyncSession
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 logger = logging.getLogger(__name__)
+
+# Counter of consecutive invalidate() failures. Once this hits the escalation
+# threshold we call `engine.sync_engine.pool.dispose()` to nuke the entire
+# pool — necessary backstop if individual connection.invalidate() calls keep
+# raising (e.g. driver-level corruption). Reset on every successful invalidate.
+_invalidate_failure_count: int = 0
+_INVALIDATE_FAILURE_ESCALATION_THRESHOLD: int = 3
+# Counter of total invalidations for telemetry — exposed via /metrics or
+# /api/admin/db-stats; dump at logger.warning whenever reasonable.
+_invalidate_total_count: int = 0
+
+
+def get_db_pool_invalidation_stats() -> dict:
+    """Snapshot of pool-invalidation counters for /metrics and admin observability."""
+    return {
+        "invalidate_total": _invalidate_total_count,
+        "invalidate_consecutive_failures": _invalidate_failure_count,
+        "invalidate_escalation_threshold": _INVALIDATE_FAILURE_ESCALATION_THRESHOLD,
+    }
 
 
 def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
@@ -26,30 +44,66 @@ def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
     disconnection-class errors is the standard SQLAlchemy pattern for
     cutover-safe pools — it ejects the bad connection from the pool entirely
     so subsequent checkouts get a fresh one.
+
+    R5 audit hardening (2026-05-04):
+      - Use `is_disconnect` exclusively. The previous isinstance fallback
+        against `sqlalchemy.exc.{Disconnection,Interface,Operational}Error`
+        was misleading: by the time this listener fires, the original
+        exception is the DBAPI-level wrapped form (e.g.
+        `AsyncAdapt_asyncpg_dbapi.InterfaceError`), not the SQLAlchemy class.
+        The dialect's `is_disconnect()` check (set BEFORE listeners fire) is
+        the authoritative signal — `asyncpg`'s adapter correctly reports
+        True for `InterfaceError("connection is closed")` and friends.
+      - Escalate to `pool.dispose()` after 3 consecutive `invalidate()`
+        failures, so the pool isn't left with stuck poisoned connections.
     """
 
     @event.listens_for(engine.sync_engine, "handle_error")
     def _invalidate_on_disconnect(ctx: object) -> None:
-        original_exc = getattr(ctx, "original_exception", None)
-        is_disconnect = getattr(ctx, "is_disconnect", False)
-        if not is_disconnect and not isinstance(
-            original_exc, (DisconnectionError, InterfaceError, OperationalError),
-        ):
+        global _invalidate_failure_count, _invalidate_total_count
+        # `is_disconnect` is the authoritative SQLAlchemy-set flag. Dialects
+        # populate it via `do_is_disconnect()` BEFORE listeners run; for
+        # asyncpg this catches "connection is closed", "admin shutdown",
+        # "connection does not exist", etc.
+        if not getattr(ctx, "is_disconnect", False):
             return
-        # is_disconnect is the authoritative SQLAlchemy signal; the isinstance
-        # check above is a belt-and-suspenders catch for asyncpg-driver
-        # exceptions that don't always set is_disconnect on the dialect adapter.
+        original_exc = getattr(ctx, "original_exception", None)
         connection = getattr(ctx, "connection", None)
         if connection is None:
             return
         try:
             connection.invalidate()
+            _invalidate_total_count += 1
+            _invalidate_failure_count = 0  # reset on success
             logger.warning(
-                "[DB] Invalidated pool connection after %s — pool will recycle on next checkout",
+                "[DB] Invalidated pool connection after %s "
+                "(total_invalidations=%d) — pool will recycle on next checkout",
                 type(original_exc).__name__,
+                _invalidate_total_count,
             )
         except Exception as inv_exc:
-            logger.warning("[DB] Connection invalidation failed (non-fatal): %s", inv_exc)
+            _invalidate_failure_count += 1
+            logger.warning(
+                "[DB] Connection invalidation failed "
+                "(consecutive_failures=%d): %s",
+                _invalidate_failure_count, inv_exc,
+            )
+            if _invalidate_failure_count >= _INVALIDATE_FAILURE_ESCALATION_THRESHOLD:
+                # Repeated invalidation failures imply driver-level corruption.
+                # Dispose the entire pool: existing checked-out connections
+                # remain valid for in-flight requests, but the pool itself is
+                # rebuilt on next checkout. Reset the counter so we don't
+                # re-dispose on every subsequent error.
+                logger.error(
+                    "[DB] %d consecutive invalidate() failures — calling pool.dispose() "
+                    "to rebuild the pool",
+                    _invalidate_failure_count,
+                )
+                try:
+                    engine.sync_engine.pool.dispose()
+                except Exception as disp_exc:
+                    logger.error("[DB] pool.dispose() raised: %s", disp_exc, exc_info=True)
+                _invalidate_failure_count = 0
 
 
 def _make_engine():

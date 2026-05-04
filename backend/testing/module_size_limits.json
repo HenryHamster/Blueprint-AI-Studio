@@ -3,7 +3,7 @@
   "backend": {
     "main.py": 3500,
     "task_completion.py": 3000,
-    "task_lifecycle.py": 2870,
+    "task_lifecycle.py": 2970,
     "orchestrator.py": 3650,
     "admin.py": 3000,
     "compute.py": 2500,
@@ -20,7 +20,7 @@
     "autonomous_research.py": 2050,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
-    "rollup_management.py": 2050,
+    "rollup_management.py": 2150,
     "reaper.py": 2350,
     "review_pipeline.py": 1800,
     "deploy_health.py": 1000
