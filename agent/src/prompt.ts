@@ -97,11 +97,11 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
   'self_audit': 'Score system maturity on four signals: test_coverage, friction_density, claim_consistency, failure_mix. Each component is 0-100. Pick recommended_mode (audit|fundamentals|ship|pause) from the worst component. Do not modify any files — output is a JSON findings report only.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
-  'create': 'Before finishing: Run the relevant lint, build, and test commands for every area you modified (check the Codebase Instructions for commands). Fix any failures. Do not leave broken tests, lint errors, build failures, or conflict markers. If the task involves libraries or frameworks you\'re uncertain about, fetch their official documentation before writing code. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.',
-  'fix': 'You are fixing issues from a code review or a pipeline failure (merge conflict or failing CI). Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state over the original description. If the error involves a third-party library, fetch its docs or search for the specific error message. Before declaring done, verify that local lint/type/test suites pass on the changed files. Run the relevant test suite to confirm your fix does not introduce regressions. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.',
+  'create': 'Before finishing: edit the files you need to change, run `./check` to validate lint/build, fix any failures, then `./pr open --title "feat/fix/etc: ..." --body "Summary of changes"` to ship and `./done` to mark complete. The `./pr` helper gates on `./check` so broken code can\'t reach a PR. If a library is unfamiliar, fetch its docs first. If you determine the task can\'t be completed (scope wrong, conflicting requirements, blocker found), call `./fail "<reason>"` instead of leaving silently.',
+  'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done`. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.',
   'docs': 'Read the existing README and documentation files first. Understand the current documentation structure before making changes.',
   'deps': 'Check for breaking changes in major version bumps. Run the full test suite after updating to verify compatibility.',
-  'refactor': 'Run the full test suite BEFORE and AFTER changes. Zero test regressions allowed. Do not change external behavior. If the refactor involves libraries or frameworks you\'re uncertain about, fetch their official documentation before writing code. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.',
+  'refactor': 'Run the full test suite BEFORE and AFTER changes via `./check test`. Zero test regressions allowed. Do not change external behavior. After refactoring + verifying via `./check`, run `./pr open --title "refactor: ..." --body "..."` and `./done`. Use `./fail` if the refactor proves not feasible.',
   'investigate': 'This is a read-only investigation. Do NOT modify any files. Search for known issues related to error patterns you discover. Write your findings to the output JSON only.',
   'debug': 'Search for known issues related to error patterns you discover. Use WebSearch to look up specific error messages or stack traces when local context is insufficient.',
 };
@@ -132,8 +132,8 @@ export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, stri
   }
   if (testCmds.length > 0) {
     const cmdsText = testCmds.join(', ');
-    hints['create'] = `Before finishing: Run the relevant lint, build, and test commands for every area you modified (${cmdsText}). Fix any failures. Do not leave broken tests, lint errors, build failures, or conflict markers. If the task involves libraries or frameworks you're uncertain about, fetch their official documentation before writing code. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.`;
-    hints['refactor'] = `Run the full test suite BEFORE and AFTER changes (${cmdsText}). Zero test regressions allowed. Do not change external behavior. If the refactor involves libraries or frameworks you're uncertain about, fetch their official documentation before writing code. IMPORTANT: Do NOT run git commit, git rebase, or git push — the automation framework handles committing, rebasing, and pushing after you exit.`;
+    hints['create'] = `Before finishing: edit the files you need, run \`./check\` to validate lint/build (which uses ${cmdsText} under the hood), fix any failures, then \`./pr open --title "feat/fix/etc: ..." --body "Summary"\` and \`./done\`. The \`./pr\` helper gates on \`./check\`. Use \`./fail "<reason>"\` if the task can't be completed.`;
+    hints['refactor'] = `Use \`./check test\` to run the full test suite BEFORE and AFTER changes (${cmdsText}). Zero test regressions allowed. After refactoring + verifying, \`./pr open --title "refactor: ..." --body "..."\` then \`./done\`. \`./fail\` if not feasible.`;
   }
 
   // 'deps' hint: list actual package managers detected
@@ -463,7 +463,9 @@ WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
 WITH_TESTS=0
-[ "\${1:-}" = "test" ] || [ "\${1:-}" = "--tests" ] && WITH_TESTS=1
+if [ "\${1:-}" = "test" ] || [ "\${1:-}" = "--tests" ]; then
+  WITH_TESTS=1
+fi
 
 # Determine changed paths: committed since base + uncommitted
 BASE="${cfg.baseBranch}"
@@ -572,12 +574,20 @@ done
 # 1. Run ./check as gate (lint always; tests on main branch when --with-tests
 #    OR on review-fix path that touches backend changes).
 if [ "$SKIP_CHECK" = "0" ]; then
-  CHECK_ARGS=()
-  [ "$WITH_TESTS" = "1" ] && CHECK_ARGS+=("test")
-  if ! ./check "\${CHECK_ARGS[@]}"; then
-    echo ""
-    echo "[pr] ./check failed — fix lint/build/tests then re-run ./pr open. Use --skip-check ONLY if you've manually verified, otherwise broken code lands."
-    exit 1
+  # Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
+  # aborts on an empty array expansion, so just call ./check directly.
+  if [ "$WITH_TESTS" = "1" ]; then
+    if ! ./check test; then
+      echo ""
+      echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
+      exit 1
+    fi
+  else
+    if ! ./check; then
+      echo ""
+      echo "[pr] ./check failed — fix lint/build then re-run ./pr open."
+      exit 1
+    fi
   fi
 fi
 
@@ -636,12 +646,16 @@ if [ -n "$EXISTING_PR" ]; then
 else
   BODY_FILE=$(mktemp)
   printf '%s' "$BODY" > "$BODY_FILE"
-  PR_URL=$(gh pr create --base "${cfg.baseBranch}" --head "${cfg.workBranch}" --title "$TITLE" --body-file "$BODY_FILE" 2>&1) || {
-    echo "[pr] gh pr create failed: $PR_URL" >&2
-    rm -f "$BODY_FILE"
+  # Keep stderr separate so the captured PR_URL is the URL alone, not URL +
+  # any deprecation/warning lines gh might emit on stderr.
+  PR_ERR=$(mktemp)
+  PR_URL=$(gh pr create --base "${cfg.baseBranch}" --head "${cfg.workBranch}" --title "$TITLE" --body-file "$BODY_FILE" 2>"$PR_ERR") || {
+    echo "[pr] gh pr create failed:" >&2
+    cat "$PR_ERR" >&2
+    rm -f "$BODY_FILE" "$PR_ERR"
     exit 1
   }
-  rm -f "$BODY_FILE"
+  rm -f "$BODY_FILE" "$PR_ERR"
 fi
 unset GH_TOKEN
 `}
@@ -677,13 +691,49 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${cfg.taskId}"
 
-jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
-  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}' | \\
-  curl -f -sS --max-time 30 -X POST "$API/api/agent/status" \\
-    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+# Idempotency: if marker already exists, this is a re-run — no-op cleanly.
+if [ -f /tmp/done_${cfg.taskId} ]; then
+  echo "[done] already marked — no-op (PR: $PR_URL)"
+  exit 0
+fi
 
-echo ""
+# Retry on 429/5xx/network — orchestrator returns 429 on FOR-UPDATE
+# contention with Retry-After: 5. Without retry, contended completions
+# never reach the orchestrator and the task stays IN_PROGRESS until the
+# reaper kicks in minutes later.
+PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
+  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}')
+POSTED=0
+for attempt in 1 2 3 4 5; do
+  HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/done_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+    -X POST "$API/api/agent/status" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || HTTP="000"
+  if [ "$HTTP" = "200" ] || [ "$HTTP" = "202" ]; then
+    POSTED=1
+    break
+  fi
+  if [ "$HTTP" = "429" ] || [ "\${HTTP:0:1}" = "5" ] || [ "$HTTP" = "000" ]; then
+    BACKOFF=$((attempt * 3))
+    echo "[done] POST attempt $attempt got HTTP=$HTTP — retrying in \${BACKOFF}s..." >&2
+    sleep "$BACKOFF"
+    continue
+  fi
+  # 4xx other than 429: don't retry — likely a permanent error.
+  echo "[done] POST attempt $attempt got HTTP=$HTTP (permanent failure):" >&2
+  cat /tmp/done_resp_${cfg.taskId} >&2
+  rm -f /tmp/done_resp_${cfg.taskId}
+  exit 1
+done
+rm -f /tmp/done_resp_${cfg.taskId}
+if [ "$POSTED" = "0" ]; then
+  echo "[done] POST failed after 5 retries — orchestrator unreachable. Marker NOT written; wrapper will fall back to its own status post." >&2
+  exit 1
+fi
+
+# Marker is written ONLY after a successful POST. The wrapper inspects it
+# to decide whether to skip its fallback completion path.
 touch /tmp/done_${cfg.taskId}
+echo ""
 echo "[done] OK — wrapper will exit cleanly. PR: $PR_URL"
 `;
   fs.writeFileSync(`${WORKSPACE}/done`, script, { mode: 0o755 });
@@ -707,13 +757,39 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="${cfg.taskId}"
 
-jq -n --arg tid "$TASK" --arg r "$REASON" \\
-  '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "agent_self_failed"}' | \\
-  curl -f -sS --max-time 30 -X POST "$API/api/agent/status" \\
-    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+if [ -f /tmp/fail_${cfg.taskId} ]; then
+  echo "[fail] already marked — no-op"
+  exit 0
+fi
 
-echo ""
+PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "$REASON" \\
+  '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "agent_self_failed"}')
+POSTED=0
+for attempt in 1 2 3 4 5; do
+  HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/fail_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+    -X POST "$API/api/agent/status" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || HTTP="000"
+  if [ "$HTTP" = "200" ] || [ "$HTTP" = "202" ]; then
+    POSTED=1; break
+  fi
+  if [ "$HTTP" = "429" ] || [ "\${HTTP:0:1}" = "5" ] || [ "$HTTP" = "000" ]; then
+    BACKOFF=$((attempt * 3))
+    echo "[fail] POST attempt $attempt got HTTP=$HTTP — retrying in \${BACKOFF}s..." >&2
+    sleep "$BACKOFF"; continue
+  fi
+  echo "[fail] POST attempt $attempt got HTTP=$HTTP (permanent failure):" >&2
+  cat /tmp/fail_resp_${cfg.taskId} >&2
+  rm -f /tmp/fail_resp_${cfg.taskId}
+  exit 1
+done
+rm -f /tmp/fail_resp_${cfg.taskId}
+if [ "$POSTED" = "0" ]; then
+  echo "[fail] POST failed after 5 retries — orchestrator unreachable. Marker NOT written." >&2
+  exit 1
+fi
+
 touch /tmp/fail_${cfg.taskId}
+echo ""
 echo "[fail] Posted FAILED status. Reason: $REASON"
 `;
   fs.writeFileSync(`${WORKSPACE}/fail`, script, { mode: 0o755 });
@@ -759,6 +835,50 @@ export function formatPlaybook(
     .join('\n\n');
   return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, update or delete it (\`./playbook set\` to overwrite, \`./playbook delete <key>\` to remove). The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
 }
+
+// 2026-05-04: appended to every code-change task prompt (create, refactor,
+// docs, qa, deps, migrate, fix). Tells Claude about the four end-to-end
+// helpers and the *required* exit ritual. Without this, Claude has no way
+// to know the helpers exist and falls through to the wrapper's "FAILED:
+// incomplete" path on every task.
+export const CODE_CHANGE_HELPER_GUIDANCE = `
+## Task lifecycle — you own it end-to-end
+
+This task ends only when YOU explicitly mark it done or failed. The wrapper
+does NOT auto-commit or auto-push your work. Use these helpers (already in
+the workspace, executable):
+
+- \`./check\` — runs lint/build for the stacks your changes touched
+  (admin-ui eslint+build, agent tsc+eslint, backend ruff). Fast — run it
+  every time you make a non-trivial edit. Exits non-zero on failure with
+  the actual error tail; fix and re-run until green.
+- \`./check test\` — same plus the Docker backend test suite (slower,
+  ~5-8min). Run before \`./pr open\` for any task on a main branch.
+- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
+  commits any pending changes, pushes to the work branch (force-with-lease
+  retry built in), creates a PR (or pushes updates to an existing one for
+  fix tasks). On success writes /tmp/pr_url_<task_id> with the URL.
+  Exits non-zero with a clear message on failure (lint failed, push
+  rejected, etc.) — fix and call again.
+- \`./done\` — marks the task COMPLETED with the PR URL. Requires
+  \`./pr open\` to have run first.
+- \`./fail "<reason>"\` — marks the task FAILED. Use ONLY when the task
+  fundamentally can't be completed: scope is wrong, blocker found,
+  conflicting requirements. Don't use for transient lint/test failures —
+  keep iterating with \`./check\` instead.
+
+Required exit pattern:
+  edit -> ./check -> (if green) ./pr open --title ... --body ... -> ./done
+
+If you exit without calling \`./done\` or \`./fail\`, the wrapper will try
+to finalise on your behalf based on whether you opened a PR — but this is
+the fallback path, not the happy path. Always call \`./done\` or \`./fail\`
+explicitly so the orchestrator gets a clean terminal status.
+
+DO use \`git add\`, \`git status\`, \`git diff\` to inspect your work.
+DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — those
+operations belong inside \`./pr open\` so the lint/build gate fires.
+`;
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory

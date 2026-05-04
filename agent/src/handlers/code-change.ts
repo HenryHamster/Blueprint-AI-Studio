@@ -62,6 +62,19 @@ export interface CodeChangeTaskOpts {
 export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void> {
   const { taskId, prompt, ws, statusRef, model, effort, disallowedTools } = opts;
 
+  // Stale marker cleanup: if a prior attempt on this VM left /tmp/done_<id>
+  // or /tmp/fail_<id> or /tmp/pr_url_<id> behind (e.g. agent crashed mid-
+  // status post; warm-pool retry on same VM), the wrapper would short-
+  // circuit on the stale marker and skip Claude entirely — or post a fake
+  // COMPLETED. Wipe before every run.
+  for (const f of [
+    `/tmp/done_${taskId}`,
+    `/tmp/fail_${taskId}`,
+    `/tmp/pr_url_${taskId}`,
+  ]) {
+    try { fs.unlinkSync(f); } catch { /* not present — fine */ }
+  }
+
   // 1. Write helpers (./check, ./pr, ./done, ./fail). Existing helpers
   //    (./playbook, ./messages, ./note, etc.) are written by the caller.
   writeCodeChangeHelpers({
@@ -103,12 +116,20 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   if (fs.existsSync(prUrlFile)) {
     const prUrl = fs.readFileSync(prUrlFile, 'utf-8').trim();
     sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but no ./done marker. Posting COMPLETED on Claude's behalf.\n`);
+    // Capture the diff so review-pipeline scope analysis, direction credit,
+    // and rollup management get real changed_files instead of an empty list.
+    let changedFiles: string[] = [];
+    try {
+      const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
+      changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
+    } catch { /* git may be in odd state — best effort */ }
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'COMPLETED',
       artifact_type: 'PULL_REQUEST',
       pr_url: prUrl,
       logs: 'Task completed. Claude opened PR but did not call ./done — wrapper finalised.',
+      ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
     });
     return;
   }

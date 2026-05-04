@@ -342,6 +342,18 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     'rate_limited': RATE_LIMIT,
     'scope_overflow': SCOPE_OVERFLOW,
     'timeout': AGENT_TIMEOUT,
+    # 2026-05-04: emitted by the new Claude-driven flow.
+    # ``agent_self_failed`` — Claude called ``./fail "<reason>"`` because the
+    # task fundamentally couldn't be completed (scope wrong, blocker, etc.).
+    # The reason text is preserved as latest_status_message; the category
+    # routes through the CODE_ERROR retry budget so the orchestrator's
+    # diagnosis pipeline (direction-hold investigation, etc.) still fires.
+    'agent_self_failed': CODE_ERROR,
+    # ``incomplete`` — wrapper-fallback when Claude exited without calling
+    # ./done|./fail and didn't open a PR. Distinct from claude_code_failed
+    # (which is for non-zero exit) so analytics can separate "Claude bailed
+    # silently" from "Claude crashed."
+    'incomplete': CODE_ERROR,
 }
 
 
