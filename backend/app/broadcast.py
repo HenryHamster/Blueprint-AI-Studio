@@ -15,6 +15,7 @@ import time
 from typing import Dict, List
 
 from fastapi import WebSocket
+from starlette.websockets import WebSocketState
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +112,24 @@ class ConnectionManager:
             ]
         for ws, pid in idle:
             logger.info(f"[WS] Closing idle connection (project={pid}, idle>{max_idle_seconds:.0f}s)")
-            try:
-                await ws.close(code=1001, reason="Idle timeout")
-            except Exception:
-                logger.exception(f"[WS] Failed to close idle connection for project {pid}")
+            # Skip close() if the socket already closed itself out-of-band.
+            # Calling close() on a DISCONNECTED websocket raises starlette's
+            # `RuntimeError: Cannot call "send" once a close message has been
+            # sent`, which surfaced 1× in production at 19:51:17 UTC during
+            # the Cloud Run cutover cascade. The connection state check makes
+            # the cleanup idempotent.
+            if (
+                ws.application_state != WebSocketState.DISCONNECTED
+                and ws.client_state != WebSocketState.DISCONNECTED
+            ):
+                try:
+                    await ws.close(code=1001, reason="Idle timeout")
+                except RuntimeError as _close_exc:
+                    # Race: client closed between the state check and the
+                    # close() call. Benign — just clean up our bookkeeping.
+                    logger.debug(f"[WS] Idle close race for project {pid}: {_close_exc}")
+                except Exception:
+                    logger.exception(f"[WS] Failed to close idle connection for project {pid}")
             await self.disconnect(ws, pid)
 
     async def broadcast(self, project_id: str, event_type: str, data: dict):

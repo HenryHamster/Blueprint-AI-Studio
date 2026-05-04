@@ -104,6 +104,37 @@ _last_gcp_vm_count: int = 0
 _last_gcp_vm_check: float = 0.0
 _GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
 
+# Orchestrator-initiated VM-delete tracker. Reaper consults this to distinguish
+# "VM DELETED because orchestrator told it to" from "VM DELETED because GCP
+# preempted it." Without this, the reaper sees vm_status=DELETED on a SPOT VM
+# and bumps spot_preemption_count, treating an orchestrator-completed task as
+# a preemption — observed in production 2026-05-04 when status POST 500'd
+# during cutover but agent_completion still deleted the VM (reaper later
+# misclassified the orphan).
+# Key: vm_instance_id (str). Value: (unix_ts, reason). TTL = 30min — pruned
+# lazily on read. In-memory only (Cloud Run = single instance per region for
+# this service); restart loses entries but the misclassification window then
+# closes with the worker.
+_orchestrator_deleted_vms: Dict[str, tuple[float, str]] = {}
+_ORCHESTRATOR_DELETE_TTL: float = 1800.0  # 30 minutes
+
+
+def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
+    """Return (True, reason) if `vm_id` was deleted by the orchestrator
+    within the last _ORCHESTRATOR_DELETE_TTL seconds.
+
+    Side-effect: prunes expired entries on every call. Module-level state
+    so the reaper can import it without a circular dep on `_ensure_vm_deleted`.
+    """
+    now = time.time()
+    expired = [k for k, (ts, _) in _orchestrator_deleted_vms.items() if now - ts > _ORCHESTRATOR_DELETE_TTL]
+    for k in expired:
+        _orchestrator_deleted_vms.pop(k, None)
+    entry = _orchestrator_deleted_vms.get(vm_id)
+    if entry is None:
+        return False, None
+    return True, entry[1]
+
 # --- Max Plan Account Pool ---
 # Pool state and logic extracted to max_plan_pool.py. Re-exported here for
 # backward compatibility with callers (orchestrator, tests) that import from
@@ -150,6 +181,12 @@ async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transitio
         return True  # No VM to delete
 
     logger.info(f"[VM CLEANUP] Deleting VM {vm_id} (task={task_id}, reason={reason})")
+    # Record the orchestrator-initiated delete BEFORE attempting the GCP
+    # call. Even if the call fails partway and the VM ends up in TERMINATED
+    # rather than DELETED, the marker still tells the reaper this was an
+    # orchestrator action — preventing a spot_preemption misclassification
+    # if the VM is later cleaned up by another path.
+    _orchestrator_deleted_vms[vm_id] = (time.time(), reason)
 
     for attempt in range(3):
         try:

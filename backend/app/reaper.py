@@ -740,10 +740,26 @@ async def reaper_service():
                                 vm_status = await asyncio.to_thread(
                                     get_vm_status, fresh_task.vm_instance_id, prov_zone_for_status
                                 )
-                                # TERMINATED = preempted by GCP. DELETED = already gone
-                                # (DELETE termination action under SPOT). RUNNING = real
-                                # agent crash, not preemption.
-                                if vm_status in ("TERMINATED", "DELETED"):
+                                # TERMINATED = preempted by GCP. DELETED = already gone.
+                                # DELETED is ambiguous: GCP delete-on-preempt OR orchestrator-
+                                # initiated cleanup (agent_completion, terminal_transition,
+                                # admin_requeue, etc). Production 2026-05-04: reaper misclassified
+                                # orchestrator-deleted VMs as preemptions, inflating
+                                # spot_preemption_count for tasks that were really completed
+                                # but whose status POST 500'd during a cutover.
+                                # Fix: consult the orchestrator-initiated-delete tracker. If the
+                                # VM was deleted by us within the last 30min, it's NOT a preemption.
+                                from app.main import is_orchestrator_initiated_delete
+                                is_orch_deleted, orch_delete_reason = is_orchestrator_initiated_delete(
+                                    fresh_task.vm_instance_id
+                                )
+                                if is_orch_deleted:
+                                    logger.info(
+                                        f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
+                                        f"vm_status={vm_status} but orchestrator-initiated delete "
+                                        f"(reason={orch_delete_reason}) — NOT classifying as preemption"
+                                    )
+                                elif vm_status in ("TERMINATED", "DELETED"):
                                     is_spot_preemption = True
                                     logger.warning(
                                         f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
