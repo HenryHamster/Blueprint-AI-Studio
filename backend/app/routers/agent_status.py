@@ -8,6 +8,7 @@ All deferred imports from app.main are intentional — they avoid circular impor
 (agent_status is imported BY main) and preserve test-patchability.
 """
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -74,9 +75,43 @@ async def _recover_poisoned_session(session: AsyncSession, task_id_str: str) -> 
     Returns True if a rollback was performed (caller should re-apply any
     in-memory mutations it relies on, since they were discarded), False if
     the session was already healthy and nothing was changed.
+
+    Hardening (2026-05-04): the original detection used
+    ``session.in_transaction() and not session.is_active``. That misses two
+    edge cases:
+      1. ``in_transaction()`` itself can raise on certain corrupted-state
+         sessions (e.g. mid-savepoint failure with no clean parent txn).
+      2. The session may be ``is_active == True`` but have an explicit
+         ``_rollback_only`` flag set on the underlying SyncSession — newer
+         SQLAlchemy versions use this to communicate "must rollback" to
+         async wrappers without flipping is_active immediately.
+    Both are now caught by an additional ``except Exception`` around the
+    state probe and an unconditional best-effort rollback when any flag
+    indicates trouble.
     """
     try:
-        if session.in_transaction() and not session.is_active:
+        in_tx = session.in_transaction()
+    except Exception as _probe_exc:
+        # State probe itself failed — session is in an unknown bad state.
+        # Force a rollback unconditionally; if it fails too, return True so
+        # the caller knows the session may still be poisoned.
+        logger.warning(
+            f"[STATUS] session.in_transaction() probe failed for {task_id_str}: "
+            f"{_probe_exc}; attempting unconditional rollback"
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return True
+
+    try:
+        # Standard pending-rollback detection: open transaction marked inactive.
+        if in_tx and not session.is_active:
+            await session.rollback()
+            return True
+        # Belt-and-suspenders: some SQLAlchemy paths set _rollback_only on the
+        # underlying sync session without immediately clearing is_active.
+        sync_sess = getattr(session, "sync_session", None)
+        if sync_sess is not None and getattr(sync_sess, "_rollback_only", False):
             await session.rollback()
             return True
     except Exception as _rb_exc:
@@ -523,8 +558,23 @@ async def _propagate_pipeline_failure_to_original(task: Task, session: AsyncSess
                 await session.commit()
             except Exception as _ar_exc:
                 logger.warning("[AUTO-REMEDIATION] Failed to post failure result after pipeline exhaustion: %s", _ar_exc)
+                # WHY: post_remediation_result_message does session.add() and the
+                # following session.commit() can raise on FK/serialization conflict,
+                # leaving the session in pending-rollback state. Without this rollback
+                # the subsequent early commit in update_agent_status (line ~1979)
+                # surfaces as PendingRollbackError, the swallow point being invisible.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
     except Exception as e:
         logger.warning(f"[PIPELINE] Failed to propagate failure to {original_task_id}: {e}", exc_info=True)
+        # WHY: session.commit() at line ~510 (and the rollup helper that may
+        # call session.execute beneath it) can raise on serialization conflict
+        # / FK violation / lock contention, leaving the session in
+        # pending-rollback state. The handler then proceeds to the early commit
+        # at line ~1979 of update_agent_status which raises PendingRollbackError
+        # — production logs at 2026-05-04 19:46:43 UTC showed this exact pattern.
+        with contextlib.suppress(Exception):
+            await session.rollback()
 
 
 
@@ -1070,6 +1120,14 @@ async def update_agent_status(
                             asyncio.ensure_future(dispatch_external_notification(task.project_id, "account_model_regression_recovered", {k: _rr.get(k) for k in ("account_id", "account_label", "provider", "model")}))  # noqa: RUF006
                     except Exception as e:
                         logger.warning(f"[STATUS] regression recovery failed for {acct_id_clear}: {e}", exc_info=True)
+                        # WHY: post_account_model_regression_recovered_message
+                        # → post_event_message issues session.add(ProjectMessage).
+                        # Any autoflush triggered along the way (e.g. by an
+                        # implicit relationship load) can raise and poison the
+                        # session, which then surfaces only at the early commit
+                        # at ~1979 as an opaque PendingRollbackError.
+                        with contextlib.suppress(Exception):
+                            await session.rollback()
                 if acct_id_clear and task.vm_provisioned_at:
                     try:
                         duration_secs = (_utcnow() - task.vm_provisioned_at).total_seconds()
@@ -1649,6 +1707,13 @@ async def update_agent_status(
                     ) if _proj else 0
                 except Exception:
                     _playbook_count = 0
+                    # WHY: session.get(Project) can raise OperationalError /
+                    # SerializationFailure / connection-lost, marking the
+                    # transaction rollback-only. Without this rollback the next
+                    # session op (session.add(task) on line ~1674 below, then
+                    # the early commit at ~1979) raises PendingRollbackError.
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
                 _ctx["_had_playbook"] = bool(_playbook_count)
                 _ctx["_had_arch_context"] = bool(_ctx.get("_had_arch_context"))
                 task.context = _ctx
@@ -1719,8 +1784,24 @@ async def update_agent_status(
                         await capture_success_pattern(task, session)
                     except Exception as _sce:
                         logger.warning(f"[PLAYBOOK] Failed to capture success pattern for task {task.id}: {_sce}")
+                        # WHY: capture_success_pattern issues a COUNT query
+                        # (session.execute) and session.get(Project, ...) — both
+                        # may raise on serialization / lock-timeout / connection
+                        # loss, leaving the session pending-rollback and
+                        # crashing the early commit at line ~1979. This was one
+                        # of the leak categories explicitly named in the
+                        # comment block at lines ~1951-1962 ("playbook
+                        # capture/learning").
+                        with contextlib.suppress(Exception):
+                            await session.rollback()
             except Exception as _e:
                 logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
+                # WHY: the metrics block also touches session.get and session.add;
+                # any inner op raising past the inner try/excepts (e.g. on a
+                # poisoned session that we already failed to recover) lands here.
+                # Roll back so the early commit at ~1979 has a clean session.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
         # Auto-create playbook entries from recurring failure patterns
         if payload.status == TaskStatus.FAILED:
@@ -1728,6 +1809,15 @@ async def update_agent_status(
                 await _check_recurring_failures(task, session)
             except Exception as _pbe:
                 logger.warning(f"[PLAYBOOK] Failed to check recurring failures for task {task.id}: {_pbe}")
+                # WHY: _check_recurring_failures issues session.execute() (SELECT),
+                # session.get(Project, ...), and session.add(project) without an
+                # internal flush. A serialization/lock-timeout/connection error
+                # raised from session.execute leaves the transaction in
+                # pending-rollback state — every later session op (including the
+                # early commit at line ~1979) raises PendingRollbackError. Roll
+                # back here so downstream commits land on a clean session.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload
@@ -1839,6 +1929,15 @@ async def update_agent_status(
                     await post_failure_alert_message(session, task.project_id, _cb_alert_text, task.id)
                 except Exception as _e:
                     logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
+                    # WHY: post_failure_alert_message → post_event_message does
+                    # session.add(ProjectMessage). Most failures here are pre-add
+                    # (import / no-flush), but autoflush triggered by any
+                    # implicit attribute load on `task` (relationship lazy-load)
+                    # could surface a flush error and poison the session before
+                    # the early commit at ~1979. Roll back defensively — this
+                    # was named in the leak categories at lines ~1951-1962.
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
             # CLOSED → OPEN after 5 consecutive infra failures (wall of provisioning/rate-limit)
             elif breaker["state"] == "CLOSED" and breaker.get("infra_failure_count", 0) >= 5:
@@ -1863,6 +1962,12 @@ async def update_agent_status(
                     await post_failure_alert_message(session, task.project_id, _cb_alert_text, task.id)
                 except Exception as _e:
                     logger.warning(f"[NOTIFY] Failed to post circuit breaker message: {_e}")
+                    # WHY: same poison risk as the CODE-class branch above —
+                    # post_event_message does session.add and an autoflush could
+                    # raise. Roll back so the early commit at ~1979 doesn't
+                    # surface the upstream poisoning as PendingRollbackError.
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
             # Persist breaker state on any transition
             if (
                 breaker["state"] != "CLOSED"
