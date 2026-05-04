@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
-  apiPost, persistAndPostStatus, apiGet, git, gitAsync, gitCommit, sendHeartbeatSync, runClaudeCode,
+  persistAndPostStatus, git, runClaudeCode,
   listOpenPullRequestsForBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -10,10 +10,11 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed, JsonExtractionError } from '../json-extract.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { runCodeChangeTask } from './code-change.js';
 
 // ── Handler: Security Audit (analyze codebase for vulnerabilities, output findings) ──
 export async function handleSecurityAudit(
@@ -124,12 +125,10 @@ export async function handleMigrate(
 ) {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   const rawBaseBranch = strVal(payload.base_branch, 'main');
-  const rawTitle = strVal(task.title) || strVal(payload.title) || 'database migration';
   const migrateTaskTitle = strVal(task.title);
   const prompt = migrateTaskTitle ? `Task: ${migrateTaskTitle}\n\n${rawPrompt}` : rawPrompt;
 
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-  const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
   if (!prompt) throw new Error('No prompt found in task payloads');
 
   // Clone
@@ -213,7 +212,7 @@ Follow these steps precisely:
 
 7. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
 
-8. Once migration applies cleanly, the files should be modified. Do NOT commit — the agent harness will handle the commit.
+8. Once migration applies cleanly, run \`./check\` to verify lint/build, then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
 
 CRITICAL RULES:
 - Never delete or modify existing migration files in \`${alembicVersionsPath}\` (except the one you just generated)
@@ -229,72 +228,31 @@ CRITICAL RULES:
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
   const migrateBaseCommit = git(['rev-parse', 'HEAD']);
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext + migratePrompt + migrateFirstTaskSection + PLAYBOOK_GUIDANCE + migratePromptSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
+    + migratePrompt + migrateFirstTaskSection
+    + CODE_CHANGE_HELPER_GUIDANCE + PLAYBOOK_GUIDANCE
+    + migratePromptSuffix + `
 
-  const diff = git(['status', '--porcelain']);
-  const currentHead = git(['rev-parse', 'HEAD']);
-  // Detect changes from BOTH uncommitted files AND commits Claude may have created
-  const hasChanges = diff.length > 0 || currentHead !== migrateBaseCommit;
-
-  if (hasChanges && exitCode === 0) {
-    statusRef.value = 'Pushing changes...';
-    sendLog(ws, '\nCommitting and pushing migration changes...\n');
-
-    git(['add', '-A']);
-    const migrateStaged = git(['status', '--porcelain']);
-    if (migrateStaged.length > 0) {
-      const committed = gitCommit(`migrate: ${taskTitle}\n\nAutomated by Blueprint Agent (task: ${shortId})`);
-      if (!committed) sendLog(ws, 'Nothing to commit after staging migration (pre-commit hook may have reverted)\n');
-    }
-
-    // Rebase onto latest base branch before push
-    statusRef.value = `Rebasing onto ${baseBranch}...`;
-    try {
-      git(['fetch', 'origin', baseBranch]);
-      sendHeartbeatSync(taskId, `Fetched ${baseBranch}, rebasing...`);
-      git(['rebase', `origin/${baseBranch}`]);
-      sendLog(ws, `Rebased onto latest ${baseBranch}\n`);
-    } catch {
-      sendLog(ws, `Rebase onto ${baseBranch} had conflicts — pushing as-is\n`);
-      try { git(['rebase', '--abort']); } catch { /* ignore */ }
-    }
-
-    const commitHash = git(['rev-parse', 'HEAD']);
-
-    sendHeartbeatSync(taskId, `Pushing ${workBranch}...`);
-    const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
-    const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
-    execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-    await gitAsync(['push', 'origin', workBranch]);
-    sendLog(ws, `Pushed to branch: ${workBranch}\n`);
-
-    sendHeartbeatSync(taskId, `Creating pull request for ${workBranch}...`);
-    statusRef.value = 'Creating pull request...';
-    let prUrl = '';
-    try {
-      const prBody = lastResultText
-        ? `## Summary\n\n${lastResultText.slice(0, 3000)}\n\n---\n*Automated by Blueprint Agent*`
-        : `Database migration: ${taskTitle}\n\n---\n*Automated by Blueprint Agent*`;
-      const prRes = await apiPost('/api/agent/github/pull-requests', {
-        task_id: taskId, owner, repo, title: `migrate: ${taskTitle}`,
-        head: workBranch, base: baseBranch, body: prBody,
-      }, undefined, 90_000) as { data?: { html_url?: string } };
-      prUrl = prRes.data?.html_url ?? '';
-      sendLog(ws, `PR created: ${prUrl}\n`);
-    } catch (e) { sendLog(ws, `Failed to create PR: ${String(e)}\n`); }
-
-    await persistAndPostStatus(taskId, {
-      task_id: taskId, status: 'COMPLETED', artifact_type: 'PULL_REQUEST',
-      commit_hash: commitHash, pr_url: prUrl, repo_url: `https://github.com/${owner}/${repo}`,
-    });
-  } else if (exitCode === 0) {
-    await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: 'No migration changes generated.' });
-  } else {
-    await persistAndPostStatus(taskId, {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: 'claude_code_failed',
-    });
-  }
+${DEFAULT_TOOL_GUIDANCE}`;
+  // 2026-05-04: post-Claude commit/rebase/push/PR pipeline replaced with
+  // runCodeChangeTask. Claude calls ./check + ./pr open + ./done from
+  // inside its own session. See agent/src/handlers/code-change.ts.
+  await runCodeChangeTask({
+    taskId,
+    prompt: finalMigratePrompt,
+    ws,
+    statusRef,
+    workBranch,
+    baseBranch,
+    owner,
+    repo,
+    testsOnMainBranch: baseBranch === 'main',
+    baseCommit: migrateBaseCommit,
+    model,
+    effort,
+    disallowedTools,
+    noChangesMessage: 'No migration changes generated.',
+  });
 }
 
 // ── Handler: Smoketest (post-merge end-to-end health checks) ─────────────────

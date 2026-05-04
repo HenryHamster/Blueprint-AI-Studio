@@ -3,16 +3,17 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
-  persistAndPostStatus, apiGet, git, gitAsync, gitCommit,
-  runClaudeCode, runProjectLintChecks, lintFixLoop, testFixLoop,
-  captureTestBaseline, sendHeartbeatSync, extractPytestSelectorsFromOutput,
+  persistAndPostStatus, git, gitAsync,
+  runClaudeCode,
+  captureTestBaseline, testFixLoop, extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
 } from '../index.js';
+import { runCodeChangeTask } from './code-change.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   SIZE_GUARDRAIL_GUIDANCE, READ_THE_FAILURE_MESSAGE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
   readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
@@ -398,25 +399,6 @@ export function buildBlueprintPrFooter(opts: {
   return `<!-- blueprint:meta -->\n*${parts.join(' · ')}*`;
 }
 
-async function patchPrBodyMeta(
-  ghToken: string, owner: string, repo: string, prNumber: number, footer: string,
-): Promise<void> {
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
-    headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json' },
-  });
-  if (!res.ok) return;
-  const { body } = await res.json() as { body?: string };
-  const current = body || '';
-  const marker = '<!-- blueprint:meta -->';
-  const updated = current.includes(marker)
-    ? current.slice(0, current.indexOf(marker)) + footer
-    : `${current}\n\n${footer}`;
-  await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
-    method: 'PATCH',
-    headers: { Authorization: `token ${ghToken}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ body: updated }),
-  });
-}
 
 // Medium-scope priority hint based on which subsystem the PR touches. The
 // reviewer otherwise weights every checklist section equally, accumulating
@@ -1150,7 +1132,7 @@ export async function handleFix(
   if (fixTypeHints['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${fixTypeHints['fix']}`;
   }
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${READ_THE_FAILURE_MESSAGE}${SIZE_GUARDRAIL_GUIDANCE}${PRIOR_ATTEMPT_DIVERGENCE}${BEYOND_SCOPE_REPORTING}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${READ_THE_FAILURE_MESSAGE}${SIZE_GUARDRAIL_GUIDANCE}${PRIOR_ATTEMPT_DIVERGENCE}${BEYOND_SCOPE_REPORTING}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
@@ -1195,12 +1177,13 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   // This lets testFixLoop distinguish pre-existing failures from newly-broken tests,
   // matching the same logic used in the create handler.
   const fixScope = (task.context as Record<string, unknown> | undefined)?.scope as string | undefined;
-  let fixBaselineFailures: Set<string> | undefined;
   if (fixReason === 'ci_failure') {
     sendLog(ws, '[Baseline] Skipped — this is a CI-failure fix; all existing test failures on the PR are in scope.\n');
   } else if (fixScope === 'medium' || fixScope === 'large') {
-    const captured = await captureTestBaseline(ws, statusRef, fixBuildConfig, fixRelatedFiles);
-    fixBaselineFailures = captured ?? undefined;
+    // Baseline is captured for the side-effect of warming up the test runner
+    // and surfacing pre-existing failures in the agent log; the captured set
+    // is no longer consumed by the wrapper (Claude does its own ./check test).
+    await captureTestBaseline(ws, statusRef, fixBuildConfig, fixRelatedFiles);
   }
 
   if (fixReason === 'ci_failure') {
@@ -1235,328 +1218,25 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   // Run Claude with the review feedback as the prompt
   statusRef.value = 'Addressing review feedback...';
   const fixBaseCommit = git(['rev-parse', 'HEAD']);
-  const { exitCode, allOutput } = await runClaudeCode(enrichedPrompt, ws, statusRef, model, effort, disallowedToolsFix);
-
-  // Best-effort: read structured fix-agent responses written by Claude per the
-  // dialog-system prompt section above.  Validation here is permissive (parse
-  // errors → skip) since the schema validator caps array length backend-side
-  // and review_pipeline drops responses with non-mechanical verify steps.
-  const fixResponsesPath = `/tmp/fix_responses_${taskId}.json`;
-  let fixAgentResponses: Array<Record<string, unknown>> | undefined;
-  try {
-    if (fs.existsSync(fixResponsesPath)) {
-      const raw = fs.readFileSync(fixResponsesPath, 'utf-8').trim();
-      if (raw.length > 0) {
-        const parsed: unknown = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          // Cap 5 to match backend AgentStatusPayload max_length=5; trim
-          // verify lists to 10 to bound payload size.
-          const normalized: Array<Record<string, unknown>> = [];
-          for (const entry of parsed.slice(0, 5)) {
-            if (typeof entry !== 'object' || entry === null) continue;
-            const e = entry as Record<string, unknown>;
-            const verify = Array.isArray(e.verify)
-              ? (e.verify as unknown[]).filter((v): v is string => typeof v === 'string').slice(0, 10)
-              : [];
-            const candidate: Record<string, unknown> = {
-              issue_id: typeof e.issue_id === 'string' ? e.issue_id.slice(0, 64) : '',
-              issue_summary: typeof e.issue_summary === 'string' ? e.issue_summary.slice(0, 200) : '',
-              source_iteration: typeof e.source_iteration === 'number' ? e.source_iteration : 0,
-              response_type: typeof e.response_type === 'string' ? e.response_type : '',
-              claim: typeof e.claim === 'string' ? e.claim.slice(0, 1000) : '',
-              verify,
-            };
-            if (verifyStepsOk(candidate)) normalized.push(candidate);
-          }
-          fixAgentResponses = normalized.length > 0 ? normalized : undefined;
-        }
-      }
-    }
-  } catch (e) {
-    sendLog(ws, `Note: Failed to parse ${fixResponsesPath}: ${String(e)}\n`);
-  }
-
-  // Check for changes — both uncommitted files and commits Claude may have made
-  const diff = git(['status', '--porcelain']);
-  const fixCurrentHead = git(['rev-parse', 'HEAD']);
-  const hasFixChanges = diff.length > 0 || fixCurrentHead !== fixBaseCommit;
-  if (hasFixChanges && exitCode === 0) {
-    // Collect changed paths from both uncommitted changes and any commits Claude made
-    const fixUncommittedPaths = diff.length > 0
-      ? diff.split('\n').map(l => l.trim().split(/\s+/).pop() || '')
-      : [];
-    const fixCommittedPaths = fixCurrentHead !== fixBaseCommit
-      ? git(['diff', '--name-only', `${fixBaseCommit}..HEAD`]).split('\n').filter(Boolean)
-      : [];
-    const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
-    const lintResult = await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
-    if (!lintResult.passed) {
-      sendLog(ws, 'Lint checks still failing after max attempts — failing review-fix cycle early.\n');
-      const reasonSuffix =
-        lintResult.exitReason === 'early_unchanged'
-          ? '(loop exited early — same fingerprint repeated)'
-          : '(loop reached max attempts)';
-      const errorBody = lintResult.lastErrorTail
-        ? `Last lint output:\n${sanitize((lintResult.lastErrorTail).slice(-10_000))}`
-        : '(no lint output captured)';
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Lint/build checks failed after max fix attempts during review-fix cycle ${reasonSuffix}.\n\n${errorBody}`,
-        failure_category: 'lint_failed',
-        changed_files: changedPaths.slice(0, 50),
-      });
-      return;
-    }
-
-    const { testFailuresDetected: fixTestFailures, passed: fixTestsPassed, setupFailed: fixTestSetupFailed, failureSummary: fixTestFailureSummary } = await testFixLoop(
-      ws, statusRef, model, effort, fixBuildConfig,
-      fixBaselineFailures, fixRelatedFiles, undefined,
-      fixReason === 'ci_failure' && ciFailureSelectors.length > 0
-        ? { targetPytestSelectors: ciFailureSelectors, runImpactAfterTargeted: true, requireTestmonForImpact: true }
-        : {},
-    );
-
-    // Setup failure: tests couldn't run at all (npm ci / runner timeout).
-    // Fail the task with a build_failed category — pushing code that was
-    // never test-verified would be worse than failing visibly.
-    if (fixTestSetupFailed) {
-      sendLog(ws, 'Test setup failed during review-fix — cannot verify changes, marking task as FAILED.\n');
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: `Test suite could not run (setup failure — not a fixable test failure):\n${fixTestFailureSummary ?? 'unknown'}`,
-        failure_category: 'build_failed',
-        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(-5000) } : {}),
-      });
-      return;
-    }
-
-    // Match standard handler behaviour: if tests still fail after the fix loop,
-    // fail the task rather than pushing known-broken code into the review pipeline.
-    if (fixTestFailures && !fixTestsPassed) {
-      sendLog(ws, 'Tests failed after review-fix — marking task as FAILED instead of pushing known-broken code.\n');
-      const failedLogs = fixTestFailureSummary
-        ? `Test suite failed after review-fix attempts. Failing tests:\n${fixTestFailureSummary}`
-        : `Test suite failed after review-fix attempts. Last output:\n${sanitize(allOutput.slice(-10_000))}`;
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: failedLogs,
-        failure_category: 'test_failed',
-        ...(fixTestFailureSummary ? { test_failure_summary: fixTestFailureSummary.slice(-5000) } : {}),
-      });
-      return;
-    }
-
-    git(['add', '-A']);
-
-    // Parse restricted paths from CLAUDE.md and unstage any violations before commit.
-    {
-      const claudeMdContent = readClaudeMd();
-      if (claudeMdContent) {
-        const restrictedPaths: string[] = [];
-        for (const line of claudeMdContent.split('\n')) {
-          const match = line.match(/Do NOT modify.*?`([^`]+)`/i);
-          if (match) restrictedPaths.push(match[1]);
-        }
-        if (restrictedPaths.length > 0) {
-          let stagedFiles: string[];
-          try {
-            stagedFiles = execFileSync('git', ['-C', WORKSPACE, 'diff', '--name-only', '--cached'], { encoding: 'utf-8' })
-              .trim().split('\n').filter(Boolean);
-          } catch { stagedFiles = []; }
-          const violations = stagedFiles.filter(f => restrictedPaths.some(p => f.startsWith(p)));
-          if (violations.length > 0) {
-            sendLog(ws, `WARNING: Unstaging ${violations.length} restricted file(s) that must not be modified:\n${violations.join('\n')}\n`);
-            for (const v of violations) {
-              try { execFileSync('git', ['-C', WORKSPACE, 'restore', '--staged', v], { encoding: 'utf-8' }); } catch { /* ignore */ }
-            }
-          }
-        }
-      }
-    }
-
-    const shortId = taskId.replace(/-/g, '').slice(0, 8);
-    const testNote = fixTestFailures
-      ? `\n\nNote: test failures detected, manual review recommended${fixTestFailureSummary ? `:\n${fixTestFailureSummary.slice(0, 500)}` : ''}`
-      : '';
-    // Only create a new commit if there are uncommitted changes (Claude may have already committed).
-    // Two-step check: working tree has any change → stage it all → inspect the
-    // staged diff. If nothing ends up staged (e.g. the only "changes" were
-    // untracked ignored files, or pre-commit hooks in Claude's prior runs
-    // cleaned up), skip the commit instead of hitting "nothing to commit" —
-    // which, with pre-commit hooks firing on commit, previously surfaced as
-    // an opaque "Command failed: git commit" and burned all 3 retries without
-    // progress.
-    const fixStaged = git(['status', '--porcelain']);
-    if (fixStaged.length > 0) {
-      // Make sure everything the agent modified is actually staged before we
-      // attempt the commit. Without this, Edit-tool changes that weren't
-      // `git add`ed by Claude would leave the index empty.
-      try { git(['add', '-A']); } catch { /* pre-commit add-failures are rare; fall through */ }
-      let hasStagedDiff = true;
-      try {
-        execFileSync('git', ['-C', WORKSPACE, 'diff', '--cached', '--quiet'], { encoding: 'utf-8' });
-        // Exit 0 = no staged diff; exit 1 = has staged diff (throws)
-        hasStagedDiff = false;
-      } catch {
-        hasStagedDiff = true;
-      }
-      if (!hasStagedDiff) {
-        sendLog(ws, 'REVIEW_FIX_NO_CHANGES: working tree has changes but nothing staged for commit — skipping (likely untracked-only or reverted by hooks)\n');
-      } else {
-        const committed = gitCommit(`blueprint: address review feedback\n\nAutomated by Blueprint Agent (task: ${shortId})${testNote}`);
-        if (!committed) sendLog(ws, 'Nothing to commit after review fix (pre-commit hook may have reverted changes)\n');
-      }
-    }
-  }
-
-  // Final rebase onto base branch to ensure no conflicts remain before push.
-  // If rebase fails, fall back to merge — don't throw, let the push succeed
-  // and the review pipeline handle any remaining issues.
-  if (exitCode === 0) {
-    try {
-      git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);
-      git(['rebase', `origin/${baseBranch}`]);
-      sendLog(ws, `Final rebase onto ${baseBranch} successful\n`);
-    } catch {
-      let conflictList = '';
-      try { conflictList = git(['diff', '--name-only', '--diff-filter=U']).trim(); } catch { /* ignore */ }
-      try { git(['rebase', '--abort']); } catch { /* ignore */ }
-      sendLog(ws, `Final rebase had conflicts — trying merge instead\n`);
-      try {
-        git(['merge', `origin/${baseBranch}`, '--no-edit']);
-        sendLog(ws, `Merge onto ${baseBranch} successful\n`);
-      } catch {
-        // Both rebase and merge failed — the working tree is fundamentally
-        // conflicted. Fail fast so the backend retry mechanism can spawn a
-        // fresh attempt with a clean clone, rather than burning a Claude call
-        // on post-push in-place repair of complex conflicts.
-        try { git(['merge', '--abort']); } catch { /* ignore */ }
-        sendLog(ws, `Rebase and merge both failed (${conflictList || 'unknown files'}) — failing task for fresh retry\n`);
-        await persistAndPostStatus(taskId, {
-          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: `Rebase onto ${baseBranch} failed and merge fallback also failed. Conflicting files: ${conflictList || 'unknown'}. Failing task so retry spawns a fresh clone.`,
-          failure_category: 'rebase_failed',
-        });
-        return;
-      }
-    }
-  }
-
-  // Check for remaining conflict markers — give Claude one chance to fix them
-  if (exitCode === 0) {
-    try {
-      const remainingMarkers = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
-      if (remainingMarkers) {
-        sendLog(ws, `Conflict markers still present in:\n${remainingMarkers}\nAsking Claude to resolve...\n`);
-        await runClaudeCode(
-          `CRITICAL: These files still have git conflict markers (${'<'.repeat(7)}, ${'='.repeat(7)}, ${'>'.repeat(7)}):\n${remainingMarkers}\n\nResolve ALL conflict markers in every file listed. The base branch is the source of truth — keep its code structure and only re-apply this PR's specific additions. After resolving, stage with git add.`,
-          ws, statusRef, model, effort
-        );
-        git(['add', '-A']);
-        gitCommit('blueprint: resolve remaining conflict markers');
-        // Final check — if markers persist after retry, fail this cycle so the
-        // retry mechanism can spawn a fresh attempt. Pushing conflict markers
-        // guarantees a CI failure and burns a full review-fix iteration.
-        try {
-          const stillConflicting = execFileSync('git', ['-C', WORKSPACE, 'grep', '-rl', '<' + '<<<<<<', '--', '*.ts', '*.tsx', '*.py', '*.js', '*.jsx', '*.json'], { encoding: 'utf-8', timeout: 10_000 }).trim();
-          if (stillConflicting) {
-            sendLog(ws, `Conflict markers persist after retry in:\n${stillConflicting}\nFailing this cycle — will not push known-broken code.\n`);
-            await persistAndPostStatus(taskId, {
-              task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-              logs: `Conflict markers still present after retry, refusing to push:\n${stillConflicting}`,
-              failure_category: 'unresolved_conflicts',
-            });
-            return;
-          }
-        } catch { /* no markers — resolved successfully */ }
-      }
-    } catch { /* grep found nothing — no markers, good */ }
-  }
-
-  // Re-run lint after rebase — upstream changes can introduce new errors
-  if (exitCode === 0 && hasFixChanges) {
-    const postRebaseDiff = git(['status', '--porcelain']);
-    const changedPaths = postRebaseDiff.length > 0
-      ? postRebaseDiff.split('\n').map(l => l.trim().split(/\s+/).pop() || '')
-      : git(['diff', '--name-only', `origin/${baseBranch}..HEAD`]).split('\n').filter(Boolean);
-    try {
-      runProjectLintChecks(changedPaths, ws, fixBuildConfig);
-    } catch (postRebaseLintErr: unknown) {
-      const msg = postRebaseLintErr instanceof Error ? postRebaseLintErr.message : String(postRebaseLintErr);
-      sendLog(ws, `Post-rebase lint failed:\n${msg.slice(0, 3000)}\nClaude will fix...\n`);
-      await runClaudeCode(
-        `After rebasing onto ${baseBranch}, lint/build errors appeared. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}`,
-        ws, statusRef, model, effort
-      );
-      git(['add', '-A']);
-      const postLintStaged = git(['status', '--porcelain']);
-      if (postLintStaged.length > 0) {
-        const shortId = taskId.replace(/-/g, '').slice(0, 8);
-        gitCommit(`blueprint: fix post-rebase lint errors\n\nAutomated by Blueprint Agent (task: ${shortId})`);
-      }
-      // Re-validate that the fix actually resolved lint. Without this, a partial
-      // fix gets pushed and only surfaces as a CI failure — burning a full review
-      // cycle. Recompute paths in case Claude touched new files during the fix.
-      const revalidatePaths = git(['diff', '--name-only', `origin/${baseBranch}..HEAD`]).split('\n').filter(Boolean);
-      try {
-        runProjectLintChecks(revalidatePaths, ws, fixBuildConfig);
-      } catch (revalidateErr: unknown) {
-        const revalidateMsg = revalidateErr instanceof Error ? revalidateErr.message : String(revalidateErr);
-        sendLog(ws, `Post-rebase lint still failing after fix attempt — failing this cycle, will not push known-broken code:\n${revalidateMsg.slice(0, 2000)}\n`);
-        await persistAndPostStatus(taskId, {
-          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: `Post-rebase lint still failing after fix attempt:\n${revalidateMsg.slice(0, 5000)}`,
-          failure_category: 'lint_failed',
-        });
-        return;
-      }
-    }
-  }
-
-  // Always push if the branch has diverged from origin (rebase or new commits)
-  if (exitCode === 0) {
-    statusRef.value = 'Pushing fixes...';
-    const localHead = git(['rev-parse', 'HEAD']);
-    let remoteHead = '';
-    try { remoteHead = git(['rev-parse', `origin/${branch}`]); } catch { /* ignore */ }
-
-    if (localHead !== remoteHead) {
-      sendHeartbeatSync(taskId, `Pushing fixes to ${branch}...`);
-      const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
-      const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
-      execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
-      await pushForceWithLeaseRetrying(branch, ws);
-      sendLog(ws, `Pushed fixes to ${branch}\n`);
-
-      // Best-effort: annotate the PR body with iteration/direction context so
-      // reviewers on GitHub see strategic metadata without leaving the PR page.
-      const fixCtxForMeta = (task.context as Record<string, unknown> | undefined) || {};
-      const prFooter = buildBlueprintPrFooter({
-        iterations: iteration,
-        maxIterations,
-        directionId: fixCtxForMeta.direction_id as string | undefined,
-        directionTitle: fixCtxForMeta.direction_title as string | undefined,
-        provider: process.env.PROVIDER,
-        model: process.env.LLM_MODEL,
-      });
-      if (prFooter) patchPrBodyMeta(ghToken, owner, repo, prNumber, prFooter).catch(() => { /* best-effort */ });
-
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'COMPLETED', artifact_type: 'GIT_COMMIT',
-        commit_hash: localHead, repo_url: `https://github.com/${owner}/${repo}`,
-        ...(fixAgentResponses ? { fix_agent_responses: fixAgentResponses } : {}),
-      });
-    } else {
-      await persistAndPostStatus(taskId, {
-        task_id: taskId, status: 'COMPLETED', logs: 'No changes needed for review feedback.',
-        ...(fixAgentResponses ? { fix_agent_responses: fixAgentResponses } : {}),
-      });
-    }
-  } else {
-    await persistAndPostStatus(taskId, {
-      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG', logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: 'claude_code_failed',
-      ...(fixAgentResponses ? { fix_agent_responses: fixAgentResponses } : {}),
-    });
-  }
+  // 2026-05-04: post-Claude lint/test/push pipeline replaced with
+  // runCodeChangeTask. Claude calls ./check + ./pr open (which pushes
+  // updates to the EXISTING PR via existingPrNumber) + ./done from
+  // inside its own session. See agent/src/handlers/code-change.ts.
+  await runCodeChangeTask({
+    taskId,
+    prompt: enrichedPrompt,
+    ws,
+    statusRef,
+    workBranch: branch,
+    baseBranch,
+    owner,
+    repo,
+    existingPrNumber: prNumber,
+    testsOnMainBranch: baseBranch === 'main',
+    baseCommit: fixBaseCommit,
+    model,
+    effort,
+    disallowedTools: disallowedToolsFix,
+    noChangesMessage: 'No file changes after review-fix iteration.',
+  });
 }
