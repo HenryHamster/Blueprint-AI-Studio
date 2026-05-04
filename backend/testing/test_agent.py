@@ -3302,6 +3302,22 @@ async def test_safe_ws_close_swallows_double_close_runtime_error():
 
 
 @pytest.mark.asyncio
+async def test_safe_ws_close_swallows_send_once_close_runtime_error():
+    """2026-05-04 production: the 90s idle-timeout path raised RuntimeError
+    'Cannot call "send" once a close message has been sent.' — distinct from
+    the 'websocket.close' double-close variant. Both mean the socket is gone
+    and the close is cosmetic; both must be swallowed."""
+    from unittest.mock import AsyncMock
+    from app.routers.projects import _safe_ws_close
+    ws = AsyncMock()
+    ws.close.side_effect = RuntimeError(
+        'Cannot call "send" once a close message has been sent.'
+    )
+    await _safe_ws_close(ws, code=1001, reason="Idle timeout")
+    ws.close.assert_awaited_once_with(code=1001, reason="Idle timeout")
+
+
+@pytest.mark.asyncio
 async def test_safe_ws_close_reraises_other_runtime_errors():
     """Only the double-close race is swallowed; other RuntimeErrors propagate
     so real bugs don't get hidden."""

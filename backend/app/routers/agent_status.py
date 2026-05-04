@@ -59,6 +59,37 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _recover_poisoned_session(session: AsyncSession, task_id_str: str) -> bool:
+    """Roll back the request session if a swallowed exception left it in
+    pending-rollback state.
+
+    The big update_agent_status() handler has several broad ``except Exception``
+    clauses that log-and-continue. When the swallowed exception was a flush or
+    commit failure, SQLAlchemy marks the transaction as "rollback only" — every
+    subsequent ``session.flush()``/``session.commit()`` then raises
+    PendingRollbackError, masking the real upstream cause as a misleading 500.
+    This helper detects that state (transaction open but not active) and
+    rolls it back so the caller can keep going on a clean session.
+
+    Returns True if a rollback was performed (caller should re-apply any
+    in-memory mutations it relies on, since they were discarded), False if
+    the session was already healthy and nothing was changed.
+    """
+    try:
+        if session.in_transaction() and not session.is_active:
+            await session.rollback()
+            return True
+    except Exception as _rb_exc:
+        logger.error(
+            f"[STATUS] Session recovery rollback failed for {task_id_str}: {_rb_exc}",
+            exc_info=True,
+        )
+        # Best-effort: tell the caller a rollback was attempted so it can
+        # decide whether to re-apply state or bail.
+        return True
+    return False
+
+
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 
 
@@ -225,6 +256,14 @@ _STOPWORDS = frozenset([
     "failed", "failure", "retries", "exhausted", "attempt", "status",
     "message", "timeout", "unknown", "none", "null", "true", "false",
     "code", "line", "file", "test", "run", "running", "agent", "vm",
+    # Words that recur in *templated* failure messages (e.g.
+    # "Lint/build checks failed after max fix attempts. See logs above
+    # for details.") and surface as noise in keyword-frequency auto
+    # playbook entries — they describe the template, not the failure.
+    "above", "after", "before", "details", "logs", "log", "max", "fix",
+    "attempts", "build", "checks", "check", "see", "lint", "report",
+    "session", "session_id", "init", "complete", "completed", "children",
+    "child", "evaluation", "evaluating", "hours", "minutes",
 ])
 
 _AUTO_PLAYBOOK_CAP = 5
@@ -572,6 +611,13 @@ async def update_agent_status(
     # request-session autoflush; commit still flushes all pending work.
     session.sync_session.autoflush = False
 
+    # Capture task.id as a plain string up front so the broad except clauses
+    # below (and the post-commit early-commit handler at line ~1854) can log
+    # without re-accessing `task.id` on a session that may already be in
+    # pending-rollback state. Mirrors the pattern e15af067 introduced for the
+    # post-commit logger.
+    _task_id_str = str(task.id)
+
     # Idempotency guard: if the task is already in a terminal state, ignore duplicate
     # callbacks (e.g. agent HTTP retries).  Still return 200 so the agent doesn't retry.
     # Exception: if post_commit_pending is set, the early-commit succeeded but
@@ -784,7 +830,7 @@ async def update_agent_status(
                 }
             ))
         except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {task.id}: {e}", exc_info=True)
+            logger.warning(f"[SMOKETEST] Failed to parse smoketest result for task {_task_id_str}: {e}", exc_info=True)
 
     # 3b-ii. On smoketest failure, spawn a plan task and create a persistent alert
     if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.status == TaskStatus.FAILED and payload.logs:
@@ -897,17 +943,28 @@ async def update_agent_status(
             # we surface the failure: set spawn_failed=True so operators can query,
             # AND create a persistent alert so the situation can't be missed.
             logger.error(
-                f"[SMOKETEST] Failed to spawn plan task after smoketest failure for task {task.id}: {e}",
+                f"[SMOKETEST] Failed to spawn plan task after smoketest failure for task {_task_id_str}: {e}",
                 exc_info=True,
             )
+            # If the failure was the session.flush() at line ~905 (FK violation,
+            # serialization conflict), the session is now in pending-rollback
+            # state and any subsequent session op (including session.add below
+            # and downstream commits) raises PendingRollbackError. Recover the
+            # session, then re-apply the in-memory task mutations from the
+            # status-update block (lines ~623-671) before re-staging spawn_failed.
+            _rolled_back = await _recover_poisoned_session(session, _task_id_str)
+            if _rolled_back:
+                task.status = payload.status
+                if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+                    task.latest_status_message = payload.logs[-8000:]
             task.spawn_failed = True
             try:
                 spawn_alert = Alert(
                     project_id=task.project_id,
                     severity=AlertSeverity.ERROR,
-                    title=f"Smoketest fix-plan spawn failed for task {task.id}",
+                    title=f"Smoketest fix-plan spawn failed for task {_task_id_str}",
                     message=(
-                        f"A smoketest reported failures on task {task.id} but the "
+                        f"A smoketest reported failures on task {_task_id_str} but the "
                         f"follow-up plan task could not be spawned: {type(e).__name__}: {e!r}. "
                         f"Operator must manually create a plan task to address the smoketest failures."
                     )[:1000],
@@ -920,9 +977,10 @@ async def update_agent_status(
                 )
             except Exception as alert_err:
                 logger.error(
-                    f"[SMOKETEST] Failed to create spawn-failed alert for task {task.id}: {alert_err}",
+                    f"[SMOKETEST] Failed to create spawn-failed alert for task {_task_id_str}: {alert_err}",
                     exc_info=True,
                 )
+            session.add(task)
 
     # 3c. Parse debug result, store in plan_output, and optionally spawn a fix task
     if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
@@ -965,7 +1023,16 @@ async def update_agent_status(
                 )
                 logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
         except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"[DEBUG] Failed to parse debug result for task {task.id}: {e}", exc_info=True)
+            logger.warning(f"[DEBUG] Failed to parse debug result for task {_task_id_str}: {e}", exc_info=True)
+            # Same poisoning concern as the smoketest spawn block: the
+            # session.flush() at line ~1018 can raise on FK/serialization,
+            # leaving the session in pending-rollback state and breaking
+            # downstream commits. Recover and re-apply core task mutations.
+            if await _recover_poisoned_session(session, _task_id_str):
+                task.status = payload.status
+                if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+                    task.latest_status_message = payload.logs[-8000:]
+                session.add(task)
 
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
@@ -1234,7 +1301,27 @@ async def update_agent_status(
                         await _ensure_vm_deleted(old_vm_id_rl, reason="rate_limit_requeue")
                         return {"status": "accepted"}
         except Exception as e:
-            logger.error(f"[STATUS] Exception during result recording for task {task.id}: {e!r}", exc_info=True)
+            logger.error(f"[STATUS] Exception during result recording for task {_task_id_str}: {e!r}", exc_info=True)
+            # If the swallowed exception left the session in pending-rollback
+            # state — most likely the rate-limit-requeue commit at line ~1276
+            # raising on a serialization conflict / deadlock — every subsequent
+            # session.flush()/commit() in this handler raises PendingRollbackError.
+            # 2026-05-03 production: 10x failures pointed at the FAILED-retry
+            # commit at line ~1474 because of exactly this. Recover the session
+            # here and re-apply the in-memory mutations from lines ~623-671 that
+            # the retry path / terminal-failure annotation / early-commit all
+            # depend on.
+            if await _recover_poisoned_session(session, _task_id_str):
+                task.status = payload.status
+                if payload.logs and (not payload.artifact_type or payload.status == TaskStatus.FAILED):
+                    task.latest_status_message = payload.logs[-8000:]
+                if payload.failure_category:
+                    from app.failure_classification import normalize_agent_failure_category
+                    ctx = dict(task.context or {})
+                    ctx['failure_category'] = normalize_agent_failure_category(payload.failure_category, task)
+                    task.context = ctx
+                    flag_modified(task, 'context')
+                session.add(task)
 
         # Release Max plan account slot (idempotent — skip if already released by reaper)
         # Runs regardless of whether result recording above succeeded or threw.
@@ -1370,10 +1457,24 @@ async def update_agent_status(
                     # Best-effort: if review-spawn fails, the reaper's stale-EVALUATING
                     # sweep retries within 15min, and the 6h hard timeout bounds it.
                     logger.warning(
-                        f"[AGENT_STATUS] Review spawn failed for FAILED-with-open-PR task {task.id}: "
+                        f"[AGENT_STATUS] Review spawn failed for FAILED-with-open-PR task {_task_id_str}: "
                         f"{type(_spawn_exc).__name__}: {_spawn_exc}",
                         exc_info=True,
                     )
+                    # _spawn_pipeline_task does session.flush()/commit() internally —
+                    # if it raised on a flush/commit, the session is now in
+                    # pending-rollback state and the commit on the next line
+                    # would surface as PendingRollbackError. Recover and re-stage
+                    # the EVALUATING handoff so the task isn't stranded RUNNING.
+                    if await _recover_poisoned_session(session, _task_id_str):
+                        task.status = TaskStatus.EVALUATING
+                        task.vm_instance_id = None
+                        task.last_heartbeat = None
+                        task.latest_status_message = (
+                            f"Reported FAILED with open PR #{_pr_num}; handed off to review pipeline "
+                            f"({failure_class}) — review spawn failed, reaper will retry"
+                        )
+                        session.add(task)
                 await session.commit()
                 await broadcast_to_project(
                     str(task.project_id), "task_updated",
@@ -1432,6 +1533,20 @@ async def update_agent_status(
                 ctx.pop("provision_failures", None)
             task.context = ctx
             session.add(task)
+
+            # Same defensive pattern as the early commit below: production
+            # 2026-05-04 logged 2x PendingRollbackError at this commit when
+            # the upstream result-recording broad-except (line ~1303) or the
+            # rate-limit-requeue commit (line ~1297) had already poisoned the
+            # session. Recover here so the FAILED→QUEUED retry transition
+            # actually persists instead of returning 500 and stranding the
+            # task RUNNING.
+            if await _recover_poisoned_session(session, _task_id_str):
+                logger.warning(
+                    f"[PIPELINE] Recovered poisoned session for {_task_id_str} "
+                    f"before FAILED-retry commit — upstream swallow-point leaked"
+                )
+                session.add(task)
 
             await session.commit()
 
@@ -1833,6 +1948,24 @@ async def update_agent_status(
         # the original `early_exc` survive into the log so we can actually see
         # which upstream operation poisoned the session.
         _task_id_str = str(task.id)
+        # Defensive catch-all: many broad except clauses upstream
+        # (playbook capture/learning, _check_recurring_failures,
+        # _propagate_pipeline_failure_to_original, circuit-breaker
+        # post_failure_alert_message, etc.) log-and-continue on flush
+        # failures without rolling back, leaving the session in
+        # pending-rollback state. The named recovery sites only cover
+        # the largest known swallow-points; any leak surfaces here as
+        # PendingRollbackError on the early commit (12x in production
+        # 2026-05-04 logs at this line). Rolling back a poisoned session
+        # before commit returns the request to a clean state and re-stages
+        # the in-memory task mutations so the COMPLETED/FAILED transition
+        # the agent reported is still persisted.
+        if await _recover_poisoned_session(session, _task_id_str):
+            logger.warning(
+                f"[PIPELINE] Recovered poisoned session for {_task_id_str} "
+                f"before early commit — an upstream swallow-point leaked"
+            )
+            session.add(task)
         try:
             # Commit unconditionally if a transaction is open. The earlier
             # `if session.dirty or session.new` was unsafe: autoflush from any

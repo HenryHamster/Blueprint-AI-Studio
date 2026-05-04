@@ -33,16 +33,24 @@ logger = logging.getLogger(__name__)
 async def _safe_ws_close(ws: WebSocket, code: int, reason: str = "") -> None:
     """Close a WebSocket, tolerating the double-close race.
 
-    starlette raises ``RuntimeError('Unexpected ASGI message "websocket.close",
-    after sending "websocket.close"')`` when the peer already hung up mid-auth
-    — ``receive_json`` raised ``WebSocketDisconnect``, which silently sent a
-    close frame, and our explicit close then tries to send a second one. That
-    specific race is cosmetic; any other RuntimeError is real and re-raised.
+    starlette raises two distinct messages for already-closed sockets:
+      * ``RuntimeError('Unexpected ASGI message "websocket.close",
+        after sending "websocket.close"')`` — peer hung up mid-auth and
+        ``receive_json``'s WebSocketDisconnect silently sent a close frame.
+      * ``RuntimeError('Cannot call "send" once a close message has been
+        sent.')`` — produced when the underlying send loop has already
+        finalised; surfaced 2026-05-04 from the 90s idle-timeout path
+        (projects.py:341) when the socket was already half-closed.
+
+    Both are cosmetic for our purposes — the connection is gone either
+    way, and the finally block will still run ``manager.disconnect``.
+    Any other RuntimeError is real and re-raised.
     """
     try:
         await ws.close(code=code, reason=reason)
     except RuntimeError as exc:
-        if "websocket.close" in str(exc):
+        msg = str(exc)
+        if "websocket.close" in msg or "close message has been sent" in msg:
             return
         raise
 

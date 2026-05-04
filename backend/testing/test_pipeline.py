@@ -4287,3 +4287,81 @@ class TestPredictSpawnSuccessNoCrossModulePenalty:
                 runtime_config.pop("pipeline_scope_merge_rates", None)
             else:
                 runtime_config["pipeline_scope_merge_rates"] = prev
+
+
+# ── Session recovery helper ────────────────────────────────────────────────
+# Regression coverage for the 2026-05-03 PendingRollbackError incident:
+# update_agent_status' broad except clauses used to log-and-continue without
+# rolling back, leaving the session in pending-rollback state and surfacing
+# every downstream commit as a misleading 500. _recover_poisoned_session is
+# the helper that detects + repairs that state.
+
+
+class TestRecoverPoisonedSession:
+    @pytest.mark.asyncio
+    async def test_returns_false_when_session_is_clean(self):
+        """Healthy session: no rollback, no surprise side effects."""
+        from app.routers.agent_status import _recover_poisoned_session
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            # No transaction at all → not poisoned.
+            assert await _recover_poisoned_session(session, "task-123") is False
+
+            # Active transaction → still not poisoned.
+            await session.execute(text_helper("SELECT 1"))
+            assert await _recover_poisoned_session(session, "task-123") is False
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_rolls_back_pending_rollback_state(self):
+        """When an inner flush/commit failed and was swallowed, the session is
+        in pending-rollback state. _recover_poisoned_session must rollback so
+        the next session op succeeds. Simulated by triggering a duplicate-PK
+        violation at flush — Pydantic-level validation happens at construction
+        and would short-circuit before we ever reach the DB, so we use uniqueness
+        (enforced at the DB layer) as the reliable trigger."""
+        from app.routers.agent_status import _recover_poisoned_session
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_factory() as session:
+            # Open a transaction with a clean insert so we have something to roll back.
+            project = Project(name="poison-test", user_id="u")
+            session.add(project)
+            await session.flush()
+
+            # Now poison the transaction by violating PK uniqueness — this
+            # fires at the DB layer (after Pydantic validation), so the
+            # exception lands at session.flush() the way the production
+            # FK/serialization failures do.
+            duplicate = Project(id=project.id, name="dup", user_id="u")
+            session.add(duplicate)
+            try:
+                await session.flush()
+            except Exception as _swallowed:
+                # Mirror the swallowing pattern in update_agent_status: log
+                # but do NOT rollback. Recovery is what we're testing below.
+                _ = _swallowed
+
+            assert session.in_transaction()
+            assert not session.is_active, "session should be in pending-rollback after swallowed flush failure"
+
+            recovered = await _recover_poisoned_session(session, "task-poison")
+            assert recovered is True
+            # Session is now usable again — fresh op succeeds where it would
+            # otherwise raise PendingRollbackError.
+            await session.execute(text_helper("SELECT 1"))
+        await engine.dispose()
+
+
+def text_helper(s):
+    """Small wrapper so the test can keep using sqlalchemy.text without
+    importing it at module top."""
+    from sqlalchemy import text
+    return text(s)
