@@ -442,7 +442,25 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     # Check if this task IS the parent (has plan_output or is a research task).
     is_parent = task.plan_output is not None or (task.first_payload).get("type") in ("research", "plan")
     if is_parent:
-        staging = ctx.get("plan_branch") or ctx.get("research_branch")
+        # Route by task_type so we only target the staging branch THIS task
+        # itself owns. A plan child of a research task inherits the parent's
+        # research_branch in its own context; the prior
+        # `plan_branch or research_branch` OR-fallback would grab that inherited
+        # value when its own plan_branch was unset and delete the parent's
+        # branch on child cancel — orphaning sibling work that had merged into
+        # it but not yet rolled up to main (incident 2026-05-04: cancelling
+        # plan child b9456e05 of research 4759796b deleted research/4759796b
+        # 670ms before the parent's rollup, stranding PRs #3606/3607/3612/3613).
+        task_type = (task.first_payload).get("type", "")
+        if task_type == "research":
+            staging = ctx.get("research_branch")
+        elif task_type == "plan":
+            staging = ctx.get("plan_branch")
+        else:
+            # is_parent was True via plan_output on a non-research/non-plan
+            # task — we don't know which branch type that should own. Skip
+            # rather than guess (safer than the prior fallback).
+            staging = None
         if staging:
             # Guard 1: Don't delete if children are still active (they push to this branch)
             active_children = (await session.execute(

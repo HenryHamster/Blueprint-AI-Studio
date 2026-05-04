@@ -8,7 +8,8 @@ Covers _cleanup_branches:
   - Guard 3: open PRs targeting the staging branch → skip
   - Guard 3: GitHub API error → skip (safe default)
   - Happy path: parent with no active children, no competing rollups, no open PRs → staging deleted
-  - plan_output presence marks non-research task as parent
+  - plan_output alone does NOT trigger staging deletion (regression: 2026-05-04)
+  - plan child does NOT delete inherited research_branch (regression: 2026-05-04)
   - Feature branch cleanup: pr_merged=True with blueprint/ branch → feature branch deleted
   - Non-blueprint branch not deleted even with pr_merged=True
   - No staging branch in context → no deletion
@@ -412,18 +413,19 @@ async def test_cleanup_happy_path_plan_branch_deleted(cleanup_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_plan_output_marks_task_as_parent(cleanup_db, mocker):
-    """A task with plan_output set is identified as a parent even if payload type
-    is not research/plan (e.g., type=create with plan_output from a completed plan stage)."""
+async def test_cleanup_plan_output_alone_does_not_delete_staging(cleanup_db, mocker):
+    """Regression: plan_output presence alone (without task_type=research/plan)
+    must not be enough to trigger staging deletion. plan_output and the staging
+    branch context keys can both be inherited / stale; only the task's own
+    role (task_type) determines what staging branch it owns."""
     project = await _make_project(cleanup_db)
-    parent = await _make_task(
+    task = await _make_task(
         cleanup_db, project.id,
         task_type="create",
         status=TaskStatus.EVALUATING,
-        context={"plan_branch": "plan/output-branch"},
+        context={"plan_branch": "plan/inherited-from-parent"},
         plan_output={"steps": ["implement feature"]},
     )
-    # No children
 
     mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
     mocker.patch(
@@ -433,9 +435,76 @@ async def test_cleanup_plan_output_marks_task_as_parent(cleanup_db, mocker):
     )
     mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
 
-    await _cleanup_branches(parent, cleanup_db)
+    await _cleanup_branches(task, cleanup_db)
 
-    mock_delete.assert_called_once_with("gh-token", "owner", "repo", "plan/output-branch")
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_plan_child_does_not_delete_inherited_research_branch(cleanup_db, mocker):
+    """Regression for incident 2026-05-04: cancelling a plan child of a research
+    task must not delete the parent's research_branch.
+
+    Context: plan children of research tasks inherit the parent's
+    research_branch in their own context. The prior `plan_branch or research_branch`
+    OR-fallback grabbed the inherited research_branch when the child's own
+    plan_branch was unset (e.g. when _ensure_branch returned None before
+    plan_branch could be written), then proceeded to delete the parent's
+    branch — orphaning sibling work that had merged into it but not yet
+    rolled up to main."""
+    project = await _make_project(cleanup_db)
+    plan_child = await _make_task(
+        cleanup_db, project.id,
+        task_type="plan",
+        status=TaskStatus.CANCELLED,
+        context={
+            # research_branch INHERITED from research parent — not this task's own
+            "research_branch": "research/parent-branch",
+            # No plan_branch — _ensure_branch returned None before it was written
+        },
+    )
+
+    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+
+    await _cleanup_branches(plan_child, cleanup_db)
+
+    # research_branch belongs to the research parent — must not be deleted.
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_research_child_does_not_delete_inherited_plan_branch(cleanup_db, mocker):
+    """Symmetric regression: a research task that somehow has plan_branch in
+    its context (inherited / stale) must not delete that plan_branch — research
+    tasks own research_branch, never plan_branch."""
+    project = await _make_project(cleanup_db)
+    research_task = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.CANCELLED,
+        context={
+            "plan_branch": "plan/some-other-task",  # not owned by this task
+            # No research_branch
+        },
+    )
+
+    mock_delete = mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+
+    await _cleanup_branches(research_task, cleanup_db)
+
+    mock_delete.assert_not_called()
 
 
 @pytest.mark.asyncio
