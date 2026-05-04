@@ -1,6 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
+// 2026-05-04: handleMigrate no longer drives commit/rebase/push/PR via the
+// wrapper. apiPost('/api/agent/github/pull-requests', ...) and the
+// commit_hash/repo_url/pr_url status fields are gone — Claude calls
+// ./pr open + ./done from inside its own session via runCodeChangeTask
+// (agent/src/handlers/code-change.ts). Tests therefore mock runCodeChangeTask
+// (default no-op) and assert on its arguments — primarily the `prompt` and
+// the rest of the opts wiring (workBranch, baseBranch, owner, repo,
+// disallowedTools, noChangesMessage). Stale-branch handling (ls-remote +
+// listOpenPullRequestsForBranch) still runs PRE-Claude and remains tested.
+//
+// The other handlers in this file (handleSecurityAudit, handleSmoketest,
+// handleDebug, handlePerf, handleInvestigate, handleSelfAudit) still drive
+// their own runClaudeCode invocation directly — those tests are unchanged.
 vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
   return {
@@ -18,10 +31,7 @@ vi.mock('../index.js', async (importOriginal) => {
     gitAsync: vi.fn().mockResolvedValue(''),
     gitCommit: vi.fn().mockReturnValue(true),
     setupWorkspace: vi.fn(),
-    pushAndCreatePR: vi.fn(),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-    lintFixLoop: vi.fn(),
-    testFixLoop: vi.fn(),
     cloneWithRetry: vi.fn().mockResolvedValue(undefined),
     sendHeartbeatSync: vi.fn(),
     listOpenPullRequestsForBranch: vi.fn().mockResolvedValue([]),
@@ -44,6 +54,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     configureAgentPermissions: vi.fn().mockReturnValue([]),
     writePlaybookHelper: vi.fn(),
     writeMessagesHelper: vi.fn(),
+    writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
     buildRetryContext: vi.fn().mockReturnValue(''),
     buildSelfReviewPrompt: vi.fn().mockReturnValue(''),
@@ -54,8 +65,16 @@ vi.mock('../build-config.js', () => ({
   resolveBuildConfig: vi.fn().mockReturnValue(undefined),
 }));
 
-vi.mock('fs', () => ({
-  default: {
+// Mock the code-change module so handleMigrate tests can assert on what was
+// passed to runCodeChangeTask without exercising the marker-detection branches.
+vi.mock('./code-change.js', () => ({
+  runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
+}));
+
+// fs is consumed by both default + namespace imports across the modules under
+// test. Mock both shapes so vitest doesn't reject either access pattern.
+vi.mock('fs', () => {
+  const stub = {
     readFileSync: vi.fn().mockReturnValue(''),
     writeFileSync: vi.fn(),
     existsSync: vi.fn().mockReturnValue(false),
@@ -63,8 +82,9 @@ vi.mock('fs', () => ({
     mkdirSync: vi.fn(),
     readdirSync: vi.fn().mockReturnValue([]),
     unlinkSync: vi.fn(),
-  },
-}));
+  };
+  return { ...stub, default: stub };
+});
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
@@ -99,8 +119,9 @@ import {
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
-  git, apiGet, apiPost, listOpenPullRequestsForBranch,
+  git, listOpenPullRequestsForBranch,
 } from '../index.js';
+import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
@@ -112,6 +133,23 @@ const WS = null;
 const STATUS_REF = () => ({ value: '' });
 const BASE_TASK = { title: 'Test Task', description: '', context: {}, project_context: {} };
 const BASE_PAYLOAD = { base_branch: 'main' };
+// handleInvestigate hard-fails when no prompt is supplied; provide a default
+// for cases where the test isn't exercising that error path.
+const INVESTIGATE_PAYLOAD = { ...BASE_PAYLOAD, prompt: 'investigate the issue' };
+
+/** Returns the prompt passed to the latest runCodeChangeTask invocation. */
+function capturedMigratePrompt(): string {
+  const calls = vi.mocked(runCodeChangeTask).mock.calls;
+  if (calls.length === 0) throw new Error('runCodeChangeTask was not invoked');
+  return calls[calls.length - 1][0].prompt;
+}
+
+/** Returns the full opts object passed to the latest runCodeChangeTask invocation. */
+function capturedMigrateOpts(): Parameters<typeof runCodeChangeTask>[0] {
+  const calls = vi.mocked(runCodeChangeTask).mock.calls;
+  if (calls.length === 0) throw new Error('runCodeChangeTask was not invoked');
+  return calls[calls.length - 1][0];
+}
 
 // ── handleSecurityAudit — JSON extraction fallback ────────────────────────────
 describe('handleSecurityAudit — JSON extraction fallback', () => {
@@ -410,7 +448,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
     };
     vi.mocked(readHandlerOutput).mockReturnValue(investigationResult);
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
@@ -422,7 +460,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
@@ -445,7 +483,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
       lastResultText: JSON.stringify(recovered),
     });
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
@@ -470,7 +508,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
       lastResultText: '',
     });
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
@@ -491,7 +529,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
       lastResultText: malformedJson,
     });
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
@@ -507,7 +545,7 @@ describe('handleInvestigate — report reading and status mapping', () => {
       lastResultText: '',
     });
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
@@ -518,62 +556,75 @@ describe('handleInvestigate — report reading and status mapping', () => {
     vi.mocked(readHandlerOutput).mockReturnValue({ summary: 'partial', root_cause: '', affected_files: [], recommended_fix: '', severity: 'low', confidence: 'low' });
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: '', lastResultText: '' });
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
+
+  it('throws when no prompt is provided in payload or task', async () => {
+    await expect(
+      handleInvestigate(
+        TASK_ID,
+        BASE_PAYLOAD,
+        { title: '', description: '', context: {}, project_context: {} },
+        GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      ),
+    ).rejects.toThrow(/No prompt found/);
+  });
 });
 
-// ── handleMigrate — stale-branch handling and migration workflow ─────────────
-describe('handleMigrate — stale-branch handling and workflow', () => {
+// ── handleMigrate — stale-branch handling and runCodeChangeTask delegation ───
+//
+// 2026-05-04: handleMigrate's post-Claude commit/rebase/push/PR pipeline was
+// replaced with runCodeChangeTask. The handler now: (1) clones, (2) handles
+// stale branch deletion (still active production code), (3) builds the
+// migration prompt (alembic guidance + ./check test mention +
+// CODE_CHANGE_HELPER_GUIDANCE), (4) delegates to runCodeChangeTask. Tests
+// assert on the prompt, opts forwarding, and the stale-branch guard.
+describe('handleMigrate — stale-branch handling and runCodeChangeTask delegation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     // Default: ls-remote throws (work branch does not exist on remote)
     vi.mocked(git).mockImplementation((args: string[]) => {
       if (args[0] === 'ls-remote') throw new Error('exit code 2: branch not found');
+      if (args[0] === 'rev-parse') return 'abc1234567';
       return '';
     });
     vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([]);
   });
 
-  it('completes full migration flow with PR creation when Claude produces changes', async () => {
-    // Non-empty porcelain output triggers hasChanges; rev-parse returns a commit SHA
-    vi.mocked(git).mockImplementation((args: string[]) => {
-      if (args[0] === 'ls-remote') throw new Error('exit code 2');
-      if (args[0] === 'status' && args[1] === '--porcelain') return 'M backend/app/models.py\n';
-      if (args[0] === 'rev-parse') return 'abc1234567';
-      return '';
-    });
-    vi.mocked(apiGet).mockResolvedValue({ data: { token: 'fresh-token' } });
-    vi.mocked(apiPost).mockResolvedValue({ data: { html_url: 'https://github.com/owner/repo/pull/99' } });
-
+  it('delegates to runCodeChangeTask with the right opts when prompt is provided', async () => {
     await handleMigrate(
       TASK_ID,
       { ...BASE_PAYLOAD, prompt: 'Add user_role column' },
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('COMPLETED');
-    expect(call.artifact_type).toBe('PULL_REQUEST');
-    expect(call.pr_url).toBe('https://github.com/owner/repo/pull/99');
-    expect(call.commit_hash).toBe('abc1234567');
-    // PR creation endpoint should have been called (shortId = taskId sans dashes, first 8 chars)
-    expect(apiPost).toHaveBeenCalledWith(
-      '/api/agent/github/pull-requests',
-      expect.objectContaining({
-        task_id: TASK_ID,
-        owner: OWNER,
-        repo: REPO,
-        head: 'blueprint/migrate-taskabc1',
-        base: 'main',
-      }),
-      undefined,
-      90_000,
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
+    const opts = capturedMigrateOpts();
+    expect(opts.taskId).toBe(TASK_ID);
+    expect(opts.owner).toBe(OWNER);
+    expect(opts.repo).toBe(REPO);
+    expect(opts.baseBranch).toBe('main');
+    expect(opts.testsOnMainBranch).toBe(true);
+    // shortId = taskId sans dashes, first 8 chars → 'taskabc1'
+    expect(opts.workBranch).toBe('blueprint/migrate-taskabc1');
+    expect(opts.baseCommit).toBe('abc1234567');
+    expect(opts.noChangesMessage).toBe('No migration changes generated.');
+  });
+
+  it('forwards a custom base_branch and disables tests-on-main accordingly', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { base_branch: 'feature/parent', prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('feature/parent');
+    expect(opts.testsOnMainBranch).toBe(false);
   });
 
   it('throws when stale remote branch has open PRs (refuses to delete)', async () => {
@@ -591,7 +642,7 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
         TASK_ID,
         { ...BASE_PAYLOAD, prompt: 'Add column' },
         BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
-      )
+      ),
     ).rejects.toThrow(/Refusing to delete stale branch.*#42/);
 
     // Must not have pushed --delete when refusing
@@ -600,12 +651,15 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
       return a[0] === 'push' && a.includes('--delete');
     });
     expect(deleteCall).toBeUndefined();
+    // Must not have invoked runCodeChangeTask either
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 
   it('deletes stale remote branch and continues when no open PRs exist', async () => {
     // ls-remote succeeds (branch exists); no open PRs
     vi.mocked(git).mockImplementation((args: string[]) => {
       if (args[0] === 'ls-remote') return 'abc\trefs/heads/blueprint/migrate-xxx';
+      if (args[0] === 'rev-parse') return 'abc1234567';
       return '';
     });
     vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([]);
@@ -621,34 +675,8 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
       return a[0] === 'push' && a.includes('--delete');
     });
     expect(deleteCall).toBeDefined();
-    // No changes were generated (default git mock returns '') → COMPLETED with "no changes" message
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('COMPLETED');
-    expect(call.logs).toBe('No migration changes generated.');
-  });
-
-  it('reports FAILED with claude_code_failed category when Claude exits non-zero', async () => {
-    vi.mocked(runClaudeCode).mockResolvedValue({
-      exitCode: 1, allOutput: 'migration error trace', lastResultText: '',
-    });
-
-    await handleMigrate(
-      TASK_ID,
-      { ...BASE_PAYLOAD, prompt: 'Add column' },
-      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
-    );
-
-    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
-    expect(call.artifact_type).toBe('ERROR_LOG');
-    expect(call.failure_category).toBe('claude_code_failed');
-    // No PR should have been created on failure
-    expect(apiPost).not.toHaveBeenCalledWith(
-      '/api/agent/github/pull-requests',
-      expect.anything(),
-      undefined,
-      90_000,
-    );
+    // After cleanup, runCodeChangeTask must still be invoked.
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
   });
 
   it('migrate prompt instructs agent to bump EXPECTED_SCHEMA_REVISION', async () => {
@@ -657,9 +685,66 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
       { ...BASE_PAYLOAD, prompt: 'Add column' },
       BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
-    const promptArg = vi.mocked(runClaudeCode).mock.calls[0][0];
-    expect(promptArg).toContain('EXPECTED_SCHEMA_REVISION');
-    expect(promptArg).toContain('app/main.py');
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('EXPECTED_SCHEMA_REVISION');
+    expect(prompt).toContain('app/main.py');
+  });
+
+  it('migrate prompt instructs agent to run ./check test before ./pr open (Docker pytest)', async () => {
+    // Migrations always touch backend, so tests must run before shipping.
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('./check test');
+    expect(prompt).toContain('./pr open');
+  });
+
+  it('includes CODE_CHANGE_HELPER_GUIDANCE in the prompt (./check, ./pr, ./done, ./fail)', async () => {
+    // The wrapper writes ./check + ./pr + ./done + ./fail; without this
+    // guidance Claude has no way to ship its work and the wrapper falls back
+    // to FAILED-incomplete on every migration task.
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('./check');
+    expect(prompt).toContain('./pr');
+    expect(prompt).toContain('./done');
+    expect(prompt).toContain('./fail');
+  });
+
+  it('includes the migration step list in the prompt (alembic autogenerate, downgrade test, schema revision bump)', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    // Step 1: examine existing migrations
+    expect(prompt).toContain('Examine existing migrations');
+    // Step 3: run alembic revision --autogenerate
+    expect(prompt).toContain('alembic revision --autogenerate');
+    // Step 6: alembic upgrade head
+    expect(prompt).toContain('alembic upgrade head');
+    // Step 7: downgrade round-trip
+    expect(prompt).toContain('alembic downgrade');
+  });
+
+  it('embeds the user prompt and task title into the migration prompt', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add user_role column' },
+      { ...BASE_TASK, title: 'Migration: user roles' },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('Add user_role column');
+    expect(prompt).toContain('Task: Migration: user roles');
   });
 
   it('throws when no prompt is provided in payload or task', async () => {
@@ -669,8 +754,10 @@ describe('handleMigrate — stale-branch handling and workflow', () => {
         { base_branch: 'main' },
         { title: '', description: '', context: {}, project_context: {} },
         GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
-      )
+      ),
     ).rejects.toThrow(/No prompt found/);
+    // No runCodeChangeTask call when prompt missing
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 });
 
@@ -723,7 +810,7 @@ describe('handler statusRef.value updates', () => {
     vi.mocked(readHandlerOutput).mockReturnValue({ summary: '', root_cause: '', affected_files: [], recommended_fix: '', severity: 'low', confidence: 'low' });
     const statusRef = STATUS_REF();
 
-    await handleInvestigate(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, statusRef);
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, statusRef);
 
     expect(statusRef.value).toBe('Running investigation...');
   });

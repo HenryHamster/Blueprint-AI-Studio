@@ -1,6 +1,22 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
+// 2026-05-04: handleFix no longer drives lint/test/push/PR via wrapper helpers.
+// It builds an enrichedPrompt (iteration header, scope convergence, CI failure
+// context, dialog-system prompt) and delegates everything post-prompt to
+// runCodeChangeTask. Tests:
+//   • Mock runCodeChangeTask (default no-op) and inspect its `prompt` opt to
+//     verify the various sections the handler is supposed to inject.
+//   • Keep the rebase / conflict-marker / stale-premise pre-Claude logic
+//     covered — those remain active production code that runs before
+//     runCodeChangeTask.
+//   • Delete the wrapper-driven tests: pushAndCreatePR, lintFixLoop,
+//     post-rebase lint re-validation, conflict-marker retry failure, PR body
+//     annotation after push (patchPrBodyMeta is gone).
+//
+// handleReview is unchanged by the rewrite — it still calls runClaudeCode
+// directly with the review prompt — so the bulk of the existing handleReview
+// tests pass through unchanged.
 vi.mock('../index.js', () => ({
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
@@ -17,18 +33,15 @@ vi.mock('../index.js', () => ({
   gitAsync: vi.fn().mockResolvedValue(''),
   gitCommit: vi.fn().mockReturnValue(true),
   setupWorkspace: vi.fn(),
-  pushAndCreatePR: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-  lintFixLoop: vi.fn(),
-  testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
   captureTestBaseline: vi.fn().mockResolvedValue(null),
+  testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
   extractPytestSelectorsFromOutput: vi.fn((output: string) => {
     const match = output.match(/FAILED\s+(backend\/testing\/\S+\.py::\S+)/);
     return match ? [match[1].replace(/\s+-.*$/, '')] : [];
   }),
   snapshotToolTrace: vi.fn().mockReturnValue([]),
   extractInvestigatedFiles: vi.fn().mockReturnValue([]),
-  runProjectLintChecks: vi.fn(),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
 }));
@@ -47,6 +60,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
     configureAgentPermissions: vi.fn().mockReturnValue([]),
     writePlaybookHelper: vi.fn(),
     writeMessagesHelper: vi.fn(),
+    writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
     buildRetryContext: vi.fn().mockReturnValue(''),
     discoverRelatedTests: vi.fn().mockReturnValue(''),
@@ -58,22 +72,43 @@ vi.mock('../build-config.js', () => ({
   resolveBuildConfig: vi.fn().mockReturnValue({}),
 }));
 
-vi.mock('fs', () => ({
-  default: {
+// Mock the code-change module so handleFix tests can assert on what was
+// passed to runCodeChangeTask without exercising marker-detection branches.
+vi.mock('./code-change.js', () => ({
+  runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('fs', () => {
+  const stub = {
     readFileSync: vi.fn().mockReturnValue(''),
     writeFileSync: vi.fn(),
     existsSync: vi.fn().mockReturnValue(false),
-  },
-}));
+  };
+  return { ...stub, default: stub };
+});
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(''),
+  execFile: vi.fn(),
+  execSync: vi.fn().mockReturnValue(''),
+  spawn: vi.fn().mockReturnValue({
+    stderr: { on: vi.fn() },
+    stdout: { on: vi.fn() },
+    on: vi.fn(),
+    kill: vi.fn(),
+  }),
 }));
 
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
-import { computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS, annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying, detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix.js';
+import {
+  computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS,
+  annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
+  detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter,
+  formatTrajectorySection, formatDriftSection, verifyStepsOk,
+} from './review-fix.js';
+import { runCodeChangeTask } from './code-change.js';
 
 const statusRef = () => ({ value: '' });
 
@@ -81,6 +116,21 @@ const statusRef = () => ({ value: '' });
 function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
   if (v === undefined || v === null) throw new Error(msg);
   return v;
+}
+
+/** Returns the prompt arg passed to the latest runCodeChangeTask invocation
+ *  (handleFix delegates to it). */
+function capturedFixPrompt(): string {
+  const calls = vi.mocked(runCodeChangeTask).mock.calls;
+  if (calls.length === 0) throw new Error('runCodeChangeTask was not invoked');
+  return calls[calls.length - 1][0].prompt;
+}
+
+/** Returns the full opts object passed to the latest runCodeChangeTask invocation. */
+function capturedFixOpts(): Parameters<typeof runCodeChangeTask>[0] {
+  const calls = vi.mocked(runCodeChangeTask).mock.calls;
+  if (calls.length === 0) throw new Error('runCodeChangeTask was not invoked');
+  return calls[calls.length - 1][0];
 }
 
 beforeEach(() => {
@@ -95,7 +145,6 @@ beforeEach(() => {
   vi.mocked(indexMod.apiGet).mockResolvedValue({ data: { token: 'fresh' } });
   vi.mocked(indexMod.testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' });
   vi.mocked(indexMod.captureTestBaseline).mockResolvedValue(null);
-  vi.mocked(indexMod.lintFixLoop).mockResolvedValue({ passed: true, attempts: [] });
   // fetch is used by handleReview for PR metadata
   global.fetch = vi.fn().mockResolvedValue({
     ok: true,
@@ -288,7 +337,7 @@ describe('review history feedback truncation — reviewer sees at least as much 
       { context: { scope: 'small', review_loop: { iteration: 2, review_history: histNoStructured } } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const prompt = capturedFixPrompt();
     const iterMatch = prompt.match(/- Iteration 1: (x+)/);
     expect(iterMatch?.[1]?.length).toBe(REVIEW_FEEDBACK_HISTORY_CHARS);
   });
@@ -313,7 +362,7 @@ describe('review history feedback truncation — reviewer sees at least as much 
       { context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const prompt = capturedFixPrompt();
     expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
     expect(prompt).not.toMatch(/- Iteration 1: x+/);
   });
@@ -720,7 +769,7 @@ describe('handleReview — verdict file parsing', () => {
   it('reads verdict JSON from /tmp file and forwards it as verdict_json', async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue(
-      '{"verdict":"APPROVE","feedback":"looks good"}'
+      '{"verdict":"APPROVE","feedback":"looks good"}',
     );
     vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: 'review output', lastResultText: 'review text',
@@ -742,7 +791,7 @@ describe('handleReview — verdict file parsing', () => {
   it("augments verdict_json with investigated_files derived from the review's tool trace", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue(
-      '{"verdict":"REQUEST_CHANGES","feedback":"x","issues":[]}'
+      '{"verdict":"REQUEST_CHANGES","feedback":"x","issues":[]}',
     );
     vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
@@ -833,6 +882,115 @@ describe('handleReview — verdict file parsing', () => {
   });
 });
 
+// ── handleFix: prompt enrichment + runCodeChangeTask delegation ─────────────
+//
+// 2026-05-04: handleFix's wrapper-driven post-Claude pipeline (push, retry-
+// with-lease, lint re-validation, conflict-marker retry-then-fail, PR body
+// annotation) was replaced with runCodeChangeTask. The handler now: clones,
+// rebases, optionally enriches the prompt for conflicts/stale-premise/CI
+// failures/iteration headers/scope-pressure, then delegates to
+// runCodeChangeTask. Tests inspect the prompt arg and the rest of the opts.
+describe('handleFix — runCodeChangeTask delegation', () => {
+  const basePayload = {
+    branch: 'feature/x',
+    base_branch: 'main',
+    pr_number: 42,
+    prompt: 'address review feedback',
+  };
+
+  it('forwards the right opts (existingPrNumber wired so ./pr open updates the existing PR)', async () => {
+    await handleFix(
+      'task-fix-opts',
+      basePayload,
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
+    const opts = capturedFixOpts();
+    expect(opts.taskId).toBe('task-fix-opts');
+    expect(opts.workBranch).toBe('feature/x');
+    expect(opts.baseBranch).toBe('main');
+    expect(opts.owner).toBe('owner');
+    expect(opts.repo).toBe('repo');
+    // The defining wiring: existingPrNumber tells ./pr open to push to the
+    // existing PR's branch instead of creating a new one.
+    expect(opts.existingPrNumber).toBe(42);
+    expect(opts.testsOnMainBranch).toBe(true);
+    expect(opts.noChangesMessage).toBe('No file changes after review-fix iteration.');
+  });
+
+  it('sets testsOnMainBranch=false when base_branch is not main', async () => {
+    await handleFix(
+      'task-fix-feature-base',
+      { ...basePayload, base_branch: 'feature/parent' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('feature/parent');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
+  it('throws when prompt is missing — never calls runCodeChangeTask', async () => {
+    await expect(
+      handleFix(
+        'task-fix-noprompt',
+        { branch: 'feature/x', base_branch: 'main', pr_number: 42 },
+        { context: { scope: 'small' } },
+        'gh-token', 'owner', 'repo', null, statusRef(),
+      ),
+    ).rejects.toThrow(/Fix task missing prompt/);
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
+  });
+
+  it('rebases onto base branch before delegating to runCodeChangeTask', async () => {
+    const seenGitArgs: string[][] = [];
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args) seenGitArgs.push(args);
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleFix(
+      'task-fix-rebase',
+      basePayload,
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // The handler fetches the base branch and rebases onto it as part of
+    // pre-Claude conflict resolution. Both must run.
+    const fetchCall = seenGitArgs.find(a => a[0] === 'fetch' && a.some(x => x.includes('refs/heads/main')));
+    const rebaseCall = seenGitArgs.find(a => a[0] === 'rebase' && a[1] === 'origin/main');
+    expect(fetchCall).toBeDefined();
+    expect(rebaseCall).toBeDefined();
+    // Implementation must follow.
+    expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('handleFix — code-change helper guidance is in prompt', () => {
+  // The prompt now MUST tell Claude about ./check + ./pr + ./done + ./fail. If
+  // CODE_CHANGE_HELPER_GUIDANCE drops out of handleFix, Claude has no way to
+  // ship its work — silent regression that would only show up in production.
+  // Lock it in.
+  it('includes ./check, ./pr, ./done, ./fail guidance in the enriched prompt', async () => {
+    await handleFix(
+      'task-fix-helpers',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('./check');
+    expect(prompt).toContain('./pr');
+    expect(prompt).toContain('./done');
+    expect(prompt).toContain('./fail');
+  });
+});
+
 // ── handleFix: conflict marker + stale-premise detection ────────────────────
 describe('handleFix — conflict marker detection', () => {
   it('enriches the prompt with a CONFLICT MARKERS FOUND header when git grep finds markers', async () => {
@@ -851,10 +1009,8 @@ describe('handleFix — conflict marker detection', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    // Claude was invoked at least once with the marker-enriched prompt.
-    const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
-    expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
-    const prompt = firstCall[0];
+    // runCodeChangeTask was invoked with the marker-enriched prompt.
+    const prompt = capturedFixPrompt();
     expect(prompt).toContain('CONFLICT MARKERS FOUND');
     expect(prompt).toContain('backend/app/foo.py');
     expect(prompt).toContain('agent/src/bar.ts');
@@ -862,6 +1018,11 @@ describe('handleFix — conflict marker detection', () => {
 });
 
 describe('handleFix — baseline capture', () => {
+  // captureTestBaseline still runs PRE-Claude in the medium/large scope code-
+  // review path. It's a side-effect (warms the test runner, surfaces pre-
+  // existing failures in logs) — handleFix no longer consumes its return value
+  // (Claude does its own ./check test), but it's still called for the side
+  // effects.
   it('captures baseline for medium non-CI review fixes', async () => {
     await handleFix(
       'task-fix-baseline-1',
@@ -918,8 +1079,34 @@ describe('handleFix — baseline capture', () => {
   });
 });
 
+describe('handleFix — CI failure context is injected into the prompt', () => {
+  it('prepends CI repro failureSummary when targeted pytest selector failed locally', async () => {
+    vi.mocked(indexMod.testFixLoop).mockResolvedValueOnce({
+      passed: false,
+      testFailuresDetected: true,
+      failureSummary: 'AssertionError at backend/testing/test_models.py::test_create',
+    });
+
+    await handleFix(
+      'task-fix-ci-repro',
+      {
+        branch: 'feature/x',
+        base_branch: 'main',
+        pr_number: 7,
+        prompt: 'CI failed:\nFAILED backend/testing/test_models.py::test_create - AssertionError',
+      },
+      { context: { scope: 'medium', review_loop: { fix_reason: 'ci_failure' }, related_files: ['backend/app/foo.py'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('Local targeted CI repro');
+    expect(prompt).toContain('AssertionError at backend/testing/test_models.py::test_create');
+  });
+});
+
 describe('handleFix — reviewer working set propagation', () => {
-  it('prepends a Reviewer\'s Working Set section when task.context.investigated_files is present', async () => {
+  it("prepends a Reviewer's Working Set section when task.context.investigated_files is present", async () => {
     await handleFix(
       'task-fix-investigated-1',
       { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
@@ -936,9 +1123,7 @@ describe('handleFix — reviewer working set propagation', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
-    expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
-    const prompt = firstCall[0];
+    const prompt = capturedFixPrompt();
     expect(prompt).toContain("Reviewer's Working Set");
     expect(prompt).toContain('admin-ui/src/components/DirectionCard.tsx');
     expect(prompt).toContain('admin-ui/src/components/DirectionCard.test.tsx');
@@ -952,8 +1137,7 @@ describe('handleFix — reviewer working set propagation', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
-    const prompt = firstCall[0];
+    const prompt = capturedFixPrompt();
     expect(prompt).not.toContain("Reviewer's Working Set");
   });
 });
@@ -990,9 +1174,7 @@ describe('handleFix — stale-premise detection', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const firstCall = vi.mocked(indexMod.runClaudeCode).mock.calls[0];
-    expect(firstCall, 'runClaudeCode should have been called').toBeTruthy();
-    const prompt = firstCall[0];
+    const prompt = capturedFixPrompt();
     expect(prompt).toContain('Stale-premise notice');
     expect(prompt).toContain('ci/backend-tests');
     expect(prompt).toContain('ci/frontend-build');
@@ -1024,8 +1206,8 @@ describe('handleFix — stale-premise detection', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    // The obsolete path short-circuits before runClaudeCode.
-    expect(vi.mocked(indexMod.runClaudeCode)).not.toHaveBeenCalled();
+    // The obsolete path short-circuits before Claude/runCodeChangeTask.
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
 
     const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
     expect(statusCalls.length).toBeGreaterThanOrEqual(1);
@@ -1059,7 +1241,7 @@ describe('handleFix — stale-premise detection', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const prompt = capturedFixPrompt();
     expect(prompt).toContain('Stale-premise notice');
     expect(prompt).toContain('GitHub still reports');
     expect(prompt).toContain('mergeable=false');
@@ -1086,107 +1268,55 @@ describe('handleFix — stale-premise detection', () => {
     const curlCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'curl');
     expect(curlCalls.length).toBe(0);
 
-    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('Stale-premise notice');
   });
 });
 
-// ── handleFix: post-rebase lint re-validation ───────────────────────────────
-describe('handleFix — post-rebase lint re-validation', () => {
-  // Mock `git` so `hasFixChanges` is true (non-empty status output) and the
-  // post-rebase changedPaths derivation produces a non-empty list. Both the
-  // status-porcelain-derived paths and the diff-derived re-validation paths
-  // resolve to a single TS file under agent/.
-  const setupGitForLintPath = () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
-      if (!args) return '';
-      if (args[0] === 'status' && args.includes('--porcelain')) return ' M agent/src/foo.ts';
-      if (args[0] === 'diff' && args.includes('--name-only')) return 'agent/src/foo.ts';
-      return '';
-    }) as unknown as typeof indexMod.git);
-  };
-
-  it('fails the cycle and refuses to push when re-validation lint still fails after fix attempt', async () => {
-    setupGitForLintPath();
-    let lintCalls = 0;
-    vi.mocked(indexMod.runProjectLintChecks).mockImplementation((() => {
-      lintCalls += 1;
-      throw new Error('eslint: agent/src/foo.ts:1 no-unused-vars');
-    }) as unknown as typeof indexMod.runProjectLintChecks);
-
+// ── handleFix: iteration header ─────────────────────────────────────────────
+describe('handleFix — iteration header in enriched prompt', () => {
+  it('includes "iteration N of M" header at iteration 1', async () => {
     await handleFix(
-      'task-revalidate-fail',
-      { branch: 'feature/x', base_branch: 'main', pr_number: 50, prompt: 'fix lint regression' },
-      { context: { scope: 'small' } },
+      'task-fix-iter1',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 50, prompt: 'address review' },
+      { context: { scope: 'medium', review_loop: { iteration: 1 } } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-
-    // Initial post-rebase lint check + re-validation after Claude's fix attempt.
-    expect(lintCalls).toBe(2);
-    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => c[1]);
-    expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(true);
-    // Task finalized as FAILED with lint_failed category.
-    const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
-    const finalStatus = statusCalls[statusCalls.length - 1][1];
-    expect(finalStatus.status).toBe('FAILED');
-    expect(finalStatus.failure_category).toBe('lint_failed');
-    expect(String(finalStatus.logs)).toContain('Post-rebase lint still failing');
-    // Push must not be attempted — apiGet fetches the fresh push token right before push.
-    expect(vi.mocked(indexMod.apiGet)).not.toHaveBeenCalled();
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('iteration 1 of 12');
   });
 
-  it('does not warn when re-validation passes after the fix attempt', async () => {
-    setupGitForLintPath();
-    let lintCalls = 0;
-    vi.mocked(indexMod.runProjectLintChecks).mockImplementation((() => {
-      lintCalls += 1;
-      if (lintCalls === 1) throw new Error('eslint: agent/src/foo.ts:1 no-unused-vars');
-      // Second call (re-validation) returns cleanly — fix worked.
-    }) as unknown as typeof indexMod.runProjectLintChecks);
-
+  it('includes FINAL-attempt warning at the iteration cap', async () => {
     await handleFix(
-      'task-revalidate-ok',
-      { branch: 'feature/x', base_branch: 'main', pr_number: 51, prompt: 'fix lint regression' },
-      { context: { scope: 'small' } },
+      'task-fix-final',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 50, prompt: 'address review' },
+      { context: { scope: 'medium', review_loop: { iteration: 12 } } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-
-    expect(lintCalls).toBe(2);
-    const sendLogMessages = vi.mocked(indexMod.sendLog).mock.calls.map(c => c[1]);
-    expect(sendLogMessages.some(m => /still failing/i.test(m))).toBe(false);
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('FINAL attempt');
   });
-});
 
-// ── handleFix: conflict markers persist after retry -> fail cycle ───────────
-describe('handleFix — conflict-marker retry failure', () => {
-  it('fails the cycle and refuses to push when conflict markers persist after Claude retry', async () => {
-    // First grep (pre-Claude enrichedPrompt) finds markers → enriched-prompt path.
-    // Post-retry grep ALSO finds markers → fail cycle.
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
-      if (cmd === 'git' && args && args.includes('grep')) {
-        return 'agent/src/foo.ts\n';
-      }
-      return '';
-    }) as unknown as typeof execFileSync);
-
+  it('triggers Convergence mode at >= 50% of the iteration budget', async () => {
+    // medium scope budget = 12; iteration 6 hits the 50% threshold.
     await handleFix(
-      'task-markers-persist',
-      { branch: 'feature/x', base_branch: 'main', pr_number: 90, prompt: 'resolve conflicts' },
-      { context: { scope: 'small' } },
+      'task-fix-converge',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 50, prompt: 'address review' },
+      { context: { scope: 'medium', review_loop: { iteration: 6 } } },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
-
-    const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
-    const finalStatus = statusCalls[statusCalls.length - 1][1];
-    expect(finalStatus.status).toBe('FAILED');
-    expect(finalStatus.failure_category).toBe('unresolved_conflicts');
-    expect(String(finalStatus.logs)).toContain('Conflict markers still present');
-    // Push must not be attempted.
-    expect(vi.mocked(indexMod.apiGet)).not.toHaveBeenCalled();
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('Convergence mode');
+    expect(prompt).toContain('minimal changes');
   });
 });
 
 // ── pushForceWithLeaseRetrying: concurrent push retry paths ─────────────────
+//
+// pushForceWithLeaseRetrying is exported from review-fix.ts but is no longer
+// invoked by handleFix (Claude calls ./pr open which has its own push retry
+// logic). The function remains for any caller that wants the push-with-retry
+// primitive — we keep its tests so the helper itself is verified.
 describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
   it('returns after a successful first push without retrying', async () => {
     vi.mocked(indexMod.gitAsync).mockResolvedValueOnce('');
@@ -1367,6 +1497,11 @@ describe('detectMigrationConflict', () => {
 });
 
 describe('buildBlueprintPrFooter', () => {
+  // Note: 2026-05-04 — the in-handler call site for this footer
+  // (patchPrBodyMeta) was deleted along with the wrapper-driven push pipeline.
+  // The function itself is still exported and remains useful as a composable
+  // helper for any caller that wants to render the footer (e.g. ./pr open in
+  // the future, or ad-hoc PR body annotation). Keep its unit tests.
   it('returns empty string when no meaningful data', () => {
     expect(buildBlueprintPrFooter({})).toBe('');
   });
@@ -1425,81 +1560,6 @@ describe('buildBlueprintPrFooter', () => {
   it('shows unknown provider when only model is set', () => {
     const result = buildBlueprintPrFooter({ model: 'claude-3-5-sonnet-20241022' });
     expect(result).toContain('provider: unknown (claude-3-5-sonnet-20241022)');
-  });
-});
-
-describe('handleFix — PR body annotation after push', () => {
-  let _savedProvider: string | undefined;
-  let _savedLLMModel: string | undefined;
-  beforeEach(() => {
-    _savedProvider = process.env.PROVIDER;
-    _savedLLMModel = process.env.LLM_MODEL;
-    delete process.env.PROVIDER;
-    delete process.env.LLM_MODEL;
-  });
-  afterEach(() => {
-    if (_savedProvider === undefined) delete process.env.PROVIDER;
-    else process.env.PROVIDER = _savedProvider;
-    if (_savedLLMModel === undefined) delete process.env.LLM_MODEL;
-    else process.env.LLM_MODEL = _savedLLMModel;
-  });
-
-  it('calls GitHub PATCH to annotate PR body when push succeeds and direction_id is set', async () => {
-    // Make git rev-parse return different local/remote heads so push path runs.
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
-      if (args && args[0] === 'rev-parse' && args[1] === 'HEAD') return 'abc';
-      if (args && args[0] === 'rev-parse') return 'def'; // remote head differs
-      return '';
-    }) as unknown as typeof indexMod.git);
-
-    const fetchCalls: string[] = [];
-    global.fetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
-      fetchCalls.push(`${opts?.method ?? 'GET'} ${url}`);
-      if ((opts?.method ?? 'GET') === 'GET' || opts?.method === undefined) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ body: 'existing body' }) });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
-    }) as unknown as typeof fetch;
-
-    await handleFix(
-      'task-meta-patch',
-      { branch: 'feature/x', base_branch: 'main', pr_number: 42, prompt: 'fix the issue' },
-      { context: { scope: 'small', direction_id: 'd-test', review_loop: { iteration: 2 } } },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-
-    // Give the fire-and-forget promise a tick to run.
-    await new Promise(r => setTimeout(r, 0));
-
-    const patchCall = fetchCalls.find(c => c.startsWith('PATCH'));
-    expect(patchCall).toBeTruthy();
-    expect(patchCall).toContain('/pulls/42');
-  });
-
-  it('skips PR body annotation when footer would be empty (no direction, iterations=1)', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
-      if (args && args[0] === 'rev-parse' && args[1] === 'HEAD') return 'abc';
-      if (args && args[0] === 'rev-parse') return 'def';
-      return '';
-    }) as unknown as typeof indexMod.git);
-
-    const fetchCalls: string[] = [];
-    global.fetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
-      fetchCalls.push(`${opts?.method ?? 'GET'} ${url}`);
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({ title: 'PR title', body: 'body' }) });
-    }) as unknown as typeof fetch;
-
-    await handleFix(
-      'task-meta-skip',
-      { branch: 'feature/x', base_branch: 'main', pr_number: 43, prompt: 'fix it' },
-      { context: { scope: 'small', review_loop: { iteration: 1 } } },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-
-    await new Promise(r => setTimeout(r, 0));
-
-    const patchCall = fetchCalls.find(c => c.startsWith('PATCH') && c.includes('/pulls/43'));
-    expect(patchCall).toBeUndefined();
   });
 });
 

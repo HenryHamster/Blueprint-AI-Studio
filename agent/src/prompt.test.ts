@@ -1711,7 +1711,11 @@ describe('getTaskTypeHints', () => {
   it('returns static hint from TASK_TYPE_HINTS when buildConfig is undefined', () => {
     const result = getTaskTypeHints(undefined)['create'];
     expect(result).toBe(TASK_TYPE_HINTS['create']);
-    expect(result).toContain('Run the relevant lint');
+    // 2026-05-04: hint now points at ./check / ./pr / ./done helpers (the
+    // wrapper-driven lint-loop language was removed in 5c186061).
+    expect(result).toContain('./check');
+    expect(result).toContain('./pr open');
+    expect(result).toContain('./done');
   });
 
   it('returns undefined for unknown task type when buildConfig is undefined', () => {
