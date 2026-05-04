@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import type WebSocket from 'ws';
 import {
   sanitize, sendLog, runClaudeCode, persistAndPostStatus, git,
+  rotateOAuthCredentialsIfChanged,
 } from '../index.js';
 import { writeCodeChangeHelpers } from '../prompt.js';
 
@@ -71,8 +72,22 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     `/tmp/done_${taskId}`,
     `/tmp/fail_${taskId}`,
     `/tmp/pr_url_${taskId}`,
+    `/tmp/base_commit_${taskId}`,
+    `/tmp/fix_responses_${taskId}.json`,
+    `/tmp/self_review_${taskId}.json`,
+    `/tmp/task_${taskId}_result.json`,
   ]) {
     try { fs.unlinkSync(f); } catch { /* not present — fine */ }
+  }
+
+  // Persist baseCommit so ./done can compute the changed_files diff for
+  // its enriched payload (review-pipeline scope analysis, direction
+  // credit, rollup management all read task.context._pr_changed_files).
+  try {
+    fs.writeFileSync(`/tmp/base_commit_${taskId}`, opts.baseCommit, { mode: 0o644 });
+  } catch (e) {
+    sendLog(ws, `[wrapper] Failed to write base_commit marker: ${e instanceof Error ? e.message : String(e)}\n`);
+    // Non-fatal — ./done's enrichment is optional.
   }
 
   // 1. Write helpers (./check, ./pr, ./done, ./fail). Existing helpers
@@ -93,6 +108,24 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   const { exitCode, allOutput } = await runClaudeCode(
     prompt, ws, statusRef, model, effort, disallowedTools,
   );
+
+  // 2b. Rotate OAuth credentials if Claude refreshed its tokens during
+  //     the session. This used to live in applyFinalStatusPrerequisites
+  //     (only fired on the TS persistAndPostStatus path); the bash ./done
+  //     bypasses it, so we run it here regardless of who posts the
+  //     terminal status. The rotation function is idempotent (SHA-256 hash
+  //     compare against the at-claim-time hash) and safe to call even if
+  //     ./done already finished — it's a no-op when credentials haven't
+  //     changed. Critical for OpenAI/Codex OAuth users only; no-op for
+  //     ANTHROPIC_API_KEY auth.
+  try {
+    await rotateOAuthCredentialsIfChanged(taskId);
+  } catch (e) {
+    sendLog(ws, `[wrapper] OAuth rotation failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    // Don't fail the task — Claude's work is done, the rotation only
+    // affects the NEXT task on this account. Surfaced in logs for
+    // operator triage.
+  }
 
   // 3. Inspect marker files written by ./done|./fail|./pr to determine
   //    terminal status without re-querying GitHub.

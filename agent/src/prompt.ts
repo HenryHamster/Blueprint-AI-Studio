@@ -462,14 +462,31 @@ set -uo pipefail
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
+# Sanity: make sure we're in a git repo. Without this, the diff commands
+# below silently swallow errors and CHANGED becomes empty -> all stack
+# blocks skipped -> "PASS" with zero actual checks.
+git rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "Error: $WORKSPACE is not a git repo (missing .git)" >&2
+  exit 2
+}
+
 WITH_TESTS=0
 if [ "\${1:-}" = "test" ] || [ "\${1:-}" = "--tests" ]; then
   WITH_TESTS=1
 fi
 
-# Determine changed paths: committed since base + uncommitted
+# Determine changed paths: committed since base + uncommitted. Verify at
+# least one diff source actually worked — silently-empty CHANGED used to
+# fall through to "PASS — all checks green" without running anything.
 BASE="${cfg.baseBranch}"
-COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || git diff --name-only "$BASE...HEAD" 2>/dev/null || true)
+COMMITTED=""
+if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
+  COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || true)
+elif git rev-parse --verify "$BASE" >/dev/null 2>&1; then
+  COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null || true)
+else
+  echo "[check] WARNING: neither origin/$BASE nor $BASE exists locally — falling back to working-tree diff only" >&2
+fi
 UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 CHANGED=$(printf '%s\\n%s\\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)
 
@@ -735,12 +752,71 @@ if [ -f /tmp/done_${cfg.taskId} ]; then
   exit 0
 fi
 
+# Optional enrichment: if Claude wrote /tmp/fix_responses_<task_id>.json
+# (review-fix dialog-system response), include it in the payload so the
+# orchestrator's verify-mode reviewer can chain-of-custody the fix
+# rationale forward (review_pipeline.py:1664-1681).
+FIX_RESPONSES_FILE="/tmp/fix_responses_${cfg.taskId}.json"
+FIX_RESPONSES_JSON=""
+if [ -s "$FIX_RESPONSES_FILE" ]; then
+  if jq empty "$FIX_RESPONSES_FILE" >/dev/null 2>&1; then
+    FIX_RESPONSES_JSON=$(cat "$FIX_RESPONSES_FILE")
+  else
+    echo "[done] /tmp/fix_responses_${cfg.taskId}.json exists but is not valid JSON — skipping enrichment" >&2
+  fi
+fi
+
+# Optional enrichment: self-review outcome. Claude can write a structured
+# self-review JSON to /tmp/self_review_<task_id>.json before calling
+# ./done; we forward it as self_review_outcome on the payload so
+# downstream consumers (review_pipeline retry context, admin_digest
+# catch-rate metrics, reaper retry pairing) get the signal.
+SELF_REVIEW_FILE="/tmp/self_review_${cfg.taskId}.json"
+SELF_REVIEW_JSON=""
+if [ -s "$SELF_REVIEW_FILE" ]; then
+  if jq empty "$SELF_REVIEW_FILE" >/dev/null 2>&1; then
+    SELF_REVIEW_JSON=$(cat "$SELF_REVIEW_FILE")
+  else
+    echo "[done] /tmp/self_review_${cfg.taskId}.json exists but is not valid JSON — skipping enrichment" >&2
+  fi
+fi
+
+# Optional enrichment: changed_files from git diff — review-pipeline scope
+# analysis, direction credit, rollup management all read this from
+# task.context._pr_changed_files. Without it those signals degrade.
+CHANGED_FILES_JSON=""
+if BASE_COMMIT_FILE="/tmp/base_commit_${cfg.taskId}" && [ -s "$BASE_COMMIT_FILE" ]; then
+  BASE_COMMIT=$(cat "$BASE_COMMIT_FILE")
+  CHANGED_FILES=$(git -C "${WORKSPACE}" diff --name-only "$BASE_COMMIT..HEAD" 2>/dev/null | head -50 | jq -R . | jq -s .)
+  if [ -n "$CHANGED_FILES" ] && [ "$CHANGED_FILES" != "[]" ]; then
+    CHANGED_FILES_JSON="$CHANGED_FILES"
+  fi
+fi
+
 # Retry on 429/5xx/network — orchestrator returns 429 on FOR-UPDATE
 # contention with Retry-After: 5. Without retry, contended completions
 # never reach the orchestrator and the task stays IN_PROGRESS until the
 # reaper kicks in minutes later.
 PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
-  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}')
+  --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
+  --argjson self_review "\${SELF_REVIEW_JSON:-null}" \\
+  --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
+  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}
+   + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
+   + (if $self_review then {self_review_outcome: $self_review} else {} end)
+   + (if $changed_files then {changed_files: $changed_files} else {} end)')
+
+# Stale-result envelope: persist BEFORE attempting the POST so that if
+# the VM is killed mid-retry, the next agent boot can scan for the
+# envelope and replay the COMPLETED post. Mirrors the TS-side behaviour
+# in persistAndPostStatus (index.ts:567). Without this, a kill during
+# the bash 45s retry window leaves the task IN_PROGRESS until the reaper
+# sweeps it as orphan, then re-runs from scratch — duplicate work + retry
+# budget burn.
+ENVELOPE="/tmp/task_${cfg.taskId}_result.json"
+printf '%s' "$PAYLOAD" > "$ENVELOPE" 2>/dev/null || \
+  echo "[done] WARNING: failed to persist stale-result envelope to $ENVELOPE" >&2
+
 POSTED=0
 for attempt in 1 2 3 4 5; do
   HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/done_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
@@ -771,6 +847,9 @@ fi
 # Marker is written ONLY after a successful POST. The wrapper inspects it
 # to decide whether to skip its fallback completion path.
 touch /tmp/done_${cfg.taskId}
+# Envelope replayed successfully — remove it so the next agent boot doesn't
+# resend a duplicate COMPLETED post for this task ID.
+rm -f "$ENVELOPE"
 echo ""
 echo "[done] OK — wrapper will exit cleanly. PR: $PR_URL"
 `;
@@ -923,6 +1002,33 @@ DO use \`git status\`, \`git diff\` to inspect your work.
 DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — use
 \`./pr open\` so the lint/build gate fires and the orchestrator records
 the PR atomically.
+
+## Optional: self-review before \`./done\`
+
+Just before calling \`./done\`, you can write a structured self-review
+JSON to \`/tmp/self_review_<task_id>.json\` (your task ID is in the
+ORCHESTRATOR env or the prompt context). When present, \`./done\`
+includes it in the COMPLETED payload as \`self_review_outcome\` —
+downstream consumers use it for retry context, dashboard catch-rate
+metrics, and reviewer-iteration priming. Schema:
+
+\`\`\`json
+{
+  "verdict": "pass" | "fail",
+  "fixes_applied": true | false,
+  "check_results": {
+    "<category>": { "passed": true | false, "issue": "..." }
+  },
+  "blind_spots": ["...", "..."]
+}
+\`\`\`
+
+Categories should reflect the actual checks you ran on your diff
+(e.g. correctness, error_handling, security, type_safety, scope,
+cross_file_consistency). \`fixes_applied: true\` means YOU caught
+something during self-review and fixed it before pushing. Skip the
+self-review entirely if you have nothing useful to record — graceful
+degradation.
 `;
 
 export const PLAYBOOK_GUIDANCE = `
