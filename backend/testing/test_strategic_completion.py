@@ -34,7 +34,7 @@ from app.strategic_completion import (
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
 )
-from app.strategic_spawning import _build_previous_decision_outcomes
+from app.strategic_spawning import _build_previous_decision_outcomes, _build_past_retirement_critiques
 from app.models import Project, Task
 
 
@@ -472,6 +472,35 @@ class TestIsDirectionDuplicate:
         proposal = "Cache Database Query Performance Results"
         existing = [{"text": "cache database query performance improvements"}]
         assert _is_direction_duplicate(proposal, existing, []) is True
+
+    def test_retired_direction_tighter_threshold_3_words_triggers_duplicate(self):
+        # 3-word overlap against an expired direction should be flagged (tighter threshold = 3)
+        # Note: "improve" is a stopword and is excluded from overlap counting
+        proposal = "cache database query performance"
+        existing = [{"text": "cache database query latency optimization", "status": "expired"}]
+        # Non-stopword overlap: cache, database, query = 3 >= threshold 3 for retired → True
+        assert _is_direction_duplicate(proposal, existing, []) is True
+
+    def test_active_direction_still_requires_4_words(self):
+        # Same 3-word overlap against an active direction should NOT be flagged (threshold 4)
+        proposal = "cache database query performance"
+        existing = [{"text": "cache database query latency optimization", "status": "active"}]
+        # Non-stopword overlap: cache, database, query = 3 < threshold 4 for active → False
+        assert _is_direction_duplicate(proposal, existing, []) is False
+
+    def test_superseded_direction_tighter_threshold(self):
+        # superseded status also uses the tighter threshold of 3
+        proposal = "migrate authentication service token"
+        existing = [{"text": "migrate authentication service old token system", "status": "superseded"}]
+        # Overlap: migrate, authentication, service, token = 4 >= 3 → True
+        assert _is_direction_duplicate(proposal, existing, []) is True
+
+    def test_retired_threshold_2_words_does_not_trigger(self):
+        # Only 2 shared non-stopword words even against a retired direction → False
+        proposal = "caching performance metrics"
+        existing = [{"text": "caching performance strategy deployment", "status": "expired"}]
+        # Overlap: caching, performance = 2 < 3 → False
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
 
 # ── _record_strategic_task_failure ───────────────────────────────────────────
@@ -1573,3 +1602,197 @@ async def test_legacy_direction_without_structured_fields_loads(db_session, mock
     # text and status are still accessible
     assert found["text"] == "Legacy direction"
     assert found["status"] == "active"
+
+
+# ── Retirement critique persistence ──────────────────────────────────────────
+
+
+class TestBuildPastRetirementCritiques:
+    def test_empty_cycle_history_returns_empty(self):
+        assert _build_past_retirement_critiques([]) == []
+
+    def test_cycles_without_retirement_critiques_key_return_empty(self):
+        history = [{"cycle_id": "sc-1", "outcome": "completed"}]
+        assert _build_past_retirement_critiques(history) == []
+
+    def test_incomplete_cycles_skipped(self):
+        history = [
+            {"cycle_id": "sc-1", "outcome": "failed_phase2", "retirement_critiques": [{"direction_id": "d-1", "what_it_addressed": "x", "pattern_that_produced_it": "y", "lesson": "z"}]},
+            {"cycle_id": "sc-2", "outcome": "completed", "retirement_critiques": [{"direction_id": "d-2", "what_it_addressed": "a", "pattern_that_produced_it": "b", "lesson": "c"}]},
+        ]
+        result = _build_past_retirement_critiques(history)
+        assert len(result) == 1
+        assert result[0]["direction_id"] == "d-2"
+
+    def test_list_critiques_extracted(self):
+        critiques = [
+            {"direction_id": "d-abc", "what_it_addressed": "CI pipeline speed", "pattern_that_produced_it": "premature optimization", "lesson": "Wait for evidence before optimizing."},
+        ]
+        history = [{"cycle_id": "sc-1", "outcome": "completed", "retirement_critiques": critiques}]
+        result = _build_past_retirement_critiques(history)
+        assert len(result) == 1
+        assert result[0]["direction_id"] == "d-abc"
+        assert result[0]["pattern_that_produced_it"] == "premature optimization"
+
+    def test_no_eligible_sentinel_preserved(self):
+        history = [{"cycle_id": "sc-1", "outcome": "completed", "retirement_critiques": {"no_eligible_retirements": True}}]
+        result = _build_past_retirement_critiques(history)
+        assert result == [{"no_eligible_retirements": True}]
+
+    def test_truncates_to_n(self):
+        critiques = [
+            {"direction_id": f"d-{i}", "what_it_addressed": "x", "pattern_that_produced_it": "y", "lesson": "z"}
+            for i in range(3)
+        ]
+        history = [
+            {"cycle_id": f"sc-{j}", "outcome": "completed", "retirement_critiques": critiques}
+            for j in range(4)
+        ]
+        result = _build_past_retirement_critiques(history, n=5)
+        assert len(result) == 5
+
+    def test_default_n_is_5(self):
+        critiques = [
+            {"direction_id": f"d-{i}", "what_it_addressed": "x", "pattern_that_produced_it": "y", "lesson": "z"}
+            for i in range(4)
+        ]
+        history = [
+            {"cycle_id": f"sc-{j}", "outcome": "completed", "retirement_critiques": critiques}
+            for j in range(10)
+        ]
+        result = _build_past_retirement_critiques(history)
+        assert len(result) == 5
+
+
+@pytest.mark.asyncio
+async def test_retirement_critiques_persisted_via_api_path(db_session, mocker):
+    """API path: _strategic_retirement_critiques from task.context ends up in cycle metadata."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="RC-API", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[{"id": "d-ret1", "status": "expired", "text": "Old direction", "research_history": []}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    critiques = [{"direction_id": "d-ret1", "what_it_addressed": "Speed up CI", "pattern_that_produced_it": "premature optimization", "lesson": "Wait for evidence."}]
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={
+            "_strategic_vision_set": True,
+            "strategic_cycle_id": cycle.id,
+            "_strategic_retirement_critiques": critiques,
+        },
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert "retirement_critiques" in meta, "retirement_critiques must be persisted in cycle_metadata"
+    assert meta["retirement_critiques"] == critiques
+
+
+@pytest.mark.asyncio
+async def test_retirement_critiques_persisted_via_fallback_path(db_session, mocker):
+    """Fallback (log-parse) path: retired_direction_critiques from JSON output ends up in cycle metadata."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="RC-FB", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    critiques = [{"direction_id": "d-old1", "what_it_addressed": "Caching layer", "pattern_that_produced_it": "scope drift", "lesson": "Keep scope tight."}]
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [],
+        "retired_direction_critiques": critiques,
+    })
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert "retirement_critiques" in meta, "retirement_critiques must be persisted via fallback path"
+    assert meta["retirement_critiques"] == critiques
+
+
+@pytest.mark.asyncio
+async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
+    """no_eligible_retirements sentinel is persisted cleanly."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="RC-NE", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [],
+        "retired_direction_critiques": {"no_eligible_retirements": True},
+    })
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("retirement_critiques") == {"no_eligible_retirements": True}

@@ -436,8 +436,16 @@ def _check_direction_completion(direction: dict) -> str | None:
     return None
 
 
+_RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
+
+
 def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejected_proposals: list) -> bool:
-    """Return True if proposal_text overlaps with an existing or recently rejected direction."""
+    """Return True if proposal_text overlaps with an existing or recently rejected direction.
+
+    Retired directions (expired/retired/superseded) use a tighter threshold (3 shared
+    non-stopword tokens) to catch paraphrased retirements. Active directions keep
+    the default threshold of 4.
+    """
     STOPWORDS = {'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
                  'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
                  'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
@@ -447,7 +455,8 @@ def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejec
     for d in existing_directions:
         existing_text = (d.get("text") or "").lower()
         existing_words = set(existing_text.split()) - STOPWORDS
-        if len(words & existing_words) >= 4:
+        threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
+        if len(words & existing_words) >= threshold:
             return True
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
     for entry in rejected_proposals:
@@ -695,6 +704,17 @@ async def _handle_strategic_completion(
             retired_final_metrics = _collect_retirement_metrics(project, retired_ids)
             # Audit W2: cycle outcome lives on the StrategicCycle row;
             # per-direction maps land in cycle_metadata.
+            _retirement_critiques = (task.context or {}).get("_strategic_retirement_critiques")
+            _extra: dict = {
+                "created_direction_ids": created_ids,
+                "retired_direction_ids": retired_ids,
+                "created_rationales": created_rationales,
+                "retired_rationales": retired_rationales,
+                "created_predictions": created_predictions,
+                "retired_final_metrics": retired_final_metrics,
+            }
+            if _retirement_critiques is not None:
+                _extra["retirement_critiques"] = _retirement_critiques
             await strategic_cycle.mark_phase2_completed(
                 session, cycle_id,
                 summary_text=_summary,
@@ -703,14 +723,7 @@ async def _handle_strategic_completion(
                 directions_retired=dirs_retired,
                 tasks_spawned=tasks_spawned,
                 vision_updated=_vision_updated,
-                extra_metadata={
-                    "created_direction_ids": created_ids,
-                    "retired_direction_ids": retired_ids,
-                    "created_rationales": created_rationales,
-                    "retired_rationales": retired_rationales,
-                    "created_predictions": created_predictions,
-                    "retired_final_metrics": retired_final_metrics,
-                },
+                extra_metadata=_extra,
             )
         await _check_direction_starvation(project, dirs_created, session)
         session.add(project)
@@ -1204,6 +1217,17 @@ async def _handle_strategic_completion(
         _vision_rev_fb = (project.vision or {}).get("revision", 0)
         _summary_fb = f"rev {_vision_rev_fb}, {_active_dirs_fb} active, {dirs_created} created, {dirs_retired} retired"
         if vision_produced:
+            _fb_extra: dict = {
+                "created_direction_ids": list(created_ids_fb),
+                "retired_direction_ids": list(retired_ids_fb),
+                "created_rationales": dict(created_rationales_fb),
+                "retired_rationales": dict(retired_rationales_fb),
+                "created_predictions": _collect_creation_predictions(project, created_ids_fb),
+                "retired_final_metrics": _collect_retirement_metrics(project, retired_ids_fb),
+            }
+            _fb_critiques = parsed.get("retired_direction_critiques")
+            if _fb_critiques is not None:
+                _fb_extra["retirement_critiques"] = _fb_critiques
             await strategic_cycle.mark_phase2_completed(
                 session, cycle_id,
                 summary_text=_summary_fb,
@@ -1211,14 +1235,7 @@ async def _handle_strategic_completion(
                 directions_created=dirs_created,
                 directions_retired=dirs_retired,
                 vision_updated=True,
-                extra_metadata={
-                    "created_direction_ids": list(created_ids_fb),
-                    "retired_direction_ids": list(retired_ids_fb),
-                    "created_rationales": dict(created_rationales_fb),
-                    "retired_rationales": dict(retired_rationales_fb),
-                    "created_predictions": _collect_creation_predictions(project, created_ids_fb),
-                    "retired_final_metrics": _collect_retirement_metrics(project, retired_ids_fb),
-                },
+                extra_metadata=_fb_extra,
             )
         else:
             await strategic_cycle.mark_failure(

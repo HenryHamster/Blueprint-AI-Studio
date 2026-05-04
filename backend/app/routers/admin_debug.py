@@ -989,3 +989,72 @@ async def get_project_system_maturity(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/projects/{project_id}/recent-findings
+# ---------------------------------------------------------------------------
+
+@router.get("/projects/{project_id}/recent-findings")
+async def get_recent_findings(
+    project_id: uuid.UUID,
+    limit: int = 50,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return recent research findings with actionability grades and grade distribution."""
+    await _get_user_project(project_id, current_user["user_id"], session)
+    cutoff = _utcnow() - timedelta(days=7)
+    result = await session.execute(
+        select(Task)
+        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context))
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+            Task.plan_output.isnot(None),
+        )
+        .order_by(Task.created_at.desc())
+        .limit(100)
+    )
+    tasks = result.scalars().all()
+
+    findings_out: list[dict] = []
+    grade_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for t in tasks:
+        raw = t.plan_output
+        if not isinstance(raw, list):
+            continue
+        for f in raw:
+            if not isinstance(f, dict) or not f.get("title"):
+                continue
+            grade = f.get("actionability_grade", "MEDIUM")
+            if grade not in grade_counts:
+                grade = "MEDIUM"
+            grade_counts[grade] = grade_counts.get(grade, 0) + 1
+            findings_out.append({
+                "task_id": str(t.id),
+                "title": f.get("title", ""),
+                "type": f.get("type", ""),
+                "scope": f.get("scope", ""),
+                "priority": f.get("priority", "medium"),
+                "actionability_grade": grade,
+                "direction_id": f.get("direction_id"),
+                "researched_at": t.created_at.isoformat() if t.created_at else None,
+            })
+            if len(findings_out) >= limit:
+                break
+        if len(findings_out) >= limit:
+            break
+
+    total = sum(grade_counts.values())
+    grade_pct = {
+        g: round(c / total * 100, 1) if total > 0 else 0.0
+        for g, c in grade_counts.items()
+    }
+    return {
+        "findings": findings_out,
+        "grade_distribution": grade_counts,
+        "grade_distribution_pct": grade_pct,
+        "total": total,
+    }

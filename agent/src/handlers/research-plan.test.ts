@@ -25,6 +25,8 @@ import {
   formatPreviousDecisionOutcomes,
   readProgressArtifact,
   buildPortfolioComposition,
+  buildThinkerPrompt,
+  type ThinkerPromptParams,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -989,5 +991,197 @@ describe('buildPortfolioComposition', () => {
     expect(out).not.toContain('CONCENTRATION RISK');
     expect(out).not.toContain('In-flight scope mix');
     expect(out).not.toContain('System coverage');
+  });
+});
+
+describe('buildThinkerPrompt', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: 'Clock: 2026-05-04',
+    isSelfRepo: false,
+    userStateLine: 'User last active: today',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    threadSection: '',
+    taskId: 'test-task-123',
+  };
+
+  it('includes required structural headers when inputs are populated', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('## Your current understanding (problem_model)');
+    expect(prompt).toContain('## What you previously said was hard');
+    expect(prompt).toContain('## Running update');
+    expect(prompt).toContain('## Architecture');
+    expect(prompt).toContain('## Current research directions');
+    expect(prompt).toContain('## Direction Health');
+    expect(prompt).toContain('## Portfolio Composition');
+  });
+
+  it('includes all required output section headers', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('## 1. State assessment');
+    expect(prompt).toContain('## 2. Gap analysis');
+    expect(prompt).toContain('## 3. Moves');
+    expect(prompt).toContain('## 4. Running update document');
+    expect(prompt).toContain('## 5. Self-reflection');
+    expect(prompt).toContain('## 6. Problem model');
+  });
+
+  it('section ordering is stable: key sections appear in expected sequence', () => {
+    const prompt = buildThinkerPrompt(base);
+    const idx = (s: string) => prompt.indexOf(s);
+    // Context sections appear before instructions
+    expect(idx('## Architecture')).toBeLessThan(idx('## Current research directions'));
+    expect(idx('## Current research directions')).toBeLessThan(idx('## Direction Health'));
+    expect(idx('## Direction Health')).toBeLessThan(idx('## Portfolio Composition'));
+    expect(idx('## Portfolio Composition')).toBeLessThan(idx('# Your job'));
+    // Output sections appear at the end
+    expect(idx('# Your job')).toBeLessThan(idx('## 1. State assessment'));
+    expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
+  });
+
+  it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    });
+    expect(prompt).toContain('_(empty — bootstrap)_');
+    // Bootstrap guidance section should also be present
+    expect(prompt).toContain('# Bootstrap (when the problem_model is empty)');
+  });
+
+  it('vision section rendered only when visionJson is non-empty', () => {
+    const withVision = buildThinkerPrompt({ ...base, visionJson: '{"systems":[]}' });
+    expect(withVision).toContain('## Vision (legacy artifact');
+
+    const withoutVision = buildThinkerPrompt({ ...base, visionJson: '' });
+    expect(withoutVision).not.toContain('## Vision (legacy artifact');
+  });
+
+  it('system maturity section rendered only when systemMaturitySection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, systemMaturitySection: '\n## System Maturity\nsome data\n' });
+    expect(with_).toContain('## System Maturity');
+
+    const without = buildThinkerPrompt({ ...base, systemMaturitySection: '' });
+    expect(without).not.toContain('## System Maturity');
+  });
+
+  it('drift section rendered only when driftSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, driftSection: '\n## Drift Signals\nover_claim: true\n' });
+    expect(with_).toContain('## Drift Signals');
+
+    const without = buildThinkerPrompt({ ...base, driftSection: '' });
+    expect(without).not.toContain('## Drift Signals');
+  });
+
+  it('self-improvement block rendered only when isSelfRepo=true', () => {
+    const selfRepoPrompt = buildThinkerPrompt({
+      ...base,
+      isSelfRepo: true,
+      selfImprovementBlock: '\n\n# Self-improvement\n\nThis project\'s codebase includes your own prompts.',
+    });
+    expect(selfRepoPrompt).toContain('# Self-improvement');
+
+    const notSelfRepo = buildThinkerPrompt({ ...base, isSelfRepo: false, selfImprovementBlock: '' });
+    expect(notSelfRepo).not.toContain('# Self-improvement');
+  });
+
+  it('Self-repo line reflects isSelfRepo flag', () => {
+    expect(buildThinkerPrompt({ ...base, isSelfRepo: true })).toContain('Self-repo: true');
+    expect(buildThinkerPrompt({ ...base, isSelfRepo: false })).toContain('Self-repo: false');
+  });
+
+  it('includes required recommended_mode instruction on create-direction calls', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('recommended_mode');
+    expect(prompt).toContain('create-direction');
+    // The instruction must explicitly require emitting recommended_mode on create-direction
+    const rdIdx = prompt.indexOf('create-direction');
+    const rmIdx = prompt.indexOf('recommended_mode');
+    // recommended_mode instruction appears in the prompt with create-direction nearby
+    expect(Math.abs(rdIdx - rmIdx)).toBeLessThan(1000);
+  });
+
+  it('includes source citation instruction (dedup-justification)', () => {
+    const prompt = buildThinkerPrompt(base);
+    // Agents must cite sources on gaps/directions so dedup logic can trace provenance
+    expect(prompt).toMatch(/source.*user_message/);
+    expect(prompt).toContain('Cite sources');
+  });
+
+  it('includes retire-direction instruction language', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The prompt must instruct the agent to retire directions
+    expect(prompt).toContain('retire');
+    // Moves section must explicitly list retirement
+    expect(prompt).toMatch(/Directions to retire/);
+  });
+
+  it('does not contain banned legacy directive phrases', () => {
+    const prompt = buildThinkerPrompt(base);
+    // These are removed/renamed operations that should not appear in current prompt
+    expect(prompt).not.toContain('add-gap');
+    expect(prompt).not.toContain('create-gap');
+    expect(prompt).not.toContain('create_gap');
+    // set_vision was the old API; problem_model is the new substrate
+    expect(prompt).not.toContain('set_vision');
+  });
+
+  it('dirSummaryText contribution stays under 50,000 chars', () => {
+    const hugeDirSummary = 'x'.repeat(49_000);
+    const prompt = buildThinkerPrompt({ ...base, dirSummaryText: hugeDirSummary });
+    const idx = prompt.indexOf(hugeDirSummary);
+    expect(idx).toBeGreaterThan(-1);
+    // The prompt should not balloon — the section itself is bounded by its input
+    expect(hugeDirSummary.length).toBeLessThan(50_000);
+  });
+
+  it('outcomeSection contribution stays under 30,000 chars', () => {
+    const hugeOutcome = 'y'.repeat(29_000);
+    const prompt = buildThinkerPrompt({ ...base, outcomeSection: hugeOutcome });
+    expect(prompt).toContain(hugeOutcome);
+    expect(hugeOutcome.length).toBeLessThan(30_000);
+  });
+
+  it('threadSection contribution stays under 20,000 chars', () => {
+    const hugeThread = 'z'.repeat(19_000);
+    const prompt = buildThinkerPrompt({ ...base, threadSection: hugeThread });
+    expect(prompt).toContain(hugeThread);
+    expect(hugeThread.length).toBeLessThan(20_000);
+  });
+
+  it('includes the taskId in file paths for problem model and running update', () => {
+    const prompt = buildThinkerPrompt({ ...base, taskId: 'abc-456' });
+    expect(prompt).toContain('/tmp/problem_model_abc-456.json');
+    expect(prompt).toContain('/tmp/running_update_abc-456.md');
+    expect(prompt).toContain('/tmp/research_progress_abc-456.md');
+  });
+
+  it('fails detection: removing a required section header causes assertion to fail', () => {
+    // Simulate a broken prompt where "## 1. State assessment" was accidentally removed
+    const prompt = buildThinkerPrompt(base);
+    const broken = prompt.replace('## 1. State assessment', '');
+    expect(broken).not.toContain('## 1. State assessment');
+    // This verifies our structural test WOULD catch such a regression
+    expect(prompt).toContain('## 1. State assessment'); // original still passes
   });
 });

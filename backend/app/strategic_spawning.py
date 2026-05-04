@@ -333,6 +333,8 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # drift_signals is actionable mode-switch input (audit/pause triggers), so it
     # must survive budget pressure — promoted to medium alongside conversation_thread.
     "drift_signals":                   {"priority": "medium"},
+    # Lessons from retired directions — helps the agent avoid repeating patterns.
+    "past_retirement_critiques":       {"priority": "low"},
 }
 
 
@@ -815,6 +817,32 @@ def _build_previous_decision_outcomes(project: Project, cycle_history: list) -> 
     return result
 
 
+def _build_past_retirement_critiques(
+    cycle_history: list, n: int = 5
+) -> list[dict[str, Any]]:
+    """Collect the most recent N retirement critiques from cycle history.
+
+    Each element is a critique object persisted by ``set_retirement_critiques``
+    (fields: direction_id, what_it_addressed, pattern_that_produced_it, lesson)
+    or the sentinel ``{"no_eligible_retirements": true}``. Returns [] when no
+    cycle has recorded retirement_critiques yet.
+    """
+    results: list[dict[str, Any]] = []
+    for entry in cycle_history:
+        if entry.get("outcome") != "completed":
+            continue
+        critiques = entry.get("retirement_critiques")
+        if critiques is None:
+            continue
+        if isinstance(critiques, dict) and critiques.get("no_eligible_retirements"):
+            results.append({"no_eligible_retirements": True})
+        elif isinstance(critiques, list):
+            results.extend(critiques)
+        if len(results) >= n:
+            break
+    return results[:n]
+
+
 def _build_anomaly_summary(project: Project) -> dict[str, Any] | None:
     """Summarize high-occurrence persistent anomalies for the strategic agent.
 
@@ -1068,11 +1096,15 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         recent_history = history[-5:]
         recent_findings = []
         recent_failures = []
+        _agg_grade: dict = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for h in recent_history:
             for desc in (h.get("key_finding_descriptions") or []):
                 if desc and desc not in recent_findings:
                     recent_findings.append(desc)
             recent_failures.extend(fd for fd in (h.get("failed_task_details") or []) if fd)
+            for _gk, _gv in (h.get("grade_distribution") or {}).items():
+                if _gk in _agg_grade:
+                    _agg_grade[_gk] = _agg_grade.get(_gk, 0) + int(_gv or 0)
         total_prs = total_merged + total_rejected
         operator_rejection_rate = round(total_rejected / total_prs, 2) if total_prs > 0 else None
         stat_entry: dict = {
@@ -1110,6 +1142,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
             stat_entry["research_context"] = ctx[:3000]
         if recent_findings:
             stat_entry["recent_findings"] = recent_findings[:10]
+        if any(_agg_grade.values()):
+            stat_entry["recent_findings_grade_distribution"] = _agg_grade
         if recent_failures:
             stat_entry["recent_failures"] = recent_failures[:5]
         if d.get("system_id"):
@@ -1267,6 +1301,8 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         # don't carry empty fields through the strategic payload size cap.
         **({"system_maturity": system_maturity_payload} if system_maturity_payload else {}),
         **({"drift_signals": drift_summary} if drift_summary else {}),
+        **({"past_retirement_critiques": _past_critiques}
+           if (_past_critiques := _build_past_retirement_critiques(cycle_history)) else {}),
         "base_branch": "main",
         **({"model": review_model} if review_model else {}),
         **({"effort": review_effort} if review_effort else {}),

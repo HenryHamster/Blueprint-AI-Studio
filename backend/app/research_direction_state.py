@@ -199,10 +199,16 @@ async def apply_post_spawn_state(
             # the global total. Applies the same parent-direction fallback used
             # for filtered_findings bucketing.
             findings_produced_by_dir: dict = {}
+            grade_dist_by_dir: dict = {}
             for _f in findings:
                 _did = _f.get("direction_id") or current_direction_id
                 if _did:
                     findings_produced_by_dir[_did] = findings_produced_by_dir.get(_did, 0) + 1
+                    _g = _f.get("actionability_grade", "MEDIUM")
+                    if _g not in ("HIGH", "MEDIUM", "LOW"):
+                        _g = "MEDIUM"
+                    _gd = grade_dist_by_dir.setdefault(_did, {"HIGH": 0, "MEDIUM": 0, "LOW": 0})
+                    _gd[_g] = _gd.get(_g, 0) + 1
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -212,6 +218,7 @@ async def apply_post_spawn_state(
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]
                     descriptions = finding_descriptions_by_dir.get(did, [])[:3]
+                    _dir_grade_dist = grade_dist_by_dir.get(did)
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
@@ -221,6 +228,7 @@ async def apply_post_spawn_state(
                         "summary": "; ".join(t[:60] for t in titles) if titles else "no findings",
                         "finding_titles": titles,
                         "key_finding_descriptions": descriptions,
+                        **({"grade_distribution": _dir_grade_dist} if _dir_grade_dist else {}),
                         "filter_breakdown": {
                             "hash_dedup": hash_dedup_by_dir.get(did, 0),
                             "word_overlap_dedup": word_overlap_by_dir.get(did, 0),

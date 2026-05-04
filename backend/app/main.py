@@ -2434,6 +2434,49 @@ async def strategic_operation(
             "id": pending.id,
         })
 
+    elif payload.op == "set_retirement_critiques":
+        # Store structured critique(s) of retired directions so the completion
+        # handler can persist them in StrategicCycle metadata for future cycles.
+        # data must be a list of critique objects, or {"no_eligible_retirements": true}.
+        if isinstance(data, dict) and data.get("no_eligible_retirements"):
+            critiques: object = {"no_eligible_retirements": True}
+        elif isinstance(data, list):
+            cleaned = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                direction_id = str(item.get("direction_id", "")).strip()
+                what_addressed = str(item.get("what_it_addressed", "")).strip()
+                pattern = str(item.get("pattern_that_produced_it", "")).strip()
+                lesson = str(item.get("lesson", "")).strip()
+                if direction_id and what_addressed and pattern and lesson:
+                    cleaned.append({
+                        "direction_id": direction_id[:64],
+                        "what_it_addressed": what_addressed[:500],
+                        "pattern_that_produced_it": pattern[:500],
+                        "lesson": lesson[:300],
+                    })
+            critiques = cleaned
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail='set_retirement_critiques: data must be a list of critique objects or {"no_eligible_retirements": true}',
+            )
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_retirement_critiques": critiques,
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        n = len(critiques) if isinstance(critiques, list) else 0
+        logger.info(
+            f"[STRATEGIC API] Stored {n} retirement critique(s) for task {task.id}"
+        )
+        return _resp({"status": "ok", "op": "set_retirement_critiques", "count": n})
+
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 

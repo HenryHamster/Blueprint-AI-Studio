@@ -532,6 +532,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await session.commit()
         return
 
+    # Normalize actionability_grade: any missing or invalid value defaults to MEDIUM.
+    # The agent is prompted to emit a grade on every finding; this guard ensures
+    # downstream gates (low-actionability deferral) and admin surfaces always see
+    # a valid value rather than silently acting on None.
+    _valid_grades = {"HIGH", "MEDIUM", "LOW"}
+    for _f in findings:
+        _g = _f.get("actionability_grade")
+        if _g not in _valid_grades:
+            logger.warning(
+                "[RESEARCH] Finding '%s' has missing or invalid actionability_grade=%r; "
+                "defaulting to MEDIUM",
+                _f.get("title", "<untitled>"),
+                _g,
+            )
+            _f["actionability_grade"] = "MEDIUM"
+
     # Store all findings for admin visibility before filtering
     task.plan_output = findings
     session.add(task)
@@ -582,9 +598,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
         prior_actionable = _fresh_actionable
         # Decay: discard findings that have been deferred repeatedly for outcome-blind
-        # reasons (ultra_low_confidence / degradation_gate). Retrying them unchanged
-        # wastes a findings slot each cycle. batch_cap deferrals are pure capacity
-        # constraints and are not decayed.
+        # reasons (ultra_low_confidence / degradation_gate / low_actionability).
+        # Retrying them unchanged wastes a findings slot each cycle. batch_cap deferrals
+        # are pure capacity constraints and are not decayed.
         _decayed: list[dict] = []
         _kept: list[dict] = []
         for f in prior_actionable:
@@ -593,6 +609,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _reason == "ultra_low_confidence" and _count >= 4:
                 _decayed.append(f)
             elif _reason == "degradation_gate" and _count >= 3:
+                _decayed.append(f)
+            elif _reason == "low_actionability" and _count >= 3:
                 _decayed.append(f)
             else:
                 _kept.append(f)
@@ -788,7 +806,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session, task.project_id, _effective_cap,
     )
     _impl_spawned = 0
-    _deferred_findings: list[dict] = []
+    _degradation_gate_deferred: list[dict] = []
+    _low_actionability_deferred: list[dict] = []
     _low_conf_skipped_findings: list[dict] = []
     _scope_skip_counts: dict[str, int] = {}
 
@@ -955,7 +974,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # to avoid queuing tasks that will fail immediately or stall indefinitely.
         # Metadata findings (already handled above) and already_spawned bypass this check.
         if _pipeline_degraded and _impl_spawned >= _DEGRADED_SPAWN_CAP:
-            _deferred_findings.append(finding)
+            _degradation_gate_deferred.append(finding)
             continue
 
         # Apply scope calibration from direction's historical merge rates (skip if already calibrated)
@@ -1016,6 +1035,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             task_type = "plan"     # large scope needs decomposition
         else:
             task_type = "create"   # small/medium scope is single-PR work
+
+        # Low-actionability gate: defer findings with actionability_grade == LOW.
+        # These findings are under-specified and spawn implementers that cannot succeed.
+        # Defer with decay rule: discard after 3 consecutive deferrals (mirrors degradation_gate).
+        # Only apply to new findings; previously-deferred findings have their reason stamped
+        # from the prior cycle and are handled by the decay logic.
+        if finding.get("actionability_grade") == "LOW" and not finding.get("deferred_reason"):
+            _low_actionability_deferred.append(finding)
+            logger.info(
+                "[RESEARCH] Deferring low-actionability finding '%s' "
+                "(actionability_grade=LOW)",
+                title,
+            )
+            continue
 
         # Apply failure-feedback mitigation: downscope when rejection patterns are high
         # for this direction, and bias toward smaller scopes with proven success patterns.
@@ -1474,7 +1507,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return stamped
 
     _all_deferred = (
-        [_stamp_deferral(f, "degradation_gate") for f in _deferred_findings]
+        [_stamp_deferral(f, "low_actionability") for f in _low_actionability_deferred]
+        + [_stamp_deferral(f, "degradation_gate") for f in _degradation_gate_deferred]
         + [_stamp_deferral(f, "batch_cap") for f in _batch_cap_deferred]
         + [
             {**_stamp_deferral(f, "ultra_low_confidence"), "skip_reason": "ultra_low_confidence"}
@@ -1490,12 +1524,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
-        if _deferred_findings and _batch_cap_deferred:
-            _reason = f"degradation gate ({_health_reason}) + batch cap"
-        elif _deferred_findings:
-            _reason = f"degradation gate ({_health_reason})"
-        else:
-            _reason = "batch cap"
+        _deferral_reasons: list[str] = []
+        if _low_actionability_deferred:
+            _deferral_reasons.append(f"low_actionability ({len(_low_actionability_deferred)})")
+        if _degradation_gate_deferred:
+            _deferral_reasons.append(f"degradation gate ({_health_reason}; {len(_degradation_gate_deferred)})")
+        if _batch_cap_deferred:
+            _deferral_reasons.append(f"batch cap ({len(_batch_cap_deferred)})")
+        _reason = " + ".join(_deferral_reasons) if _deferral_reasons else "unknown"
         logger.warning(
             f"[RESEARCH] Deferred {len(_all_deferred)} findings ({_reason}); "
             f"spawning {_impl_spawned} tasks. "
@@ -1588,7 +1624,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _deferred_stats = {
             "total": _total_deferred,
             "by_reason": {
-                "degradation_gate": len(_deferred_findings),
+                "low_actionability": len(_low_actionability_deferred),
+                "degradation_gate": len(_degradation_gate_deferred),
                 "batch_cap": len(_batch_cap_deferred),
                 "ultra_low_confidence": len(_low_conf_skipped_findings),
             },
