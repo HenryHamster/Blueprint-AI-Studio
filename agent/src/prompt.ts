@@ -25,10 +25,8 @@ export {
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
   parseAnalysisPlanVerifyFiles,
-  getMandatoryChecks,
 } from './prompts/analysis.js';
 export {
-  buildSelfReviewPrompt,
   formatSelfReviewBlindSpots,
 } from './prompts/self-review.js';
 
@@ -766,19 +764,25 @@ if [ -s "$FIX_RESPONSES_FILE" ]; then
   fi
 fi
 
-# Optional enrichment: self-review outcome. Claude can write a structured
+# Soft-fallback self-review outcome. Claude should write a structured
 # self-review JSON to /tmp/self_review_<task_id>.json before calling
 # ./done; we forward it as self_review_outcome on the payload so
 # downstream consumers (review_pipeline retry context, admin_digest
-# catch-rate metrics, reaper retry pairing) get the signal.
+# catch-rate metrics, reaper retry pairing) get the signal. If missing
+# or invalid, we emit a minimal fallback envelope so the gap is visible
+# in metrics but the task doesn't block.
 SELF_REVIEW_FILE="/tmp/self_review_${cfg.taskId}.json"
 SELF_REVIEW_JSON=""
 if [ -s "$SELF_REVIEW_FILE" ]; then
   if jq empty "$SELF_REVIEW_FILE" >/dev/null 2>&1; then
     SELF_REVIEW_JSON=$(cat "$SELF_REVIEW_FILE")
   else
-    echo "[done] /tmp/self_review_${cfg.taskId}.json exists but is not valid JSON — skipping enrichment" >&2
+    echo "[done] /tmp/self_review_${cfg.taskId}.json exists but is not valid JSON — using fallback envelope" >&2
+    SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review JSON parsing failed"]}'
   fi
+else
+  echo "[done] /tmp/self_review_${cfg.taskId}.json not found — using minimal fallback envelope" >&2
+  SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review skipped — investigate"]}'
 fi
 
 # Optional enrichment: changed_files from git diff — review-pipeline scope
@@ -799,11 +803,11 @@ fi
 # reaper kicks in minutes later.
 PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
   --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
-  --argjson self_review "\${SELF_REVIEW_JSON:-null}" \\
+  --argjson self_review "$SELF_REVIEW_JSON" \\
   --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
   '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}
    + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
-   + (if $self_review then {self_review_outcome: $self_review} else {} end)
+   + {self_review_outcome: $self_review}
    + (if $changed_files then {changed_files: $changed_files} else {} end)')
 
 # Stale-result envelope: persist BEFORE attempting the POST so that if

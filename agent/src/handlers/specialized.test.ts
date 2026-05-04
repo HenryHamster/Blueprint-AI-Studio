@@ -57,7 +57,6 @@ vi.mock('../prompt.js', async (importOriginal) => {
     writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
     buildRetryContext: vi.fn().mockReturnValue(''),
-    buildSelfReviewPrompt: vi.fn().mockReturnValue(''),
   };
 });
 

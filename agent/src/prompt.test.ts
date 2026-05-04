@@ -49,12 +49,10 @@ import {
   extractTestConventions,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
-  buildSelfReviewPrompt,
   buildAnalysisPrompt,
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
   parseAnalysisPlanVerifyFiles,
-  getMandatoryChecks,
   extractModuleInterfaces,
   discoverAffectedConsumers,
   relativeTimeFromIso,
@@ -2326,413 +2324,6 @@ describe('buildRetryContext', () => {
   });
 });
 
-describe('buildSelfReviewPrompt', () => {
-  const baseOpts = {
-    diff: 'diff --git a/foo.ts b/foo.ts',
-    reviewPlaybook: {},
-    claudeMd: '',
-  };
-
-  it('includes default build commands when buildConfig is absent', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    expect(result).toContain('## Build Verification');
-    expect(result).toContain('npm run build');
-    expect(result).toContain('tsc --noEmit');
-    expect(result).toContain('py_compile');
-  });
-
-  it('includes default build commands when buildConfig has empty directories', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, buildConfig: { directories: [] } });
-    expect(result).toContain('## Build Verification');
-    expect(result).toContain('npm run build');
-  });
-
-  it('uses buildConfig commands when directories have build_cmd', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      buildConfig: {
-        directories: [{ path: 'frontend', type: 'node', build_cmd: 'npm run build', lint_cmd: '' }],
-      },
-    });
-    expect(result).toContain('## Build Verification');
-    expect(result).toContain('`npm run build`');
-    expect(result).toContain('frontend/');
-    // should NOT contain default fallback text
-    expect(result).not.toContain('admin-ui');
-  });
-
-  it('uses lint_cmd when build_cmd is absent', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      buildConfig: {
-        directories: [{ path: 'backend', type: 'python', build_cmd: '', lint_cmd: 'flake8 .' }],
-      },
-    });
-    expect(result).toContain('`flake8 .`');
-  });
-
-  it('omits build verification section when all directories lack both build_cmd and lint_cmd', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      buildConfig: {
-        directories: [{ path: 'docs', type: 'node', build_cmd: '', lint_cmd: '' }],
-      },
-    });
-    expect(result).not.toContain('## Build Verification');
-  });
-
-  it('positions Build Verification before the Self-Review Instructions checklist', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    const buildPos = result.indexOf('## Build Verification');
-    const checklistPos = result.indexOf('## Self-Review Instructions');
-    expect(buildPos).toBeGreaterThan(-1);
-    expect(buildPos).toBeLessThan(checklistPos);
-  });
-
-  it('instructs agent to run commands before the checklist', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    expect(result).toContain('fix the errors before proceeding with the review checklist');
-  });
-
-  it('renders project-specific review patterns when reviewIssueDistribution is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      reviewIssueDistribution: { 'test-coverage': 0.35, 'type-safety': 0.25, 'error-handling': 0.20 },
-    });
-    expect(result).toContain('## Project-Specific Review Patterns');
-    expect(result).toContain('test-coverage (35%)');
-    expect(result).toContain('type-safety (25%)');
-    expect(result).toContain('error-handling (20%)');
-    expect(result).toContain('Prioritize these checks');
-  });
-
-  it('sorts review issue distribution by frequency descending', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      reviewIssueDistribution: { 'error-handling': 0.10, 'test-coverage': 0.40, 'type-safety': 0.20 },
-    });
-    const patternsSection = result.slice(result.indexOf('## Project-Specific Review Patterns'));
-    const testCoveragePos = patternsSection.indexOf('test-coverage');
-    const typeSafetyPos = patternsSection.indexOf('type-safety');
-    const errorHandlingPos = patternsSection.indexOf('error-handling');
-    expect(testCoveragePos).toBeLessThan(typeSafetyPos);
-    expect(typeSafetyPos).toBeLessThan(errorHandlingPos);
-  });
-
-  it('omits project-specific review patterns when reviewIssueDistribution is undefined', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    expect(result).not.toContain('## Project-Specific Review Patterns');
-  });
-
-  it('omits project-specific review patterns when reviewIssueDistribution is empty', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, reviewIssueDistribution: {} });
-    expect(result).not.toContain('## Project-Specific Review Patterns');
-  });
-
-  it('renders first-attempt rejection priorities section when firstAttemptByCategory is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      firstAttemptByCategory: { 'test-coverage': 0.45, 'type-safety': 0.30, 'error-handling': 0.15 },
-    });
-    expect(result).toContain('## First-Attempt Rejection Priorities');
-    expect(result).toContain('test-coverage: 45% of first-attempt rejections');
-    expect(result).toContain('type-safety: 30% of first-attempt rejections');
-    expect(result).toContain('error-handling: 15% of first-attempt rejections');
-  });
-
-  it('sorts first-attempt rejection priorities by rate descending', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      firstAttemptByCategory: { 'error-handling': 0.10, 'test-coverage': 0.45, 'type-safety': 0.25 },
-    });
-    const section = result.slice(result.indexOf('## First-Attempt Rejection Priorities'));
-    const testCoveragePos = section.indexOf('test-coverage');
-    const typeSafetyPos = section.indexOf('type-safety');
-    const errorHandlingPos = section.indexOf('error-handling');
-    expect(testCoveragePos).toBeLessThan(typeSafetyPos);
-    expect(typeSafetyPos).toBeLessThan(errorHandlingPos);
-  });
-
-  it('marks persistent issues with [PERSISTENT] tag', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      firstAttemptByCategory: { 'test-coverage': 0.45, 'type-safety': 0.20 },
-      persistentReviewIssues: ['test-coverage'],
-    });
-    expect(result).toContain('test-coverage: 45% of first-attempt rejections [PERSISTENT]');
-    expect(result).not.toContain('type-safety: 20% of first-attempt rejections [PERSISTENT]');
-  });
-
-  it('omits [PERSISTENT] tag when persistentReviewIssues is not provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      firstAttemptByCategory: { 'test-coverage': 0.45 },
-    });
-    expect(result).not.toContain('[PERSISTENT]');
-  });
-
-  it('renders direction-specific first-attempt rejections when directionFirstAttemptFeedback is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      directionFirstAttemptFeedback: { 'test-coverage': 8, 'error-handling': 3 },
-    });
-    expect(result).toContain('## Direction-Specific First-Attempt Rejections');
-    expect(result).toContain('test-coverage: 8 rejections');
-    expect(result).toContain('error-handling: 3 rejections');
-    expect(result).toContain('pay extra attention to test-coverage before submitting');
-  });
-
-  it('omits direction-specific first-attempt rejections when directionFirstAttemptFeedback is empty', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, directionFirstAttemptFeedback: {} });
-    expect(result).not.toContain('## Direction-Specific First-Attempt Rejections');
-  });
-
-  it('omits first-attempt rejection priorities when firstAttemptByCategory is undefined', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    expect(result).not.toContain('## First-Attempt Rejection Priorities');
-  });
-
-  it('omits first-attempt rejection priorities when firstAttemptByCategory is empty', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, firstAttemptByCategory: {} });
-    expect(result).not.toContain('## First-Attempt Rejection Priorities');
-  });
-
-  it('positions first-attempt rejection priorities after project-specific review patterns', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      reviewIssueDistribution: { 'test-coverage': 0.35 },
-      firstAttemptByCategory: { 'test-coverage': 0.45 },
-    });
-    const issueDistPos = result.indexOf('## Project-Specific Review Patterns');
-    const firstAttemptPos = result.indexOf('## First-Attempt Rejection Priorities');
-    expect(issueDistPos).toBeGreaterThan(-1);
-    expect(firstAttemptPos).toBeGreaterThan(issueDistPos);
-  });
-
-  it('renders specific patterns section when topFirstReviewIssues is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      topFirstReviewIssues: [
-        { description: 'missing return type on exported function', count: 3, category: 'type_safety' },
-        { description: 'untested error path', count: 2, category: 'test_coverage' },
-      ],
-    });
-    expect(result).toContain('## Specific Patterns That Cause First-Review Rejections');
-    expect(result).toContain('"missing return type on exported function" (seen 3x, category: type_safety)');
-    expect(result).toContain('"untested error path" (seen 2x, category: test_coverage)');
-  });
-
-  it('caps topFirstReviewIssues at 5 entries', () => {
-    const issues = Array.from({ length: 8 }, (_, i) => ({
-      description: `issue-${i}`,
-      count: 8 - i,
-      category: 'other',
-    }));
-    const result = buildSelfReviewPrompt({ ...baseOpts, topFirstReviewIssues: issues });
-    expect(result).toContain('issue-0');
-    expect(result).toContain('issue-4');
-    expect(result).not.toContain('issue-5');
-  });
-
-  it('omits specific patterns section when topFirstReviewIssues is undefined or empty', () => {
-    expect(buildSelfReviewPrompt(baseOpts)).not.toContain('## Specific Patterns That Cause First-Review Rejections');
-    expect(buildSelfReviewPrompt({ ...baseOpts, topFirstReviewIssues: [] }))
-      .not.toContain('## Specific Patterns That Cause First-Review Rejections');
-  });
-
-  it('renders File-Specific Review History when moduleFeedbackWarnings is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      moduleFeedbackWarnings: [
-        { file: 'backend/app/orchestrator.py', top_categories: { test_coverage: 0.45, error_handling: 0.30 }, sample_size: 20 },
-      ],
-    });
-    expect(result).toContain('## File-Specific Review History');
-    expect(result).toContain('`backend/app/orchestrator.py`');
-    expect(result).toContain('45% test_coverage');
-    expect(result).toContain('30% error_handling');
-    expect(result).toContain('from 20 past issues');
-  });
-
-  it('omits File-Specific Review History when moduleFeedbackWarnings is undefined or empty', () => {
-    expect(buildSelfReviewPrompt(baseOpts)).not.toContain('## File-Specific Review History');
-    expect(buildSelfReviewPrompt({ ...baseOpts, moduleFeedbackWarnings: [] }))
-      .not.toContain('## File-Specific Review History');
-  });
-
-  it('renders Plan Completion Status section with counts and missing files when planCompletion is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      planCompletion: {
-        plannedProductionCount: 4,
-        changedPlannedProductionCount: 3,
-        plannedTestCount: 2,
-        changedPlannedTestCount: 1,
-        missingProduction: ['backend/app/foo.py'],
-        missingTest: ['testing/test_foo.py'],
-      },
-    });
-    expect(result).toContain('## Plan Completion Status');
-    expect(result).toContain('3/4 planned production files changed');
-    expect(result).toContain('1/2 planned test files created or modified');
-    expect(result).toContain('- backend/app/foo.py (production)');
-    expect(result).toContain('- testing/test_foo.py (test)');
-  });
-
-  it('omits Missing block in Plan Completion Status when nothing is missing', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      planCompletion: {
-        plannedProductionCount: 2,
-        changedPlannedProductionCount: 2,
-        plannedTestCount: 1,
-        changedPlannedTestCount: 1,
-        missingProduction: [],
-        missingTest: [],
-      },
-    });
-    expect(result).toContain('## Plan Completion Status');
-    expect(result).toContain('2/2 planned production files changed');
-    expect(result).not.toContain('\nMissing:\n');
-  });
-
-  it('omits Plan Completion Status when planCompletion has zero planned files', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      planCompletion: {
-        plannedProductionCount: 0,
-        changedPlannedProductionCount: 0,
-        plannedTestCount: 0,
-        changedPlannedTestCount: 0,
-        missingProduction: [],
-        missingTest: [],
-      },
-    });
-    expect(result).not.toContain('## Plan Completion Status');
-  });
-
-  it('omits Plan Completion Status when planCompletion is undefined', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    expect(result).not.toContain('## Plan Completion Status');
-  });
-
-  it('plan_alignment checklist item is bidirectional when analysisPlan is provided', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      taskScope: 'medium',
-      analysisPlan: '**Files to change**\n- agent/src/foo.ts\n',
-    });
-    expect(result).toContain('Plan alignment');
-    expect(result).toContain('Tri-directional check');
-    expect(result).toContain('Tests to add or update');
-    expect(result).toContain('Plan Completion Status');
-    expect(result).toContain('Callers to verify after implementation');
-    expect(result).toContain('Callers verification');
-  });
-
-  it('JSON example blocks are internally consistent (verdict matches check_results, issues_found matches failed-check count)', () => {
-    const result = buildSelfReviewPrompt(baseOpts);
-    const jsonBlocks = [...result.matchAll(/```json\s*\n([\s\S]*?)\n```/g)].map(m => m[1]);
-    expect(jsonBlocks.length).toBeGreaterThan(0);
-    for (const block of jsonBlocks) {
-      const parsed = JSON.parse(block) as {
-        verdict: string;
-        check_results: Record<string, { passed: boolean; issue?: string }>;
-        issues_found: number;
-      };
-      const failedCount = Object.values(parsed.check_results).filter(r => !r.passed).length;
-      if (failedCount > 0) {
-        expect(parsed.verdict).toBe('FAIL');
-        expect(parsed.issues_found).toBeGreaterThanOrEqual(1);
-      } else {
-        expect(parsed.verdict).toBe('PASS');
-        expect(parsed.issues_found).toBe(0);
-      }
-    }
-  });
-});
-
-// ── buildSelfReviewChecklist (via buildSelfReviewPrompt) ─────────────────────
-describe('buildSelfReviewChecklist', () => {
-  const baseOpts = {
-    diff: 'diff --git a/foo.ts b/foo.ts',
-    reviewPlaybook: {},
-    claudeMd: '',
-  };
-
-  it('taskScope=small produces a 6-item checklist with severity guide', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'small' });
-    expect(result).toContain('Correctness');
-    expect(result).toContain('Missing test coverage');
-    expect(result).toContain('Error handling');
-    expect(result).toContain('Security quick-check');
-    expect(result).toContain('Import and type verification');
-    expect(result).toContain('Scope violations');
-    expect(result).toContain('CRITICAL');
-    expect(result).toContain('MAJOR');
-    expect(result).not.toContain('Type safety violations');
-    expect(result).not.toContain('Pattern violations');
-  });
-
-  it('taskScope=large produces a 9-item comprehensive checklist', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'large' });
-    expect(result).toContain('Missing test coverage');
-    expect(result).toContain('Type safety violations');
-    expect(result).toContain('Scope violations');
-    expect(result).toContain('Security issues');
-    expect(result).toContain('Pattern violations');
-    expect(result).toContain('Cross-file consistency');
-    expect(result).toContain('Backwards compatibility');
-    expect(result).toContain('Data model safety');
-    expect(result).toContain('Import/dependency verification');
-  });
-
-  it('taskScope=undefined produces the standard 8-item checklist', () => {
-    const result = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
-    expect(result).toContain('Missing test coverage');
-    expect(result).toContain('Type safety violations');
-    expect(result).toContain('Scope violations');
-    expect(result).toContain('Security issues');
-    expect(result).toContain('Pattern violations');
-    expect(result).toContain('Cross-file consistency');
-    expect(result).toContain('Backwards compatibility');
-    expect(result).toContain('Import/dependency verification');
-    expect(result).not.toContain('Data model safety');
-    expect(result).not.toContain('Correctness');
-  });
-
-  it('taskScope=medium (explicit) produces the same 8-item checklist as undefined', () => {
-    const resultUndefined = buildSelfReviewPrompt({ ...baseOpts, taskScope: undefined });
-    const resultMedium = buildSelfReviewPrompt({ ...baseOpts, taskScope: 'medium' });
-    expect(resultMedium).toContain('Missing test coverage');
-    expect(resultMedium).toContain('Type safety violations');
-    expect(resultMedium).toContain('Scope violations');
-    expect(resultMedium).toContain('Security issues');
-    expect(resultMedium).toContain('Pattern violations');
-    expect(resultMedium).toContain('Cross-file consistency');
-    expect(resultMedium).toContain('Backwards compatibility');
-    expect(resultMedium).toContain('Import/dependency verification');
-    expect(resultMedium).not.toContain('Correctness');
-    // medium and undefined produce identical checklist output
-    expect(resultMedium).toBe(resultUndefined);
-  });
-
-  it('medium with analysisPlan classifies unplanned files; only scope creep and missing planned files force FAIL', () => {
-    const result = buildSelfReviewPrompt({
-      ...baseOpts,
-      taskScope: 'medium',
-      analysisPlan: 'Files to change:\n- foo.ts',
-    });
-    expect(result).toContain('Plan alignment');
-    expect(result).toContain('caller impact');
-    expect(result).toContain('discovered dependency');
-    expect(result).toContain('scope creep');
-    expect(result).toContain('MUST result in a FAIL verdict');
-    // Unplanned-but-justified files are no longer an unconditional FAIL
-    expect(result).not.toMatch(/Justification is NOT acceptable/);
-  });
-});
-
 // ── extractModuleInterfaces ───────────────────────────────────────────────────
 describe('extractModuleInterfaces', () => {
   beforeEach(() => {
@@ -3388,79 +2979,6 @@ describe('parseAnalysisPlanTestFiles', () => {
   });
 });
 
-// ── getMandatoryChecks ───────────────────────────────────────────────────────
-describe('getMandatoryChecks', () => {
-  it('returns correctness + test-coverage + import-verification for small scope', () => {
-    expect(getMandatoryChecks('small')).toEqual([
-      'correctness',
-      'test-coverage',
-      'import-verification',
-    ]);
-  });
-
-  it('ignores hasAnalysisPlan for small scope', () => {
-    expect(getMandatoryChecks('small', true)).toEqual([
-      'correctness',
-      'test-coverage',
-      'import-verification',
-    ]);
-  });
-
-  it('returns the full 9-item list for large scope', () => {
-    expect(getMandatoryChecks('large')).toEqual([
-      'test-coverage',
-      'type-safety',
-      'scope-violations',
-      'security',
-      'pattern-violations',
-      'cross-file-consistency',
-      'backwards-compatibility',
-      'data-model-safety',
-      'import-verification',
-    ]);
-  });
-
-  it('ignores hasAnalysisPlan for large scope', () => {
-    expect(getMandatoryChecks('large', true)).toEqual(getMandatoryChecks('large'));
-  });
-
-  it('returns the 8-item base list for medium scope without analysis plan', () => {
-    expect(getMandatoryChecks('medium')).toEqual([
-      'test-coverage',
-      'type-safety',
-      'scope-violations',
-      'security',
-      'pattern-violations',
-      'cross-file-consistency',
-      'backwards-compatibility',
-      'import-verification',
-    ]);
-  });
-
-  it('prepends plan-alignment for medium scope with analysis plan', () => {
-    expect(getMandatoryChecks('medium', true)).toEqual([
-      'plan-alignment',
-      'test-coverage',
-      'type-safety',
-      'scope-violations',
-      'security',
-      'pattern-violations',
-      'cross-file-consistency',
-      'backwards-compatibility',
-      'import-verification',
-    ]);
-  });
-
-  it('treats undefined scope like medium', () => {
-    expect(getMandatoryChecks(undefined)).toEqual(getMandatoryChecks('medium'));
-    expect(getMandatoryChecks(undefined, true)).toEqual(getMandatoryChecks('medium', true));
-  });
-
-  it('treats unknown scope like medium', () => {
-    expect(getMandatoryChecks('xl')).toEqual(getMandatoryChecks('medium'));
-  });
-});
-
 describe('formatSelfReviewBlindSpots', () => {
   it('returns empty string when self-review outcome is undefined', () => {
     expect(formatSelfReviewBlindSpots(undefined, ['a.ts'])).toBe('');
@@ -3500,5 +3018,44 @@ describe('formatSelfReviewBlindSpots', () => {
     const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts']);
     expect(out).toContain('Files the self-review verified');
     expect(out).not.toContain('Files NOT verified by self-review');
+  });
+});
+
+describe('writeCodeChangeHelpers — self-review fallback', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('generates ./done script with soft-fallback self-review handling', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // Verify that the script checks for self-review file (with interpolated task ID)
+    expect(doneScript).toContain('SELF_REVIEW_FILE="/tmp/self_review_test-task-123.json"');
+
+    // Verify that it uses fallback when file is missing
+    expect(doneScript).toContain('self-review skipped — investigate');
+
+    // Verify that it uses fallback when file is invalid JSON
+    expect(doneScript).toContain('self-review JSON parsing failed');
+
+    // Verify that it always includes self_review_outcome in payload
+    expect(doneScript).toContain('{self_review_outcome: $self_review}');
   });
 });
