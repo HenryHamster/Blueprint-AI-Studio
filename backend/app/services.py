@@ -1701,13 +1701,50 @@ async def _sweep_post_commit_pending():
     MAX_ATTEMPTS = 5
     try:
         async with AsyncSessionLocal() as session:
+            # Status filter: COMPLETED / FAILED only. Tasks that an admin
+            # explicitly CANCELLED must NOT have their post-commit retried —
+            # a successful retry of `_handle_plan_completion` (or analogous
+            # handlers) would unconditionally flip status back to EVALUATING
+            # and spawn children, silently overriding the admin's cancel
+            # decision (incident 2026-05-04: cancelled plan b9456e05 was
+            # zombied 2 hours later — sweep retried, status flipped
+            # CANCELLED → EVALUATING, child b403b76a spawned).
+            #
+            # CANCELLED tasks with post_commit_pending=True are cleaned up
+            # below as a separate sub-query so the flag doesn't keep
+            # reappearing in the sweep candidate set.
             tasks = (await session.execute(
                 select(Task).where(
                     Task.post_commit_pending.is_(True),
-                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
                     Task.archived.is_(False),
                 ).limit(50)
             )).scalars().all()
+
+            # Clear the pending flag on admin-cancelled tasks — the admin
+            # cancel is sticky; we don't retry post-commit and we don't
+            # want this row to clutter future sweeps.
+            cancelled_pending = (await session.execute(
+                select(Task).where(
+                    Task.post_commit_pending.is_(True),
+                    Task.status == TaskStatus.CANCELLED,
+                    Task.archived.is_(False),
+                ).limit(50)
+            )).scalars().all()
+            for task in cancelled_pending:
+                logger.info(
+                    f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} is CANCELLED — "
+                    f"clearing post_commit_pending without retry"
+                )
+                from sqlalchemy.orm.attributes import flag_modified
+                new_ctx = dict(task.context or {})
+                new_ctx.pop("_post_commit_pending_meta", None)
+                task.context = new_ctx
+                task.post_commit_pending = False
+                flag_modified(task, "context")
+                session.add(task)
+            if cancelled_pending:
+                await session.commit()
 
             if not tasks:
                 return

@@ -32,6 +32,7 @@ from app.services import (
     _persist_zone_health,
     _recover_orphaned_tasks,
     _run_auto_archive_cycle,
+    _sweep_post_commit_pending,
     gcp_cleanup_service,
 )
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
@@ -1154,3 +1155,107 @@ async def test_cleanup_old_images_collects_per_image_failures(mocker):
     assert len(result["failed"]) == 1
     assert result["failed"][0]["name"] == "img-2"
     assert "permissionDenied" in result["failed"][0]["error"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _sweep_post_commit_pending — admin-cancel must be sticky (regression 2026-05-04)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_skips_cancelled_tasks_and_clears_pending(svc_db, mocker):
+    """Regression for incident 2026-05-04: an admin-cancelled plan task
+    (b9456e05) was zombied 2 hours later when the post-commit sweep retried
+    `_handle_plan_completion`. The handler unconditionally set status back to
+    EVALUATING and spawned a child (b403b76a), silently overriding the
+    admin's cancel decision.
+
+    The sweep must NOT call `_process_post_commit` on CANCELLED tasks.
+    Instead it should clear `post_commit_pending` so the row stops appearing
+    in future sweeps."""
+    project = await _make_project(svc_db)
+    cancelled_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.CANCELLED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": "irrelevant", "status": "COMPLETED", "logs": "{}",
+                },
+                "attempts": 1,
+            }
+        },
+    )
+    svc_db.add(cancelled_task)
+    await svc_db.commit()
+    await svc_db.refresh(cancelled_task)
+
+    # If `_process_post_commit` is called, the test fails — it should never run.
+    mock_process = AsyncMock(side_effect=AssertionError(
+        "_process_post_commit must not run on CANCELLED tasks"
+    ))
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _sweep_post_commit_pending()
+
+    await svc_db.refresh(cancelled_task)
+    assert cancelled_task.status == TaskStatus.CANCELLED, "status must stay CANCELLED"
+    assert cancelled_task.post_commit_pending is False, (
+        "pending flag must be cleared so the row stops appearing in sweeps"
+    )
+    assert "_post_commit_pending_meta" not in (cancelled_task.context or {}), (
+        "pending meta must be cleared alongside the flag"
+    )
+    mock_process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mocker):
+    """The sweep continues to retry COMPLETED and FAILED tasks — only
+    CANCELLED is special-cased."""
+    import uuid as _uuid
+    project = await _make_project(svc_db)
+    completed_id = _uuid.uuid4()
+    failed_id = _uuid.uuid4()
+    completed_task = Task(
+        id=completed_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={"_post_commit_pending_meta": {
+            "at": _naive_utcnow().isoformat(),
+            "reason": "post_commit_error",
+            "payload": {"task_id": str(completed_id), "status": "COMPLETED", "logs": "{}"},
+            "attempts": 1,
+        }},
+    )
+    failed_task = Task(
+        id=failed_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={"_post_commit_pending_meta": {
+            "at": _naive_utcnow().isoformat(),
+            "reason": "post_commit_error",
+            "payload": {"task_id": str(failed_id), "status": "FAILED", "logs": "{}"},
+            "attempts": 1,
+        }},
+    )
+    svc_db.add_all([completed_task, failed_task])
+    await svc_db.commit()
+
+    mock_process = AsyncMock()  # succeed silently
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _sweep_post_commit_pending()
+
+    # Both retried.
+    assert mock_process.call_count == 2
