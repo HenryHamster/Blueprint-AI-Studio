@@ -617,7 +617,9 @@ describe('lintFixLoop early exit on identical errors', () => {
     });
 
     const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result).toBe(false);
+    expect(result.passed).toBe(false);
+    expect(result.exitReason).toBe('early_unchanged');
+    expect(result.lastErrorTail).toContain('eslint');
     const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
     expect(npmCalls).toBeLessThanOrEqual(2);
   });

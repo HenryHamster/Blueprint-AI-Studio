@@ -18,7 +18,7 @@ import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
   STALE_RESULT_RETRY_BASE_MS, STALE_RESULT_RETRY_MAX_MS,
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
-  PROCESS_KILL_GRACE_MS, LOG_TAIL_BYTES,
+  PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -2860,6 +2860,13 @@ echo ""
     const timeoutMs = runCommand.timeoutMs;
     const timeoutMinutes = timeoutMs / 60000;
     let forceKillTimer: NodeJS.Timeout | null = null;
+    // Post-result grace timer: armed when claude-code emits its structured
+    // `result` event. If the subprocess doesn't exit within
+    // CLAUDE_RESULT_GRACE_MS, send SIGTERM so the wrapper can proceed to
+    // commit/push/PR rather than waiting the full wall-clock timeout.
+    // This is NOT a timeout (flags.timedOut stays false) — we got a clean
+    // result event, the model finished, the work product is in the diff.
+    let resultGraceTimer: NodeJS.Timeout | null = null;
     const originalPid = child.pid;
     const processGroupStillOwned = () =>
       originalPid !== undefined
@@ -2916,6 +2923,28 @@ echo ""
           } else if (objType === 'result') {
             lastResultText = (obj as { result?: string }).result ?? '';
             sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
+            // Arm the post-result grace timer so a hung subprocess doesn't
+            // burn the wall-clock budget. Only set it once — extra result
+            // events (defensive — Claude Code shouldn't emit multiple) don't
+            // reset the timer.
+            if (resultGraceTimer === null && processGroupStillOwned()) {
+              resultGraceTimer = setTimeout(() => {
+                if (!processGroupStillOwned()) return;
+                sendLog(
+                  ws,
+                  `\n[runtime] result event received >${CLAUDE_RESULT_GRACE_MS / 1000}s ago without process exit — `
+                    + `sending SIGTERM so wrapper can proceed to commit/push.\n`,
+                );
+                const pid = originalPid;
+                if (pid !== undefined) {
+                  try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+                  forceKillTimer = setTimeout(() => {
+                    if (!processGroupStillOwned()) return;
+                    try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+                  }, PROCESS_KILL_GRACE_MS);
+                }
+              }, CLAUDE_RESULT_GRACE_MS);
+            }
           } else if (objType === 'error') {
             // Surface explicit error messages from the runner so failure
             // classification & status reporting see them.
@@ -2955,6 +2984,7 @@ echo ""
     child.on('error', (err) => {
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (resultGraceTimer) clearTimeout(resultGraceTimer);
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
@@ -2965,6 +2995,7 @@ echo ""
       const closeSignal = signal ?? null;
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (resultGraceTimer) clearTimeout(resultGraceTimer);
       // Phase 1: unregister now that we know the child exited; reset routine
       // doesn't need to chase a dead PID.
       if (typeof originalPid === 'number') {

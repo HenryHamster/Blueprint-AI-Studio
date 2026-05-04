@@ -20,6 +20,18 @@ export const STDERR_TAIL_BYTES = 50_000;
 // Subprocess lifecycle: grace window between SIGTERM and SIGKILL escalation.
 export const PROCESS_KILL_GRACE_MS = 5_000;
 
+// After Claude Code emits the structured `result` event (model finished its
+// turn), the subprocess should exit promptly. If it doesn't, send SIGTERM after
+// this grace window so the agent wrapper can proceed to commit/push/PR rather
+// than burning the full CLAUDE_TIMEOUT_MS wall-clock budget.
+//
+// Observed 2026-05-04 on task 4ea9ff49: claude-code emitted result + completion
+// summary, then hung. Wrapper waited 35 min (medium effort wall clock), threw
+// ClaudeTimeoutError, task FAILED + requeued — work discarded with the VM
+// because the post-Claude commit/push phase never ran. With this grace window
+// the wrapper would have killed at +30s and proceeded to commit the diff.
+export const CLAUDE_RESULT_GRACE_MS = 30_000;
+
 // Log/error message tail length used in status reports.
 export const LOG_TAIL_BYTES = 5_000;
 
