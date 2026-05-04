@@ -25,10 +25,8 @@ export {
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
   parseAnalysisPlanVerifyFiles,
-  getMandatoryChecks,
 } from './prompts/analysis.js';
 export {
-  buildSelfReviewPrompt,
   formatSelfReviewBlindSpots,
 } from './prompts/self-review.js';
 
