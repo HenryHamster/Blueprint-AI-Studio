@@ -1428,6 +1428,37 @@ async def update_agent_status(
                 logger.warning(f"[AGENT_STATUS] PR-artifact lookup failed for task {task.id}: {_pr_check_err}")
                 _has_pr_artifact, _pr_num = False, None
             if _has_pr_artifact and _pr_num:
+                # ── RELEASE FOR UPDATE BEFORE SLOW GITHUB I/O ──
+                # The handler holds the FOR UPDATE on this task row from
+                # line ~619 (the early `select(...).with_for_update`).
+                # `get_pull_request` below makes a synchronous GitHub API
+                # call that can take 5-30s normally and 60-120s during
+                # rate-limit / Cloud Run cutover. Holding the lock through
+                # that window:
+                #   - blocks heartbeats on the same task (they fast-fail with
+                #     409 via skip_locked, but rapid 409 churn looks like a
+                #     stuck VM to the reaper)
+                #   - hits the 60s `idle_in_transaction_session_timeout` set
+                #     in database.py, which kills the asyncpg connection
+                #     mid-transaction and surfaces downstream as
+                #     `InterfaceError("connection is closed")` +
+                #     `PendingRollbackError` cascades on subsequent
+                #     requests pulling that connection back out of the pool.
+                # Production incident 2026-05-04 19:45:29 UTC: 70s
+                # server-side latency on /api/agent/status during cutover,
+                # caused by exactly this held-lock-around-GH path.
+                # Pre-commit a tentative EVALUATING state so the lock
+                # releases cleanly, then make the GitHub call with no row
+                # lock held, then re-acquire FOR UPDATE on a fresh select
+                # to finalize the status. flag_modified is imported at
+                # module-level (line 20).
+                task.context = {**(task.context or {}), "_pr_state_check_pending": True}
+                flag_modified(task, "context")
+                session.add(task)
+                if await _recover_poisoned_session(session, _task_id_str):
+                    session.add(task)
+                await session.commit()
+
                 _gh_pr_state: str | None = None
                 _gh_pr_merged: bool = False
                 try:
@@ -1445,6 +1476,35 @@ async def update_agent_status(
                         f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open"
                     )
                     _gh_pr_state = "open"
+
+                # Re-acquire FOR UPDATE on the same row for the final state
+                # transition. populate_existing=True forces SQLAlchemy to
+                # refresh the in-memory instance from the SELECT result
+                # rather than returning the cached object (which would still
+                # show the pre-commit state).
+                relock_stmt = (
+                    select(Task)
+                    .where(Task.id == task.id)
+                    .with_for_update(skip_locked=True)
+                    .execution_options(populate_existing=True)
+                )
+                fresh = (await session.execute(relock_stmt)).scalars().first()
+                if fresh is None:
+                    # Row currently locked by another writer (rare — most
+                    # likely a concurrent reaper sweep finalizing this task).
+                    # The tentative commit above persisted the
+                    # `_pr_state_check_pending` flag so the reaper /
+                    # post-commit pending machinery can resume the handoff.
+                    logger.info(
+                        f"[AGENT_STATUS] Task {task.id} re-lock skipped (locked elsewhere) — "
+                        f"tentative state persisted, returning"
+                    )
+                    return {"status": "accepted_pr_check_deferred"}
+                task = fresh
+                _ctx = dict(task.context or {})
+                _ctx.pop("_pr_state_check_pending", None)
+                task.context = _ctx
+                flag_modified(task, "context")
                 if _gh_pr_state == "closed" and _gh_pr_merged:
                     logger.info(
                         f"[AGENT_STATUS] Task {task.id} reported FAILED but PR #{_pr_num} was merged "

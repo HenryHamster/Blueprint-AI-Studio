@@ -1,13 +1,61 @@
+import logging
 import os
 from typing import cast
+from sqlalchemy import event
+from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncEngine, AsyncSession
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+logger = logging.getLogger(__name__)
+
+
+def _install_disconnect_invalidation(engine: AsyncEngine) -> None:
+    """Eject pool connections after a disconnection-class error.
+
+    `pool_pre_ping=True` only catches dead TCP at checkout. It does NOT catch
+    a connection that fails mid-request because of a Cloud Run cutover, Cloud
+    SQL failover, or asyncpg `InterfaceError("connection is closed")`. When
+    that happens, the bad connection goes back to the pool, the next request
+    pulls it out, and the SQLAlchemy session ends up in pending-rollback
+    state — which surfaces downstream as `PendingRollbackError` on commit.
+
+    Production incident 2026-05-04 19:46:43 UTC: Cloud Run rollout cutover
+    triggered ~12 PendingRollbackError + InterfaceError cascades on the
+    `/api/agent/status` and `/api/agent/heartbeat` endpoints. Adding a
+    `handle_error` listener that calls `connection.invalidate()` on
+    disconnection-class errors is the standard SQLAlchemy pattern for
+    cutover-safe pools — it ejects the bad connection from the pool entirely
+    so subsequent checkouts get a fresh one.
+    """
+
+    @event.listens_for(engine.sync_engine, "handle_error")
+    def _invalidate_on_disconnect(ctx: object) -> None:
+        original_exc = getattr(ctx, "original_exception", None)
+        is_disconnect = getattr(ctx, "is_disconnect", False)
+        if not is_disconnect and not isinstance(
+            original_exc, (DisconnectionError, InterfaceError, OperationalError),
+        ):
+            return
+        # is_disconnect is the authoritative SQLAlchemy signal; the isinstance
+        # check above is a belt-and-suspenders catch for asyncpg-driver
+        # exceptions that don't always set is_disconnect on the dialect adapter.
+        connection = getattr(ctx, "connection", None)
+        if connection is None:
+            return
+        try:
+            connection.invalidate()
+            logger.warning(
+                "[DB] Invalidated pool connection after %s — pool will recycle on next checkout",
+                type(original_exc).__name__,
+            )
+        except Exception as inv_exc:
+            logger.warning("[DB] Connection invalidation failed (non-fatal): %s", inv_exc)
+
 
 def _make_engine():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is required")
-    return create_async_engine(
+    eng = create_async_engine(
         DATABASE_URL,
         echo=os.getenv("SQL_ECHO", "false").lower() == "true",
         future=True,
@@ -26,6 +74,8 @@ def _make_engine():
             },
         },
     )
+    _install_disconnect_invalidation(eng)
+    return eng
 
 # Lazy engine: created on first access so test environments can import without asyncpg
 class _LazyEngine:

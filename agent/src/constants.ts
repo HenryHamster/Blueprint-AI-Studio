@@ -133,6 +133,17 @@ export const MAX_OUTPUT_BYTES = 10_000_000;
 export const WITHIN_CHUNK_YIELD_LINES = 50;
 export const WITHIN_CHUNK_YIELD_MS = 50;
 
+// Heartbeat-specific API params, overriding the global API_TIMEOUT / API_MAX_RETRIES.
+// Heartbeats are best-effort liveness signals — if the orchestrator is slow
+// or returning 5xx during a Cloud Run cutover, retrying for the full 30s × 5
+// chain (~3min) holds the in-flight mutex and starves subsequent setInterval
+// ticks. Tighter timeouts + fewer retries keep the mutex turning over so
+// the orchestrator can see fresh heartbeats once it recovers.
+// Production incident 2026-05-04: cutover-driven 5xx run blocked heartbeats
+// for 15+ minutes with the stock retry chain.
+export const HEARTBEAT_API_TIMEOUT = 10_000;
+export const HEARTBEAT_API_MAX_RETRIES = 2;
+
 // Effort-scaled subprocess timeout. Low-effort tasks that hang waste less VM
 // time; max-effort deep analysis gets more room. Unknown/unset effort falls
 // back to CLAUDE_TIMEOUT_MS.

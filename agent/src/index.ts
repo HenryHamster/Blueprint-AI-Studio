@@ -23,6 +23,7 @@ import {
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
   PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
+  HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -993,7 +994,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
         tool_trace: snapshotToolTrace(),
-      });
+      }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
@@ -1018,12 +1019,17 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
           log(`WARNING: Memory at ${(memPct * 100).toFixed(0)}% of cgroup limit (${metrics.cgroup_mb}MB / ${metrics.cgroup_limit_mb}MB) — OOM kill imminent`);
         }
       }
+      // Tighter heartbeat-specific retry/timeout (10s × 2 vs default 30s × 5).
+      // Holding the in-flight mutex through the full 150s+ default chain on a
+      // sustained 5xx run starves subsequent setInterval ticks — so the
+      // orchestrator never sees a fresh heartbeat even after it recovers.
+      // Tighter values keep the mutex turning over.
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
         tool_trace: snapshotToolTrace(),
-      });
+      }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
       log(`Heartbeat failed: ${String(e)}`);
@@ -1045,7 +1051,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
               metrics: retryMetrics,
               tool_trace: snapshotToolTrace(),
-            });
+            }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
             log('Heartbeat retry succeeded');
             traceHeartbeat('retry-409', retryStart, Date.now(), 'ok');
             return;
