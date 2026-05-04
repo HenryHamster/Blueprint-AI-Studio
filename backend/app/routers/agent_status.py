@@ -1452,11 +1452,44 @@ async def update_agent_status(
                 # lock held, then re-acquire FOR UPDATE on a fresh select
                 # to finalize the status. flag_modified is imported at
                 # module-level (line 20).
+                #
+                # R5 fix (2026-05-04): two correctness changes to the
+                # tentative pre-commit:
+                #   (a) Set status=EVALUATING explicitly. Without this the
+                #       pre-commit lands status=FAILED (set at line ~711),
+                #       which fires the SQLAlchemy set event registering
+                #       the task in `_terminated_task_ids`. JWT validation
+                #       for this task then 401s for the entire GH window
+                #       even though we're going to upgrade to EVALUATING.
+                #       Setting EVALUATING here keeps the JWT live and
+                #       avoids the cache pollution.
+                #   (b) Pop `_terminated_task_ids` defensively — the
+                #       FAILED set event already ran upstream (line 711),
+                #       so the cache entry exists. Mirrors lines 1291-1293
+                #       and 1624-1625 (other FAILED→non-terminal paths).
+                #   No `_recover_poisoned_session` call here: the recovery
+                #   would discard the upstream attribute mutations
+                #   (attempt_count, payload, retry context, etc.) and
+                #   `session.add(task)` after rollback re-attaches an
+                #   instance whose change-tracker is empty — so the
+                #   pre-commit would land a fragmentary state. If the
+                #   session is poisoned upstream, let the commit raise;
+                #   the request retries cleanly with an idempotency guard.
+                task.status = TaskStatus.EVALUATING
+                from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+                _terminated_task_ids.pop(str(task.id), None)
+                task.last_heartbeat = None
+                task.latest_status_message = (
+                    f"Reported FAILED with open PR #{_pr_num}; checking PR state"
+                )
                 task.context = {**(task.context or {}), "_pr_state_check_pending": True}
                 flag_modified(task, "context")
                 session.add(task)
-                if await _recover_poisoned_session(session, _task_id_str):
-                    session.add(task)
+                # Capture pre-GH status for the staleness check after the
+                # GitHub call. Used to detect concurrent writers (reaper,
+                # admin endpoints, parallel /api/agent/status from a peer
+                # role) so we don't clobber their decisions.
+                _pre_gh_status = TaskStatus.EVALUATING
                 await session.commit()
 
                 _gh_pr_state: str | None = None
@@ -1514,6 +1547,22 @@ async def update_agent_status(
                         f"tentative state persisted, returning"
                     )
                     return {"status": "accepted_pr_check_deferred"}
+                # Staleness check (R5 H2): a concurrent writer (reaper,
+                # admin endpoint, parallel /api/agent/status) could have
+                # mutated the row to a terminal state during the GH window.
+                # Don't overwrite their decision. Compare against the
+                # tentative status we committed pre-GH; anything else means
+                # someone else finalized.
+                if fresh.status != _pre_gh_status:
+                    logger.info(
+                        f"[AGENT_STATUS] Task {task.id} status changed from "
+                        f"{_pre_gh_status} to {fresh.status} during GH window "
+                        f"— accepting peer's decision, skipping finalize"
+                    )
+                    return {
+                        "status": "accepted_pr_check_raced",
+                        "final_status": fresh.status.value if hasattr(fresh.status, "value") else str(fresh.status),
+                    }
                 task = fresh
                 _ctx = dict(task.context or {})
                 _ctx.pop("_pr_state_check_pending", None)

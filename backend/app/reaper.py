@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -20,6 +21,71 @@ from app.retry_budget import append_failure_class_history
 from app.time_utils import _utcnow, set_retry_after, RETRY_AFTER_MAX_MINUTES
 
 logger = logging.getLogger(__name__)
+
+
+async def _relock_orphan_task(
+    session,
+    task_id,
+    cached_task: Task | None,
+    expected_status,
+    expected_last_heartbeat,
+) -> Task | None:
+    """Re-acquire FOR UPDATE on an orphan task and validate the pre-IO snapshot.
+
+    Mirrors ``rollup_management._relock_parent`` (canonical reference) and
+    ``ci_completion._relock_merge_task``: expire-then-populate_existing-SELECT
+    handles the cached-identity-map staleness under async + skip_locked.
+
+    Returns the freshly-loaded Task if:
+      - the row is still ours (not held by another writer), AND
+      - status is unchanged (still PROVISIONING or IN_PROGRESS, not COMPLETED/FAILED), AND
+      - last_heartbeat hasn't advanced (agent didn't revive during the unlocked window)
+
+    Returns None on any of those conditions failing — caller should ``continue``
+    to the next orphan task.
+    """
+    if cached_task is not None:
+        try:
+            session.expire(cached_task)
+        except InvalidRequestError:
+            session.expire_all()
+    relock_stmt = (
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    fresh = (await session.execute(relock_stmt)).scalars().first()
+    if fresh is None:
+        logger.info(
+            f"[REAPER] Orphan re-lock skipped for task {task_id} — held by peer "
+            f"(deferring to next reaper cycle)"
+        )
+        return None
+    if fresh.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
+        logger.info(
+            f"[REAPER] Orphan re-lock found task {task_id} status transitioned "
+            f"to {fresh.status} during external I/O — skipping reap"
+        )
+        return None
+    if fresh.last_heartbeat != expected_last_heartbeat:
+        logger.info(
+            f"[REAPER] Orphan re-lock found task {task_id} heartbeat advanced "
+            f"({expected_last_heartbeat} → {fresh.last_heartbeat}) during external I/O "
+            f"— agent revived, skipping reap"
+        )
+        return None
+    if fresh.status != expected_status:
+        # Defensive: status changed within the (PROVISIONING, IN_PROGRESS) set
+        # — e.g. claim_task flipped PROVISIONING → IN_PROGRESS. Not the same as
+        # a terminal transition, but the reap reason classification was based on
+        # the original status, so safer to defer.
+        logger.info(
+            f"[REAPER] Orphan re-lock found task {task_id} status changed "
+            f"({expected_status} → {fresh.status}) during external I/O — skipping reap"
+        )
+        return None
+    return fresh
 
 
 # Reaper: track tasks skipped by skip_locked to force-reap after repeated skips
@@ -623,6 +689,25 @@ async def reaper_service():
                             verified.append(t)
                     orphaned_tasks = verified
 
+                # ── RELEASE MULTI-ROW FOR UPDATE BEFORE EXTERNAL I/O LOOP ──
+                # Production 2026-05-04 cascade shape: the orphan-loop body
+                # below makes 4 external API calls per task — get_vm_status,
+                # disable_account_model (with retry+sleep), _capture_serial_for_vm,
+                # get_pull_request — each up to 30s, with combined per-task
+                # worst-case 30-120s. The multi-row FOR UPDATE acquired at
+                # lock_stmt/force_stmt above was previously held until the
+                # batch commit at the end of the for loop, blocking heartbeats
+                # on EVERY orphan row across the entire batch and tripping
+                # the 60s idle_in_transaction_session_timeout under load.
+                # Release it now: classification was already done against the
+                # ``verified`` list, and each per-task iteration below does its
+                # own release-around-IO + skip_locked re-acquire dance for the
+                # mutation phase. expire_all() ensures subsequent reads come
+                # from fresh DB state.
+                if orphaned_tasks:
+                    await session.commit()
+                    session.expire_all()
+
                 # Collect old VM IDs for deletion after commit (can't set attrs on SQLModel)
                 _reaper_old_vms: Dict[str, str] = {}
                 # Audit 2026-04-25 A8: defer parent re-queue to AFTER session.commit()
@@ -696,11 +781,10 @@ async def reaper_service():
                     if fresh_task.vm_instance_id:
                         _reaper_old_vms[str(task.id)] = fresh_task.vm_instance_id
 
-                    # Release Max Plan account slot (idempotent — skip if already released)
+                    # Read-only inputs to the I/O block + branch decisions below.
+                    # No mutations happen until AFTER the relock further down.
                     acct_id = get_task_llm_account_id(fresh_task)
-                    if acct_id and not (fresh_task.context or {}).get("_slot_released"):
-                        await release_max_plan_account(acct_id)
-                        task.context = {**(task.context or {}), "_slot_released": True}
+                    _slot_already_released = bool((fresh_task.context or {}).get("_slot_released"))
 
                     # Separate provision failures from agent failures for retry budgeting
                     is_provision_failure = fresh_task.status == TaskStatus.PROVISIONING
@@ -718,17 +802,29 @@ async def reaper_service():
                     )
                     is_rate_limited = classify_failure(task, logs=combined_logs) == "RATE_LIMIT"
 
-                    # Spot preemption fast-path: when a SPOT VM is preempted
-                    # mid-task, GCP DELETEs the instance with 30s notice. The
-                    # agent never sends a final heartbeat, so the reaper sees
-                    # heartbeat_timeout. Without this fast-path, repeated
-                    # preemptions burn class_budget on a perfectly healthy task
-                    # — at ~5%% preemption rate over 30-min tasks, ~3 preempts
-                    # in a row exhausts retries on a task that would succeed
-                    # on STANDARD. Treat preemption as infra (skip
-                    # attempt_count++) similar to RATE_LIMIT below.
+                    # ── EXTERNAL I/O BLOCK (no row lock held) ─────────────────
+                    # Production 2026-05-04: this block previously ran with the
+                    # multi-row FOR UPDATE on this task held, blocking heartbeats
+                    # for 30-120s per task across get_vm_status (GCP) +
+                    # disable_account_model (with retry+sleep) + _capture_serial_for_vm
+                    # (GCP serial console) + get_pull_request (GitHub). The
+                    # multi-row lock is released above, so this whole block runs
+                    # unlocked. We re-acquire FOR UPDATE briefly after this block
+                    # to apply the resulting mutations.
+                    # ──────────────────────────────────────────────────────────
+
+                    # Capture pre-IO snapshot so the relock below can detect peer
+                    # mutation during the unlocked window. status + last_heartbeat
+                    # are the two fields the heartbeat path writes; an advance in
+                    # either signals the agent revived and the reap should be aborted.
+                    pre_io_status = fresh_task.status
+                    pre_io_last_hb = fresh_task.last_heartbeat
+
+                    # 1. Spot preemption check (GCP API)
                     is_spot_preemption = False
                     prov_zone_for_status: str | None = None
+                    io_vm_status: str | None = None
+                    io_orch_delete_info: tuple[bool, str] = (False, "")
                     if (
                         getattr(fresh_task, "vm_spot", False)
                         and fresh_task.vm_instance_id
@@ -737,7 +833,7 @@ async def reaper_service():
                         prov_zone_for_status = (task.context or {}).get("provision_zone") or get_vm_zone(fresh_task.vm_instance_id)
                         if prov_zone_for_status:
                             try:
-                                vm_status = await asyncio.to_thread(
+                                io_vm_status = await asyncio.to_thread(
                                     get_vm_status, fresh_task.vm_instance_id, prov_zone_for_status
                                 )
                                 # TERMINATED = preempted by GCP. DELETED = already gone.
@@ -750,24 +846,155 @@ async def reaper_service():
                                 # Fix: consult the orchestrator-initiated-delete tracker. If the
                                 # VM was deleted by us within the last 30min, it's NOT a preemption.
                                 from app.main import is_orchestrator_initiated_delete
-                                is_orch_deleted, orch_delete_reason = is_orchestrator_initiated_delete(
+                                io_orch_delete_info = is_orchestrator_initiated_delete(
                                     fresh_task.vm_instance_id
                                 )
-                                if is_orch_deleted:
+                                if io_orch_delete_info[0]:
                                     logger.info(
                                         f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
-                                        f"vm_status={vm_status} but orchestrator-initiated delete "
-                                        f"(reason={orch_delete_reason}) — NOT classifying as preemption"
+                                        f"vm_status={io_vm_status} but orchestrator-initiated delete "
+                                        f"(reason={io_orch_delete_info[1]}) — NOT classifying as preemption"
                                     )
-                                elif vm_status in ("TERMINATED", "DELETED"):
+                                elif io_vm_status in ("TERMINATED", "DELETED"):
                                     is_spot_preemption = True
                                     logger.warning(
                                         f"[REAPER] Task {task.id} on SPOT VM {fresh_task.vm_instance_id} "
-                                        f"in {prov_zone_for_status} — vm_status={vm_status}, treating "
+                                        f"in {prov_zone_for_status} — vm_status={io_vm_status}, treating "
                                         f"as preemption (skipping attempt_count++)"
                                     )
                             except Exception as e:
                                 logger.debug(f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}")
+
+                    # 2. Rate-limited account-disable I/O (called only when is_rate_limited
+                    #    AND not is_spot_preemption; mirrors the original elif chain where
+                    #    the rate-limited branch was skipped if spot preempt fired first).
+                    #    Side-effect-only — disables the account/model in the in-memory pool
+                    #    + persists to DB via its own internal session.
+                    rl_acct_id: str | None = None
+                    rl_model: str | None = None
+                    if is_rate_limited and not is_spot_preemption:
+                        rl_acct_id = get_task_llm_account_id(task)
+                        logger.info(
+                            f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — "
+                            f"requeuing immediately with account blacklisted"
+                        )
+                        # Disable the exhausted model on the account so the orchestrator's
+                        # blacklist pruning preserves this entry on the next dispatch cycle.
+                        rl_model = _extract_task_model(task)
+                        if not rl_model:
+                            _rl_task_type = (task.first_payload or {}).get("type", "create")
+                            rl_model = _runtime_config.get("task_type_models", {}).get(_rl_task_type)
+                        if rl_acct_id and rl_model:
+                            _reaper_ctx_io = task.context or {}
+                            _reaper_kwargs_io = {
+                                "retry_after_seconds": _reaper_ctx_io.get("rate_limit_retry_after_seconds"),
+                                "kind": _reaper_ctx_io.get("rate_limit_kind") or "rate_limit",
+                            }
+                            try:
+                                await disable_account_model(rl_acct_id, rl_model, **_reaper_kwargs_io)
+                            except Exception as _disable_err:
+                                logger.warning(
+                                    f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: "
+                                    f"{_disable_err}; retrying in 1s"
+                                )
+                                await asyncio.sleep(1)
+                                try:
+                                    await disable_account_model(rl_acct_id, rl_model, **_reaper_kwargs_io)
+                                except Exception as _disable_err2:
+                                    logger.error(
+                                        f"[REAPER] disable_account_model retry also failed for "
+                                        f"{rl_acct_id}/{rl_model}: {_disable_err2}. "
+                                        "Account remains active in pool — tight re-selection loop risk."
+                                    )
+
+                    # 3. Provision-failure serial capture I/O (GCP serial console).
+                    # Run unconditionally on provision failures: the spot-preempt
+                    # branch falls through to the provision-failure mutation block
+                    # below (which uses io_serial_log), so we need the capture
+                    # whenever is_provision_failure regardless of spot/rate-limit
+                    # branch. Tiny perf cost when spot/rate fast-paths skip the
+                    # mutation block, but avoids re-introducing the held-lock-during-IO
+                    # bug as a fallback path.
+                    io_serial_log: str | None = None
+                    io_prov_zone: str | None = None
+                    io_provision_err: str | None = None
+                    if is_provision_failure:
+                        # Resolve zone (in-memory cache + persisted fallback). The two
+                        # values prov_zone and provision_err are stable post-fail; reading
+                        # them while unlocked is safe — no peer mutates them.
+                        if fresh_task.vm_instance_id:
+                            cached = get_vm_zone(fresh_task.vm_instance_id)
+                            if cached and cached != "unknown":
+                                io_prov_zone = cached
+                        if not io_prov_zone:
+                            io_prov_zone = (task.context or {}).get("provision_zone")
+                        io_provision_err = get_provision_error(fresh_task.vm_instance_id or "")
+                        if io_prov_zone and fresh_task.vm_instance_id:
+                            try:
+                                io_serial_log = await asyncio.to_thread(
+                                    _capture_serial_for_vm, fresh_task.vm_instance_id, io_prov_zone
+                                )
+                                if io_serial_log:
+                                    logger.warning(
+                                        f"[REAPER] Serial log for dying agent {fresh_task.vm_instance_id} "
+                                        f"(task {task.id}):\n{io_serial_log}"
+                                    )
+                            except Exception:
+                                logger.exception(
+                                    f"[REAPER] Failed to capture serial log for VM {fresh_task.vm_instance_id}"
+                                )
+
+                    # 4. PR-state lookup I/O (GitHub API)
+                    _has_pr_artifact, _pr_num = await _task_has_open_pr(task, session)
+                    io_gh_pr_state: str | None = None
+                    io_gh_pr_merged: bool = False
+                    if _has_pr_artifact and _pr_num:
+                        try:
+                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                            from app.github import get_pull_request  # noqa: PLC0415
+                            _gh_token, _gh_owner, _gh_repo = await get_github_token_for_task(task.id, session)
+                            _pr_data = await get_pull_request(_gh_token, _gh_owner, _gh_repo, _pr_num)
+                            io_gh_pr_state = _pr_data.get("state")
+                            io_gh_pr_merged = bool(_pr_data.get("merged"))
+                        except Exception as _gh_exc:
+                            # GH API unreachable: fall back to "open" — handing off
+                            # to review pipeline is the safer default.
+                            logger.warning(
+                                f"[REAPER] PR-state lookup failed for task {task.id} PR #{_pr_num}: "
+                                f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open",
+                                exc_info=True,
+                            )
+                            io_gh_pr_state = "open"
+
+                    # ── RE-ACQUIRE FOR UPDATE FOR MUTATIONS ──────────────────
+                    # All external I/O above is done. Re-acquire the FOR UPDATE
+                    # lock briefly to apply state mutations atomically. If the
+                    # row is held by a peer (e.g. concurrent reaper, finalize
+                    # path) or status changed during the unlocked window,
+                    # _relock_orphan_task returns None and we skip this iter.
+                    relocked = await _relock_orphan_task(
+                        session, task.id, fresh_task, pre_io_status, pre_io_last_hb,
+                    )
+                    if relocked is None:
+                        # Peer is finalizing this task or agent revived; skip safely.
+                        # Don't add to _reaper_old_vms-driven cleanup either — let
+                        # the peer (or next reaper cycle) handle it.
+                        _reaper_old_vms.pop(str(task.id), None)
+                        continue
+                    task = relocked
+                    fresh_task = relocked
+
+                    # Apply the in-memory account-slot release marker. Re-check
+                    # the flag from the FRESH (post-relock) context to avoid a
+                    # double-release on the rare case where a peer reaper iteration
+                    # set the flag between our pre-IO capture and the relock (would
+                    # require last_heartbeat unchanged, since the relock validates
+                    # that). The release op itself is also idempotent inside the
+                    # in-memory pool, so this is belt-and-suspenders.
+                    _slot_now_released = bool((task.context or {}).get("_slot_released"))
+                    if acct_id and not _slot_already_released and not _slot_now_released:
+                        await release_max_plan_account(acct_id)
+                        task.context = {**(task.context or {}), "_slot_released": True}
 
                     if is_spot_preemption:
                         # Skip attempt_count++ and provision_failures++ — preemption
@@ -791,37 +1018,9 @@ async def reaper_service():
                             zone=prov_zone_for_status,
                         )
                     elif is_rate_limited:
-                        rl_acct_id = get_task_llm_account_id(task)
-                        logger.info(f"[REAPER] Task {task.id} rate-limited (account={rl_acct_id}) — requeuing immediately with account blacklisted")
-                        # Disable the exhausted model on the account so the orchestrator's
-                        # blacklist pruning preserves this entry on the next dispatch cycle.
-                        # Without this, the pool sees disabled_models empty, _account_available
-                        # returns True, and the same account gets re-selected immediately.
-                        rl_model = _extract_task_model(task)
-                        if not rl_model:
-                            _rl_task_type = (task.first_payload or {}).get("type", "create")
-                            rl_model = _runtime_config.get("task_type_models", {}).get(_rl_task_type)
-                        if rl_acct_id and rl_model:
-                            # classify_failure() wrote the structured signal into task.context
-                            # on the line above; pass it through so reaper-path cooldowns honor
-                            # retry hints and quota-exhausted flat curves the same way.
-                            _reaper_ctx = task.context or {}
-                            _reaper_kwargs = {
-                                "retry_after_seconds": _reaper_ctx.get("rate_limit_retry_after_seconds"),
-                                "kind": _reaper_ctx.get("rate_limit_kind") or "rate_limit",
-                            }
-                            try:
-                                await disable_account_model(rl_acct_id, rl_model, **_reaper_kwargs)
-                            except Exception as _disable_err:
-                                logger.warning(f"[REAPER] disable_account_model failed for {rl_acct_id}/{rl_model}: {_disable_err}; retrying in 1s")
-                                await asyncio.sleep(1)
-                                try:
-                                    await disable_account_model(rl_acct_id, rl_model, **_reaper_kwargs)
-                                except Exception as _disable_err2:
-                                    logger.error(
-                                        f"[REAPER] disable_account_model retry also failed for {rl_acct_id}/{rl_model}: {_disable_err2}. "
-                                        "Account remains active in pool — tight re-selection loop risk."
-                                    )
+                        # disable_account_model was already invoked (with retry+sleep)
+                        # in the unlocked I/O block above; rl_acct_id and rl_model
+                        # captured there. Apply the resulting state mutations here.
                         task.status = TaskStatus.QUEUED
                         task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         task.last_heartbeat = None
@@ -865,13 +1064,14 @@ async def reaper_service():
 
                     if is_provision_failure:
                         provision_failures += 1
-                        # Resolve zone with a fallback chain so serial log capture works
-                        # even when the in-memory _vm_zones cache has been cleared (e.g.
-                        # after an orchestrator restart between provision and reap).
-                        #   1. get_vm_zone() — in-memory cache, populated at provision time
-                        #   2. task.context["provision_zone"] — persisted at orchestrator.py:862
-                        prov_zone = None
-                        if fresh_task.vm_instance_id:
+                        # Reuse zone + provision_err + serial_log captured by the
+                        # unlocked I/O block above. Read-only locals fall back to
+                        # the same fallback chain when the I/O block didn't fire
+                        # (e.g. is_provision_failure was True but the row was rate-
+                        # limited or spot-preempted, in which case those branches
+                        # already returned via `continue` and we never reach here).
+                        prov_zone = io_prov_zone
+                        if prov_zone is None and fresh_task.vm_instance_id:
                             cached = get_vm_zone(fresh_task.vm_instance_id)
                             if cached and cached != "unknown":
                                 prov_zone = cached
@@ -880,30 +1080,23 @@ async def reaper_service():
                         failed_acct = get_task_llm_account_id(task)
 
                         # Classify: infra-wide (all zones/quota exhausted) vs task-specific
-                        provision_err = get_provision_error(fresh_task.vm_instance_id or "")
+                        provision_err = io_provision_err if io_provision_err is not None else get_provision_error(fresh_task.vm_instance_id or "")
                         err_lower = ((provision_err or "") + " " + (task.latest_status_message or "")).lower()
                         is_infra = (
                             any(p in err_lower for p in INFRA_PROVISION_PATTERNS)
                             or (not prov_zone and not any_zone_available())
                         )
 
-                        serial_log = None
+                        # Serial log was captured by the unlocked I/O block above.
+                        # We intentionally do NOT re-capture here on failure: doing so
+                        # would call _capture_serial_for_vm (5-30s GCP API) while holding
+                        # the FOR UPDATE lock, re-introducing the production-2026-05-04
+                        # cascade. If the I/O block couldn't capture (zone unresolvable
+                        # or transient GCP error), the next reaper cycle will retry from
+                        # the unlocked I/O path.
+                        serial_log = io_serial_log
                         if prov_zone:
                             # VM was created (GCP API succeeded) but agent never claimed.
-                            # Capture serial logs before the VM is deleted — this is the
-                            # only way to diagnose agent startup crashes. Serial log is
-                            # persisted to task.context so it survives in the UI/db.
-                            vm_id = fresh_task.vm_instance_id
-                            if vm_id:
-                                try:
-                                    serial_log = await asyncio.to_thread(_capture_serial_for_vm, vm_id, prov_zone)
-                                    if serial_log:
-                                        logger.warning(
-                                            f"[REAPER] Serial log for dying agent {vm_id} "
-                                            f"(task {task.id}):\n{serial_log}"
-                                        )
-                                except Exception:
-                                    logger.exception(f"[REAPER] Failed to capture serial log for VM {vm_id}")
 
                             # Blacklist the account so retry uses a different one.
                             # We maintain two lists:
@@ -999,33 +1192,12 @@ async def reaper_service():
                     # pipeline instead — review/fix iteration + the existing
                     # 6h EVALUATING hard timeout (services.py:807) + the 16-iter
                     # review-fix cap guarantee termination.
-                    _has_pr_artifact, _pr_num = await _task_has_open_pr(task, session)
-                    # Artifact existence is necessary but not sufficient: the PR
-                    # may have been closed (operator rejection / empty rollup) or
-                    # merged out-of-band before the reaper got here. Confirm the
-                    # actual GitHub state — handing off a closed PR to the review
-                    # pipeline wedges the task in EVALUATING since review can't
-                    # act on a closed PR.
-                    _gh_pr_state: str | None = None
-                    _gh_pr_merged: bool = False
-                    if _has_pr_artifact and _pr_num:
-                        try:
-                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-                            from app.github import get_pull_request  # noqa: PLC0415
-                            _gh_token, _gh_owner, _gh_repo = await get_github_token_for_task(task.id, session)
-                            _pr_data = await get_pull_request(_gh_token, _gh_owner, _gh_repo, _pr_num)
-                            _gh_pr_state = _pr_data.get("state")
-                            _gh_pr_merged = bool(_pr_data.get("merged"))
-                        except Exception as _gh_exc:
-                            # GH API unreachable: fall back to current behavior
-                            # (assume open and hand off). One transient error
-                            # shouldn't strand the task as FAILED.
-                            logger.warning(
-                                f"[REAPER] PR-state lookup failed for task {task.id} PR #{_pr_num}: "
-                                f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open",
-                                exc_info=True,
-                            )
-                            _gh_pr_state = "open"
+                    #
+                    # PR state was already fetched in the unlocked I/O block above
+                    # (io_gh_pr_state, io_gh_pr_merged) so the GitHub round-trip
+                    # doesn't run with FOR UPDATE held. Reuse those values here.
+                    _gh_pr_state = io_gh_pr_state
+                    _gh_pr_merged = io_gh_pr_merged
                     _pr_actually_open = _has_pr_artifact and _pr_num and _gh_pr_state == "open"
 
                     if _has_pr_artifact and _pr_num and _gh_pr_state == "closed" and _gh_pr_merged:

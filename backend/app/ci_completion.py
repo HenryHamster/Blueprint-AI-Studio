@@ -21,6 +21,7 @@ import re
 import uuid
 
 from sqlalchemy import func
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -186,6 +187,58 @@ def _capture_merge_snapshot(task: Task) -> dict:
     }
 
 
+async def _relock_merge_task(
+    session: AsyncSession,
+    task_id,
+    expected_snapshot: dict,
+    cached_task: Task | None,
+    *,
+    source: str,
+) -> Task | None:
+    """Re-acquire FOR UPDATE on the merge task and validate the pre-release snapshot.
+
+    Mirrors ``rollup_management._relock_parent`` (the canonical reference). Returns
+    the freshly-loaded Task if the row is still ours and the merge-gate snapshot
+    still matches, or None if the row is held by a peer or has been mutated during
+    the unlocked window — in which case the caller should defer to the next sweep
+    rather than overwrite a peer's terminal transition.
+
+    Why ``session.expire`` first: ``populate_existing=True`` alone has been observed
+    unreliable under async + ``with_for_update(skip_locked=True)`` (see
+    rollup_management.py:155 and task_completion.py:1671). Expiring the cached
+    instance guarantees the re-SELECT cannot return stale identity-map attributes.
+    """
+    if cached_task is not None:
+        try:
+            session.expire(cached_task)
+        except InvalidRequestError:
+            # Object detached from this session — fall back to expire_all so the
+            # populate_existing SELECT below can repopulate from a clean slate.
+            session.expire_all()
+    relock_stmt = (
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    fresh = (await session.execute(relock_stmt)).scalars().first()
+    if fresh is None:
+        logger.info(
+            f"[CI] Task {task_id} held by peer after merge call — "
+            f"deferring to next sweep ({source})"
+        )
+        return None
+    fresh_snapshot = _capture_merge_snapshot(fresh)
+    if fresh_snapshot != expected_snapshot:
+        logger.info(
+            f"[CI] Task {task_id} mutated during merge window "
+            f"(expected snapshot={expected_snapshot}, found {fresh_snapshot}) — "
+            f"deferring to next sweep ({source})"
+        )
+        return None
+    return fresh
+
+
 async def _attempt_merge_with_retry_and_escalation(
     task: Task,
     gh_token: str,
@@ -277,58 +330,76 @@ async def _attempt_merge_with_retry_and_escalation(
             if merge_result.get("merged") or merge_result.get("conflict"):
                 break
 
-    # Re-acquire with snapshot validation. If a peer mutated during our
-    # unlocked window, defer to next sweep. The merge call may have already
-    # succeeded externally; the next sweep observes pr_state.merged=True via
-    # get_pull_request below.
+    # ── PRE-RELOCK GITHUB I/O ──────────────────────────────────────────────
+    # Round 5 W1 (this commit): all GitHub API calls below this point used to
+    # run with the task FOR UPDATE lock held (re-acquired after merge_pull_request).
+    # That meant 30-120s of held-lock during create_pr_comment + _post_merge_summary
+    # (merged path), get_pull_request (recheck), and update_branch (behind path) —
+    # blocking concurrent heartbeats and tripping idle_in_transaction_session_timeout.
+    # Production 2026-05-04: same incident shape as agent_status.py:1430 cascade.
     #
-    # Round 4 W1 (audit C1): bypass SQLAlchemy's identity-map cache so the
-    # re-SELECT actually reads fresh DB state. ``populate_existing=True``
-    # is the canonical hint, but reaper.py:382 documents that under async
-    # sessions + ``with_for_update(skip_locked=True)`` it doesn't always
-    # refresh reliably. Belt-and-suspenders: also call ``session.expire``
-    # on the task instance (mirrors reaper's ``expire_all`` pattern) so
-    # the next SELECT cannot return cached attributes.
-    #
-    # Round 5 W1 (HIGH-1): the comment above promised ``session.expire``
-    # but the code only set ``populate_existing=True``. Add the expire()
-    # belt-and-suspenders, mirroring task_completion.py:1671 where the
-    # same pattern reliably refreshes the locked instance under async +
-    # skip_locked. The ``task`` here is the released-but-cached instance
-    # post-commit; expire() marks its attributes stale so any read
-    # between here and the fresh SELECT below would refresh, and the
-    # populate_existing SELECT clobbers any stale identity-map state.
-    session.expire(task)
-    fresh_stmt = (
-        select(Task)
-        .where(Task.id == parent_id_local)
-        .with_for_update(skip_locked=True)
-        .execution_options(populate_existing=True)
+    # New structure: do all remaining GitHub I/O while still UNLOCKED, decide the
+    # outcome, then re-acquire the lock only to apply the final DB mutation.
+    # ──────────────────────────────────────────────────────────────────────
+
+    merge_msg = merge_result.get("message", "")
+    _in_progress = "in progress" in merge_msg.lower() or "status check" in merge_msg.lower()
+
+    # If the merge succeeded, post the cosmetic GitHub artefacts (merge banner +
+    # summary comment) BEFORE re-acquiring the lock. We use the cached, stale
+    # ``task`` instance for _post_merge_summary's read-only field access; the
+    # post-relock task assignment will pick up any peer mutation if it happened.
+    if merge_result.get("merged"):
+        try:
+            await create_pr_comment(gh_token, owner, repo, ci_pr_number,
+                "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
+        except Exception as e:
+            logger.warning(f"[CI] create_pr_comment after merge failed for PR #{ci_pr_number}: {e}", exc_info=True)
+        try:
+            await _post_merge_summary(gh_token, owner, repo, ci_pr_number, task, ci_loop)
+        except Exception as e:
+            logger.warning(f"[CI] _post_merge_summary failed for PR #{ci_pr_number}: {e}", exc_info=True)
+
+    # If the merge failed and we're not in the "checks in progress" early-exit
+    # path, fetch the PR state to drive escalation logic. Done unlocked so the
+    # GitHub round-trip (typ. 1-30s, up to 120s on cutover) doesn't hold FOR UPDATE.
+    _recheck_pr: dict | None = None
+    _recheck_err: BaseException | None = None
+    _ms: str = ""
+    _upd: dict | None = None
+    if not merge_result.get("merged") and not _in_progress:
+        try:
+            _recheck_pr = await get_pull_request(gh_token, owner, repo, ci_pr_number)
+            _ms = ((_recheck_pr or {}).get("mergeable_state") or "").lower()
+        except Exception as e:
+            _recheck_err = e
+            logger.warning(f"[CI] get_pull_request recheck failed for PR #{ci_pr_number}: {e}", exc_info=True)
+
+        # 'behind' path: call update_branch (GitHub write) BEFORE re-acquiring
+        # the lock. The result is consumed in the lock-held block below.
+        if _recheck_err is None and _ms == "behind":
+            from app.github import update_branch  # noqa: PLC0415
+            try:
+                _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
+            except Exception as e:
+                _upd = {"updated": False, "message": str(e)[:200]}
+                logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+
+    # ── RE-ACQUIRE FOR UPDATE FOR FINAL DB MUTATIONS ──────────────────────
+    # All GitHub I/O above ran with no row lock held. Now re-acquire briefly
+    # to apply state mutations (status, context, latest_status_message) and
+    # any spawn calls (which do DB work but no further GitHub I/O).
+    fresh_task = await _relock_merge_task(
+        session, parent_id_local, pre_merge_snapshot, task, source=source,
     )
-    fresh_task = (await session.execute(fresh_stmt)).scalars().first()
     if fresh_task is None:
-        logger.info(
-            f"[CI] Task {parent_id_local} held by peer after merge call — "
-            f"deferring to next sweep ({source})"
-        )
         return bool(merge_result.get("merged"))
-    fresh_snapshot = _capture_merge_snapshot(fresh_task)
-    if fresh_snapshot != pre_merge_snapshot:
-        logger.info(
-            f"[CI] Task {parent_id_local} mutated during merge window "
-            f"(expected snapshot={pre_merge_snapshot}, found {fresh_snapshot}) — "
-            f"deferring to next sweep ({source})"
-        )
-        return bool(merge_result.get("merged"))
-    # Re-bind ``task`` to the fresh row so mutations below operate on the
-    # currently-locked instance (the original ``task`` is detached / stale).
+    # Re-bind ``task`` to the fresh, locked instance — the original is stale.
     task = fresh_task
     ci_loop = (task.context or {}).get("review_loop", {})
 
     if merge_result.get("merged"):
-        await create_pr_comment(gh_token, owner, repo, ci_pr_number,
-            "**Blueprint CI + Review**: All checks passed, PR auto-merged.")
-        await _post_merge_summary(gh_token, owner, repo, ci_pr_number, task, ci_loop)
+        # GitHub artefacts already posted (above). Apply DB state under the lock.
         task.status = TaskStatus.COMPLETED
         task.latest_status_message = f"CI passed + review approved, PR #{ci_pr_number} merged ({source})"
         if ci_orig_id:
@@ -345,8 +416,7 @@ async def _attempt_merge_with_retry_and_escalation(
         logger.info(f"[CI] PR #{ci_pr_number} merged ({source})")
         return True
 
-    merge_msg = merge_result.get("message", "")
-    if "in progress" in merge_msg.lower() or "status check" in merge_msg.lower():
+    if _in_progress:
         from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
         ci_loop["ci_poll_interval"] = 10
         ci_loop["ci_last_polled"] = _utcnow().isoformat()
@@ -358,7 +428,10 @@ async def _attempt_merge_with_retry_and_escalation(
         return False
 
     try:
-        _recheck_pr = await get_pull_request(gh_token, owner, repo, ci_pr_number)
+        # If get_pull_request raised in the unlocked window, surface that as
+        # the recheck-failed branch (mirrors the original except-clause behavior).
+        if _recheck_err is not None:
+            raise _recheck_err
         if _recheck_pr and (_recheck_pr.get("merged") or _recheck_pr.get("state") == "closed"):
             task.status = TaskStatus.COMPLETED
             task.latest_status_message = f"PR #{ci_pr_number} already merged by another task"
@@ -369,7 +442,6 @@ async def _attempt_merge_with_retry_and_escalation(
         # authoritative and resilient to GitHub API error-message wording changes.
         # Fall back to keyword matching only when mergeable_state is absent or still
         # 'unknown' (GitHub hasn't finished computing it).
-        _ms = ((_recheck_pr or {}).get("mergeable_state") or "").lower()
         if _ms and _ms != "unknown":
             _is_rule_block = _ms == "blocked"
         else:
@@ -400,16 +472,10 @@ async def _attempt_merge_with_retry_and_escalation(
             )
             return False
 
-        # 'behind': PR branch is behind the base. Use update_branch to merge
-        # base into the PR branch (creates a merge commit, triggers fresh CI),
-        # then re-enter CI polling instead of burning merge retries.
+        # 'behind': PR branch is behind the base. update_branch was already
+        # called in the unlocked window above; ``_upd`` holds the result.
         if _ms == "behind":
-            from app.github import update_branch  # noqa: PLC0415
-            try:
-                _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
-            except Exception as e:
-                _upd = {"updated": False, "message": str(e)[:200]}
-                logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+            assert _upd is not None  # set in unlocked block when _ms == "behind"
             from app import pause_clock  # noqa: PLC0415 — local import to avoid cycle
             ci_loop["ci_passed"] = False
             ci_loop["ci_poll_interval"] = 30
