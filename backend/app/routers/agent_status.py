@@ -15,7 +15,7 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -1478,10 +1478,19 @@ async def update_agent_status(
                     _gh_pr_state = "open"
 
                 # Re-acquire FOR UPDATE on the same row for the final state
-                # transition. populate_existing=True forces SQLAlchemy to
-                # refresh the in-memory instance from the SELECT result
-                # rather than returning the cached object (which would still
-                # show the pre-commit state).
+                # transition. populate_existing=True forces SQLA to refresh
+                # the cached identity-map instance from the SELECT result.
+                # session.expire(task) before the re-SELECT is belt-and-
+                # suspenders: populate_existing alone has been observed to
+                # be unreliable under async + with_for_update(skip_locked=True)
+                # — see rollup_management._relock_parent (~line 186) and
+                # task_completion.py:1671 for the canonical pattern.
+                try:
+                    session.expire(task)
+                except InvalidRequestError:
+                    # Object detached (rare); fall through to the SELECT,
+                    # which will repopulate the row via the identity map.
+                    session.expire_all()
                 relock_stmt = (
                     select(Task)
                     .where(Task.id == task.id)
@@ -1493,8 +1502,13 @@ async def update_agent_status(
                     # Row currently locked by another writer (rare — most
                     # likely a concurrent reaper sweep finalizing this task).
                     # The tentative commit above persisted the
-                    # `_pr_state_check_pending` flag so the reaper /
-                    # post-commit pending machinery can resume the handoff.
+                    # `_pr_state_check_pending` flag as a forensic marker —
+                    # no consumer is plumbed yet, so on contention the task
+                    # stays in the tentative EVALUATING state. The reaper's
+                    # stale-EVALUATING sweep (services._check_evaluating_timeouts,
+                    # via the 48h backstop) is the safety net; if a consumer
+                    # is added later it can grep for `_pr_state_check_pending`
+                    # to find these tasks.
                     logger.info(
                         f"[AGENT_STATUS] Task {task.id} re-lock skipped (locked elsewhere) — "
                         f"tentative state persisted, returning"
