@@ -18,7 +18,7 @@ import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
   STALE_RESULT_RETRY_BASE_MS, STALE_RESULT_RETRY_MAX_MS,
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
-  PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, LOG_TAIL_BYTES,
+  PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -27,7 +27,7 @@ import {
   AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
   RUFF_TIMEOUT,
   TEST_RUNNER_TIMEOUT, TEST_RUNNER_DOCKER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
-  claudeTimeoutForEffort, MAX_OUTPUT_BYTES,
+  claudeTimeoutForEffort, MAX_OUTPUT_BYTES, TOOL_USE_STALL_TIMEOUT_MS,
 } from './constants.js';
 
 // ── Failure categories ───────────────────────────────────────────────────────
@@ -2758,7 +2758,11 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // Wrap mutable flags in an object so TS doesn't narrow them to `false` after
   // the Promise resolves — the close/timeout callbacks mutate them inside the
   // Promise scope, and TS's flow analysis can't see across the await boundary.
-  const flags: { timedOut: boolean; providerKilledByOOM: boolean } = { timedOut: false, providerKilledByOOM: false };
+  const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false };
+  // Mid-stream stall tracking: set when a tool_use block is seen, cleared when
+  // the corresponding tool-result (user event) arrives.
+  let lastToolUseAt: number | null = null;
+  let toolInFlight = false;
 
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
@@ -2867,12 +2871,38 @@ echo ""
     // This is NOT a timeout (flags.timedOut stays false) — we got a clean
     // result event, the model finished, the work product is in the diff.
     let resultGraceTimer: NodeJS.Timeout | null = null;
+    // Mid-stream stall watchdog: resets on every stdout chunk; fires if stdout
+    // goes silent for CLAUDE_STREAM_STALL_MS while the process is still alive
+    // (e.g. hung tool call). Uses the same SIGTERM→SIGKILL escalation as
+    // resultGraceTimer; flags.timedOut stays false so post-Claude phase runs.
+    let stallWatchdog: NodeJS.Timeout | null = null;
     const originalPid = child.pid;
     const processGroupStillOwned = () =>
       originalPid !== undefined
       && child.pid === originalPid
       && child.exitCode === null
       && child.signalCode === null;
+    const resetStallWatchdog = () => {
+      if (stallWatchdog) clearTimeout(stallWatchdog);
+      stallWatchdog = setTimeout(() => {
+        if (!processGroupStillOwned()) return;
+        sendLog(
+          ws,
+          `\n[runtime] stream-stall: no stdout for >${CLAUDE_STREAM_STALL_MS / 1000}s — `
+            + `sending SIGTERM so wrapper can proceed to commit/push.\n`,
+        );
+        const pid = originalPid;
+        if (pid !== undefined) {
+          try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+          forceKillTimer = setTimeout(() => {
+            if (!processGroupStillOwned()) return;
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+          }, PROCESS_KILL_GRACE_MS);
+        }
+      }, CLAUDE_STREAM_STALL_MS);
+    };
+    // Arm eagerly so pre-data silence is also guarded.
+    resetStallWatchdog();
     const killTimer = setTimeout(() => {
       log(`${runCommand.displayName} process timed out after ${timeoutMinutes} minutes — killing process group`);
       sendLog(ws, `\n[TIMEOUT] ${runCommand.displayName} exceeded ${timeoutMinutes}-minute time limit\n`);
@@ -2887,10 +2917,38 @@ echo ""
       }
     }, timeoutMs);
 
+    // Stall watchdog: fires every 60s to detect tool_use events that never
+    // receive a tool-result (user) event back from claude-code. This catches
+    // hangs that occur mid-tool rather than post-result.
+    let stallWatchdogTimer: NodeJS.Timeout | null = setInterval(() => {
+      if (
+        toolInFlight &&
+        lastToolUseAt !== null &&
+        Date.now() - lastToolUseAt > TOOL_USE_STALL_TIMEOUT_MS &&
+        processGroupStillOwned()
+      ) {
+        sendLog(
+          ws,
+          `\n[runtime] tool_use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result — sending SIGTERM\n`,
+        );
+        flags.stalledMidStream = true;
+        if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
+        const pid = originalPid;
+        if (pid !== undefined) {
+          try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+          forceKillTimer = setTimeout(() => {
+            if (!processGroupStillOwned()) return;
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+          }, PROCESS_KILL_GRACE_MS);
+        }
+      }
+    }, 60_000);
+
     if (!child.stdout || !child.stderr) {
       throw new Error('spawn returned no stdio streams');
     }
     child.stdout.on('data', (data: Buffer) => {
+      resetStallWatchdog();
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (runCommand.outputMode === 'claude-stream-json') {
@@ -2918,6 +2976,8 @@ echo ""
                 sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
                 statusRef.value = `Using tool: ${strVal(block.name)}`;
                 recordToolUse(strVal(block.name), block.input);
+                toolInFlight = true;
+                lastToolUseAt = Date.now();
               }
             }
           } else if (objType === 'result') {
@@ -2958,7 +3018,8 @@ echo ""
             if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += errLine;
             stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
           } else if (objType === 'system' || objType === 'user') {
-            // Benign metadata — ignore silently.
+            // user event carries tool results back to the model — tool is no longer in-flight.
+            if (objType === 'user') toolInFlight = false;
           } else if (objType) {
             // Unknown type: log so we don't silently drop information.
             sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
@@ -2985,6 +3046,8 @@ echo ""
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
+      if (stallWatchdog) clearTimeout(stallWatchdog);
+      if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
@@ -2996,6 +3059,8 @@ echo ""
       clearTimeout(killTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
+      if (stallWatchdog) clearTimeout(stallWatchdog);
+      if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
       // Phase 1: unregister now that we know the child exited; reset routine
       // doesn't need to chase a dead PID.
       if (typeof originalPid === 'number') {
@@ -3020,6 +3085,9 @@ echo ""
 
   if (flags.timedOut) {
     throw new ClaudeTimeoutError(`${runner.displayName} exceeded ${runCommand.timeoutMs / 60000}-minute time limit`);
+  }
+  if (flags.stalledMidStream) {
+    throw new ClaudeTimeoutError(`${runner.displayName} mid-stream tool-use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result`);
   }
   if (flags.providerKilledByOOM) {
     const err = new ClaudeTimeoutError(`EOOM: ${runner.displayName} received external SIGKILL before agent timeout; likely cgroup OOM`);

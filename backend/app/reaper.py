@@ -85,6 +85,42 @@ _PRECLAIM_STALE_DEFAULTS = {
 }
 
 
+def _extract_tool_trace_tail(task) -> str:
+    """Extract and format the tail of _tool_trace from task.context.
+
+    Returns a compact formatted string of recent tool calls (timestamp + tool name
+    + first ~80 chars of input preview), limited to ~400 chars total. If _tool_trace
+    is missing or empty, returns empty string.
+    """
+    ctx = task.context or {}
+    tool_trace = ctx.get("_tool_trace") or []
+    if not tool_trace:
+        return ""
+
+    # Take the last 5 entries to stay within 400-char budget
+    entries = tool_trace[-5:] if len(tool_trace) > 5 else tool_trace
+    parts = []
+    total_len = 0
+    max_total = 400
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        t_str = entry.get("t", "").split("T")[-1][:8]  # HH:MM:SS from ISO-8601
+        tool_name = entry.get("tool", "?")[:20]
+        input_preview = entry.get("input_preview", "")[:80]
+        # Compact format: timestamp + tool + input
+        part = f"{t_str} {tool_name}: {input_preview}"
+        if total_len + len(part) + 3 > max_total:  # +3 for " | "
+            break
+        parts.append(part)
+        total_len += len(part) + 3
+
+    if not parts:
+        return ""
+    return " | ".join(parts)
+
+
 def _preclaim_stale_cutoff(task, now: datetime) -> datetime:
     ctx = task.context or {}
     payload = task.first_payload or {}
@@ -94,7 +130,14 @@ def _preclaim_stale_cutoff(task, now: datetime) -> datetime:
     return now - timedelta(seconds=seconds)
 
 
-def _heartbeat_stale_cutoff(task, now: datetime) -> datetime:
+def _heartbeat_stale_cutoff(task, now: datetime, has_open_pr: bool = False) -> datetime:
+    # When a task has an open PR, reduce the heartbeat-stale cutoff to 90s
+    # to detect post-PR silent deaths faster and hand off to the review
+    # pipeline sooner (normally 5-15 min delay; with PR cutoff ~90-150s).
+    # The 90s gives one missed heartbeat (60s) plus one reaper cycle (~30s).
+    if has_open_pr:
+        return now - timedelta(seconds=90)
+
     ctx = task.context or {}
     payload = task.first_payload or {}
     scope = ctx.get("scope") or payload.get("scope")
@@ -424,6 +467,18 @@ async def reaper_service():
                 ten_minutes_ago = now - timedelta(minutes=10)
                 fifteen_minutes_ago = now - timedelta(minutes=15)
 
+                # Batch query for PULL_REQUEST artifacts to support PR-based heartbeat
+                # cutoff reduction. Tasks with open PRs use a 90s cutoff instead of
+                # scope-aware defaults to detect post-PR silent deaths faster.
+                task_ids_to_check = {t.id for t in active_tasks if t.vm_instance_id}
+                pr_artifacts = (await session.execute(
+                    select(Artifact).where(
+                        Artifact.task_id.in_(task_ids_to_check),
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )).scalars().all() if task_ids_to_check else []
+                tasks_with_pr = {a.task_id for a in pr_artifacts}
+
                 # State-machine invariants after the clock-separation fix:
                 #   - vm_provisioned_at: written by orchestrator when the VM is dispatched
                 #     and when GCE confirms it's running. Never written by the agent.
@@ -433,6 +488,7 @@ async def reaper_service():
                 # Thresholds:
                 #   - IN_PROGRESS + stale heartbeat → agent crashed mid-run (attempt budget).
                 #     Stale cutoff is scope-aware: 5min (small) / 7min (medium) / 10min (large).
+                #     Exception: tasks with open PRs use 90s cutoff to speed handoff to review.
                 #   - PROVISIONING + vm_provisioned_at > 6min ago + no heartbeat → silent pre-claim
                 #     death (provision budget). 6min gives margin over the ~90-150s nominal cold
                 #     boot + auth validation + claim sequence.
@@ -441,7 +497,8 @@ async def reaper_service():
                 for task in active_tasks:
                     if not task.vm_instance_id:
                         continue
-                    hb_cutoff = _heartbeat_stale_cutoff(task, now)
+                    has_pr = task.id in tasks_with_pr
+                    hb_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=has_pr)
                     if task.status == TaskStatus.PROVISIONING:
                         if task.started_at and task.started_at < fifteen_minutes_ago:
                             orphaned_ids.append(task.id)  # absolute provisioning ceiling
@@ -520,7 +577,8 @@ async def reaper_service():
                             for t in force_locked:
                                 if t.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
                                     continue
-                                if t.last_heartbeat and t.last_heartbeat >= _heartbeat_stale_cutoff(t, now):
+                                has_pr = t.id in tasks_with_pr
+                                if t.last_heartbeat and t.last_heartbeat >= _heartbeat_stale_cutoff(t, now, has_open_pr=has_pr):
                                     continue
                                 _reaper_skip_counts.pop(t.id, None)
                                 orphaned_tasks.append(t)
@@ -545,7 +603,8 @@ async def reaper_service():
                     fifteen_minutes_ago = now - timedelta(minutes=15)
                     verified = []
                     for t in orphaned_tasks:
-                        hb_cutoff = _heartbeat_stale_cutoff(t, now)
+                        has_pr = t.id in tasks_with_pr
+                        hb_cutoff = _heartbeat_stale_cutoff(t, now, has_open_pr=has_pr)
                         if t.status == TaskStatus.PROVISIONING:
                             if t.started_at and t.started_at < fifteen_minutes_ago:
                                 verified.append(t)
@@ -599,11 +658,19 @@ async def reaper_service():
                     elif fresh_task.last_heartbeat:
                         age = int((now - fresh_task.last_heartbeat).total_seconds())
                         reap_reason = f"No heartbeat for {age}s (last: {fresh_task.last_heartbeat.isoformat()})"
+                        # Enrich with tool trace tail for post-mortem analysis
+                        tool_trace_tail = _extract_tool_trace_tail(fresh_task)
+                        if tool_trace_tail:
+                            reap_reason += f" | last tools: {tool_trace_tail}"
                         reap_reason_code = 'heartbeat_timeout_post_claim'
                     elif fresh_task.started_at:
                         # IN_PROGRESS without a heartbeat (defensive branch — should be rare).
                         age = int((now - fresh_task.started_at).total_seconds())
                         reap_reason = f"IN_PROGRESS without heartbeat for {age}s since dispatch"
+                        # Enrich with tool trace tail for post-mortem analysis
+                        tool_trace_tail = _extract_tool_trace_tail(fresh_task)
+                        if tool_trace_tail:
+                            reap_reason += f" | last tools: {tool_trace_tail}"
                         reap_reason_code = 'heartbeat_timeout_post_claim'
                     else:
                         age = int((now - fresh_task.created_at).total_seconds())

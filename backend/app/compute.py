@@ -356,7 +356,8 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                               provider: str | None = None, auth_mode: str | None = None,
                               model: str | None = None, execution_mode: str | None = None,
                               provider_metadata: dict | None = None,
-                              provider_settings: dict | None = None):
+                              provider_settings: dict | None = None,
+                              provisioning_model: str | None = None):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
@@ -401,7 +402,8 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                                 task_type=task_type, secret_version_name=secret_version_name,
                                 provider=provider, auth_mode=auth_mode, model=model,
                                 execution_mode=execution_mode, provider_metadata=provider_metadata,
-                                provider_settings=provider_settings)
+                                provider_settings=provider_settings,
+                                provisioning_model=provisioning_model)
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
@@ -804,7 +806,8 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                          provider: str | None = None, auth_mode: str | None = None,
                          model: str | None = None, execution_mode: str | None = None,
                          provider_metadata: dict | None = None,
-                         provider_settings: dict | None = None):
+                         provider_settings: dict | None = None,
+                         provisioning_model: str | None = None):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
@@ -883,7 +886,10 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     # cheaper but can be terminated by GCP with 30s notice when capacity is
     # needed. Existing reaper + retry handles re-spawn on termination. Default
     # is STANDARD; cloudbuild.yaml sets VM_PROVISIONING_MODEL=SPOT in prod.
-    if VM_PROVISIONING_MODEL == "SPOT":
+    # provisioning_model overrides the process-wide default (e.g. to force
+    # STANDARD after repeated preemptions on a specific task).
+    _effective_provisioning_model = (provisioning_model or VM_PROVISIONING_MODEL).upper()
+    if _effective_provisioning_model == "SPOT":
         scheduling = compute_v1.Scheduling()
         scheduling.provisioning_model = "SPOT"
         # DELETE on preemption: Spot VMs we provision are single-task and can't

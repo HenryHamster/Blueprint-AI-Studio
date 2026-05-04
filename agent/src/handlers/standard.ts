@@ -385,7 +385,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     model,
     effort,
     disallowedTools,
-    noChangesMessage: noChangesMessage ?? 'No file changes.',
+    noChangesMessage,
     analysisContext,
   });
 }

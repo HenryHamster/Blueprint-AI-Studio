@@ -32,6 +32,14 @@ export const PROCESS_KILL_GRACE_MS = 5_000;
 // the wrapper would have killed at +30s and proceeded to commit the diff.
 export const CLAUDE_RESULT_GRACE_MS = 30_000;
 
+// Mid-stream stall watchdog: if the claude-code subprocess stdout goes silent
+// for this long while still alive (no data chunks received), force-kill via the
+// same SIGTERM→SIGKILL escalation as resultGraceTimer. Resets on every chunk.
+// Chosen to be well above any legitimate single tool call but well under the
+// 20-60 min wall-clock budget so a hung tool call is caught quickly.
+// flags.timedOut stays false so the post-Claude commit/push phase still runs.
+export const CLAUDE_STREAM_STALL_MS = 5 * 60_000;
+
 // Log/error message tail length used in status reports.
 export const LOG_TAIL_BYTES = 5_000;
 
@@ -105,6 +113,11 @@ export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
 // narrowing directive once, then fails fast rather than burning the
 // implementation budget on a task that will hit SCOPE_OVERFLOW_THRESHOLDS.
 export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 10;
+
+// Mid-stream stall detection: if a tool_use event is in-flight for longer
+// than this without a corresponding tool-result (user) event, the subprocess
+// is considered stalled and will be SIGTERMed.
+export const TOOL_USE_STALL_TIMEOUT_MS = 30 * 60_000;
 
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;

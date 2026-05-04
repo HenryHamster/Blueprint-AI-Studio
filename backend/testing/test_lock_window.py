@@ -44,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -52,7 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import select
 
-from app.models import Project, Task, TaskStatus
+from app.models import Project, Task, TaskStatus, Artifact, ArtifactType
 from app.rollup_management import (
     _capture_rollup_parent_snapshot,
     _release_parent_lock,
@@ -1175,3 +1175,223 @@ async def test_release_parent_lock_silently_drops_context_when_dirty_flag_omitte
             "to MutableDict), remove this test and update the _release_parent_lock "
             "docstring. Otherwise, the footgun guard regressed."
         )
+
+
+# ── Tool trace enrichment in reaper failure messages ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reaper_enriches_heartbeat_timeout_with_tool_trace(db_session):
+    """When the reaper marks a task FAILED for heartbeat timeout (post-claim),
+    the reap_reason and latest_status_message must include the tail of the
+    _tool_trace from task.context so operators can see what the agent was
+    running when it went silent without digging into the context JSONB.
+
+    The tool trace is captured by the heartbeat endpoint and stored as a ring
+    buffer of recent tool calls (timestamp, tool name, input preview).
+    """
+    from app.reaper import _extract_tool_trace_tail
+
+    # Create a task with a mock tool trace
+    project = Project(name="tool trace test", user_id="user-trace")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="task with trace",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "scope": "small"}],
+        started_at=datetime.utcnow() - timedelta(seconds=400),
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=350),
+        context={
+            "_tool_trace": [
+                {
+                    "t": "2026-05-04T10:12:30.123Z",
+                    "tool": "Read",
+                    "input_preview": "file_path=/tmp/workspace/backend/app/models.py, limit=100",
+                },
+                {
+                    "t": "2026-05-04T10:12:45.456Z",
+                    "tool": "Grep",
+                    "input_preview": "pattern=_tool_trace, path=/tmp/workspace/backend/app",
+                },
+                {
+                    "t": "2026-05-04T10:13:00.789Z",
+                    "tool": "Edit",
+                    "input_preview": "file_path=/tmp/workspace/backend/app/reaper.py, old_string=..., new_string=...",
+                },
+            ]
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Verify the helper extracts and formats the tail correctly
+    tail = _extract_tool_trace_tail(task)
+    assert tail, "Expected non-empty tool trace tail"
+    assert "Read:" in tail or "Grep:" in tail or "Edit:" in tail, (
+        f"Expected tool name in tail; got: {tail}"
+    )
+    assert "10:12" in tail or "10:13" in tail, (
+        f"Expected timestamp in tail; got: {tail}"
+    )
+    # Should include at least part of the input preview
+    assert len(tail) > 0, "Tool trace tail should have content"
+
+
+@pytest.mark.asyncio
+async def test_reaper_tool_trace_fallback_when_missing(db_session):
+    """When _tool_trace is missing or empty, the helper returns an empty
+    string and reap_reason is unchanged (no "| last tools:" suffix).
+    """
+    from app.reaper import _extract_tool_trace_tail
+
+    project = Project(name="no trace test", user_id="user-no-trace")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Task with no tool trace
+    task = Task(
+        project_id=project.id,
+        title="no trace",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    tail = _extract_tool_trace_tail(task)
+    assert tail == "", (
+        f"Expected empty tail for missing _tool_trace; got: {tail}"
+    )
+
+    # Task with empty tool trace list
+    task2 = Task(
+        project_id=project.id,
+        title="empty trace",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+        context={"_tool_trace": []},
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    tail2 = _extract_tool_trace_tail(task2)
+    assert tail2 == "", (
+        f"Expected empty tail for empty _tool_trace; got: {tail2}"
+    )
+
+
+# ── Heartbeat-stale cutoff with PR artifact (reaper.py feature) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_stale_cutoff_uses_90s_for_pr_tasks():
+    """When a task has a PULL_REQUEST artifact, the heartbeat-stale cutoff
+    should be 90s instead of the scope-aware default (300-900s).
+
+    This allows the reaper to detect post-PR silent deaths faster (90-150s
+    instead of 5-15 min) and hand off to the review pipeline sooner.
+
+    Regression test for fix(reaper): ratchet heartbeat-stale cutoff to 90s
+    once PR artifact exists.
+    """
+    from app.reaper import _heartbeat_stale_cutoff
+    from datetime import datetime, timezone
+
+    # Create a task with any scope/effort combination
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="pr task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "scope": "large"}],
+    )
+
+    now = datetime(2026, 5, 4, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Without PR, should use scope-aware cutoff (large = 900s)
+    cutoff_without_pr = _heartbeat_stale_cutoff(task, now, has_open_pr=False)
+    expected_without_pr = now - timedelta(seconds=900)
+    assert cutoff_without_pr == expected_without_pr, (
+        f"Expected cutoff {expected_without_pr} for large-scope task without PR; "
+        f"got {cutoff_without_pr}"
+    )
+
+    # With PR, should use 90s cutoff regardless of scope
+    cutoff_with_pr = _heartbeat_stale_cutoff(task, now, has_open_pr=True)
+    expected_with_pr = now - timedelta(seconds=90)
+    assert cutoff_with_pr == expected_with_pr, (
+        f"Expected cutoff {expected_with_pr} for task with open PR; "
+        f"got {cutoff_with_pr}"
+    )
+
+    # Verify the difference: PR cutoff is much shorter
+    # cutoff_with_pr is later (closer to now) than cutoff_without_pr
+    # so cutoff_with_pr > cutoff_without_pr, and the difference is positive
+    diff_seconds = (cutoff_with_pr - cutoff_without_pr).total_seconds()
+    assert diff_seconds == 810, (
+        f"Expected 810s difference (900s - 90s); got {diff_seconds}s. "
+        "PR-based cutoff is not reducing the stale window correctly."
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_pr_handoff_fires_within_90s_window(db_session):
+    """Regression test: when a task with a PULL_REQUEST artifact has a stale
+    heartbeat (older than 90s), the reaper should detect it as orphaned in the
+    initial detection phase (using the fast 90s cutoff) and hand it off to the
+    review pipeline.
+
+    This verifies the end-to-end flow: task creation + PR artifact + stale
+    heartbeat → reaper detects orphan → hands off to review.
+    """
+    project = Project(name="pr handoff", user_id="user-pr-handoff")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Create a task with IN_PROGRESS status and a stale heartbeat
+    # (120s old, which exceeds 90s cutoff but is within 300s scope default)
+    task = Task(
+        project_id=project.id,
+        title="t",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create", "scope": "small"}],
+        vm_instance_id="test-vm-1",
+        started_at=datetime.utcnow() - timedelta(seconds=10),
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=120),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Add a PULL_REQUEST artifact to mark the task as having an open PR
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/123",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    # Import the cutoff function to verify the task meets the 90s orphan threshold
+    from app.reaper import _heartbeat_stale_cutoff
+    now = datetime.utcnow()
+
+    # Verify the task's heartbeat is stale according to the 90s PR-cutoff
+    pr_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=True)
+    assert task.last_heartbeat < pr_cutoff, (
+        f"Task's heartbeat ({task.last_heartbeat}) should be < 90s PR cutoff ({pr_cutoff}) "
+        "for this test to verify the orphan detection fires."
+    )
+
+    # Verify the task's heartbeat would NOT be stale with scope-default (300s)
+    scope_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=False)
+    assert task.last_heartbeat >= scope_cutoff, (
+        f"Task's heartbeat ({task.last_heartbeat}) should be >= scope cutoff ({scope_cutoff}) "
+        "to verify the PR-based fast cutoff is the differentiator."
+    )

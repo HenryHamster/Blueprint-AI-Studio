@@ -2377,7 +2377,13 @@ async def orchestrator_worker():
                     # dashboard overstates by ~3.3x when the orchestrator runs in
                     # SPOT mode. compute.VM_PROVISIONING_MODEL is the source of truth
                     # (env-driven; STANDARD by default).
-                    task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT")
+                    # Tasks with >=2 prior spot preemptions are forced to STANDARD
+                    # to avoid a third preemption on the same task.
+                    _spot_preemption_count = (task.context or {}).get("spot_preemption_count", 0)
+                    _force_standard = (VM_PROVISIONING_MODEL == "SPOT") and (_spot_preemption_count >= 2)
+                    if _force_standard:
+                        logger.info(f"[ORCHESTRATOR] Task {task.id} forced to STANDARD VM after {_spot_preemption_count} spot preemptions")
+                    task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT") and not _force_standard
                     task.last_heartbeat = None
                     _shared_state.deploy_monitoring["last_dispatch_time"] = _utcnow()
                     session.add(task)
@@ -2414,7 +2420,8 @@ async def orchestrator_worker():
                                                     llm_model: str | None,
                                                     llm_execution_mode: str | None,
                                                     llm_provider_metadata: dict | None,
-                                                    llm_provider_settings: dict | None):
+                                                    llm_provider_settings: dict | None,
+                                                    force_standard: bool = False):
                         success = False
                         try:
                             t_type = (payloads[0] or {}).get("type", "") if payloads else ""
@@ -2448,7 +2455,8 @@ async def orchestrator_worker():
                                                                provider=llm_provider, auth_mode=llm_auth_mode,
                                                                model=llm_model, execution_mode=llm_execution_mode,
                                                                provider_metadata=llm_provider_metadata,
-                                                               provider_settings=llm_provider_settings)
+                                                               provider_settings=llm_provider_settings,
+                                                               provisioning_model="STANDARD" if force_standard else None)
                             if success:
                                 # Verify the task still wants this VM — stale recovery may have
                                 # requeued the task with a new vm_id while we were provisioning.
@@ -2473,7 +2481,7 @@ async def orchestrator_worker():
                                             hb_task.vm_provisioned_at = _utcnow()
                                             # vm_spot mirrors orchestrator-mode at provision-confirm time;
                                             # see comment at the dispatch-site write above.
-                                            hb_task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT")
+                                            hb_task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT") and not force_standard
                                             # Save provision zone for diagnostics
                                             prov_zone = get_vm_zone(vm_id)
                                             hb_task.context = {**(hb_task.context or {}), "provision_zone": prov_zone}
@@ -2632,6 +2640,7 @@ async def orchestrator_worker():
                         runtime_provider, runtime_auth_mode, runtime_model,
                         runtime_execution_mode, runtime_provider_metadata,
                         runtime_provider_settings,
+                        force_standard=_force_standard,
                     ))
                     _provision_coroutines[str(task.id)] = provision_coro
                     provision_coro.add_done_callback(lambda _, tid=str(task.id): _provision_coroutines.pop(tid, None))

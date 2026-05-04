@@ -357,6 +357,74 @@ class TestZoneHealthOutput:
         assert zone in summary["zone_success_rates"]
         assert summary["zone_success_rates"][zone] == pytest.approx(0.75)
 
+
+# ─── Spot preemption override tests ──────────────────────────────────────────
+
+class TestSpotPreemptionOverride:
+    """provision_agent_vm respects the provisioning_model override parameter.
+
+    A task with spot_preemption_count >= 2 causes the orchestrator to pass
+    provisioning_model="STANDARD" to provision_agent_vm, suppressing the SPOT
+    scheduling block even when the process-wide VM_PROVISIONING_MODEL is "SPOT".
+    """
+
+    async def test_provisioning_model_override_passed_to_gcp(self, monkeypatch):
+        """provision_agent_vm forwards provisioning_model="STANDARD" to _provision_gcp."""
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        captured = {}
+
+        async def fake_gcp(*args, **kwargs):
+            captured["provisioning_model"] = kwargs.get("provisioning_model")
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_gcp)
+
+        await compute.provision_agent_vm(
+            "vm-preempt-test", uuid.uuid4(), provisioning_model="STANDARD"
+        )
+        assert captured["provisioning_model"] == "STANDARD"
+
+    async def test_provisioning_model_none_passes_none_to_gcp(self, monkeypatch):
+        """When provisioning_model=None, None propagates so the global env drives it."""
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        captured = {}
+
+        async def fake_gcp(*args, **kwargs):
+            captured["provisioning_model"] = kwargs.get("provisioning_model")
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_gcp)
+
+        await compute.provision_agent_vm("vm-spot-test", uuid.uuid4())
+        assert captured["provisioning_model"] is None
+
+    async def test_standard_override_wins_over_spot_global_env(self, monkeypatch):
+        """STANDARD override beats VM_PROVISIONING_MODEL=SPOT (simulates 2nd preemption path).
+
+        When spot_preemption_count >= 2, the orchestrator passes provisioning_model='STANDARD'
+        to provision_agent_vm even though the process-wide env is SPOT.  This verifies
+        the compute layer passes 'STANDARD' through to _provision_gcp in that scenario.
+        """
+        monkeypatch.setattr(compute, "VM_PROVISIONING_MODEL", "SPOT")
+        monkeypatch.setattr(compute, "_image_family_valid", True)
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+
+        captured = {}
+
+        async def fake_gcp(*args, **kwargs):
+            captured["provisioning_model"] = kwargs.get("provisioning_model")
+            return True
+
+        monkeypatch.setattr(compute, "_provision_gcp", fake_gcp)
+
+        await compute.provision_agent_vm("vm-2nd-preempt", uuid.uuid4(), provisioning_model="STANDARD")
+        # STANDARD override must arrive at _provision_gcp even though global env is SPOT
+        assert captured["provisioning_model"] == "STANDARD"
+
     def test_get_zone_health_summary_empty_rates_when_no_history(self, clean_zone_health):
         """zone_success_rates is empty when no zone has any history."""
         summary = compute.get_zone_health_summary()

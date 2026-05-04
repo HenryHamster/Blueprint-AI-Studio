@@ -69,9 +69,9 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
-import { MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS } from './constants.js';
+import { MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS, TOOL_USE_STALL_TIMEOUT_MS, CLAUDE_STREAM_STALL_MS } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -2592,5 +2592,293 @@ describe('pollForNextRole vm-heartbeat timing', () => {
     // have run. Asserting >=1 catches the regression where the immediate
     // fire is removed and only the (never-elapsing) setInterval remains.
     expect(heartbeatCount).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ── mid-stream tool-use stall watchdog ───────────────────────────────────────
+// Verifies that a tool_use event with no subsequent tool-result (user event)
+// triggers SIGTERM and ClaudeTimeoutError after TOOL_USE_STALL_TIMEOUT_MS.
+describe('mid-stream stall watchdog', () => {
+  type StdoutCb = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeStallChild(pid: number) {
+    const stdoutCbs: StdoutCb[] = [];
+    const handlers: ChildHandlers = {};
+    const child = {
+      pid,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, cb: StdoutCb) => {
+          if (event === 'data') stdoutCbs.push(cb);
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'close') handlers.close = cb as ChildHandlers['close'];
+        else if (event === 'error') handlers.error = cb as ChildHandlers['error'];
+      }),
+    };
+    const emitStdout = (line: string) => {
+      for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
+    };
+    return { child, handlers, emitStdout };
+  }
+
+  // Drive fake time forward in steps shorter than CLAUDE_STREAM_STALL_MS (5 min),
+  // emitting a no-op 'system' event between steps. Each emission flows through
+  // stdout.on('data') -> resetStallWatchdog(), keeping the stream-stall watchdog
+  // alive so we can isolate the tool-use stall watchdog under test. 'system'
+  // events do NOT mutate toolInFlight (only 'user' events do).
+  const advanceWithStreamHeartbeat = async (
+    totalMs: number,
+    emitStdout: (s: string) => void,
+  ) => {
+    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    let remaining = totalMs;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(JSON.stringify({ type: 'system' }));
+      remaining -= STEP;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearPidRegistry();
+  });
+
+  it('emits SIGTERM and throws ClaudeTimeoutError when tool_use in-flight exceeds stall timeout', async () => {
+    const { child, handlers, emitStdout } = makeStallChild(7701);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Emit a tool_use event — tool goes in-flight
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/tmp/x' } }] },
+    }));
+
+    // Advance past the stall threshold (watchdog checks every 60s)
+    await vi.advanceTimersByTimeAsync(TOOL_USE_STALL_TIMEOUT_MS + 60_001);
+
+    // Simulate the process exiting after SIGTERM
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+
+    await expect(promise).rejects.toBeInstanceOf(ClaudeTimeoutError);
+    expect(killSpy).toHaveBeenCalledWith(-7701, 'SIGTERM');
+
+    killSpy.mockRestore();
+  });
+
+  it('does not stall when tool-result (user event) arrives before timeout', async () => {
+    const { child, handlers, emitStdout } = makeStallChild(7702);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Emit tool_use then tool result before stall timeout
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Read', input: {} }] },
+    }));
+    emitStdout(JSON.stringify({ type: 'user' }));
+
+    // Advance well past the stall timeout — watchdog should not fire because
+    // toolInFlight was cleared by the user event above. Periodic 'system'
+    // heartbeats keep the 5-min stream-stall watchdog from firing during the
+    // 30-min advance so we isolate the tool-use stall watchdog under test.
+    await advanceWithStreamHeartbeat(TOOL_USE_STALL_TIMEOUT_MS + 60_001, emitStdout);
+
+    // Process exits cleanly
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+
+    const result = await promise;
+    expect(result.exitCode).toBe(0);
+    expect(killSpy).not.toHaveBeenCalledWith(-7702, 'SIGTERM');
+
+    killSpy.mockRestore();
+  });
+
+  it('clears stall watchdog when process exits before threshold fires', async () => {
+    const { child, handlers, emitStdout } = makeStallChild(7703);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Emit tool_use but process exits before watchdog fires
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] },
+    }));
+
+    // Advance partially — under the tool-use stall threshold. Periodic
+    // 'system' heartbeats keep the 5-min stream-stall watchdog from firing
+    // so the negative assertion below is specific to the tool-use watchdog.
+    await advanceWithStreamHeartbeat(TOOL_USE_STALL_TIMEOUT_MS - 60_000, emitStdout);
+
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await promise.catch(() => undefined);
+
+    // Advance past threshold after close — watchdog should be cleared and not fire
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(killSpy).not.toHaveBeenCalledWith(-7703, 'SIGTERM');
+
+    killSpy.mockRestore();
+  });
+});
+
+// ── runProviderAgent stream-stall watchdog ────────────────────────────────────
+// Verifies the stream-stall watchdog arms on spawn, resets on data chunks,
+// and fires SIGTERM→SIGKILL when stdout goes silent for CLAUDE_STREAM_STALL_MS.
+// The close/error handlers must clear the watchdog before it fires.
+describe('runProviderAgent stream-stall watchdog', () => {
+  type StdoutHandler = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    let stdoutHandler: StdoutHandler | null = null;
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, handler: StdoutHandler) => {
+          if (event === 'data') stdoutHandler = handler;
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+    };
+    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearPidRegistry();
+  });
+
+  it('fires SIGTERM after CLAUDE_STREAM_STALL_MS with no stdout data', async () => {
+    const { fakeChild, childHandlers } = makeChild(7001);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Advance past stall threshold — watchdog should fire SIGTERM.
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
+
+    expect(killSpy).toHaveBeenCalledWith(-7001, 'SIGTERM');
+
+    // Clean up by resolving the promise.
+    childHandlers.close?.(0, null);
+    await promise.catch(() => undefined);
+    killSpy.mockRestore();
+  });
+
+  it('does NOT fire when stdout data resets the watchdog before threshold', async () => {
+    const { fakeChild, childHandlers, emitData } = makeChild(7002);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Emit data chunks just before the threshold, resetting the watchdog each time.
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 100);
+    emitData(Buffer.from('chunk1'));
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 100);
+    emitData(Buffer.from('chunk2'));
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 100);
+
+    // Should not have fired SIGTERM yet — each chunk reset the watchdog.
+    expect(killSpy).not.toHaveBeenCalledWith(-7002, 'SIGTERM');
+
+    childHandlers.close?.(0, null);
+    await promise.catch(() => undefined);
+    killSpy.mockRestore();
+  });
+
+  it('clears watchdog in close handler so no kill fires after process exits', async () => {
+    const { fakeChild, childHandlers } = makeChild(7003);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    // Close the process well before the stall threshold.
+    childHandlers.close?.(0, null);
+    await promise.catch(() => undefined);
+
+    // Advancing past threshold should NOT fire the watchdog — it was cleared.
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
+    expect(killSpy).not.toHaveBeenCalledWith(-7003, 'SIGTERM');
+    killSpy.mockRestore();
+  });
+
+  it('clears watchdog in error handler so no kill fires after process errors', async () => {
+    const { fakeChild, childHandlers } = makeChild(7004);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const ws = null as unknown as WebSocket | null;
+    const statusRef = { value: '' };
+    const promise = runProviderAgent('hello', ws, statusRef);
+    await Promise.resolve();
+
+    childHandlers.error?.(new Error('spawn error'));
+    await promise.catch(() => undefined);
+
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
+    expect(killSpy).not.toHaveBeenCalledWith(-7004, 'SIGTERM');
+    killSpy.mockRestore();
   });
 });
