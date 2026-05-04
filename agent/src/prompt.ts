@@ -318,7 +318,7 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc'];
+const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;
@@ -405,6 +405,318 @@ echo ""
 `;
   fs.writeFileSync(`${WORKSPACE}/messages`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
+}
+
+// ── Code-change task helpers (./check, ./pr, ./done, ./fail) ────────────────
+//
+// These four helpers replace the wrapper-driven lint/test/push/PR pipeline
+// for tasks that produce code changes. Claude owns its own loop:
+//
+//   edit → ./check → see errors → edit → ./check → ... (one Claude session,
+//   full task context, intelligent pivots) → ./pr open --title --body
+//   → ./done (mark COMPLETED with PR URL)  OR  ./fail "reason"
+//
+// The wrapper just runs Claude, watches for ./done|./fail marker files,
+// and posts status accordingly. No more wrapper-driven lintFixLoop /
+// testFixLoop / pushAndCreatePR for these task types.
+
+interface CodeChangeHelperConfig {
+  taskId: string;
+  /** Working branch name, e.g. ``blueprint/task-abc12345``. */
+  workBranch: string;
+  baseBranch: string;
+  owner: string;
+  repo: string;
+  /** Existing PR number (review-fix path). When set, ./pr open just pushes
+   *  to the existing PR instead of creating a new one. */
+  existingPrNumber?: number;
+  /** When true, ./check test runs the Docker backend test suite for any
+   *  task whose changes touch ``backend/``. Set when base_branch === 'main'. */
+  testsOnMainBranch: boolean;
+}
+
+/** Write ./check, ./pr, ./done, ./fail to WORKSPACE. Idempotent. */
+export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
+  writeCheckHelper(cfg);
+  writePrHelper(cfg);
+  writeDoneHelper(cfg);
+  writeFailHelper(cfg);
+  excludeAgentHelpers();
+}
+
+function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
+  // Auto-detects which stacks were touched (admin-ui / agent / backend) by
+  // inspecting `git diff --name-only` against the base branch + uncommitted.
+  // Runs the corresponding lint/build commands. Optional `./check test` also
+  // runs the Docker backend test suite when backend/ was touched and
+  // tests-on-main is enabled.
+  const script = `#!/bin/bash
+# ./check — run lint/build (and optionally tests) for changed paths.
+# Usage:
+#   ./check        # lint+build only — fast, run before each iteration
+#   ./check test   # also run tests (slow; mainly before ./pr open)
+# Exits 0 on green, non-zero on any failure. Output is the actual error tail
+# so you can act on it. Re-run after edits.
+
+set -uo pipefail
+WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
+cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
+
+WITH_TESTS=0
+[ "\${1:-}" = "test" ] || [ "\${1:-}" = "--tests" ] && WITH_TESTS=1
+
+# Determine changed paths: committed since base + uncommitted
+BASE="${cfg.baseBranch}"
+COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || git diff --name-only "$BASE...HEAD" 2>/dev/null || true)
+UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+CHANGED=$(printf '%s\\n%s\\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)
+
+touches() { printf '%s\\n' "$CHANGED" | grep -q "^$1"; }
+
+FAILED=()
+
+run() {
+  local label="$1"; shift
+  echo "[check] $label..."
+  if "$@"; then
+    echo "[check] $label OK"
+  else
+    echo "[check] $label FAILED"
+    FAILED+=("$label")
+  fi
+}
+
+if touches admin-ui/; then
+  ( cd admin-ui && [ -d node_modules ] || npm ci ) >/tmp/check_npm_ci.log 2>&1 || {
+    echo "[check] admin-ui npm ci FAILED — see /tmp/check_npm_ci.log"
+    tail -30 /tmp/check_npm_ci.log
+    FAILED+=("admin-ui npm ci")
+  }
+  run "admin-ui eslint"  bash -c 'cd admin-ui && npx eslint . 2>&1'
+  run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
+fi
+
+if touches agent/; then
+  ( cd agent && [ -d node_modules ] || npm ci ) >/tmp/check_agent_npm_ci.log 2>&1 || {
+    echo "[check] agent npm ci FAILED — see /tmp/check_agent_npm_ci.log"
+    tail -30 /tmp/check_agent_npm_ci.log
+    FAILED+=("agent npm ci")
+  }
+  run "agent tsc"        bash -c 'cd agent && npx tsc --noEmit 2>&1'
+  run "agent eslint"     bash -c 'cd agent && npx eslint . 2>&1'
+fi
+
+if touches backend/; then
+  if command -v ruff >/dev/null 2>&1 || python3 -m ruff --version >/dev/null 2>&1; then
+    run "backend ruff"    bash -c 'python3 -m ruff check backend/ --select E,F,W --ignore E501 2>&1'
+    run "backend ruff fmt" bash -c 'python3 -m ruff format --check backend/ 2>&1'
+  else
+    echo "[check] ruff not installed, skipping backend lint"
+  fi
+  if [ "$WITH_TESTS" = "1" ] && [ "${cfg.testsOnMainBranch ? '1' : '0'}" = "1" ]; then
+    run "backend pytest" bash -c 'bash scripts/test-backend.sh --postgres 2>&1 | tail -200'
+  fi
+fi
+
+if [ \${#FAILED[@]} -eq 0 ]; then
+  echo ""
+  echo "[check] PASS — all checks green"
+  exit 0
+else
+  echo ""
+  echo "[check] FAIL — \${#FAILED[@]} check(s) failed: \${FAILED[*]}"
+  exit 1
+fi
+`;
+  fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
+}
+
+function writePrHelper(cfg: CodeChangeHelperConfig): void {
+  // Idempotent push + PR creation/update. Gates on ./check first.
+  // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
+  // pick up the URL without re-querying GitHub.
+  const script = `#!/bin/bash
+# ./pr open --title "..." --body "..."  — ship the diff via PR
+#
+# Gates on ./check (must pass). Then commits any pending changes, pushes
+# to ${cfg.workBranch}, and creates a PR (or pushes an update to an
+# existing PR for review-fix tasks).
+#
+# Exits 0 on success (PR URL written to /tmp/pr_url_${cfg.taskId}).
+# Non-zero on any failure — error tail printed; fix and retry.
+
+set -uo pipefail
+WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
+cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
+
+OP="\${1:-}"
+shift || true
+[ "$OP" != "open" ] && { echo "Usage: ./pr open --title <title> --body <body> [--skip-check]"; exit 2; }
+
+TITLE=""
+BODY=""
+SKIP_CHECK=0
+WITH_TESTS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title) TITLE="$2"; shift 2 ;;
+    --body) BODY="$2"; shift 2 ;;
+    --skip-check) SKIP_CHECK=1; shift ;;
+    --with-tests) WITH_TESTS=1; shift ;;
+    *) echo "Unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -z "$TITLE" ] && { echo "Error: --title is required" >&2; exit 2; }
+
+# 1. Run ./check as gate (lint always; tests on main branch when --with-tests
+#    OR on review-fix path that touches backend changes).
+if [ "$SKIP_CHECK" = "0" ]; then
+  CHECK_ARGS=()
+  [ "$WITH_TESTS" = "1" ] && CHECK_ARGS+=("test")
+  if ! ./check "\${CHECK_ARGS[@]}"; then
+    echo ""
+    echo "[pr] ./check failed — fix lint/build/tests then re-run ./pr open. Use --skip-check ONLY if you've manually verified, otherwise broken code lands."
+    exit 1
+  fi
+fi
+
+# 2. Stage and commit any pending changes
+if [ -n "$(git status --porcelain)" ]; then
+  git add -A
+  git -c user.email=blueprint-agent@automated.dev -c user.name='Blueprint Agent' \\
+    commit -m "$TITLE" >/dev/null || {
+    echo "[pr] git commit failed" >&2
+    git status --short
+    exit 1
+  }
+fi
+
+# Anything to push?
+COMMITS_AHEAD=$(git rev-list --count "origin/${cfg.baseBranch}..HEAD" 2>/dev/null || echo 0)
+if [ "$COMMITS_AHEAD" = "0" ]; then
+  echo "[pr] No commits ahead of ${cfg.baseBranch} — nothing to push. Did you forget to make changes?"
+  exit 1
+fi
+
+# 3. Push (with retry — concurrent-push handling)
+PUSH_OK=0
+for attempt in 1 2 3; do
+  if git push --force-with-lease origin "${cfg.workBranch}" 2>/tmp/pr_push.log; then
+    PUSH_OK=1
+    break
+  fi
+  if grep -q 'stale info' /tmp/pr_push.log; then
+    echo "[pr] push attempt $attempt: stale lease, fetching + retrying..."
+    git fetch origin "${cfg.workBranch}" 2>/dev/null || true
+    sleep 2
+  else
+    echo "[pr] push attempt $attempt failed:"; cat /tmp/pr_push.log; sleep 2
+  fi
+done
+if [ "$PUSH_OK" = "0" ]; then
+  echo "[pr] push failed after 3 attempts" >&2
+  exit 1
+fi
+
+# 4. Create or update PR
+${cfg.existingPrNumber !== undefined ? `
+# Existing PR (#${cfg.existingPrNumber}) — just pushed updates, no creation needed.
+PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/${cfg.existingPrNumber}"
+echo "[pr] Pushed updates to existing PR #${cfg.existingPrNumber}"
+` : `
+# Create a new PR (or no-op if one already exists for this branch — gh handles it).
+export GH_TOKEN="\${GITHUB_TOKEN:-\${GH_TOKEN:-}}"
+[ -z "$GH_TOKEN" ] && { echo "[pr] GITHUB_TOKEN not set — cannot create PR" >&2; exit 1; }
+
+EXISTING_PR=$(gh pr list --head "${cfg.workBranch}" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+if [ -n "$EXISTING_PR" ]; then
+  PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/$EXISTING_PR"
+  echo "[pr] PR already exists for ${cfg.workBranch}: $PR_URL — pushed updates"
+else
+  BODY_FILE=$(mktemp)
+  printf '%s' "$BODY" > "$BODY_FILE"
+  PR_URL=$(gh pr create --base "${cfg.baseBranch}" --head "${cfg.workBranch}" --title "$TITLE" --body-file "$BODY_FILE" 2>&1) || {
+    echo "[pr] gh pr create failed: $PR_URL" >&2
+    rm -f "$BODY_FILE"
+    exit 1
+  }
+  rm -f "$BODY_FILE"
+fi
+unset GH_TOKEN
+`}
+
+# 5. Persist PR URL for ./done + wrapper detection
+echo "$PR_URL" > /tmp/pr_url_${cfg.taskId}
+echo ""
+echo "[pr] OK — $PR_URL"
+echo "[pr] Next: ./done   (or call ./pr again if you push more commits)"
+`;
+  fs.writeFileSync(`${WORKSPACE}/pr`, script, { mode: 0o755 });
+}
+
+function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
+  // Posts COMPLETED to the orchestrator with the PR URL from /tmp/pr_url_<task_id>.
+  // Also writes /tmp/done_<task_id> as a marker for the wrapper to detect on
+  // exit and skip its fallback push.
+  const script = `#!/bin/bash
+# ./done — mark task COMPLETED. Requires ./pr open to have run first
+# (writes /tmp/pr_url_${cfg.taskId} which this reads). Posts the COMPLETED
+# status to the orchestrator with the PR URL, then writes a marker so the
+# wrapper exits cleanly without re-doing commit/push.
+
+set -uo pipefail
+PR_FILE="/tmp/pr_url_${cfg.taskId}"
+if [ ! -s "$PR_FILE" ]; then
+  echo "Error: $PR_FILE missing or empty — run ./pr open first." >&2
+  exit 2
+fi
+PR_URL=$(cat "$PR_FILE")
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
+  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}' | \\
+  curl -f -sS --max-time 30 -X POST "$API/api/agent/status" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+
+echo ""
+touch /tmp/done_${cfg.taskId}
+echo "[done] OK — wrapper will exit cleanly. PR: $PR_URL"
+`;
+  fs.writeFileSync(`${WORKSPACE}/done`, script, { mode: 0o755 });
+}
+
+function writeFailHelper(cfg: CodeChangeHelperConfig): void {
+  // Explicit failure signal — Claude calls this when it determines the task
+  // can't be completed (e.g. scope is wrong, blocker found, conflicting
+  // requirements). Posts FAILED with the reason. Wrapper sees the marker
+  // and exits cleanly without trying its own fallback push.
+  const script = `#!/bin/bash
+# ./fail "reason" — mark task FAILED with an operator-readable reason.
+# Use when the task can't be completed cleanly: scope is wrong, blocker
+# found, conflicting requirements, etc. Don't use for transient lint
+# failures — keep iterating with ./check instead.
+
+set -uo pipefail
+REASON="\${1:?Usage: ./fail \\"<reason>\\"}"
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+jq -n --arg tid "$TASK" --arg r "$REASON" \\
+  '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "agent_self_failed"}' | \\
+  curl -f -sS --max-time 30 -X POST "$API/api/agent/status" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+
+echo ""
+touch /tmp/fail_${cfg.taskId}
+echo "[fail] Posted FAILED status. Reason: $REASON"
+`;
+  fs.writeFileSync(`${WORKSPACE}/fail`, script, { mode: 0o755 });
 }
 
 export interface PlaybookEntry {
