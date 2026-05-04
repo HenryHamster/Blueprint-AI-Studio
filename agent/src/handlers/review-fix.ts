@@ -1289,12 +1289,19 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
       ? git(['diff', '--name-only', `${fixBaseCommit}..HEAD`]).split('\n').filter(Boolean)
       : [];
     const changedPaths = [...new Set([...fixUncommittedPaths, ...fixCommittedPaths])];
-    const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
-    if (!lintPassed) {
+    const lintResult = await lintFixLoop(changedPaths, ws, statusRef, 'the fix you just applied', model, effort, fixBuildConfig);
+    if (!lintResult.passed) {
       sendLog(ws, 'Lint checks still failing after max attempts — failing review-fix cycle early.\n');
+      const reasonSuffix =
+        lintResult.exitReason === 'early_unchanged'
+          ? '(loop exited early — same fingerprint repeated)'
+          : '(loop reached max attempts)';
+      const errorBody = lintResult.lastErrorTail
+        ? `Last lint output:\n${sanitize((lintResult.lastErrorTail).slice(-10_000))}`
+        : '(no lint output captured)';
       await persistAndPostStatus(taskId, {
         task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-        logs: 'Lint/build checks failed after max fix attempts during review-fix cycle.',
+        logs: `Lint/build checks failed after max fix attempts during review-fix cycle ${reasonSuffix}.\n\n${errorBody}`,
         failure_category: 'lint_failed',
         changed_files: changedPaths.slice(0, 50),
       });

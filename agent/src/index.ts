@@ -1635,24 +1635,37 @@ function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
 }
 
+export interface LintFixLoopResult {
+  /** True if lint converged green within MAX_LINT_FIX_ATTEMPTS. */
+  passed: boolean;
+  /** Last lint error message (tail). Set when passed=false; undefined on success. */
+  lastErrorTail?: string;
+  /** Why the loop stopped. ``early_unchanged`` = same-fingerprint exit; ``max_attempts`` = ran out. */
+  exitReason?: 'early_unchanged' | 'max_attempts';
+  /** Per-attempt diff/error history, useful for downstream diagnosis. */
+  attempts: FixAttempt[];
+}
+
 export async function lintFixLoop(
   changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
   context: string = 'the code you just wrote', model?: string, effort?: string,
   buildConfig?: BuildConfig
-): Promise<boolean> {
+): Promise<LintFixLoopResult> {
   let prevFingerprint: string | null = null;
   const prevAttempts: FixAttempt[] = [];
+  let lastErrorTail: string | undefined;
   for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
     try {
       statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
       runProjectLintChecks(changedPaths, ws, buildConfig);
-      return true;
+      return { passed: true, attempts: prevAttempts };
     } catch (lintErr: unknown) {
       const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
+      lastErrorTail = msg;
       const fingerprint = errorFingerprint(msg);
       if (prevFingerprint !== null && fingerprint === prevFingerprint) {
         sendLog(ws, `Lint error unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
-        return false;
+        return { passed: false, lastErrorTail, exitReason: 'early_unchanged', attempts: prevAttempts };
       }
       // On retry (attempt >= 1), record what the previous Claude call
       // actually did + the failure that persisted, so the next iteration's
@@ -1674,7 +1687,7 @@ export async function lintFixLoop(
     }
   }
   sendLog(ws, `WARNING: Lint checks still failing after ${MAX_LINT_FIX_ATTEMPTS} attempts.\n`);
-  return false;
+  return { passed: false, lastErrorTail, exitReason: 'max_attempts', attempts: prevAttempts };
 }
 
 // ── Test runner detection (shared by testFixLoop and captureTestBaseline) ───

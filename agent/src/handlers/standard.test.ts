@@ -21,7 +21,7 @@ vi.mock('../index.js', async (importOriginal) => {
     pushAndCreatePR: vi.fn().mockResolvedValue('https://github.com/owner/repo/pull/1'),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
     matchesRateLimit: vi.fn().mockReturnValue(false),
-    lintFixLoop: vi.fn().mockResolvedValue(true),
+    lintFixLoop: vi.fn().mockResolvedValue({ passed: true, attempts: [] }),
     testFixLoop: vi.fn().mockResolvedValue({ testFailuresDetected: false, passed: true }),
     captureTestBaseline: vi.fn().mockResolvedValue(null),
     condensedAnalysisSections: vi.fn((s: string) => s),
@@ -1898,7 +1898,7 @@ describe('analysis-phase scope feasibility gate', () => {
 
   it('includes analysis_plan in COMPLETED payload so siblings can learn from successful plans', async () => {
     vi.mocked(parseAnalysisPlanFiles).mockReturnValue(['a.ts', 'b.ts']);
-    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(lintFixLoop).mockResolvedValue({ passed: true, attempts: [] });
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
     const analysisOutput = '**Files to change**\n- a.ts\n- b.ts';
     const validSelfReviewOutput = '```json\n' + JSON.stringify({
@@ -1951,7 +1951,7 @@ describe('lint failure handling', () => {
   });
 
   it('marks task as FAILED when lintFixLoop returns false for a create task', async () => {
-    vi.mocked(lintFixLoop).mockResolvedValue(false);
+    vi.mocked(lintFixLoop).mockResolvedValue({ passed: false, lastErrorTail: 'mock lint failure', exitReason: 'max_attempts', attempts: [] });
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
@@ -1962,7 +1962,7 @@ describe('lint failure handling', () => {
   });
 
   it('does not mark task as FAILED when lintFixLoop returns true', async () => {
-    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(lintFixLoop).mockResolvedValue({ passed: true, attempts: [] });
     const task = { title: 'Task', description: '', context: {}, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
@@ -2078,7 +2078,7 @@ describe('handleRefactor blocking gates', () => {
   });
 
   it('marks task as FAILED when lint fails for refactor', async () => {
-    vi.mocked(lintFixLoop).mockResolvedValue(false);
+    vi.mocked(lintFixLoop).mockResolvedValue({ passed: false, lastErrorTail: 'mock lint failure', exitReason: 'max_attempts', attempts: [] });
     const task = { title: 'Refactor task', description: '', context: {}, project_context: {} };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
@@ -2089,7 +2089,7 @@ describe('handleRefactor blocking gates', () => {
   });
 
   it('marks task as FAILED when tests fail for refactor', async () => {
-    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(lintFixLoop).mockResolvedValue({ passed: true, attempts: [] });
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: true, passed: false, failureSummary: 'test_foo failed' });
     const task = { title: 'Refactor task', description: '', context: {}, project_context: {} };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -2131,7 +2131,7 @@ describe('scope overflow warning in PR body (post self-review)', () => {
   });
 
   function setupGitMocks(diff: string): void {
-    vi.mocked(lintFixLoop).mockResolvedValue(true);
+    vi.mocked(lintFixLoop).mockResolvedValue({ passed: true, attempts: [] });
     vi.mocked(testFixLoop).mockResolvedValue({ testFailuresDetected: false, passed: true });
     const validSelfReviewOutput = '```json\n' + JSON.stringify({
       verdict: 'PASS',

@@ -638,12 +638,25 @@ Return nothing — just write the files.`;
     }
 
     if (runLintFix) {
-      const lintPassed = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
-      if (!lintPassed && failOnTestFailure) {
+      const lintResult = await lintFixLoop(changedPaths, ws, statusRef, lintContext, model, effort, buildConfig);
+      if (!lintResult.passed && failOnTestFailure) {
         sendLog(ws, 'Lint checks still failing after max attempts — marking task as FAILED.\n');
+        // Mirror the test-failure path (line ~687-689): include the actual
+        // lint error tail so downstream diagnosis can see WHICH rule failed,
+        // not just "max fix attempts" with no signal. Prior to this change
+        // the lint output was only streamed over WebSocket and lost when
+        // the VM was torn down, leaving auto-remediation diagnoses blind.
+        const reasonSuffix =
+          lintResult.exitReason === 'early_unchanged'
+            ? '(loop exited early — same fingerprint repeated, indicating Claude could not converge on a fix)'
+            : '(loop reached max attempts)';
+        const errorBody =
+          lintResult.lastErrorTail
+            ? `Last lint output:\n${sanitize((lintResult.lastErrorTail).slice(-10_000))}`
+            : '(no lint output captured)';
         await persistAndPostStatus(taskId, {
           task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: `Lint/build checks failed after max fix attempts. See logs above for details.`,
+          logs: `Lint/build checks failed after max fix attempts ${reasonSuffix}.\n\n${errorBody}`,
           failure_category: 'lint_failed',
           changed_files: changedPaths.slice(0, 50),
           ...(diffSummary.length > 0 ? { diff_summary: diffSummary } : {}),
