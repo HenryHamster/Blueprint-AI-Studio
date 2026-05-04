@@ -795,43 +795,110 @@ class TestResidualStore:
         fc._residual_seen_task_ids.clear()
         fc._residual_closed_fingerprints.clear()
 
-    def _task_with_id(self, msg: str, task_id: str) -> "Task":
+    def _task_with_id(self, msg: str, task_id: str, status=None) -> "Task":
+        from app.models import TaskStatus
         t = MagicMock(spec=Task)
         t.latest_status_message = msg
         t.context = {}
         t.id = task_id
+        # Residual-fingerprint Gate 1 requires FAILED. Tests that need a
+        # different status pass it explicitly.
+        t.status = status if status is not None else TaskStatus.FAILED
         return t
 
     def test_record_then_query(self):
-        t = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-1")
-        record_residual_fingerprint(t)
+        t = self._task_with_id("[10.5MB] Cloning repo...", "task-1")
+        record_residual_fingerprint(t, logs="AttributeError: NoneType has no attr 'x'")
         results = get_top_residual_fingerprints(window_seconds=3600)
         assert len(results) == 1
         assert results[0]['count'] == 1
         assert results[0]['task_ids'] == ['task-1']
 
     def test_dedup_same_task_id(self):
-        t = self._task_with_id("TypeError: some error", "task-abc")
-        record_residual_fingerprint(t)
-        record_residual_fingerprint(t)
+        t = self._task_with_id("[10.5MB] Cloning...", "task-abc")
+        record_residual_fingerprint(t, logs="TypeError: some error")
+        record_residual_fingerprint(t, logs="TypeError: some error")
         results = get_top_residual_fingerprints()
         assert results[0]['count'] == 1
 
     def test_near_duplicates_cluster(self):
-        t1 = self._task_with_id("AttributeError: expected 3, got 4", "task-1")
-        t2 = self._task_with_id("AttributeError: expected 9, got 12", "task-2")
-        record_residual_fingerprint(t1)
-        record_residual_fingerprint(t2)
+        t1 = self._task_with_id("[10.5MB] Cloning...", "task-1")
+        t2 = self._task_with_id("[10.5MB] Cloning...", "task-2")
+        record_residual_fingerprint(t1, logs="AttributeError: expected 3, got 4")
+        record_residual_fingerprint(t2, logs="AttributeError: expected 9, got 12")
         results = get_top_residual_fingerprints()
         assert len(results) == 1
         assert results[0]['count'] == 2
 
     def test_classify_failure_fallthrough_records(self):
-        t = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-ff")
-        result = classify_failure(t)
+        t = self._task_with_id("[10.5MB] Cloning...", "task-ff")
+        # Status alone never drives the fingerprint — pass logs with an
+        # error-shaped line.
+        result = classify_failure(t, logs="AttributeError: NoneType has no attr 'x'")
         assert result == CODE_ERROR
         results = get_top_residual_fingerprints()
         assert any(r['task_ids'] == ['task-ff'] or 'task-ff' in r['task_ids'] for r in results)
+
+    def test_non_failed_status_does_not_record(self):
+        """Gate 1: classify_failure may be called from analytics paths on
+        COMPLETED / CANCELLED / EVALUATING tasks (read-only classification).
+        Those calls must NOT pollute the residual store with success-shape
+        inputs (rollup messages, plan output JSON, review approvals)."""
+        from app.models import TaskStatus
+        for non_failed_status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.EVALUATING,
+            TaskStatus.IN_PROGRESS,
+        ):
+            import app.failure_classification as fc
+            fc._residual_store.clear()
+            fc._residual_seen_task_ids.clear()
+            t = self._task_with_id(
+                "TypeError: real error in logs",
+                f"task-{non_failed_status}",
+                status=non_failed_status,
+            )
+            record_residual_fingerprint(t, logs="TypeError: real error in logs")
+            results = get_top_residual_fingerprints()
+            assert results == [], (
+                f"status={non_failed_status} should not record, got {results}"
+            )
+
+    def test_no_error_line_in_logs_does_not_record(self):
+        """Gate 2: no fallback to latest_status_message. If logs lack an
+        error-shaped line, no fingerprint is recorded — the status message
+        is almost always a benign heartbeat that pollutes the store."""
+        t = self._task_with_id("[10.5MB] Cloning org/repo...", "task-noerr")
+        record_residual_fingerprint(t)  # no logs at all
+        assert get_top_residual_fingerprints() == []
+        record_residual_fingerprint(t, logs="just some progress info\nnothing exceptional")
+        assert get_top_residual_fingerprints() == []
+
+    def test_json_output_does_not_record_even_with_exception_keyword(self):
+        """Regression for the 2026-05-04 plan-output false-positive: a
+        plan task's serialized JSON output mentioning ``Exception`` inside
+        a prompt string (e.g. lint guidance ``avoid except Exception:
+        blocks (BLE001)``) used to fingerprint the JSON prefix as a
+        CODE_ERROR sample, which then drove auto-remediation tasks that
+        ``fixed`` a research prompt rather than a real bug."""
+        json_logs = (
+            '{"subtasks": [{"prompt": "avoid except Exception: blocks (BLE001) '
+            'and prefer specific exception classes"}]}'
+        )
+        t = self._task_with_id("[10.5MB] Cloning...", "task-json")
+        record_residual_fingerprint(t, logs=json_logs)
+        assert get_top_residual_fingerprints() == []
+
+    def test_lint_prose_mentioning_exception_does_not_record(self):
+        """Substring-anywhere matching used to flag prose like
+        ``avoid except Exception: blocks`` as error-shaped. Strict
+        line-start patterns require the keyword at a structural position."""
+        t = self._task_with_id("[10.5MB] Cloning...", "task-prose")
+        record_residual_fingerprint(
+            t, logs="avoid except Exception: blocks (BLE001)\nuse specific classes"
+        )
+        assert get_top_residual_fingerprints() == []
 
     def test_fingerprint_prefers_error_line_over_status_message(self):
         """Regression: status messages were dominating the fingerprint
@@ -888,13 +955,14 @@ class TestResidualStore:
         results = get_top_residual_fingerprints()
         assert not any('task-timeout' in r['task_ids'] for r in results)
 
-    def test_heartbeat_records_but_is_marked_not_error_shaped(self):
-        """Regression (#3270, 2026-04-27): a task that failed with no
-        recoverable error logs and a benign status message used to drive
-        auto-remediation off the heartbeat (PROVISION_PROGRESS / Using
-        tool / Creating pull request / ...). The cluster is still kept
-        for diagnostic visibility, but flagged ``is_error_shaped=False``
-        so the spawn site can apply a higher count threshold."""
+    def test_heartbeat_only_contributions_do_not_record(self):
+        """Reversed from prior behavior (2026-05-04): heartbeat-only
+        contributions used to be recorded with ``is_error_shaped=False``
+        so the spawn-site threshold could filter them. But carrying them
+        in the store still polluted the admin-UI residual list and
+        reactivated CLOSED_ORGANICALLY DB rows. The strict gate now
+        requires an error-shaped log line; heartbeat-only contributions
+        are dropped entirely."""
         for benign in (
             "PROVISION_PROGRESS: creds fetched, entering env setup",
             "[12.1MB] Using tool: Grep",
@@ -911,19 +979,15 @@ class TestResidualStore:
             t = self._task_with_id(benign, f"task-benign-{hash(benign)}")
             record_residual_fingerprint(t)
             results = get_top_residual_fingerprints()
-            assert len(results) == 1, f"{benign!r} should still record"
-            assert results[0]['is_error_shaped'] is False, (
-                f"{benign!r} should be flagged not-error-shaped, "
-                f"got is_error_shaped={results[0]['is_error_shaped']}"
-            )
+            assert results == [], f"{benign!r} should not record, got {results}"
 
-    def test_error_shaped_status_marks_cluster_error_shaped(self):
-        """``[ERROR] ...`` is the agent's explicit error-status prefix
-        (agent/src/index.ts:2606). When the agent tags its status as an
-        error, the cluster gets ``is_error_shaped=True`` even without
-        separate log lines, so the spawn site uses the normal threshold."""
-        t = self._task_with_id("[ERROR] connection refused after 30s", "task-err-status")
-        record_residual_fingerprint(t)
+    def test_error_shaped_logs_record_as_error_shaped(self):
+        """``[ERROR] ...`` in logs is the agent's explicit error prefix
+        (agent/src/index.ts:2606). With strict gating the signal must be
+        in the logs argument, not just the status field — but matching is
+        unchanged."""
+        t = self._task_with_id("[10.5MB] Cloning...", "task-err-logs")
+        record_residual_fingerprint(t, logs="[ERROR] connection refused after 30s")
         results = get_top_residual_fingerprints()
         assert len(results) == 1
         assert results[0]['is_error_shaped'] is True
@@ -940,30 +1004,38 @@ class TestResidualStore:
         assert results[0]['is_error_shaped'] is True
         assert "TypeError" in results[0]['sample_message']
 
-    def test_is_error_shaped_is_sticky_true_across_contributions(self):
-        """If any contribution to a cluster is error-shaped, the cluster
-        stays error-shaped. Later heartbeat-only contributions to the
-        same fingerprint don't downgrade the threshold."""
-        # Same fingerprint (status text identical), first contribution
-        # has error logs, second doesn't.
-        t1 = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-1")
-        t2 = self._task_with_id("AttributeError: NoneType has no attr 'x'", "task-2")
-        record_residual_fingerprint(t1)
-        record_residual_fingerprint(t2)
+    def test_repeat_error_contributions_cluster_and_stay_error_shaped(self):
+        """Two FAILED tasks with the same error line cluster into one
+        fingerprint. ``is_error_shaped`` is always True under strict
+        gating since unshaped contributions never reach the store."""
+        t1 = self._task_with_id("[10.5MB] Cloning...", "task-1")
+        t2 = self._task_with_id("[10.5MB] Cloning...", "task-2")
+        err = "AttributeError: NoneType has no attr 'x'"
+        record_residual_fingerprint(t1, logs=err)
+        record_residual_fingerprint(t2, logs=err)
         results = get_top_residual_fingerprints()
         assert len(results) == 1
         assert results[0]['count'] == 2
         assert results[0]['is_error_shaped'] is True
 
     def test_looks_like_error_predicate(self):
+        # Real error-shaped lines.
         assert _looks_like_error("AttributeError: NoneType has no attr 'x'")
         assert _looks_like_error("TypeError: foo is not a function")
         assert _looks_like_error("[ERROR] connection refused")
+        assert _looks_like_error("[FATAL] DB connection lost")
         assert _looks_like_error("Traceback (most recent call last):")
         assert _looks_like_error("AssertionError: expected true")
         assert _looks_like_error("FAILED: build step 3")
+        assert _looks_like_error("FAIL: test_foo")
+        assert _looks_like_error("Error: file not found")
         assert _looks_like_error("cannot find module 'x'")
         assert _looks_like_error("no such file or directory")
+        # Whitespace tolerated at line start.
+        assert _looks_like_error("    raise AttributeError('nope')")
+        assert _looks_like_error("  TypeError: bad arg")
+
+        # Benign agent heartbeats — no match.
         assert not _looks_like_error("PROVISION_PROGRESS: payload ready")
         assert not _looks_like_error("[10.5MB] Using tool: Bash")
         assert not _looks_like_error("Creating pull request...")
@@ -971,6 +1043,27 @@ class TestResidualStore:
         assert not _looks_like_error("DIAGNOSTIC_TEST")
         assert not _looks_like_error("")
         assert not _looks_like_error(None)
+
+        # Strict-shape regression cases (the prior substring matcher
+        # would have accepted these and polluted the residual store).
+        assert not _looks_like_error(
+            "avoid except Exception: blocks (BLE001)"
+        )  # exception keyword in the middle of prose
+        assert not _looks_like_error(
+            "review notes: this catches the regression risk exception cases"
+        )  # exception keyword as a normal noun
+        assert not _looks_like_error(
+            '{"prompt": "see TypeError handling at line 42"}'
+        )  # JSON object — skipped outright
+        assert not _looks_like_error(
+            "all 3 subtasks completed with no actionable changes"
+        )  # success message
+        assert not _looks_like_error(
+            "research created 4 tasks from 5 findings"
+        )  # success message
+        assert not _looks_like_error(
+            "approved. the pr cleanly wires already-persisted data"
+        )  # review approval
 
     def test_get_top_residual_fingerprints_excludes_closed_cases(self):
         """Fingerprints whose case has been closed must be absent from results."""
@@ -999,11 +1092,12 @@ class TestResidualStore:
         fc._mark_residual_case_closed('some-fp')
         assert 'some-fp' in fc._residual_closed_fingerprints
 
-        t = self._task_with_id("AttributeError: some-fp error text", "task-reactivate")
+        t = self._task_with_id("[10.5MB] Cloning...", "task-reactivate")
+        err = "AttributeError: some-fp error text"
         # Seed the store with the existing fingerprint so the update path runs
-        fp = fc._fingerprint_message("AttributeError: some-fp error text") or '<empty>'
+        fp = fc._fingerprint_message(err) or '<empty>'
         fc._mark_residual_case_closed(fp)
-        record_residual_fingerprint(t)
+        record_residual_fingerprint(t, logs=err)
 
         # After recording a new occurrence the fingerprint must be gone from closed set
         assert fp not in fc._residual_closed_fingerprints

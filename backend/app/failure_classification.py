@@ -708,23 +708,59 @@ _RE_SIZE_TOKEN = re.compile(
 _RE_NUM = re.compile(r'\b\d+\b')
 
 
-# Substrings that mark a line/message as error-shaped. Single source of
-# truth for both _extract_error_signature (pulls a line out of a log
-# blob) and _looks_like_error (predicate on a status message). Keep them
-# discriminating enough that benign agent heartbeats (Cloning/Rebasing/
-# Using tool/PROVISION_PROGRESS) don't accidentally match.
-_ERROR_KEYWORDS: tuple[str, ...] = (
-    'error:', '[error]', 'exception', 'traceback', 'assertionerror',
-    'fail:', 'failed:', ' fail ', 'no such ', 'cannot ',
+# Structural patterns that mark a LINE as error-shaped. Each must match
+# at line-start (with optional leading whitespace) — never substring-
+# anywhere — so prose like ``avoid except Exception: blocks (BLE001)``
+# or JSON prompts mentioning ``Exception`` inside string values do not
+# qualify. Token-bounded class-name + ``:`` or ``(`` lookahead requires
+# real error-log shape, not just word mention.
+#
+# Single source of truth for both _extract_error_signature (pulls a line
+# out of a log blob) and _looks_like_error (predicate on a single text).
+# Both keep benign heartbeats (Cloning/Rebasing/Using tool/PROVISION_PROGRESS)
+# out and structured-data lines (JSON objects starting with ``{``) out.
+_ERROR_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Bracketed log-level prefix: [ERROR], [FATAL]
+    re.compile(r'^\s*\[(error|fatal)\]', re.I),
+    # ``Error:`` / ``FAIL:`` / ``FAILED:`` at line start
+    re.compile(r'^\s*(error|fail(ed)?)\s*:', re.I),
+    # Python tracebacks always start with this
+    re.compile(r'^\s*traceback\b', re.I),
+    # Filesystem / lookup negatives at line start
+    re.compile(r'^\s*(no such|cannot)\s', re.I),
+    # Python exception classes at line start (optionally preceded by
+    # ``raise``), followed by ``:`` or ``(`` to require structural
+    # error-log shape rather than just a word mention.
+    re.compile(
+        r'^\s*(?:raise\s+)?('
+        r'AssertionError|TypeError|ValueError|KeyError|AttributeError|'
+        r'NameError|IndexError|RuntimeError|ImportError|ModuleNotFoundError|'
+        r'FileNotFoundError|PermissionError|ConnectionError|HTTPError|'
+        r'IntegrityError|NotImplementedError|StopIteration|MemoryError|'
+        r'RecursionError|SystemError|OSError|IOError|LookupError|'
+        r'ArithmeticError|OverflowError|ZeroDivisionError|ReferenceError|'
+        r'UnicodeError|UnicodeDecodeError|UnicodeEncodeError|EOFError|'
+        r'UnboundLocalError|SyntaxError|IndentationError|EnvironmentError|'
+        r'Exception'
+        r')\s*[:(]',
+    ),
 )
 
 
 def _looks_like_error(text: str) -> bool:
-    """True when ``text`` contains an _ERROR_KEYWORDS substring."""
+    """True when ``text`` is structurally shaped like an error log line.
+
+    Strict: must match an `_ERROR_LINE_PATTERNS` pattern at line-start.
+    Lines that begin with ``{`` (serialized JSON) are rejected outright
+    — structured data with error keywords mentioned inside string values
+    is not an error log.
+    """
     if not text:
         return False
-    low = text.lower()
-    return any(kw in low for kw in _ERROR_KEYWORDS)
+    s = text.strip()
+    if not s or s[0] == '{':
+        return False
+    return any(p.search(s) for p in _ERROR_LINE_PATTERNS)
 
 
 def _extract_error_signature(logs: str | None) -> str:
@@ -733,7 +769,10 @@ def _extract_error_signature(logs: str | None) -> str:
     Prefers lines matching typical error shapes (Error/Exception/Traceback/
     assertion/FAIL). Returns the first such line found, trimmed. Empty
     string when logs are missing or have no recognizable error line —
-    callers fall back to latest_status_message in that case.
+    callers must NOT record a fingerprint in that case (no fallback
+    to latest_status_message: the message is usually a benign agent
+    heartbeat that pollutes the residual store with success-shape
+    inputs).
     """
     if not logs:
         return ''
@@ -767,34 +806,46 @@ def _fingerprint_message(msg: str) -> str:
 def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     """Record a CODE_ERROR fallthrough in the residual store.
 
+    Two strict gates keep the store free of false positives that pollute
+    auto-remediation spawn decisions:
+
+    1. ``task.status == FAILED``. ``classify_failure`` is called from
+       ~20 sites — analytics, anomaly detection, direction outcomes,
+       admin API responses — many of which run on COMPLETED/CANCELLED
+       tasks for read-only classification. Recording fingerprints on
+       non-FAILED tasks pollutes the store with success-shape strings
+       (rollup messages, plan output JSON, review approvals).
+
+    2. ``logs`` must contain an error-shaped line (Traceback / Error: /
+       Python exception class / [ERROR] / FAIL: / no such / cannot).
+       No fallback to ``latest_status_message`` — that's almost always
+       a benign heartbeat (``[10.5MB] Cloning…``, ``Using tool: Bash``)
+       that just happened to be current when classification ran.
+
     The _residual_seen_task_ids dedup set prevents double-counting when
     classify_failure_taxonomy() calls classify_failure() internally.
-
-    When `logs` contains an error-shaped line (Traceback/Error/Exception/
-    FAIL/…), fingerprints on that signature instead of on
-    latest_status_message. The status message is often a routine agent
-    heartbeat (e.g. `[10.5MB] Cloning…`) that happened to be current
-    when classification ran, which makes per-task fingerprints spurious.
     """
+    # Gate 1: only FAILED tasks contribute residual fingerprints.
+    from app.models import TaskStatus  # noqa: PLC0415 — lazy to avoid circular import
+    task_status = getattr(task, 'status', None)
+    if task_status != TaskStatus.FAILED:
+        return
     task_id = str(getattr(task, 'id', '') or '')
     if not task_id or task_id in _residual_seen_task_ids:
         return
+    # Gate 2: must have an error-shaped line in logs. No status_msg fallback.
+    err_line = _extract_error_signature(logs)
+    if not err_line:
+        return
+    # Both gates passed — claim the dedup slot now.
     if len(_residual_seen_task_ids) < _RESIDUAL_SEEN_MAX:
         _residual_seen_task_ids.add(task_id)
     status_msg = task.latest_status_message or ''
-    err_line = _extract_error_signature(logs)
-    # Fingerprint source: error line when available, status message as
-    # fallback. Status message is still retained in the store as context
-    # for human operators (shown in admin UI / remediation prompt) — we
-    # just don't let it drive the group-by.
-    fingerprint_source = err_line or status_msg
-    # Track whether this contribution is error-shaped. The spawn-side
-    # threshold uses this to demand a much higher count before
-    # auto-remediating on heartbeat-only clusters (PROVISION_PROGRESS /
-    # Using tool / Creating pull request / ...). One-off failures with
-    # no error output are noise; many failures with the same heartbeat
-    # are a real signal worth looking at.
-    is_error_shaped = bool(err_line) or _looks_like_error(status_msg)
+    fingerprint_source = err_line
+    # Always error-shaped at this point (Gate 2 guarantees err_line is
+    # non-empty + structurally matched). Field retained for backward
+    # compat with autonomous_research's threshold gate; it now no-ops.
+    is_error_shaped = True
     fp = _fingerprint_message(fingerprint_source) or '<empty>'
     now = time.time()
     trimmed_sample = fingerprint_source[:500]
