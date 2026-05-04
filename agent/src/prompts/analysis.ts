@@ -186,17 +186,17 @@ export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
 export function getMandatoryChecks(taskScope?: string, hasAnalysisPlan?: boolean, modelsChanged?: boolean, isDecomposed?: boolean): string[] {
   let checks: string[];
   if (taskScope === 'small') {
-    checks = ['correctness', 'test_coverage', 'import_verification'];
+    checks = ['correctness', 'test-coverage', 'import-verification'];
     // Decomposed small tasks (split from a larger finding) inherit cross-file
     // consistency risk because sibling subtasks can make individually correct
     // but mutually inconsistent changes (e.g., signature/caller mismatch).
-    if (isDecomposed) checks.push('cross_file_consistency');
+    if (isDecomposed) checks.push('cross-file-consistency');
   } else if (taskScope === 'large') {
-    checks = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'data_model_safety', 'import_verification'];
+    checks = ['test-coverage', 'type-safety', 'scope-violations', 'security', 'pattern-violations', 'cross-file-consistency', 'backwards-compatibility', 'data-model-safety', 'import-verification'];
   } else {
-    checks = ['test_coverage', 'type_safety', 'scope_violations', 'security', 'pattern_violations', 'cross_file_consistency', 'backwards_compatibility', 'import_verification'];
-    if (hasAnalysisPlan) checks.unshift('plan_alignment');
+    checks = ['test-coverage', 'type-safety', 'scope-violations', 'security', 'pattern-violations', 'cross-file-consistency', 'backwards-compatibility', 'import-verification'];
+    if (hasAnalysisPlan) checks.unshift('plan-alignment');
   }
-  if (modelsChanged) checks.push('migration_completeness');
+  if (modelsChanged) checks.push('migration-completeness');
   return checks;
 }

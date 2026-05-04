@@ -1647,6 +1647,58 @@ describe('formatProjectContext', () => {
     expect(result).toContain('error-handling');
   });
 
+  it('renders SR blind spots block when self_review_catch_rate has qualifying categories', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': { miss_rate: 0.8 },
+          'test-coverage': { miss_rate: 0.2 },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Self-Review Blind Spots');
+    expect(result).toContain('error-handling (80% missed)');
+    expect(result).toContain('apply extra scrutiny');
+  });
+
+  it('omits SR blind spots block when self_review_catch_rate is absent', () => {
+    const ctx = { review_issue_distribution: { 'test-coverage': 0.5 } };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Self-Review Blind Spots');
+  });
+
+  it('omits SR blind spots block when self_review_catch_rate has empty categories', () => {
+    const ctx = { self_review_catch_rate: { categories: {} } };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('Self-Review Blind Spots');
+  });
+
+  it('sorts SR blind spots by miss_rate descending and caps at top-5', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'cat-a': { miss_rate: 0.1 },
+          'cat-b': { miss_rate: 0.9 },
+          'cat-c': { miss_rate: 0.7 },
+          'cat-d': { miss_rate: 0.5 },
+          'cat-e': { miss_rate: 0.3 },
+          'cat-f': { miss_rate: 0.8 },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Self-Review Blind Spots');
+    // Top-5 by miss_rate: cat-b(90%), cat-f(80%), cat-c(70%), cat-d(50%), cat-e(30%)
+    expect(result).toContain('cat-b (90% missed)');
+    expect(result).toContain('cat-f (80% missed)');
+    expect(result).not.toContain('cat-a');
+    // cat-b should appear before cat-c in the output
+    const bIdx = result.indexOf('cat-b');
+    const cIdx = result.indexOf('cat-c');
+    expect(bIdx).toBeLessThan(cIdx);
+  });
+
   it('includes co-change budget note for medium-scope tasks', () => {
     const ctx = { cochange_files: ['src/foo.ts', 'src/bar.ts'] };
     const result = formatProjectContext(ctx, 'create', 'medium', '', 3);
@@ -3338,33 +3390,33 @@ describe('parseAnalysisPlanTestFiles', () => {
 
 // ── getMandatoryChecks ───────────────────────────────────────────────────────
 describe('getMandatoryChecks', () => {
-  it('returns correctness + test_coverage + import_verification for small scope', () => {
+  it('returns correctness + test-coverage + import-verification for small scope', () => {
     expect(getMandatoryChecks('small')).toEqual([
       'correctness',
-      'test_coverage',
-      'import_verification',
+      'test-coverage',
+      'import-verification',
     ]);
   });
 
   it('ignores hasAnalysisPlan for small scope', () => {
     expect(getMandatoryChecks('small', true)).toEqual([
       'correctness',
-      'test_coverage',
-      'import_verification',
+      'test-coverage',
+      'import-verification',
     ]);
   });
 
   it('returns the full 9-item list for large scope', () => {
     expect(getMandatoryChecks('large')).toEqual([
-      'test_coverage',
-      'type_safety',
-      'scope_violations',
+      'test-coverage',
+      'type-safety',
+      'scope-violations',
       'security',
-      'pattern_violations',
-      'cross_file_consistency',
-      'backwards_compatibility',
-      'data_model_safety',
-      'import_verification',
+      'pattern-violations',
+      'cross-file-consistency',
+      'backwards-compatibility',
+      'data-model-safety',
+      'import-verification',
     ]);
   });
 
@@ -3374,28 +3426,28 @@ describe('getMandatoryChecks', () => {
 
   it('returns the 8-item base list for medium scope without analysis plan', () => {
     expect(getMandatoryChecks('medium')).toEqual([
-      'test_coverage',
-      'type_safety',
-      'scope_violations',
+      'test-coverage',
+      'type-safety',
+      'scope-violations',
       'security',
-      'pattern_violations',
-      'cross_file_consistency',
-      'backwards_compatibility',
-      'import_verification',
+      'pattern-violations',
+      'cross-file-consistency',
+      'backwards-compatibility',
+      'import-verification',
     ]);
   });
 
-  it('prepends plan_alignment for medium scope with analysis plan', () => {
+  it('prepends plan-alignment for medium scope with analysis plan', () => {
     expect(getMandatoryChecks('medium', true)).toEqual([
-      'plan_alignment',
-      'test_coverage',
-      'type_safety',
-      'scope_violations',
+      'plan-alignment',
+      'test-coverage',
+      'type-safety',
+      'scope-violations',
       'security',
-      'pattern_violations',
-      'cross_file_consistency',
-      'backwards_compatibility',
-      'import_verification',
+      'pattern-violations',
+      'cross-file-consistency',
+      'backwards-compatibility',
+      'import-verification',
     ]);
   });
 

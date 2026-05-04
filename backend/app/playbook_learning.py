@@ -1717,3 +1717,162 @@ async def compute_review_effectiveness(
         project_id, len(categories), persistent_issues,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# SR catch-rate trend tracking
+# ---------------------------------------------------------------------------
+
+# Minimum number of tasks with BOTH self-review check_results AND human
+# rejection categories required per window.  Half the human-review threshold
+# since SR data is sparser.
+_MIN_SR_SAMPLE = 5
+
+
+async def compute_sr_catch_rate_trends(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> Optional[dict[str, Any]]:
+    """Compare SR prediction hit-rate per category across two consecutive 14-day windows.
+
+    For each canonical category found in ``_first_attempt_rejection_categories``,
+    computes the fraction of tasks where the self-review also flagged that category
+    (``prediction_hit_rate``) and the complement (``miss_rate``) for both the
+    current and previous 14-day windows, then classifies the trend.
+
+    Returns ``None`` when either window has fewer than :data:`_MIN_SR_SAMPLE`
+    tasks with both fields present.
+
+    **Side effect**: writes the result to ``project.design_doc["sr_catch_rate_trends"]``
+    and maintains a per-category ``rate_history`` list (capped at 5 entries).
+    """
+    now = _utcnow()
+    cutoff_14d = now - timedelta(days=14)
+    cutoff_28d = now - timedelta(days=28)
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    cutoff_14d_n = _naive(cutoff_14d)
+    cutoff_28d_n = _naive(cutoff_28d)
+    sentinel_n = datetime(9999, 12, 31)
+
+    def _split_sr(
+        tasks: list, start: datetime, end: datetime
+    ) -> tuple[int, dict[str, dict]]:
+        """Return (task_count_with_both, {cat: {hit_count, human_count}}).
+
+        Includes tasks where SR ran (has _self_review_outcome) and human rejected
+        (has _first_attempt_rejection_categories), even when check_results is empty
+        — empty check_results means SR passed everything and thus missed all human cats.
+        """
+        count = 0
+        cat_stats: dict[str, dict] = {}
+        for t in tasks:
+            if not t.created_at:
+                continue
+            ts = t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
+            if not (start <= ts < end):
+                continue
+            ctx = t.context or {}
+            if "_self_review_outcome" not in ctx:
+                continue
+            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+            if not human_cats:
+                continue
+            count += 1
+            check_results = ctx["_self_review_outcome"].get("check_results") or {}
+            sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            for cat in human_cats:
+                if cat not in cat_stats:
+                    cat_stats[cat] = {"hit_count": 0, "human_count": 0}
+                cat_stats[cat]["human_count"] += 1
+                if cat in sr_failed:
+                    cat_stats[cat]["hit_count"] += 1
+        return count, cat_stats
+
+    current_count, current_stats = _split_sr(all_tasks, cutoff_14d_n, sentinel_n)
+    previous_count, previous_stats = _split_sr(all_tasks, cutoff_28d_n, cutoff_14d_n)
+
+    if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
+        return None
+
+    all_cats = set(current_stats.keys()) | set(previous_stats.keys())
+    if not all_cats:
+        return None
+
+    categories: dict[str, Any] = {}
+    for cat in all_cats:
+        curr = current_stats.get(cat, {"hit_count": 0, "human_count": 0})
+        prev = previous_stats.get(cat, {"hit_count": 0, "human_count": 0})
+        current_hit_rate = (
+            round(curr["hit_count"] / curr["human_count"], 3)
+            if curr["human_count"] > 0 else None
+        )
+        previous_hit_rate = (
+            round(prev["hit_count"] / prev["human_count"], 3)
+            if prev["human_count"] > 0 else None
+        )
+        miss_rate = (
+            round(1 - current_hit_rate, 3) if current_hit_rate is not None else None
+        )
+
+        if current_hit_rate is not None and previous_hit_rate is not None:
+            delta = current_hit_rate - previous_hit_rate
+            if delta >= _TREND_DELTA_THRESHOLD:
+                trend = "increasing"
+            elif delta <= -_TREND_DELTA_THRESHOLD:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+
+        categories[cat] = {
+            "current_hit_rate": current_hit_rate,
+            "previous_hit_rate": previous_hit_rate,
+            "miss_rate": miss_rate,
+            "trend": trend,
+        }
+
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    existing: dict = dict(doc.get("sr_catch_rate_trends") or {})
+    existing_computed_at: Optional[str] = existing.get("computed_at")
+
+    is_new_window = True
+    if existing_computed_at:
+        try:
+            last_dt = datetime.fromisoformat(existing_computed_at)
+            is_new_window = (now - last_dt).days >= 14
+        except (ValueError, TypeError):
+            pass
+
+    existing_cats: dict = dict(existing.get("categories") or {})
+    for cat, data in categories.items():
+        prev_cat: dict = dict(existing_cats.get(cat) or {})
+        rate_history: list = list(prev_cat.get("rate_history") or [])
+        if (is_new_window or not rate_history) and data["current_hit_rate"] is not None:
+            rate_history.append(data["current_hit_rate"])
+            rate_history = rate_history[-5:]
+        data["rate_history"] = rate_history
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "categories": categories,
+    }
+
+    doc["sr_catch_rate_trends"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[SR_CATCH_RATE_TRENDS] project=%s categories=%d",
+        project_id, len(categories),
+    )
+    return result

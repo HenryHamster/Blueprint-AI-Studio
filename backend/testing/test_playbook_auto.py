@@ -3277,3 +3277,186 @@ async def test_finalize_pending_playbook_entries_promotes_on_success(db_session)
     entry = project.design_doc["playbook/proven"]
     assert "pending_source" not in entry, "Successful task's pending flag must be cleared"
     assert entry["content"] == "Real finding from completed task"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task(
+    project_id,
+    *,
+    age_days: float,
+    human_cats: dict,
+    sr_failed_cats: list,
+) -> Task:
+    """Build a Task with both _self_review_outcome.check_results and _first_attempt_rejection_categories."""
+    check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+    task = Task(
+        project_id=project_id,
+        title="SR task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": human_cats,
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(db_session: AsyncSession):
+    """Returns None when either window has fewer than 5 tasks with both fields."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for i in range(4):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(4):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(db_session: AsyncSession):
+    """Computes correct per-category hit_rate and miss_rate."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window (5 tasks): 3 hits, 2 misses on test-coverage
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window (5 tasks): all hits
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    assert cat["miss_rate"] == round(1 - 3 / 5, 3)
+    assert cat["previous_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_trend_classification(db_session: AsyncSession):
+    """Hit rate drops >= 5pp → trend='decreasing'."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 3/5 = 0.6
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5/5 = 1.0 (delta = -0.4, well below -5pp threshold)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["categories"]["test-coverage"]["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_rate_history_grows(db_session: AsyncSession):
+    """rate_history grows on each new window call and caps at 5."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    # Pre-seed design_doc with 4 existing history entries
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "categories": {
+                "test-coverage": {"rate_history": [0.8, 0.7, 0.6, 0.5]},
+            },
+        }
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    tasks = []
+    # Current window: 3/5 hits
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5/5 hits
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    history = result["categories"]["test-coverage"]["rate_history"]
+    # 4 existing + 1 new = 5 (capped at 5)
+    assert len(history) == 5
+    assert history[-1] == round(3 / 5, 3)
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_persists_to_design_doc(db_session: AsyncSession):
+    """Writes sr_catch_rate_trends key to project.design_doc."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    assert result is not None
+    assert "sr_catch_rate_trends" in (project.design_doc or {})
+    stored = project.design_doc["sr_catch_rate_trends"]
+    assert "computed_at" in stored
+    assert "categories" in stored

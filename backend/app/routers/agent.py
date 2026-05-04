@@ -1217,6 +1217,15 @@ async def claim_task(
                 )
             except Exception:
                 logger.exception("[AGENT] Failed to compute review_effectiveness (non-critical)")
+            try:
+                from app.playbook_learning import compute_sr_catch_rate_trends
+                await compute_sr_catch_rate_trends(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception("[AGENT] Failed to compute sr_catch_rate_trends (non-critical)")
 
         direction_concurrent_files: list[str] = []
         if current_direction_id:
@@ -1864,6 +1873,15 @@ async def claim_task(
                     )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute research review_effectiveness (non-critical)")
+                try:
+                    from app.playbook_learning import compute_sr_catch_rate_trends
+                    await compute_sr_catch_rate_trends(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)")
                 success_summary: list[str] = []
                 for scope_name, counts in research_scope_rates.items():
                     created = counts["created"]
@@ -1991,6 +2009,21 @@ async def claim_task(
                 if "project_context" not in response:
                     response["project_context"] = {}
                 response["project_context"]["module_feedback_warnings"] = module_warnings
+
+    # Inject SR catch-rate blind spots for create/fix/refactor tasks
+    if task_type in ("create", "fix", "refactor") and project_for_playbook:
+        try:
+            sr_trends = (project_for_playbook.design_doc or {}).get("sr_catch_rate_trends")
+            if sr_trends and isinstance(sr_trends.get("categories"), dict):
+                cats = {
+                    cat: {"miss_rate": data["miss_rate"]}
+                    for cat, data in sr_trends["categories"].items()
+                    if isinstance(data, dict) and isinstance(data.get("miss_rate"), (int, float))
+                }
+                if cats:
+                    response["project_context"]["self_review_catch_rate"] = {"categories": cats}
+        except Exception:
+            logger.exception("[AGENT] Failed to inject self_review_catch_rate (non-critical)")
 
     # Inject scoped architecture context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:

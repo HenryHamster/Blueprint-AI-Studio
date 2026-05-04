@@ -1003,14 +1003,28 @@ DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — use
 \`./pr open\` so the lint/build gate fires and the orchestrator records
 the PR atomically.
 
-## Optional: self-review before \`./done\`
+## Required: self-review before \`./done\` (code-change tasks)
 
-Just before calling \`./done\`, you can write a structured self-review
-JSON to \`/tmp/self_review_<task_id>.json\` (your task ID is in the
-ORCHESTRATOR env or the prompt context). When present, \`./done\`
+For create / fix / refactor / migrate tasks, write a structured self-review
+JSON to \`/tmp/self_review_<task_id>.json\` before calling \`./done\` (your
+task ID is in the ORCHESTRATOR env or the prompt context). \`./done\`
 includes it in the COMPLETED payload as \`self_review_outcome\` —
 downstream consumers use it for retry context, dashboard catch-rate
-metrics, and reviewer-iteration priming. Schema:
+metrics, and reviewer-iteration priming.
+
+Use these canonical category IDs in \`check_results\` (drawn from the
+backend review vocabulary — must match exactly):
+- \`correctness\` — logic bugs, off-by-one errors, edge cases, race conditions
+- \`error-handling\` — unhandled exceptions, missing null checks, async errors
+- \`security\` — injection, XSS, CSRF, exposed secrets, unvalidated inputs
+- \`style-conventions\` — naming, formatting, lint, code style consistency
+- \`type-safety\` — TypeScript errors, missing type annotations, unsafe casts
+- \`documentation\` — missing docstrings, inline comments, undocumented exports
+- \`performance\` — N+1 queries, missing indexes, memory leaks, slow paths
+- \`architecture\` — coupling, abstraction boundaries, pattern violations
+- \`test-coverage\` — missing tests for new behavior, untested edge cases
+
+Schema:
 
 \`\`\`json
 {
@@ -1023,12 +1037,10 @@ metrics, and reviewer-iteration priming. Schema:
 }
 \`\`\`
 
-Categories should reflect the actual checks you ran on your diff
-(e.g. correctness, error_handling, security, type_safety, scope,
-cross_file_consistency). \`fixes_applied: true\` means YOU caught
-something during self-review and fixed it before pushing. Skip the
-self-review entirely if you have nothing useful to record — graceful
-degradation.
+\`fixes_applied: true\` means YOU caught something during self-review and
+fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`
+envelope is acceptable when you have nothing useful to record, but the
+file MUST exist for code-change tasks.
 `;
 
 export const PLAYBOOK_GUIDANCE = `

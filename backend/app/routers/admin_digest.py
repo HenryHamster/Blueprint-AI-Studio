@@ -65,6 +65,32 @@ def _stash_projected_task_fields(
     object.__setattr__(task, "_projected_completed_at_ts", completed_at_ts)
 
 
+def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, Any] | None":
+    """Compute self-review prediction accuracy from tasks that have both
+    _self_review_outcome.check_results and _first_attempt_rejection_categories.
+    Returns None when sample size < 5.
+    """
+    if len(tasks_with_both) < 5:
+        return None
+    total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
+    for t in tasks_with_both:
+        ctx = t.context or {}
+        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        total_human += len(human_cats)
+        total_overlap += len(human_cats & sr_failed)
+        total_missed += len(human_cats - sr_failed)
+        total_false += len(sr_failed - human_cats)
+        total_sr_failed += len(sr_failed)
+    return {
+        "prediction_hit_rate": round(total_overlap / total_human, 3) if total_human > 0 else None,
+        "miss_rate": round(total_missed / total_human, 3) if total_human > 0 else None,
+        "false_alarm_rate": round(total_false / total_sr_failed, 3) if total_sr_failed > 0 else None,
+        "sample_size": len(tasks_with_both),
+    }
+
+
 def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
     """Compute self-review effectiveness, prediction accuracy, and review accuracy
     from a list of terminal tasks. Returns dict with three keys, each None when
@@ -119,25 +145,7 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
         and "_first_attempt_rejection_categories" in (t.context or {})
     ]
-    self_review_prediction_accuracy: Dict[str, Any] | None = None
-    if len(tasks_with_both) >= 5:
-        total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
-        for t in tasks_with_both:
-            ctx = t.context or {}
-            check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-            sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
-            total_human += len(human_cats)
-            total_overlap += len(human_cats & sr_failed)
-            total_missed += len(human_cats - sr_failed)
-            total_false += len(sr_failed - human_cats)
-            total_sr_failed += len(sr_failed)
-        self_review_prediction_accuracy = {
-            "prediction_hit_rate": round(total_overlap / total_human, 3) if total_human > 0 else None,
-            "miss_rate": round(total_missed / total_human, 3) if total_human > 0 else None,
-            "false_alarm_rate": round(total_false / total_sr_failed, 3) if total_sr_failed > 0 else None,
-            "sample_size": len(tasks_with_both),
-        }
+    self_review_prediction_accuracy = _compute_sr_prediction_accuracy(tasks_with_both)
 
     return {
         "self_review_effectiveness": self_review_effectiveness,
@@ -858,6 +866,16 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if recurrence:
             review_recurrence_by_category = recurrence
 
+    # SR catch-rate trends from compute_sr_catch_rate_trends stored in project.design_doc.
+    self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
+    if project and project.design_doc:
+        sr_trends = project.design_doc.get("sr_catch_rate_trends") or {}
+        if sr_trends:
+            self_review_prediction_accuracy_trends = {
+                "computed_at": sr_trends.get("computed_at"),
+                "categories": sr_trends.get("categories") or {},
+            }
+
     direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
     if project and project.design_doc:
         dfa = project.design_doc.get("direction_first_attempt_feedback")
@@ -865,37 +883,12 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             direction_first_attempt_feedback = dfa
 
     # Self-review prediction accuracy: compare self-review check_results against human rejection categories
-    self_review_prediction_accuracy: Dict[str, Any] | None = None
-    tasks_with_both = [
+    tasks_with_both_24h = [
         t for t in terminal_tasks_24h
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
         and "_first_attempt_rejection_categories" in (t.context or {})
     ]
-    if len(tasks_with_both) >= 5:
-        total_human_cats = 0
-        total_overlap = 0
-        total_missed = 0
-        total_false_alarms = 0
-        total_sr_failed_cats = 0
-        for t in tasks_with_both:
-            ctx = t.context or {}
-            check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-            sr_failed = {cat for cat, res in check_results.items() if not res.get("passed", True)}
-            overlap = human_cats & sr_failed
-            missed = human_cats - sr_failed
-            false_alarms = sr_failed - human_cats
-            total_human_cats += len(human_cats)
-            total_overlap += len(overlap)
-            total_missed += len(missed)
-            total_false_alarms += len(false_alarms)
-            total_sr_failed_cats += len(sr_failed)
-        self_review_prediction_accuracy = {
-            "prediction_hit_rate": round(total_overlap / total_human_cats, 3) if total_human_cats > 0 else None,
-            "miss_rate": round(total_missed / total_human_cats, 3) if total_human_cats > 0 else None,
-            "false_alarm_rate": round(total_false_alarms / total_sr_failed_cats, 3) if total_sr_failed_cats > 0 else None,
-            "sample_size": len(tasks_with_both),
-        }
+    self_review_prediction_accuracy = _compute_sr_prediction_accuracy(tasks_with_both_24h)
 
     # Medium-scope pre/post investment measurement — computed over a longer lookback
     # so research agents see the actual before/after merge rates straight from the prompt
@@ -942,6 +935,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "pipeline_conversion_rate": pipeline_conversion_rate,
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
+        "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
         "review_effectiveness_trends": review_effectiveness_trends,

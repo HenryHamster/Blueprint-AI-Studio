@@ -350,6 +350,32 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build SR catch-rate blind spots block — only if budget allows
+  type SRCatchRateCategory = { miss_rate: number };
+  const srCatchRate = ctx.self_review_catch_rate as { categories?: Record<string, SRCatchRateCategory> } | null | undefined;
+  let srBlindSpotLines: string[] = [];
+  if (srCatchRate?.categories && Object.keys(srCatchRate.categories).length > 0) {
+    const qualifying = Object.entries(srCatchRate.categories)
+      .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
+      .sort((a, b) => b[1].miss_rate - a[1].miss_rate)
+      .slice(0, 5);
+    if (qualifying.length > 0) {
+      const catList = qualifying
+        .map(([cat, data]) => `${cat} (${Math.round(data.miss_rate * 100)}% missed)`)
+        .join(', ');
+      const candidateLines = [
+        '### Self-Review Blind Spots',
+        `Your past self-reviews missed issues in these categories — apply extra scrutiny: ${catList}`,
+        '',
+      ];
+      const candidate = candidateLines.join('\n');
+      if (candidate.length <= budget) {
+        srBlindSpotLines = candidateLines;
+        budget -= candidate.length;
+      }
+    }
+  }
+
   // Build per-module review feedback warnings — only if budget allows
   type ModuleFeedbackWarning = { file: string; top_categories: Record<string, number>; sample_size: number };
   const moduleFeedbackWarnings = ctx.module_feedback_warnings as ModuleFeedbackWarning[] | null | undefined;
@@ -411,6 +437,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

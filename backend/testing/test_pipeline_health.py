@@ -631,7 +631,7 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "failure_taxonomy_by_scope", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_conversion_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
+    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "failure_taxonomy_by_scope", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "self_review_prediction_accuracy_trends", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_conversion_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement"}
     fa = result["first_attempt_success_rate"]
     assert "first_attempt_by_review_category" in fa
     assert "with_arch_context" in fa
@@ -924,6 +924,57 @@ async def test_return_structure_includes_review_effectiveness_trends():
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
     assert "review_effectiveness_trends" in result
+
+
+# ── SR prediction accuracy trends ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_trends_none_when_no_design_doc():
+    """self_review_prediction_accuracy_trends is None when project has no design_doc."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    assert result["self_review_prediction_accuracy_trends"] is None
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_trends_returned_when_present():
+    """self_review_prediction_accuracy_trends exposes per-category SR catch-rate from design_doc."""
+    sr_trends = {
+        "computed_at": "2026-04-15T00:00:00",
+        "categories": {
+            "test-coverage": {
+                "current_hit_rate": 0.7,
+                "previous_hit_rate": 0.4,
+                "miss_rate": 0.3,
+                "trend": "increasing",
+                "rate_history": [0.4, 0.7],
+            },
+        },
+    }
+    project = make_project(directions=[], design_doc={"sr_catch_rate_trends": sr_trends})
+    session = _make_mock_session(tasks=[], project=project)
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    trends = result["self_review_prediction_accuracy_trends"]
+    assert trends is not None
+    assert trends["computed_at"] == "2026-04-15T00:00:00"
+    cat = trends["categories"]["test-coverage"]
+    assert cat["current_hit_rate"] == 0.7
+    assert cat["previous_hit_rate"] == 0.4
+    assert cat["trend"] == "increasing"
+
+
+@pytest.mark.asyncio
+async def test_return_structure_includes_self_review_prediction_accuracy_trends():
+    """Result always contains self_review_prediction_accuracy_trends key."""
+    session = _make_mock_session(tasks=[], project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    assert "self_review_prediction_accuracy_trends" in result
 
 
 # ── Direction first-attempt feedback ─────────────────────────────────────────
@@ -1364,7 +1415,7 @@ async def test_self_review_prediction_accuracy_null_when_sample_too_small():
     """Returns None when fewer than 5 tasks have both fields."""
     project_id = uuid.uuid4()
     tasks = [
-        _make_sr_task(project_id, {"style": {"passed": False}}, {"style": 1}, hours_ago=i)
+        _make_sr_task(project_id, {"test-coverage": {"passed": False}}, {"test-coverage": 1}, hours_ago=i)
         for i in range(1, 5)  # only 4 tasks
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
@@ -1379,8 +1430,8 @@ async def test_self_review_prediction_accuracy_perfect_overlap():
     tasks = [
         _make_sr_task(
             project_id,
-            {"style": {"passed": False}, "tests": {"passed": False}},
-            {"style": 1, "tests": 1},
+            {"test-coverage": {"passed": False}, "type-safety": {"passed": False}},
+            {"test-coverage": 1, "type-safety": 1},
             hours_ago=i,
         )
         for i in range(1, 7)
@@ -1401,8 +1452,8 @@ async def test_self_review_prediction_accuracy_complete_miss():
     tasks = [
         _make_sr_task(
             project_id,
-            {"style": {"passed": True}},
-            {"style": 1},
+            {"error-handling": {"passed": True}},
+            {"error-handling": 1},
             hours_ago=i,
         )
         for i in range(1, 7)
@@ -1423,8 +1474,8 @@ async def test_self_review_prediction_accuracy_partial_overlap():
     tasks = [
         _make_sr_task(
             project_id,
-            {"style": {"passed": False}, "tests": {"passed": True}},
-            {"style": 1, "tests": 1},
+            {"test-coverage": {"passed": False}, "type-safety": {"passed": True}},
+            {"test-coverage": 1, "type-safety": 1},
             hours_ago=i,
         )
         for i in range(1, 7)
@@ -1435,8 +1486,31 @@ async def test_self_review_prediction_accuracy_partial_overlap():
     assert acc is not None
     assert acc["prediction_hit_rate"] == 0.5
     assert acc["miss_rate"] == 0.5
-    # false_alarm_rate: self-review flagged 1 cat (style), human rejected style too → 0 false alarms
+    # false_alarm_rate: self-review flagged 1 cat (test-coverage), human rejected it too → 0 false alarms
     assert acc["false_alarm_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_snake_case_sr_does_not_match_kebab_human():
+    """Snake_case SR keys (e.g. test_coverage) must NOT match kebab-case human cats (test-coverage)."""
+    project_id = uuid.uuid4()
+    # SR uses old snake_case keys; human cats use canonical kebab-case — no overlap expected
+    tasks = [
+        _make_sr_task(
+            project_id,
+            {"test_coverage": {"passed": False}, "type_safety": {"passed": False}},
+            {"test-coverage": 1, "type-safety": 1},
+            hours_ago=i,
+        )
+        for i in range(1, 7)
+    ]
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+    result = await compute_pipeline_health_summary(session, project_id)
+    acc = result["self_review_prediction_accuracy"]
+    assert acc is not None
+    # snake_case SR keys are different strings from kebab-case human cats → zero overlap
+    assert acc["prediction_hit_rate"] == 0.0
+    assert acc["miss_rate"] == 1.0
 
 
 # ── _compute_scope_baselines ─────────────────────────────────────────────────
