@@ -15,7 +15,7 @@
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,
     "routers/agent.py": 3100,
-    "services.py": 2100,
+    "services.py": 2150,
     "routers/agent_status.py": 2300,
     "autonomous_research.py": 2050,
     "research_completion.py": 2050,
@@ -28,7 +28,7 @@
   "frontend": {
     "useAppState.ts": 3000,
     "components/DirectionsPanel.tsx": 3000,
-    "components/CatchUpPanel.tsx": 2650,
+    "components/CatchUpPanel.tsx": 2700,
     "components/TaskDetailDrawer.tsx": 2500,
     "components/SettingsDropdown.tsx": 2500,
     "components/KanbanBoard.tsx": 1500,

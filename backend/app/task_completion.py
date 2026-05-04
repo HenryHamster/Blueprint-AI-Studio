@@ -1681,29 +1681,61 @@ async def _ensure_branch(
     # ``rollup_management._relock_parent``, ~line 155 — populate_existing
     # alone is unreliable with ``with_for_update(skip_locked=True)`` on
     # async sessions).
-    session.expire(task)
-    fresh_stmt = (
-        select(Task)
-        .where(Task.id == parent_id_local)
-        .with_for_update(skip_locked=True)
-        .execution_options(populate_existing=True)
-    )
-    fresh = (await session.execute(fresh_stmt)).scalars().first()
+    #
+    # Incident 2026-05-04 (b9456e05 / PRs #3606/3607/3612/3613): a
+    # one-shot ``skip_locked=True`` silently stranded the parent when
+    # the row happened to be locked at the wrong instant — the prior
+    # comment claimed "next sweep observes the branch artifact and
+    # proceeds" but no such sweep exists. Bounded retry (~9s) makes
+    # now-this-instant contention recoverable; on exhaustion we raise
+    # so the caller's exception path can persist post_commit_pending
+    # for the existing sweep to retry, instead of silently returning
+    # None.
+    fresh = None
+    _max_relock_attempts = 6
+    for _relock_attempt in range(_max_relock_attempts):
+        session.expire(task)
+        fresh_stmt = (
+            select(Task)
+            .where(Task.id == parent_id_local)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        fresh = (await session.execute(fresh_stmt)).scalars().first()
+        if fresh is not None:
+            break
+        if _relock_attempt < _max_relock_attempts - 1:
+            # 1.0, 1.4, 1.8, 2.2, 2.6 → ~9s total before final attempt
+            await asyncio.sleep(1.0 + _relock_attempt * 0.4)
     _defer_kind = "post-success context" if branch_created else "failure"
     if fresh is None:
-        logger.info(
-            f"[{label}] Task {parent_id_local} held by peer after branch retries — "
-            f"deferring {_defer_kind} mutation to next sweep"
+        # All retries exhausted. Word "timeout" in the message routes
+        # the caller's transient-error heuristic at task_lifecycle.py
+        # (~line 2710) to requeue the task instead of failing it
+        # permanently. A fresh agent run regenerates the plan output;
+        # post-commit then re-runs and the relock typically succeeds
+        # once the contending peer is gone.
+        raise RuntimeError(
+            f"[{label}] Task {parent_id_local} relock timeout after "
+            f"{_max_relock_attempts} retries (~9s) — could not "
+            f"persist {_defer_kind} mutation. Branch {branch_name} "
+            f"{'was created on GitHub' if branch_created else 'creation also failed'}."
         )
-        return None
     fresh_snapshot = _capture_branch_creation_snapshot(fresh)
     if fresh_snapshot != pre_branch_snapshot:
-        logger.info(
-            f"[{label}] Task {parent_id_local} mutated during branch-creation window "
-            f"(expected snapshot={pre_branch_snapshot}, found {fresh_snapshot}) — "
-            f"deferring {_defer_kind} mutation to next sweep"
+        # Genuine peer-content mutation — a different writer modified
+        # status/payloads/context during our unlock window. Re-running
+        # the agent would just race again. Raise with a non-transient
+        # message so the caller marks the task FAILED for operator
+        # review rather than silently stranding it.
+        raise RuntimeError(
+            f"[{label}] Task {parent_id_local} mutated during branch-creation "
+            f"window (expected snapshot={pre_branch_snapshot}, found "
+            f"{fresh_snapshot}) — could not persist {_defer_kind} mutation. "
+            f"Branch {branch_name} "
+            f"{'was created on GitHub' if branch_created else 'creation also failed'}. "
+            f"Manual investigation required: identify the peer writer."
         )
-        return None
 
     if branch_created:
         # C2: success — return the relocked task so caller mutates under
