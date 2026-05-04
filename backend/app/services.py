@@ -1137,7 +1137,12 @@ async def _check_evaluating_timeouts():
     from app.shared_state import runtime_config as _runtime_config
 
     EVALUATING_WARN_SECONDS = 2 * 3600   # 2 hours
-    EVALUATING_FAIL_SECONDS = 6 * 3600   # 6 hours
+    # Default backstop bumped to 48h while silent-death v2 stabilizes
+    # (2026-05-04): tasks reaped mid-flight by the 6h wall-clock were getting
+    # cascade-killed during operator-intervention windows. Runtime knob
+    # `evaluating_fail_hours` lets us drop it back once the recurrence rate
+    # for silent-death + reaper sweeps comes down.
+    EVALUATING_FAIL_SECONDS = int(_runtime_config.get("evaluating_fail_hours", 48)) * 3600
     # Hard kill for CI-waiting tasks. Tunable so multi-iteration review/fix
     # cycles (each ~5-15 min, plus pipeline-cap queueing) don't trigger a
     # premature kill that cancels in-flight children. 60 min is the default

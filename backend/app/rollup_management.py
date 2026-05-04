@@ -733,8 +733,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # Cap exhaustion: _spawn_pipeline_task sets requires_approval=True on
                     # the child. But the child is COMPLETED, so the EVALUATING approval-gate
                     # timeout never fires on it — the parent would otherwise wait the full
-                    # 6-hour hard timeout. Escalate: set requires_approval on the parent so
-                    # the 2-hour approval gate fires, and raise a failure alert.
+                    # evaluating_fail_hours (default 48h) hard timeout. Escalate: set
+                    # requires_approval on the parent so the 2-hour approval gate fires,
+                    # and raise a failure alert.
                     if not parent.requires_approval:
                         parent.requires_approval = True
                         logger.warning(

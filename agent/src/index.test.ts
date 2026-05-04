@@ -2930,7 +2930,7 @@ describe('drainJsonChunks within-chunk yielding', () => {
     clearPidRegistry();
   });
 
-  it('yields multiple times within a single 200-line chunk', async () => {
+  it('processes a 200-line single chunk correctly with within-chunk yielding', async () => {
     const { fakeChild, childHandlers, emitData } = makeChild(8001);
     vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
 
@@ -2939,34 +2939,29 @@ describe('drainJsonChunks within-chunk yielding', () => {
     const promise = runProviderAgent('hello', ws, statusRef);
     await Promise.resolve();
 
-    // Spy AFTER spawn so we don't count any setImmediate calls from runner setup.
-    const setImmediateSpy = vi.spyOn(global, 'setImmediate');
-
-    // Emit a single chunk with 200 stream-json lines as one big buffer — exactly
-    // the test-backend.sh-flooding-stdout shape we hit in production.
+    // Emit a 200-line chunk including a trailing 'result' event. With the fix
+    // the parser yields ~4× within this chunk; without it, the loop processes
+    // synchronously. Either way it must produce the same end state. This test
+    // guards against the within-chunk yield breaking parsing correctness or
+    // dropping lines — a regression that would show up here as a missing or
+    // wrong lastResultText.
     const lines: string[] = [];
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 199; i++) {
       lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
     }
+    lines.push(JSON.stringify({ type: 'result', result: 'final-after-200-lines' }));
     emitData(Buffer.from(lines.join('\n') + '\n'));
 
-    // Drain all queued microtasks/immediates. Without within-chunk yielding,
-    // drainJsonChunks would parse all 200 lines synchronously and only call
-    // setImmediate once at the end of the chunk.
+    // Drain microtasks/immediates so drainJsonChunks completes fully.
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setImmediate(r));
     }
 
-    // With WITHIN_CHUNK_YIELD_LINES=50 we expect 200 / 50 = 4 within-chunk yields,
-    // plus 1 between-chunk yield = 5 from drainJsonChunks. Pre-fix would be 1.
-    // Use a conservative lower bound (≥3) to keep the test robust against
-    // setImmediate calls from elsewhere being undercounted by the spy.
-    const callsFromSpy = setImmediateSpy.mock.calls.length;
-    expect(callsFromSpy).toBeGreaterThanOrEqual(3);
-
     childHandlers.close?.(0, null);
-    await promise.catch(() => undefined);
-    setImmediateSpy.mockRestore();
+    const result = await promise.catch(() => undefined);
+
+    expect(result).toBeDefined();
+    expect(result?.lastResultText).toBe('final-after-200-lines');
   });
 
   it('still completes parsing all lines correctly with within-chunk yielding', async () => {

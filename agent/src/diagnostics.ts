@@ -78,7 +78,13 @@ export function recordFinalState(reason: string, detail?: string): void {
   appendSyncBestEffort(AGENT_FINAL_STATE_LOG, line);
 }
 
+let exitMarkersInstalled = false;
+
 export function installExitMarkers(): void {
+  // Idempotent: re-entering main() (warm-VM continuity) must not stack
+  // duplicate listeners that fire N times on a single exit.
+  if (exitMarkersInstalled) return;
+  exitMarkersInstalled = true;
   process.on('beforeExit', (code) => {
     recordFinalState('beforeExit', `code=${code}`);
   });
@@ -86,7 +92,8 @@ export function installExitMarkers(): void {
     recordFinalState('exit', `code=${code}`);
   });
   // SIGTERM/uncaughtException already have handlers in index.ts that call
-  // _crashReport. We don't re-register them here — instead the existing
-  // handlers can call recordFinalState before sendHeartbeatSync. Keeping the
-  // wiring there preserves the single canonical death path.
+  // _crashReport, which calls recordFinalState explicitly. We don't re-register
+  // them here — keeping the wiring there preserves the single canonical
+  // death path. (This means installExitMarkers only handles the soft-exit
+  // paths: beforeExit/exit. Crash paths self-record.)
 }

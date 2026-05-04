@@ -23,6 +23,7 @@ import {
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
   PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
+  WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
   MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS,
@@ -1072,11 +1073,25 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
 
 function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  // Reset mutex so warm-VM continuity (one agent process, multiple sequential
+  // tasks) starts the next task with a clean in-flight state. Without this,
+  // a stuck heartbeat at role-end would leave the flag true and the new
+  // task's first periodic tick would skip-and-log instead of firing.
+  heartbeatInFlight = false;
 }
 
 /** Synchronous heartbeat — use between blocking execFileSync calls to prevent reaper from killing us.
- *  Fires curl in a child process (sync) so the event loop doesn't need to be free. */
-export function sendHeartbeatSync(taskId: string, statusMessage: string, extras?: Record<string, unknown>) {
+ *  Fires curl in a child process (sync) so the event loop doesn't need to be free.
+ *  `timeoutMs` defaults to 10s for normal between-step heartbeats (git clone
+ *  retry, npm ci, push, etc — degraded networks need room). Signal-handler
+ *  callers (`_crashReport` SIGTERM/uncaughtException paths) pass 3s instead so
+ *  one slow curl can't chew the GCE 30s grace window before SIGKILL. */
+export function sendHeartbeatSync(
+  taskId: string,
+  statusMessage: string,
+  extras?: Record<string, unknown>,
+  timeoutMs = 10_000,
+) {
   const start = Date.now();
   try {
     const metrics = collectMetrics();
@@ -1086,17 +1101,13 @@ export function sendHeartbeatSync(taskId: string, statusMessage: string, extras?
       metrics,
       ...(extras || {}),
     });
-    // 3s timeout: this runs from signal handlers (SIGTERM, uncaughtException)
-    // where we have ~30s before SIGKILL. A 10s blocking curl chews 1/3 of the
-    // grace window for one best-effort flush; if the network is slow that's
-    // a lot. 3s is enough for healthy networks, fails fast on partition.
     execFileSync('curl', [
       '-sf', '-X', 'POST',
       `${ORCHESTRATOR_URL}/api/agent/heartbeat`,
       '-H', 'Content-Type: application/json',
       '-H', `X-Agent-Token: ${AGENT_TOKEN}`,
       '-d', payload,
-    ], { timeout: 3_000, stdio: 'ignore' });
+    ], { timeout: timeoutMs, stdio: 'ignore' });
     traceHeartbeat('sync', start, Date.now(), 'ok');
   } catch (e) {
     log(`Sync heartbeat failed: ${e instanceof Error ? e.message : String(e)} (non-fatal)`);
@@ -2995,12 +3006,12 @@ echo ""
     const pendingJsonChunks: string[] = [];
     let drainingJsonChunks = false;
     // Yield every WITHIN_CHUNK_YIELD_LINES parsed lines OR every
-    // WITHIN_CHUNK_YIELD_MS of wall time, whichever fires first. The original
-    // 50aca46d fix yielded only between chunks; a single 1MB chunk from
-    // test-backend.sh can carry 500+ stream-json lines and parse synchronously
-    // for 30+ seconds, blocking the heartbeat setInterval and SIGTERM handler.
-    const WITHIN_CHUNK_YIELD_LINES = 50;
-    const WITHIN_CHUNK_YIELD_MS = 50;
+    // WITHIN_CHUNK_YIELD_MS of wall time, whichever fires first. Tunables in
+    // constants.ts. Pre-parse yield (BEFORE next JSON.parse, not after) bounds
+    // event-loop blocking to one parse + dispatch even when a single line is
+    // a 1-2 MB tool_use payload. Adversarial review 2026-05-04: post-parse
+    // yield was bounded by `single_line_parse_time × N`, not by wall time —
+    // a pathological huge line could block past the bound.
     const drainJsonChunks = async () => {
       if (drainingJsonChunks) return;
       drainingJsonChunks = true;
@@ -3011,6 +3022,16 @@ echo ""
           let linesSinceYield = 0;
           let lastYieldAt = Date.now();
           for (const line of chunk.split('\n').filter(Boolean)) {
+            // Pre-parse yield: if the previous iteration crossed the line-count
+            // OR wall-time bound, yield NOW before parsing the next line. This
+            // bounds event-loop blocking to (one JSON.parse + one dispatch),
+            // not (N × parse + dispatch).
+            if (linesSinceYield >= WITHIN_CHUNK_YIELD_LINES
+                || Date.now() - lastYieldAt >= WITHIN_CHUNK_YIELD_MS) {
+              await new Promise(r => setImmediate(r));
+              linesSinceYield = 0;
+              lastYieldAt = Date.now();
+            }
             let obj: ClaudeOutput | null = null;
             try {
               obj = JSON.parse(line) as ClaudeOutput;
@@ -3083,12 +3104,6 @@ echo ""
               sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
             }
             linesSinceYield++;
-            if (linesSinceYield >= WITHIN_CHUNK_YIELD_LINES
-                || Date.now() - lastYieldAt >= WITHIN_CHUNK_YIELD_MS) {
-              await new Promise(r => setImmediate(r));
-              linesSinceYield = 0;
-              lastYieldAt = Date.now();
-            }
           }
           // Yield to the event loop after each chunk so heartbeat / stall-
           // watchdog timers get a chance to fire between bursts.
@@ -3626,14 +3641,16 @@ function _crashReport(label: string, detail: string, exitCode: number) {
   recordFinalState(`crash:${label}`, detail);
   // Synchronous curl — fire-and-forget fetch() couldn't guarantee the write
   // flushed before process.exit, so crashes would show up as silent heartbeat
-  // timeouts instead of explained failures. sendHeartbeatSync blocks on curl
-  // (5s max) so the request lands before we exit.
+  // timeouts instead of explained failures. 3s timeout in the signal-handler
+  // path: GCE gives ~30s before SIGKILL, and a 10s blocking curl chews 1/3 of
+  // that window for one best-effort flush. 3s fails fast on partition while
+  // still succeeding on healthy networks.
   const taskId = process.env.TASK_ID;
   if (taskId) {
     try {
       const metrics = collectMetrics();
       const msg = `[FATAL:${label}] ${detail.slice(0, 300)}`;
-      sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`);
+      sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`, undefined, 3_000);
     } catch { /* best effort — we're dying anyway */ }
   }
   // process.exit normally never returns; if it throws (e.g. when intercepted

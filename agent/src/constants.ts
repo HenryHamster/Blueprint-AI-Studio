@@ -123,6 +123,16 @@ export const TOOL_USE_STALL_TIMEOUT_MS = 30 * 60_000;
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
 export const MAX_OUTPUT_BYTES = 10_000_000;
 
+// Stream-json drain: bound event-loop blocking inside drainJsonChunks. Yield
+// after every WITHIN_CHUNK_YIELD_LINES parsed lines OR every WITHIN_CHUNK_YIELD_MS
+// of wall time, whichever fires first. Tuned so heartbeat (30s) and SIGTERM
+// signal handlers stay deliverable even during heavy test-backend.sh stdout.
+// Lowering YIELD_LINES below 50 increases yield overhead without tangible
+// benefit on healthy VMs; raising YIELD_MS above 50 risks crossing the
+// detectable lag threshold (5s) on adversarial single-line megablobs.
+export const WITHIN_CHUNK_YIELD_LINES = 50;
+export const WITHIN_CHUNK_YIELD_MS = 50;
+
 // Effort-scaled subprocess timeout. Low-effort tasks that hang waste less VM
 // time; max-effort deep analysis gets more room. Unknown/unset effort falls
 // back to CLAUDE_TIMEOUT_MS.

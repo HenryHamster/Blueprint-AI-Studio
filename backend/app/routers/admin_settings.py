@@ -122,6 +122,7 @@ async def get_settings(
         "max_parallel_research_per_project": _runtime_config.get("max_parallel_research_per_project", 3),
         "max_total_research_per_project": _runtime_config.get("max_total_research_per_project", 5),
         "evaluating_pipeline_timeout_minutes": _runtime_config.get("evaluating_pipeline_timeout_minutes", 120),
+        "evaluating_fail_hours": _runtime_config.get("evaluating_fail_hours", 48),
         "ci_backstop_timeout_minutes": _runtime_config.get("ci_backstop_timeout_minutes", 60),
         "warm_continuity_enabled": bool(_runtime_config.get("warm_continuity_enabled", False)),
         "next_role_poll_timeout_secs": int(_runtime_config.get("next_role_poll_timeout_secs", 180)),
@@ -270,6 +271,16 @@ async def _apply_settings(payload: Dict[str, Any], session: AsyncSession, _runti
         if not (1 <= val <= 1440):
             raise HTTPException(status_code=400, detail="ci_backstop_timeout_minutes must be between 1 and 1440")
         _runtime_config["ci_backstop_timeout_minutes"] = val
+    if "evaluating_fail_hours" in payload:
+        try:
+            val = int(payload["evaluating_fail_hours"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="evaluating_fail_hours must be a number")
+        # Cap at 168h (1 week) — protects against accidental "1000h" typos
+        # while leaving plenty of room above the 48h default.
+        if not (1 <= val <= 168):
+            raise HTTPException(status_code=400, detail="evaluating_fail_hours must be between 1 and 168")
+        _runtime_config["evaluating_fail_hours"] = val
     if "max_total_research_per_project" in payload:
         try:
             val = int(payload["max_total_research_per_project"])

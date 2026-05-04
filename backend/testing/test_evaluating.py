@@ -123,6 +123,10 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     """A task that has been EVALUATING for >6 hours with non-terminal children
     should be marked FAILED with an appropriate status message."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Pin the backstop to 6h for this test (production default is 48h while
+    # silent-death stabilizes; tests still validate the 6h boundary behavior).
+    from app.shared_state import runtime_config as _rc
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Hard Timeout Test", user_id="user1")
     eval_db.add(project)
@@ -1372,6 +1376,8 @@ async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(eval
     2026-04-29 (PRs #3450/#3408 + parents c30701d3/ddd987fc)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Recoverable Defer", user_id="user1")
     eval_db.add(project)
@@ -1426,6 +1432,8 @@ async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(eva
     the defer path — the existing 6h kill path runs as before."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Code Error Kill", user_id="user1")
     eval_db.add(project)
@@ -1478,6 +1486,8 @@ async def test_evaluating_defer_window_exhausted_kills(eval_db, mocker):
     bounded so a truly stuck operator-intervention case still terminates."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
 
     project = Project(name="Defer Window Exhausted", user_id="user1")
     eval_db.add(project)

@@ -97,6 +97,10 @@ runtime_config: Dict = {
     # a single review-fix iteration (5-15 min agent + queueing) so multi-pass
     # cycles don't trigger a premature kill of in-flight children.
     "ci_backstop_timeout_minutes": int(os.getenv("CI_BACKSTOP_TIMEOUT_MINUTES", "60")),
+    # Hard EVALUATING-state backstop for parents not in CI-wait. The 6h legacy
+    # default cascade-killed otherwise-recoverable children during operator-
+    # intervention windows; bumped to 48h while silent-death stabilizes.
+    "evaluating_fail_hours": int(os.getenv("EVALUATING_FAIL_HOURS", "48")),
     # Total research tasks (any non-terminal state, *including* EVALUATING)
     # allowed per project. Distinct from max_parallel_research_per_project,
     # which counts only QUEUED/PROVISIONING/IN_PROGRESS — that cap controls
@@ -536,6 +540,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "max_pipeline_slots",
                     "evaluating_pipeline_timeout_minutes",
                     "ci_backstop_timeout_minutes",
+                    "evaluating_fail_hours",
                     "max_total_research_per_project",
                     "next_role_poll_timeout_secs",
                 ):
