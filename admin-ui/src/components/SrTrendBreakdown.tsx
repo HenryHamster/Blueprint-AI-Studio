@@ -1,5 +1,10 @@
 import { useState } from 'react';
-import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown } from 'lucide-react';
+
+export interface SrMissExample {
+  severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
+  desc: string;
+}
 
 export interface SrCategoryTrend {
   current_hit_rate?: number | null;
@@ -8,11 +13,37 @@ export interface SrCategoryTrend {
   weighted_miss_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   rate_history?: number[];
+  examples?: SrMissExample[];
 }
 
 export interface SrTaskTypeCategoryStats {
   miss_rate: number;
   sample_count: number;
+  examples?: SrMissExample[];
+}
+
+function severityColor(sev: SrMissExample['severity']): string {
+  if (sev === 'CRITICAL') return 'text-red-400';
+  if (sev === 'MAJOR') return 'text-amber-400';
+  return 'text-neutral-400';
+}
+
+function ExampleList({ examples, indent }: { examples: SrMissExample[]; indent?: boolean }) {
+  return (
+    <div className={`flex flex-col gap-0.5 mt-0.5 ${indent ? 'pl-4' : 'pl-3'} border-l border-neutral-800/60`}>
+      {examples.map((ex, i) => (
+        <div key={i} className="flex items-start gap-1 text-[10px] leading-tight">
+          <span
+            className={`font-mono shrink-0 ${severityColor(ex.severity)}`}
+            title={ex.severity}
+          >
+            {ex.severity[0]}
+          </span>
+          <span className="text-neutral-400 line-clamp-2">{ex.desc}</span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export interface SrTrendData {
@@ -134,29 +165,53 @@ function sortedEntries(
   });
 }
 
+function ByTaskTypeRow({ ttype, cats }: { ttype: string; cats: Record<string, SrTaskTypeCategoryStats> }) {
+  const [openCat, setOpenCat] = useState<string | null>(null);
+  const sorted = Object.entries(cats).sort(([, a], [, b]) => b.miss_rate - a.miss_rate);
+  const openExamples = openCat ? cats[openCat]?.examples ?? [] : [];
+  return (
+    <div className="text-[10px] mb-0.5">
+      <div className="flex items-start gap-1">
+        <span className="text-neutral-400 w-12 shrink-0 font-medium">{ttype}</span>
+        <span className="text-neutral-500 flex flex-wrap gap-x-1.5 gap-y-0">
+          {sorted.map(([cat, stats]) => {
+            const hasExamples = (stats.examples?.length ?? 0) > 0;
+            const isOpen = openCat === cat;
+            const inner = (
+              <>
+                <span className="text-neutral-400">{cat}</span>{' '}
+                <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+              </>
+            );
+            return hasExamples ? (
+              <button
+                key={cat}
+                type="button"
+                onClick={() => setOpenCat(isOpen ? null : cat)}
+                aria-expanded={isOpen}
+                title={`${stats.sample_count} samples — click for examples`}
+                className={`hover:text-neutral-300 ${isOpen ? 'underline' : ''}`}
+              >{inner}</button>
+            ) : (
+              <span key={cat} title={`${stats.sample_count} samples`}>{inner}</span>
+            );
+          })}
+        </span>
+      </div>
+      {openCat && openExamples.length > 0 && <ExampleList examples={openExamples} indent />}
+    </div>
+  );
+}
+
 function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<string, SrTaskTypeCategoryStats>> }) {
   const types = Object.keys(byTaskType).sort();
   if (types.length === 0) return null;
   return (
     <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60">
       <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Task Type</p>
-      {types.map(ttype => {
-        const cats = byTaskType[ttype];
-        const sorted = Object.entries(cats).sort(([, a], [, b]) => b.miss_rate - a.miss_rate);
-        return (
-          <div key={ttype} className="flex items-start gap-1 text-[10px] mb-0.5">
-            <span className="text-neutral-400 w-12 shrink-0 font-medium">{ttype}</span>
-            <span className="text-neutral-500 flex flex-wrap gap-x-1.5 gap-y-0">
-              {sorted.map(([cat, stats]) => (
-                <span key={cat} title={`${stats.sample_count} samples`}>
-                  <span className="text-neutral-400">{cat}</span>{' '}
-                  <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
-                </span>
-              ))}
-            </span>
-          </div>
-        );
-      })}
+      {types.map(ttype => (
+        <ByTaskTypeRow key={ttype} ttype={ttype} cats={byTaskType[ttype]} />
+      ))}
     </div>
   );
 }
@@ -175,9 +230,149 @@ export interface SrMissedTask {
 interface SrTrendBreakdownProps {
   trends: SrTrendData | null | undefined;
   variant: 'card' | 'inline';
+  onCategoryClick?: (category: string) => void;
 }
 
-export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
+function CategoryRow({
+  cat,
+  c,
+  variant,
+  onCategoryClick,
+}: {
+  cat: string;
+  c: SrCategoryTrend;
+  variant: 'card' | 'inline';
+  onCategoryClick?: (category: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const miss = deriveMissRate(c);
+  const wmiss = c.weighted_miss_rate;
+  const color = trendColorClass(c.trend);
+  const delta = calculateMissRateDelta(c);
+  const deltaColor = delta != null ? deltaColorClass(delta) : '';
+  const examples = c.examples ?? [];
+  const hasExamples = examples.length > 0;
+  const clickable = !!onCategoryClick;
+  const ChevronIcon = open ? ChevronDown : ChevronRight;
+  const chevron = hasExamples ? (
+    <button
+      type="button"
+      onClick={() => setOpen(!open)}
+      aria-expanded={open}
+      aria-label={`${open ? 'collapse' : 'expand'} ${cat} examples`}
+      className="text-neutral-500 hover:text-neutral-300 shrink-0"
+    >
+      <ChevronIcon className="w-3 h-3" />
+    </button>
+  ) : null;
+
+  const interactiveProps = clickable ? {
+    role: 'button',
+    tabIndex: 0,
+    onClick: () => onCategoryClick(cat),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onCategoryClick(cat); }
+    },
+  } : {};
+
+  if (variant === 'card') {
+    const rowBody = (
+      <>
+        <span className="text-neutral-300 truncate flex-1" title={cat}>{cat}</span>
+        <span className={`font-mono font-bold tabular-nums ${color}`}>
+          {miss != null ? `${Math.round(miss * 100)}%` : '–'}
+        </span>
+        {delta != null && (
+          <span className={`font-mono tabular-nums text-xs ${deltaColor}`} title="cycle-over-cycle change">
+            {formatDelta(delta)}
+          </span>
+        )}
+        {wmiss != null && (
+          <span className="font-mono tabular-nums text-neutral-500" title="severity-weighted miss rate">
+            {`w:${Math.round(wmiss * 100)}%`}
+          </span>
+        )}
+        <TrendIcon trend={c.trend} />
+        <MissRateSparkline
+          history={c.rate_history ?? []}
+          width={40}
+          height={12}
+          stroke={trendStroke(c.trend)}
+        />
+      </>
+    );
+    return (
+      <div>
+        <div className="flex items-center gap-2 text-[10px]">
+          {chevron}
+          {clickable ? (
+            <div
+              className="flex items-center gap-2 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60"
+              {...interactiveProps}
+            >
+              {rowBody}
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 flex-1 rounded px-0.5">
+              {rowBody}
+            </div>
+          )}
+        </div>
+        {open && hasExamples && <ExampleList examples={examples} />}
+      </div>
+    );
+  }
+
+  const inlineBody = (
+    <>
+      <span className="text-neutral-300">{cat}</span>
+      <span className={`font-mono ${color}`}>
+        {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
+      </span>
+      {delta != null && (
+        <span className={`font-mono text-xs ${deltaColor}`} title="cycle-over-cycle change">
+          {formatDelta(delta)}
+        </span>
+      )}
+      {wmiss != null && (
+        <span className="font-mono text-neutral-500" title="severity-weighted miss rate">
+          {`w:${Math.round(wmiss * 100)}%`}
+        </span>
+      )}
+      <TrendIcon trend={c.trend} />
+      <MissRateSparkline
+        history={c.rate_history ?? []}
+        width={32}
+        height={10}
+        stroke={trendStroke(c.trend)}
+      />
+    </>
+  );
+
+  return (
+    <div>
+      <div className="flex items-center gap-1.5 text-[10px]">
+        <span className="text-neutral-500">·</span>
+        {chevron}
+        {clickable ? (
+          <div
+            className="flex items-center gap-1.5 flex-1 rounded px-0.5 cursor-pointer hover:bg-neutral-800/60"
+            {...interactiveProps}
+          >
+            {inlineBody}
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5 flex-1 rounded px-0.5">
+            {inlineBody}
+          </div>
+        )}
+      </div>
+      {open && hasExamples && <ExampleList examples={examples} />}
+    </div>
+  );
+}
+
+export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -206,40 +401,9 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
           )}
         </div>
         <div className="flex flex-col gap-0.5">
-          {entries.map(([cat, c]) => {
-            const miss = deriveMissRate(c);
-            const wmiss = c.weighted_miss_rate;
-            const color = trendColorClass(c.trend);
-            const delta = calculateMissRateDelta(c);
-            const deltaColor = delta != null ? deltaColorClass(delta) : '';
-            return (
-              <div key={cat} className="flex items-center gap-2 text-[10px]">
-                <span className="text-neutral-300 truncate flex-1" title={cat}>
-                  {cat}
-                </span>
-                <span className={`font-mono font-bold tabular-nums ${color}`}>
-                  {miss != null ? `${Math.round(miss * 100)}%` : '–'}
-                </span>
-                {delta != null && (
-                  <span className={`font-mono tabular-nums text-xs ${deltaColor}`} title="cycle-over-cycle change">
-                    {formatDelta(delta)}
-                  </span>
-                )}
-                {wmiss != null && (
-                  <span className="font-mono tabular-nums text-neutral-500" title="severity-weighted miss rate">
-                    {`w:${Math.round(wmiss * 100)}%`}
-                  </span>
-                )}
-                <TrendIcon trend={c.trend} />
-                <MissRateSparkline
-                  history={c.rate_history ?? []}
-                  width={40}
-                  height={12}
-                  stroke={trendStroke(c.trend)}
-                />
-              </div>
-            );
-          })}
+          {entries.map(([cat, c]) => (
+            <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+          ))}
         </div>
         {trends?.by_task_type && Object.keys(trends.by_task_type).length > 0 && (
           <ByTaskTypeSection byTaskType={trends.by_task_type} />
@@ -250,39 +414,9 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
 
   return (
     <div data-testid="sr-trend-breakdown" className="flex flex-col gap-0.5 ml-1">
-      {entries.map(([cat, c]) => {
-        const miss = deriveMissRate(c);
-        const wmiss = c.weighted_miss_rate;
-        const color = trendColorClass(c.trend);
-        const delta = calculateMissRateDelta(c);
-        const deltaColor = delta != null ? deltaColorClass(delta) : '';
-        return (
-          <div key={cat} className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-neutral-500">·</span>
-            <span className="text-neutral-300">{cat}</span>
-            <span className={`font-mono ${color}`}>
-              {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
-            </span>
-            {delta != null && (
-              <span className={`font-mono text-xs ${deltaColor}`} title="cycle-over-cycle change">
-                {formatDelta(delta)}
-              </span>
-            )}
-            {wmiss != null && (
-              <span className="font-mono text-neutral-500" title="severity-weighted miss rate">
-                {`w:${Math.round(wmiss * 100)}%`}
-              </span>
-            )}
-            <TrendIcon trend={c.trend} />
-            <MissRateSparkline
-              history={c.rate_history ?? []}
-              width={32}
-              height={10}
-              stroke={trendStroke(c.trend)}
-            />
-          </div>
-        );
-      })}
+      {entries.map(([cat, c]) => (
+        <CategoryRow key={cat} cat={cat} c={c} variant="inline" onCategoryClick={onCategoryClick} />
+      ))}
     </div>
   );
 }
@@ -296,10 +430,11 @@ const WINDOW_OPTIONS: { label: string; days: number }[] = [
 interface SrMissedRetrospectiveProps {
   tasks: SrMissedTask[];
   onTaskClick?: (taskId: string) => void;
+  initialCategory?: string;
 }
 
-export function SrMissedRetrospective({ tasks, onTaskClick }: SrMissedRetrospectiveProps) {
-  const [categoryFilter, setCategoryFilter] = useState('');
+export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: SrMissedRetrospectiveProps) {
+  const [categoryFilter, setCategoryFilter] = useState(initialCategory ?? '');
   const [typeFilter, setTypeFilter] = useState('');
   const [windowDays, setWindowDays] = useState(14);
   const [mountedAt] = useState(() => Date.now());

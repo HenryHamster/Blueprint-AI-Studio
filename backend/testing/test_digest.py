@@ -7362,3 +7362,62 @@ async def test_digest_fresh_reviewer_effectiveness_per_category_hit_rate(
     assert fre["per_category_hit_rate"]["correctness"] == 1.0
     # agent passed correctness, reviewer flagged it, human confirmed → added value
     assert fre["reviewer_finding_added_value"].get("correctness", 0) == 3
+
+
+# ---------------------------------------------------------------------------
+# SR blind-spots aggregation endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session):
+    """Top themes are counted and skipped/fallback envelopes are excluded."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 tasks with the same first-6-token theme (should merge into count=3)
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {"correctness": {"passed": True}},
+                "blind_spots": [f"did not verify file path number {i} thoroughly"],
+            }},
+        ))
+    # 1 task with a distinct blind-spot theme
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        context={"_self_review_outcome": {
+            "verdict": "pass",
+            "fixes_applied": False,
+            "check_results": {},
+            "blind_spots": ["async error propagation not checked"],
+        }},
+    ))
+    # 1 skipped envelope — must NOT contribute to themes
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-blind-spots?days=30")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["window_days"] == 30
+    themes = {t["theme"]: t["count"] for t in body["themes"]}
+    # The 3 identical long strings normalise to the same 6-token prefix
+    assert themes.get("did not verify file path number") == 3
+    assert themes.get("async error propagation not checked") == 1
+    # Skipped envelope contributes no entries
+    assert body["total_distinct_themes"] == 2

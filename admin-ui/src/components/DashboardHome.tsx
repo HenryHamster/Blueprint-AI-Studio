@@ -278,6 +278,17 @@ const REVIEW_CAT_COLORS: Record<string, string> = {
   other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
 };
 
+interface BlindSpotTheme {
+  theme: string;
+  count: number;
+}
+
+interface BlindSpotsData {
+  themes: BlindSpotTheme[];
+  total_distinct_themes: number;
+  window_days: number;
+}
+
 interface SparkPoint {
   active: number;
   queued: number;
@@ -291,6 +302,7 @@ export interface DashboardHomeProps {
   selectedProjectId: string | null;
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
+  onCategoryClick?: (category: string) => void;
 }
 
 // ---------- helpers ----------
@@ -532,7 +544,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectionClick }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
@@ -542,6 +554,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
+  const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
@@ -647,6 +660,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               const data = await res.json();
               setSystemMaturity(Array.isArray(data) ? data : []);
             }
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
+            if (res.ok) setBlindSpots(await res.json());
           } catch { /* silent */ }
         })(),
       );
@@ -966,6 +985,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 <SrTrendBreakdown
                   trends={digest?.self_review_prediction_accuracy_trends}
                   variant="card"
+                  onCategoryClick={onCategoryClick}
                 />
                 {digest?.fresh_reviewer_effectiveness != null && (() => {
                   const fre = digest.fresh_reviewer_effectiveness!;
@@ -992,6 +1012,28 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                     </div>
                   );
                 })()}
+              </div>
+            </section>
+          )}
+
+          {/* SR Blind Spots aggregation */}
+          {!loading && blindSpots && blindSpots.themes.length > 0 && (
+            <section>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+                SR Blind Spots
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {blindSpots.total_distinct_themes} themes · {blindSpots.window_days}d</span>
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {blindSpots.themes.slice(0, 8).map((t, i) => (
+                  <span
+                    key={i}
+                    className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20"
+                    title={t.theme}
+                  >
+                    <span className="truncate max-w-[160px]">{t.theme}</span>
+                    <span className="font-bold shrink-0">×{t.count}</span>
+                  </span>
+                ))}
               </div>
             </section>
           )}

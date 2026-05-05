@@ -35,6 +35,7 @@ export interface BuildConfig {
   git_user_email?: string;
   env_vars?: Record<string, string>;
   detected_at?: string;
+  enable_fresh_reviewer?: boolean;
 }
 
 export interface Project {

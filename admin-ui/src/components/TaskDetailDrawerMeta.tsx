@@ -411,11 +411,28 @@ interface SelfReviewCheckResult {
   issue?: string;
 }
 
+interface ReviewerFinding {
+  category: string;
+  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+  description: string;
+}
+
 interface SelfReviewOutcome {
   verdict?: string;
   fixes_applied?: boolean;
   check_results?: Record<string, SelfReviewCheckResult>;
   blind_spots?: string[];
+  reviewer_findings?: ReviewerFinding[];
+}
+
+function getSeverityColor(severity: string): string {
+  switch (severity) {
+    case 'CRITICAL': return 'bg-red-950/40 border-red-800/40 text-red-400';
+    case 'HIGH': return 'bg-orange-950/40 border-orange-800/40 text-orange-400';
+    case 'MEDIUM': return 'bg-amber-950/40 border-amber-800/40 text-amber-400';
+    case 'LOW': return 'bg-yellow-950/40 border-yellow-800/40 text-yellow-400';
+    default: return 'bg-neutral-800 border-neutral-700 text-neutral-400';
+  }
 }
 
 function SelfReviewPanel({ task }: { task: Task }) {
@@ -428,6 +445,7 @@ function SelfReviewPanel({ task }: { task: Task }) {
 
   const verdict = outcome.verdict ?? 'unknown';
   const checkResults = outcome.check_results ?? {};
+  const reviewerFindings = outcome.reviewer_findings ?? [];
   const isSoftFallback = verdict === 'unknown' && Object.keys(checkResults).length === 0;
 
   const verdictColor = verdict === 'pass' ? 'text-emerald-400' : verdict === 'fail' ? 'text-red-400' : 'text-neutral-400';
@@ -479,15 +497,19 @@ function SelfReviewPanel({ task }: { task: Task }) {
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Failed checks</p>
                   <div className="space-y-1.5">
-                    {failedCategories.map(([cat, result]) => (
-                      <div key={cat} className="text-xs">
-                        <div className="flex items-center gap-1.5">
-                          <span className="w-2 h-2 rounded-full bg-red-500 shrink-0" />
-                          <span className="font-mono text-red-300">{cat}</span>
+                    {failedCategories.map(([cat, result]) => {
+                      const isFromReviewer = result.issue?.startsWith('[reviewer]');
+                      return (
+                        <div key={cat} className="text-xs">
+                          <div className="flex items-center gap-1.5">
+                            <span className={`w-2 h-2 rounded-full shrink-0 ${isFromReviewer ? 'bg-orange-500' : 'bg-red-500'}`} />
+                            <span className={`font-mono ${isFromReviewer ? 'text-orange-300' : 'text-red-300'}`}>{cat}</span>
+                            {isFromReviewer && <span className="text-[9px] px-1 py-0.5 rounded bg-orange-950/40 text-orange-300 font-semibold">from reviewer</span>}
+                          </div>
+                          {result.issue && <p className="text-neutral-400 ml-3.5 mt-0.5 break-words">{result.issue.startsWith('[reviewer]') ? result.issue.slice(10) : result.issue}</p>}
                         </div>
-                        {result.issue && <p className="text-neutral-400 ml-3.5 mt-0.5 break-words">{result.issue}</p>}
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -516,6 +538,26 @@ function SelfReviewPanel({ task }: { task: Task }) {
                       </li>
                     ))}
                   </ul>
+                </div>
+              )}
+
+              {reviewerFindings.length > 0 && (
+                <div className="border-t border-neutral-700/50 pt-3">
+                  <p className="text-xs text-neutral-400 font-medium mb-1.5">Fresh-reviewer findings</p>
+                  <div className="space-y-2">
+                    {reviewerFindings.sort((a, b) => {
+                      const severityOrder: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+                      return (severityOrder[a.severity] ?? 4) - (severityOrder[b.severity] ?? 4);
+                    }).map((finding, i) => (
+                      <div key={i} className={`text-xs rounded border px-2 py-1.5 ${getSeverityColor(finding.severity)}`}>
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <span className="font-semibold uppercase text-[9px] tracking-wide">{finding.severity}</span>
+                          <span className="font-mono text-[10px]">{finding.category}</span>
+                        </div>
+                        <p className="text-neutral-200 break-words">{finding.description}</p>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 

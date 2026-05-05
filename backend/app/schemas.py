@@ -205,6 +205,7 @@ class BuildConfig(BaseModel):
     git_user_name: str = "Blueprint Agent"
     git_user_email: str = "blueprint-agent@automated.dev"
     detected_at: str | None = None
+    enable_fresh_reviewer: bool = False
 
 
 class OnboardPayload(BaseModel):

@@ -46,6 +46,9 @@ export function ProjectBuildConfigSection({
   const [gitName, setGitName] = useState(
     buildConfig?.git_user_name ?? 'Blueprint Agent'
   );
+  const [enableFreshReviewer, setEnableFreshReviewer] = useState(
+    buildConfig?.enable_fresh_reviewer ?? false
+  );
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
 
@@ -54,6 +57,7 @@ export function ProjectBuildConfigSection({
     setDirs(buildConfig?.directories?.length ? buildConfig.directories : []);
     setGitEmail(buildConfig?.git_user_email ?? 'blueprint-agent@automated.dev');
     setGitName(buildConfig?.git_user_name ?? 'Blueprint Agent');
+    setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
   }, [buildConfig]);
 
   const handleSave = async () => {
@@ -64,6 +68,7 @@ export function ProjectBuildConfigSection({
         directories: dirs,
         git_user_email: gitEmail,
         git_user_name: gitName,
+        enable_fresh_reviewer: enableFreshReviewer,
       });
     } finally {
       setSaving(false);
@@ -269,6 +274,37 @@ export function ProjectBuildConfigSection({
               />
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Agent Behavior */}
+      {hasConfig && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Agent Behavior</h3>
+          <label className="flex items-start gap-3 cursor-pointer group">
+            <div className="mt-0.5 shrink-0">
+              <input
+                type="checkbox"
+                checked={enableFreshReviewer}
+                onChange={e => setEnableFreshReviewer(e.target.checked)}
+                className="sr-only peer"
+                id="fresh-reviewer-toggle"
+              />
+              <div
+                onClick={() => setEnableFreshReviewer(v => !v)}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableFreshReviewer ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${enableFreshReviewer ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-200 font-medium">Fresh Reviewer</span>
+              <p className="text-[11px] text-neutral-500 mt-0.5">
+                Second-pass critique by an independent Claude session before <code className="font-mono text-neutral-400">./done</code>.
+                Catches issues the primary agent may miss. Adds a small additional cost per code-change task.
+              </p>
+            </div>
+          </label>
         </div>
       )}
 

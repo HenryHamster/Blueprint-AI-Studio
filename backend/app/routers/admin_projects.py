@@ -128,7 +128,8 @@ async def update_project(
 
         from app.schemas import BuildConfig as BuildConfigSchema
         try:
-            validated = BuildConfigSchema(**payload.build_config) if payload.build_config else BuildConfigSchema()
+            merged = {**(project.build_config or {}), **payload.build_config}
+            validated = BuildConfigSchema(**merged) if merged else BuildConfigSchema()
             project.build_config = validated.model_dump(exclude_none=True)
         except ValidationError as e:
             raise HTTPException(status_code=400, detail="Invalid build_config structure") from e

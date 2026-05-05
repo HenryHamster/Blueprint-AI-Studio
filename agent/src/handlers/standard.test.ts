@@ -1360,6 +1360,67 @@ describe('runFreshReviewerPass', () => {
   });
 });
 
+// ── enable_fresh_reviewer flag integration ────────────────────────────────────
+describe('handleCreate — enable_fresh_reviewer flag', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('runs fresh-reviewer pass when project_metadata.enable_fresh_reviewer is true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' });
+
+    const task = {
+      title: 'Test task', description: '',
+      context: {}, project_context: {},
+      project_metadata: { enable_fresh_reviewer: true },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeDefined();
+  });
+
+  it('skips fresh-reviewer pass when enable_fresh_reviewer is false', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' });
+
+    const task = {
+      title: 'Test task', description: '',
+      context: {}, project_context: {},
+      project_metadata: { enable_fresh_reviewer: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeUndefined();
+  });
+
+  it('skips fresh-reviewer pass even when flag is true for auto-remediation tasks', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' });
+
+    const task = {
+      title: 'Test task', description: '',
+      context: { auto_remediation: true }, project_context: {},
+      project_metadata: { enable_fresh_reviewer: true },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeUndefined();
+  });
+});
+
 // ── Structural prompt invariants (regression-detection) ───────────────────────
 // Pins the cross-cutting guidance blocks that every code-change handler MUST
 // assemble into its prompt. A future PR that drops one of these constants from

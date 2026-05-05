@@ -765,13 +765,15 @@ async def claim_task(
     # Add project metadata so agents can adapt to different project structures
     project = await session.get(Project, task.project_id)
     if project:
+        _build_cfg = project.build_config or {}
         response["project_metadata"] = {
             "project_id": str(project.id),
             "project_name": project.name,
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
             "is_self_repo": project.is_self_repo,
-            "build_config": project.build_config or {},
+            "build_config": _build_cfg,
+            "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
         }
 
     task_type = task.first_payload.get("type", "")

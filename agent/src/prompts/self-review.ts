@@ -69,3 +69,19 @@ export function formatSelfReviewBlindSpots(
   }
   return lines.join('\n') + blindSpotsBlock + '\n\n';
 }
+
+// Format project-wide blind spot theme aggregation (from the backend /api/admin/sr-blind-spots
+// endpoint) into a prompt section so reviewers see which areas the agent has been most
+// uncertain about across recent tasks. Returns '' when themes is empty.
+export function formatProjectBlindSpotSummary(
+  themes: Array<{ theme: string; count: number }>,
+): string {
+  if (themes.length === 0) return '';
+  const top = themes.slice(0, 8);
+  const rows = top.map(t => `- ${t.theme} (${t.count} task${t.count === 1 ? '' : 's'})`).join('\n');
+  return (
+    `**Project-wide self-review blind spots (last 7 days — areas where self-review has been most uncertain):**\n` +
+    `${rows}\n` +
+    `Focus extra scrutiny on files or patterns that match these themes.\n\n`
+  );
+}

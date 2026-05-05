@@ -145,6 +145,8 @@ export default function App() {
   const [showSrMissed, setShowSrMissed] = useState(false);
   const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
   const [srMissedLoading, setSrMissedLoading] = useState(false);
+  const [srMissedCategory, setSrMissedCategory] = useState('');
+  const srMissedRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!showSrMissed || !selectedProjectId) return;
     setSrMissedLoading(true);
@@ -698,12 +700,12 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} /></ErrorBoundary>
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
               {s.selectedProjectId && (
-                <div className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+                <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
                   <button
-                    onClick={() => setShowSrMissed(v => !v)}
+                    onClick={() => { setShowSrMissed(v => { if (v) setSrMissedCategory(''); return !v; }); }}
                     className="text-xs font-medium text-neutral-400 hover:text-neutral-200"
                   >
                     Self-Review Missed Retrospectives {showSrMissed ? '▲' : '▼'}
@@ -711,7 +713,7 @@ export default function App() {
                   {showSrMissed && (
                     srMissedLoading
                       ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} /></div>
+                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} initialCategory={srMissedCategory} /></div>
                   )}
                 </div>
               )}

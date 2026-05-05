@@ -4503,3 +4503,54 @@ async def list_sr_missed_retrospectives(
         })
 
     return {"items": items, "total": total}
+
+
+@router.get("/projects/{project_id}/sr-blind-spots")
+async def list_sr_blind_spots(
+    project_id: uuid.UUID,
+    days: int = Query(14, ge=1, le=90),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate blind_spots from recent self-review outcomes.
+
+    Groups raw blind_spot strings by their first 6 tokens to surface recurring
+    themes without exposing full task-specific text.  Skipped/fallback SR
+    envelopes are excluded so noise from the ./done bash fallback doesn't inflate
+    theme counts.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .order_by(Task.created_at.desc())
+        .limit(2000)
+    )
+    result = await session.execute(stmt)
+    all_tasks = result.scalars().all()
+
+    theme_counts: Dict[str, int] = defaultdict(int)
+    for t in all_tasks:
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or _is_skipped_sr_outcome(sro):
+            continue
+        for entry in (sro.get("blind_spots") or []):
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            theme = " ".join(entry.lower().split()[:6])
+            theme_counts[theme] += 1
+
+    top = sorted(theme_counts.items(), key=lambda x: -x[1])[:limit]
+    return {
+        "window_days": days,
+        "total_distinct_themes": len(theme_counts),
+        "themes": [{"theme": t, "count": c} for t, c in top],
+    }
