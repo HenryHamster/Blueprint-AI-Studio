@@ -2335,12 +2335,12 @@ async def agent_heartbeat(
         # Validation lives at the Pydantic boundary (FixLoopEventIn); invalid
         # entries are dropped silently so a malformed event from a forward-rolled
         # agent doesn't 422 the whole heartbeat.
-        from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events  # noqa: PLC0415
+        from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events
         validated: list[FixLoopEventIn] = []
         for raw in req.fix_loop_events:
             try:
                 validated.append(FixLoopEventIn(**raw))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001, PERF203
                 logger.info("[FIX_LOOP] dropping invalid event for task %s: %s", req.task_id, exc)
         if validated:
             apply_fix_loop_events(task, validated)
@@ -2396,7 +2396,7 @@ async def vm_heartbeat(
     if req.vm_instance_id != token.get("vm_instance_id"):
         raise HTTPException(status_code=403, detail="vm_instance_mismatch")
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 
 @router.post("/next-role")
@@ -2437,7 +2437,7 @@ async def next_role(
     # mid-task with [FATAL:SIGTERM] (production 2026-05-05 task cfd73cec
     # on VM agent-vm-c44258...). The marker is recorded synchronously
     # before scheduling so it is always observable here.
-    from app.main import is_orchestrator_initiated_delete  # noqa: PLC0415
+    from app.main import is_orchestrator_initiated_delete
     _is_doomed, _delete_reason = is_orchestrator_initiated_delete(req.vm_instance_id)
     if _is_doomed:
         logger.info(
@@ -2471,7 +2471,7 @@ async def next_role(
     task = (await session.execute(stmt)).scalars().first()
 
     if task is not None:
-        from app.compute import VM_PROVISIONING_MODEL  # noqa: PLC0415
+        from app.compute import VM_PROVISIONING_MODEL
         task.vm_instance_id = req.vm_instance_id
         task.status = TaskStatus.IN_PROGRESS
         task.last_heartbeat = _utcnow()
@@ -2522,7 +2522,7 @@ async def next_role(
                 task_type=task_type,
                 project_id=str(task.project_id) if task.project_id else "",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             await session.rollback()
             logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
             raise HTTPException(status_code=500, detail="token_mint_failed") from exc
@@ -2571,7 +2571,7 @@ async def next_role(
             }
 
     # Nothing to claim. Tell the agent to keep polling.
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 
 @router.post("/spawn")
@@ -2619,7 +2619,7 @@ async def spawn_subtask(
     # that hijacks another VM's chain. Log a warning when this happens so
     # we can spot the attack pattern in production.
     raw_context = req.context or {}
-    forbidden_present = [k for k in raw_context.keys() if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS]
+    forbidden_present = [k for k in raw_context if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS]
     if forbidden_present:
         logger.warning(
             "[SPAWN] Stripped forbidden context keys from agent spawn: parent_task=%s keys=%s",
