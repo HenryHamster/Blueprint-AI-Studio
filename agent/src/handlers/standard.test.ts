@@ -1421,6 +1421,173 @@ describe('handleCreate — enable_fresh_reviewer flag', () => {
   });
 });
 
+// ── Fresh-reviewer merge logic (override semantics) ───────────────────────────
+// Tests the core merge behavior: how reviewer findings override or preserve
+// existing self-review check results.
+describe('runFreshReviewerPass merge logic', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+    // Reset writeFileSync captures
+    vi.mocked(fsModule.writeFileSync).mockClear();
+    vi.mocked(fsModule.readFileSync).mockClear();
+  });
+
+  it('creates new self-review JSON with only reviewer_findings when JSON is missing', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockImplementation(() => {
+      throw new Error('File not found');
+    });
+    let capturedJson: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_path: unknown, data: unknown) => {
+      capturedJson = JSON.parse((data as string | Buffer).toString()) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Logic bug"}]}',
+    });
+
+    const taskId = 'test-merge-1';
+    await runFreshReviewerPass(taskId, 'Test task', 'Test description', [], null, { value: '' });
+
+    expect(capturedJson).not.toBeNull();
+    const json = capturedJson as unknown as Record<string, unknown>;
+    expect(json.reviewer_findings).toBeDefined();
+    expect((json.reviewer_findings as Array<unknown>).length).toBe(1);
+    expect((json.reviewer_findings as Array<unknown>)[0]).toEqual({
+      category: 'correctness',
+      severity: 'HIGH',
+      description: 'Logic bug',
+    });
+  });
+
+  it('adds reviewer-flagged category absent from check_results with passed=false', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: { 'type-safety': { passed: true, issue: '' } },
+    }));
+    let capturedJson: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_path: unknown, data: unknown) => {
+      capturedJson = JSON.parse((data as string | Buffer).toString()) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Off-by-one error"}]}',
+    });
+
+    const taskId = 'test-merge-2';
+    await runFreshReviewerPass(taskId, 'Test task', 'Test description', [], null, { value: '' });
+
+    expect(capturedJson).not.toBeNull();
+    const json = capturedJson as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness).toBeDefined();
+    expect(checkResults.correctness.passed).toBe(false);
+    expect((checkResults.correctness.issue as string)).toContain('[reviewer]');
+    expect((checkResults.correctness.issue as string)).toContain('Off-by-one error');
+  });
+
+  it('overrides reviewer-flagged category with passed=true to passed=false', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {
+        correctness: { passed: true, issue: '' },
+        'error-handling': { passed: true, issue: '' },
+      },
+    }));
+    let capturedJson: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_path: unknown, data: unknown) => {
+      capturedJson = JSON.parse((data as string | Buffer).toString()) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Missing null check"}]}',
+    });
+
+    const taskId = 'test-merge-3';
+    await runFreshReviewerPass(taskId, 'Test task', 'Test description', [], null, { value: '' });
+
+    expect(capturedJson).not.toBeNull();
+    const json = capturedJson as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness.passed).toBe(false);
+    expect((checkResults.correctness.issue as string)).toContain('[reviewer]');
+    // error-handling should remain unchanged from original
+    expect(checkResults['error-handling'].passed).toBe(true);
+  });
+
+  it('does NOT override reviewer-flagged category with passed=false (preserves issue text)', async () => {
+    const idx = await import('../index.js');
+    const originalIssue = 'Original reviewer caught this first';
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {
+        correctness: { passed: false, issue: originalIssue },
+      },
+    }));
+    let capturedJson: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_path: unknown, data: unknown) => {
+      capturedJson = JSON.parse((data as string | Buffer).toString()) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"CRITICAL","description":"Different issue"}]}',
+    });
+
+    const taskId = 'test-merge-4';
+    await runFreshReviewerPass(taskId, 'Test task', 'Test description', [], null, { value: '' });
+
+    expect(capturedJson).not.toBeNull();
+    const json = capturedJson as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness.passed).toBe(false);
+    // Original issue text should be preserved, not overwritten by new reviewer finding
+    expect(checkResults.correctness.issue).toBe(originalIssue);
+  });
+
+  it('always writes reviewer_findings array to self-review JSON', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: { 'type-safety': { passed: true, issue: '' } },
+    }));
+    let capturedJson: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_path: unknown, data: unknown) => {
+      capturedJson = JSON.parse((data as string | Buffer).toString()) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    const findings = [
+      { category: 'correctness', severity: 'HIGH', description: 'Logic error' },
+      { category: 'scope-drift', severity: 'MEDIUM', description: 'Changed unrelated file' },
+    ];
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({ reviewer_findings: findings }),
+    });
+
+    const taskId = 'test-merge-5';
+    await runFreshReviewerPass(taskId, 'Test task', 'Test description', [], null, { value: '' });
+
+    expect(capturedJson).not.toBeNull();
+    const json = capturedJson as unknown as Record<string, unknown>;
+    expect(json.reviewer_findings).toEqual(findings);
+  });
+});
+
 // ── Structural prompt invariants (regression-detection) ───────────────────────
 // Pins the cross-cutting guidance blocks that every code-change handler MUST
 // assemble into its prompt. A future PR that drops one of these constants from
