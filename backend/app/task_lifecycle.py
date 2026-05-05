@@ -26,6 +26,7 @@ from app.database import AsyncSessionLocal
 from app.models import (
     Task, TaskHistory, Project,
     TaskStatus, ArtifactType, Alert, AlertSeverity, ProjectStatus,
+    RegressionRemediationCase,
 )
 from app.schemas import AgentStatusPayload
 from app.routers.agent import _has_local_cycle
@@ -1140,6 +1141,46 @@ async def _spawn_ci_auto_remediation_followup(
     return True
 
 
+async def _close_loop_regression_case_on_merge(
+    task: Task, pr_number: int, session: AsyncSession
+) -> None:
+    """Advance a RegressionRemediationCase to MERGED when its remediation PR merges."""
+    regression_class = (task.context or {}).get("regression_class")
+    if not regression_class:
+        return
+    result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == task.project_id,
+            RegressionRemediationCase.regression_class == regression_class,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None:
+        return
+    case.mark_merged(pr_number, (task.context or {}).get("signal_snapshot", {}))
+    session.add(case)
+
+
+async def _close_loop_regression_case_on_failure(
+    task: Task, session: AsyncSession
+) -> None:
+    """Re-arm or escalate a RegressionRemediationCase when its remediation task fails."""
+    regression_class = (task.context or {}).get("regression_class")
+    if not regression_class:
+        return
+    result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == task.project_id,
+            RegressionRemediationCase.regression_class == regression_class,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None:
+        return
+    case.re_arm()
+    session.add(case)
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -1364,6 +1405,12 @@ async def _process_post_commit(
                     exc_info=True,
                 )
 
+            # Close-loop: re-arm the RegressionRemediationCase when its fix task fails.
+            try:
+                await _close_loop_regression_case_on_failure(task, session)
+            except Exception as _rc_fail_exc:
+                logger.warning(f"[REGRESSION-CASE] Failed to re-arm case on task failure {task.id}: {_rc_fail_exc!r}")
+
         # Anti-poisoning: resolve playbook entries the task wrote while
         # IN_PROGRESS. On COMPLETED, clear pending_source so peers can see
         # them. On FAILED/CANCELLED, drop them entirely so a task that
@@ -1543,6 +1590,10 @@ async def _process_post_commit(
                                     await _record_remediation_outcome(task, merged=True, session=session)
                                 except Exception as _rr_exc:
                                     logger.warning(f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {task.id}: {_rr_exc!r}")
+                            try:
+                                await _close_loop_regression_case_on_merge(task, pr_number, session)
+                            except Exception as _rc_merge_exc:
+                                logger.warning(f"[REGRESSION-CASE] Failed to advance case on auto-merge for task {task.id}: {_rc_merge_exc!r}")
                             await session.commit()
                             await _cleanup_branches(task, session)
                             logger.info(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
@@ -2229,6 +2280,11 @@ async def _process_post_commit(
                                             )
                                         except Exception as _rp_exc:
                                             logger.warning("[REVIEW_PLAYBOOK] Failed to extract review feedback: %s", _rp_exc)
+                                        # Close-loop: advance the RegressionRemediationCase to MERGED.
+                                        try:
+                                            await _close_loop_regression_case_on_merge(orig, pr_number, session)
+                                        except Exception as _rc_merge_exc:
+                                            logger.warning(f"[REGRESSION-CASE] Failed to advance case on review-merge for task {orig.id}: {_rc_merge_exc!r}")
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)

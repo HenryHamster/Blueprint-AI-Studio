@@ -1295,4 +1295,40 @@ class RegressionRemediationCase(SQLModel, table=True):
         ),
     )
 
+    def mark_merged(self, pr_number: int, signal_snapshot: Dict[str, Any]) -> None:
+        """Transition ACTIVE → MERGED after remediation PR merges.
+
+        Captures the post-merge signal snapshot and appends a fix-log entry so
+        the recovery scan can verify the regression resolved.
+        """
+        self.signal_snapshot_at_merge = signal_snapshot
+        self.last_remediation_pr_number = pr_number
+        self.last_remediation_result = "merged"
+        log_entry: Dict[str, Any] = {
+            "fingerprint": self.regression_class,
+            "fix_pr_number": pr_number,
+            "merged_at": _utcnow().isoformat(),
+        }
+        self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [log_entry]
+        self.status = RegressionCaseStatus.MERGED
+
+    def mark_closed(self) -> None:
+        """Transition MERGED → CLOSED when the signal shows recovery."""
+        self.last_remediation_result = "closed"
+        self.status = RegressionCaseStatus.CLOSED
+
+    def re_arm(self, max_attempts: int = 3) -> None:
+        """Handle remediation failure or post-MERGED recurrence.
+
+        Increments the attempt counter and either resets to ACTIVE for another
+        spawn or escalates to NEEDS_MANUAL_INTERVENTION when the cap is reached.
+        """
+        self.attempts = (self.attempts or 0) + 1
+        self.last_remediation_result = "failed"
+        if self.attempts >= max_attempts:
+            self.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+            self.needs_manual_intervention_at = _utcnow()
+        else:
+            self.status = RegressionCaseStatus.ACTIVE
+
 

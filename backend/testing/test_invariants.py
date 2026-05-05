@@ -1050,6 +1050,7 @@ class TestFailureClassificationInvariants:
     def test_infra_classes_membership_exact(self):
         from app.failure_classification import (
             AGENT_TIMEOUT,
+            BLOCKED_PRECONDITION,
             EXTERNAL_API,
             INFRA_CLASSES,
             PROVISION_FAILURE,
@@ -1062,6 +1063,7 @@ class TestFailureClassificationInvariants:
             AGENT_TIMEOUT,
             EXTERNAL_API,
             SCOPE_OVERFLOW,
+            BLOCKED_PRECONDITION,
         }), (
             "INFRA_CLASSES membership changed — direction_outcomes and "
             "research_completion rely on this exact set to distinguish infra "
@@ -1071,6 +1073,7 @@ class TestFailureClassificationInvariants:
     def test_canonical_classes_partitioned_by_infra(self):
         from app.failure_classification import (
             AGENT_TIMEOUT,
+            BLOCKED_PRECONDITION,
             CODE_ERROR,
             EXTERNAL_API,
             INFRA_CLASSES,
@@ -1085,6 +1088,7 @@ class TestFailureClassificationInvariants:
             EXTERNAL_API,
             RATE_LIMIT,
             SCOPE_OVERFLOW,
+            BLOCKED_PRECONDITION,
         ]
         for cls in canonical:
             assert isinstance(cls, str) and cls, f"{cls!r} must be a non-empty string"
