@@ -987,10 +987,17 @@ the workspace, executable):
   green. If your changes don't touch admin-ui/, agent/, or backend/,
   \`./check\` returns PASS without running anything — that's expected
   for pure-docs tasks.
-- \`./check test\` — same plus the Docker backend test suite (~5-8min).
-  Run this before \`./pr open\` for any task that touches backend code on
-  a main branch — migrations, model changes, business-logic changes all
-  must pass tests before shipping.
+- \`./check test\` — same plus the FULL Docker backend test suite (~5-8min).
+  Reserve this for **cross-cutting changes** — migrations, model
+  schema changes, refactors that touch many modules, dependency bumps.
+  For everything else (targeted features, isolated fixes, single-module
+  edits): run only the relevant test file(s) directly via
+  \`bash scripts/test-backend.sh testing/test_<your_module>.py\` to
+  verify your changes don't regress what you touched. CI runs the full
+  suite on the PR after \`./pr open\`, so a redundant full-suite run
+  here is wasted compute that risks subprocess timeout — which kills
+  the task before it can open the PR (production 2026-05-05: lost a
+  completed implementation that way).
 - \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
   commits any pending changes, pushes to the work branch (force-with-lease
   retry built in), creates a PR (or pushes updates to an existing one for
