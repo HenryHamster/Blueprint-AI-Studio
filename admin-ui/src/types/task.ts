@@ -61,6 +61,15 @@ export interface Task {
   estimated_cost_usd?: number | null;
 }
 
+export interface SerialConsoleResponse {
+  vm_instance_id: string;
+  zone: string | null;
+  vm_status: string | null;
+  serial_log: string | null;
+  captured_at: string;
+  source: 'live' | 'cached';
+}
+
 export type TrackLogType = 'log' | 'status' | 'artifact' | 'error' | 'system';
 
 export interface TrackLogEntry {

@@ -21,6 +21,7 @@ from app.task_locking import task_lock
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import TaskType, validate_internal_payload, validate_task_payload
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 
 
 def _estimated_cost_usd(task: Task) -> Optional[float]:
@@ -914,6 +915,75 @@ async def get_task(
         "history": history,
         "child_task_ids": child_task_ids,
         "estimated_cost_usd": _estimated_cost_usd(task),
+    }
+
+@router.get("/tasks/{task_id}/serial-console")
+async def get_task_serial_console(
+    task_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """Fetch the live GCE serial console for a task's VM.
+
+    Returns the current serial console output for a task that has an active VM,
+    or cached serial log from the last reap if the VM is no longer available.
+    Returns 404 if the task has no vm_instance_id or doesn't exist.
+
+    Response shape:
+    {
+        "vm_instance_id": string,
+        "zone": string | null,
+        "vm_status": string | null,
+        "serial_log": string | null,
+        "captured_at": ISO-8601 string,
+        "source": "live" | "cached"
+    }
+    """
+    try:
+        tid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = await _get_user_task(tid, current_user["user_id"], session)
+
+    # 404 if task has no VM
+    if not task.vm_instance_id:
+        raise HTTPException(status_code=404, detail="Task has no vm_instance_id")
+
+    vm_id = task.vm_instance_id
+    # _vm_zones is process-local; on multi-replica deploys this replica may
+    # not have provisioned the VM. Fall back to the zone persisted in
+    # task.context (mirrors the reaper.py provision_zone resolution pattern).
+    zone = get_vm_zone(vm_id)
+    if zone == "unknown":
+        ctx_zone = (task.context or {}).get("provision_zone")
+        if ctx_zone:
+            zone = ctx_zone
+
+    # Try to fetch live serial console
+    live_serial = await asyncio.to_thread(_capture_serial_for_vm, vm_id, zone)
+
+    # Get VM status
+    vm_status = None
+    if zone and zone != "unknown":
+        vm_status = await asyncio.to_thread(get_vm_status, vm_id, zone)
+
+    # Determine source and fall back to cached if needed
+    serial_log = live_serial
+    source = "live"
+    if serial_log is None:
+        # Fall back to cached serial log from reaper
+        serial_log = (task.context or {}).get("last_serial_log")
+        if serial_log is not None:
+            source = "cached"
+
+    return {
+        "vm_instance_id": vm_id,
+        "zone": zone if zone != "unknown" else None,
+        "vm_status": vm_status,
+        "serial_log": serial_log,
+        "captured_at": _utcnow().isoformat(),
+        "source": source,
     }
 
 class CreateTaskPayload(BaseModel):

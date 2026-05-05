@@ -108,6 +108,12 @@ export async function fetchTask(taskId: string): Promise<import('./components/Ta
   return res.json();
 }
 
+export async function fetchTaskSerialConsole(taskId: string): Promise<import('./types/task').SerialConsoleResponse> {
+  const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}/serial-console`);
+  if (!res.ok) throw new Error(`Failed to fetch serial console: ${res.status}`);
+  return res.json();
+}
+
 export async function fetchAutonomyDebug(projectId: string): Promise<unknown> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/autonomy-debug`);
   if (!res.ok) throw new Error(`Failed to fetch autonomy debug: ${res.status}`);

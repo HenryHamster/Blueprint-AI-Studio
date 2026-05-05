@@ -2933,6 +2933,58 @@ async def test_reap_with_pr_falls_back_to_open_when_gh_unreachable(
     _spawn.assert_called_once()
 
 
+# ── Serial console persistence across requeue ─────────────────────────────
+#
+# NOTE: PR #3609 originally added two more tests here that asserted serial
+# capture fires on the heartbeat-timeout retry and rate-limit requeue paths.
+# Those were removed when this branch merged origin/main: main's lock-during-IO
+# refactor (production 2026-05-04 cascade fix) intentionally narrowed the
+# unlocked serial-capture I/O block to is_provision_failure paths only —
+# extending it back to the non-provision branches would re-introduce the
+# held-lock-during-IO antipattern that the refactor was specifically
+# designed to eliminate. The remaining test below covers the survivable
+# slice of the original feature: a serial log captured on a prior cycle
+# must persist across the requeue context copy.
+
+
+@pytest.mark.asyncio
+async def test_serial_log_survives_requeue_via_context_copy(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """last_serial_log set from a previous cycle must survive the requeue
+    context copy — clear_task_llm_runtime_context must not strip it."""
+    # Serial capture returns None this cycle (VM is gone), but previous cycle
+    # wrote a log into task.context already.
+    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-sticky-serial",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        context={
+            "provision_zone": "us-east1-a",
+            "last_serial_log": "previous cycle: agent hung at step 3",
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    ctx = t.context or {}
+    assert "last_serial_log" in ctx, (
+        "last_serial_log from a previous cycle must survive requeue context copy"
+    )
+    assert ctx["last_serial_log"] == "previous cycle: agent hung at step 3"
+
+
 # ── Reaper liveness telemetry ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
