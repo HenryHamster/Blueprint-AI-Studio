@@ -965,6 +965,26 @@ export async function handleFix(
     basePrompt = `${originalPromptSection}${trajectorySection}${driftSection}${iterationHeader}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
   }
 
+  // Surface self-review blind-spots (truncated_files_read, incomplete_review,
+  // reviewer_findings, and author-flagged blind_spots) propagated from the
+  // original create task. Empty string when no _self_review_outcome was
+  // attached (e.g. CI-failure-driven fixes).
+  const fixSelfReviewOutcome = taskContext._self_review_outcome as Record<string, unknown> | undefined;
+  let fixChangedFilePathList: string[] = [];
+  try {
+    fixChangedFilePathList = git(['diff', '--name-only', `origin/${baseBranch}...HEAD`])
+      .split('\n').map(s => s.trim()).filter(Boolean);
+  } catch { /* diff not available — fall through to fallback */ }
+  if (fixChangedFilePathList.length === 0) {
+    const plannedFallback = (taskContext._planned_files as string[] | undefined) || [];
+    fixChangedFilePathList = [...plannedFallback, ...fixRelatedFiles]
+      .filter((f): f is string => typeof f === 'string' && f.length > 0);
+  }
+  const fixSelfReviewSection = formatSelfReviewBlindSpots(fixSelfReviewOutcome, fixChangedFilePathList);
+  if (fixSelfReviewSection) {
+    basePrompt = `${fixSelfReviewSection}${basePrompt}`;
+  }
+
   // Always check for conflict markers — even if rebase/merge appeared to succeed
   let enrichedPrompt = basePrompt;
   try {

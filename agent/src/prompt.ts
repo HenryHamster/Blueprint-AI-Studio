@@ -1186,7 +1186,9 @@ Schema:
   "check_results": {
     "<category>": { "passed": true | false, "issue": "..." }
   },
-  "blind_spots": ["...", "..."]
+  "blind_spots": ["...", "..."],
+  "truncated_files_read": ["path/a.ts", "path/b.ts"],
+  "categories": ["incomplete_review"]
 }
 \`\`\`
 
@@ -1194,6 +1196,22 @@ Schema:
 fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`
 envelope is acceptable when you have nothing useful to record, but the
 file MUST exist for code-change tasks.
+
+**Optional verification-coverage fields (advisory — do NOT block \`./done\`):**
+- \`truncated_files_read\`: list the changed file paths you actually re-opened/re-read during self-review for verification. Only include files you re-inspected — it is fine for this list to be a subset of the diff. Reviewers use it to focus on unverified files.
+- \`categories: ["incomplete_review"]\`: set this marker when the diff was truncated and you could not verify all changed files even after retrying the read. \`categories\` is a top-level array (separate from \`check_results\`) reserved for coverage markers like this.
+
+Example of partial verification (verified two of three changed files, diff was truncated):
+\`\`\`json
+{
+  "verdict": "pass",
+  "fixes_applied": false,
+  "check_results": { "correctness": { "passed": true } },
+  "blind_spots": ["did not re-read c.ts after retry"],
+  "truncated_files_read": ["a.ts", "b.ts"],
+  "categories": ["incomplete_review"]
+}
+\`\`\`
 
 **Fresh-reviewer pass (when enabled):** After your session ends, a second
 read-only Claude session may run and augment the self-review JSON with a

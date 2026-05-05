@@ -352,7 +352,15 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
 
   // Build SR catch-rate blind spots block — only if budget allows
   type SRCatchRateExample = { severity: string; desc: string };
-  type SRCatchRateCategory = { miss_rate: number; weighted_miss_rate?: number; examples?: SRCatchRateExample[] };
+  type SRCatchRateCategory = {
+    miss_rate: number;
+    weighted_miss_rate?: number;
+    examples?: SRCatchRateExample[];
+    current_hit_rate?: number;
+    previous_hit_rate?: number;
+    trend?: string;
+    rate_history?: number[];
+  };
   const srCatchRate = ctx.self_review_catch_rate as {
     categories?: Record<string, SRCatchRateCategory>;
     for_task_type?: Record<string, SRCatchRateCategory>;
@@ -373,6 +381,19 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         ? ` (${taskType} tasks only)`
         : '';
 
+      const buildTrajectoryHint = (data: SRCatchRateCategory): string => {
+        if (typeof data.previous_hit_rate === 'number' && typeof data.current_hit_rate === 'number') {
+          const prevMissRate = Math.round((1 - data.previous_hit_rate) * 100);
+          const currMissRate = Math.round((1 - data.current_hit_rate) * 100);
+          const delta = currMissRate - prevMissRate;
+          const trend = data.trend === 'decreasing' ? 'regressing' : delta > 0 ? 'regressing' : 'improving';
+          const sign = delta > 0 ? '−' : '+';
+          const absDelta = Math.abs(delta);
+          return ` (last cycle: ${prevMissRate}% → now: ${currMissRate}%, ${sign}${absDelta}pp ${trend})`;
+        }
+        return '';
+      };
+
       const buildCatLines = (withExamples: boolean): string[] => {
         const lines: string[] = [
           '### Self-Review Blind Spots',
@@ -380,9 +401,11 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         ];
         for (const [cat, data] of qualifying) {
           const rawPct = Math.round(data.miss_rate * 100);
+          const trajectoryHint = buildTrajectoryHint(data);
+          const trendWarning = data.trend === 'decreasing' ? ' ⚠ Regression: scrutinize extra carefully.' : '';
           const suffix = data.weighted_miss_rate !== undefined
-            ? ` (${rawPct}% missed, ${Math.round(data.weighted_miss_rate * 100)}% severity-weighted):`
-            : ` (${rawPct}% missed):`;
+            ? ` (${rawPct}% missed, ${Math.round(data.weighted_miss_rate * 100)}% severity-weighted${trajectoryHint}):${trendWarning}`
+            : ` (${rawPct}% missed${trajectoryHint}):${trendWarning}`;
           lines.push(`- ${cat}${suffix}`);
           if (withExamples && data.examples && data.examples.length > 0) {
             for (const ex of data.examples) {

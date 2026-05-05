@@ -327,6 +327,14 @@ interface DigestData {
     diagnosis_drop_off_by_reason?: Record<string, number>;
   } | null;
   median_cost_per_merged_pr?: number | null;
+  fresh_reviewer_effectiveness?: {
+    fresh_reviewer_sample_size: number;
+    fresh_reviewer_first_attempt_approval_rate: number | null;
+    baseline_first_attempt_approval_rate: number | null;
+    per_category_hit_rate: Record<string, number>;
+    reviewer_finding_added_value: Record<string, number>;
+    prediction_sample_size: number;
+  } | null;
 }
 
 export interface CatchUpPanelProps {
@@ -2112,13 +2120,15 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 const ra = digest.review_accuracy;
                 const fra = digest.first_review_approval_rate;
                 const skip = digest.self_review_skip_rate;
+                const fre = digest.fresh_reviewer_effectiveness;
                 const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
                 const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
                 const hasSpaTrends = !!(spaTrends && spaTrends.categories && Object.keys(spaTrends.categories).length > 0);
                 const hasRa = ra && (ra.precision != null || ra.recall != null);
                 const hasFra = fra && fra.overall != null && fra.sample_size >= 5;
                 const hasSkip = !!skip;
-                if (!hasSre && !hasSpa && !hasSpaTrends && !hasRa && !hasFra && !hasSkip) return null;
+                const hasFre = !!(fre && fre.fresh_reviewer_sample_size >= 0);
+                if (!hasSre && !hasSpa && !hasSpaTrends && !hasRa && !hasFra && !hasSkip && !hasFre) return null;
                 const fraOverall = fra?.overall;
                 const fraColor = fraOverall != null
                   ? (fraOverall >= 0.8 ? 'text-emerald-400' : fraOverall >= 0.5 ? 'text-amber-400' : 'text-red-400')
@@ -2218,6 +2228,48 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             <span className="text-[10px] text-neutral-500">· n={fra.sample_size}</span>
                           </div>
                         )}
+                        {fre && hasFre && (() => {
+                          const n = fre.fresh_reviewer_sample_size;
+                          const freRate = fre.fresh_reviewer_first_attempt_approval_rate;
+                          const baseRate = fre.baseline_first_attempt_approval_rate;
+                          const lift = freRate != null && baseRate != null ? freRate - baseRate : null;
+                          const freColor = freRate != null
+                            ? (freRate >= 0.8 ? 'text-emerald-400' : freRate >= 0.5 ? 'text-amber-400' : 'text-red-400')
+                            : 'text-neutral-300';
+                          const liftColor = lift == null ? 'text-neutral-400' : lift >= 0.05 ? 'text-emerald-400' : lift >= 0 ? 'text-amber-400' : 'text-red-400';
+                          const hitEntries = Object.entries(fre.per_category_hit_rate ?? {}).slice(0, 3);
+                          return (
+                            <div className="flex flex-col gap-0.5">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Fresh-reviewer</span>
+                                {n < 5 ? (
+                                  <span className="text-[10px] text-neutral-500">sample too small (n={n})</span>
+                                ) : (
+                                  <>
+                                    {freRate != null && (
+                                      <span className="text-[10px] text-neutral-400">approval <span className={freColor}>{pct(freRate)}</span></span>
+                                    )}
+                                    {baseRate != null && (
+                                      <span className="text-[10px] text-neutral-400">· baseline <span className="text-neutral-300">{pct(baseRate)}</span></span>
+                                    )}
+                                    {lift != null && (
+                                      <span className="text-[10px] text-neutral-400">· lift <span className={liftColor}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp</span></span>
+                                    )}
+                                    <span className="text-[10px] text-neutral-500">· n={n}</span>
+                                  </>
+                                )}
+                              </div>
+                              {hitEntries.length > 0 && n >= 5 && (
+                                <div className="flex flex-wrap items-center gap-1.5 ml-2">
+                                  <span className="text-[10px] text-neutral-600">hit rate:</span>
+                                  {hitEntries.map(([cat, rate]) => (
+                                    <span key={cat} className="text-[10px] text-neutral-500">{cat} <span className="text-neutral-300">{pct(rate)}</span></span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
                   </div>

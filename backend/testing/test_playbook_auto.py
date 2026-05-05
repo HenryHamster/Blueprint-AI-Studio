@@ -3538,6 +3538,167 @@ def test_categorize_review_issues_scope_drift_not_in_other_bucket():
     assert "other" not in result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _categorize_review_issues — regression_risk bucket
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_categorize_review_issues_regression_risk_keyword_routes_correctly():
+    """Review comments mentioning a previously-passing test now failing route to regression_risk."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {
+                    "description": "previously passing test now fails after this change",
+                    "severity": "MAJOR",
+                },
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "regression_risk" in result
+    assert len(result["regression_risk"]) == 1
+    assert result["regression_risk"][0]["severity"] == "MAJOR"
+
+
+@pytest.mark.parametrize("phrasing", [
+    "this regresses test_foo",
+    "broke test_foo in this diff",
+    "now failing assertion that was passing before",
+    "the build no longer works after these changes",
+    "this is a regression in the auth flow",
+    "breaks test_serializer",
+])
+def test_categorize_review_issues_regression_risk_phrasings(phrasing):
+    """A variety of regression-flavored phrasings all route to regression_risk."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": phrasing, "severity": "MAJOR"},
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "regression_risk" in result, f"phrasing did not route: {phrasing!r}"
+    # Must NOT fall through to correctness or other.
+    assert "other" not in result, f"phrasing leaked to other: {phrasing!r}"
+
+
+def test_categorize_review_issues_regression_risk_wins_over_correctness():
+    """First-match ordering: a regression phrasing that also contains 'assertion'
+    must land in regression_risk, NOT correctness."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {
+                    "description": "this breaks the previously-passing assertion in test_foo",
+                    "severity": "CRITICAL",
+                },
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "regression_risk" in result
+    assert "correctness" not in result
+
+
+def test_categorize_review_issues_regression_risk_does_not_steal_correctness():
+    """A vanilla correctness comment with no regression keywords must still land
+    in correctness, not in regression_risk."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {
+                    "description": "off-by-one bug in the boundary handling logic",
+                    "severity": "MAJOR",
+                },
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "correctness" in result
+    assert "regression_risk" not in result
+
+
+def test_categorize_review_issues_regression_risk_in_valid_categories():
+    """regression_risk is exposed as an LLM-classifier valid category."""
+    from app.playbook_learning import _REVIEW_CATEGORIES, _VALID_CATEGORIES
+
+    assert "regression_risk" in _REVIEW_CATEGORIES
+    assert "regression_risk" in _VALID_CATEGORIES
+    # Ordering matters for first-match-wins keyword classification.
+    keys = list(_REVIEW_CATEGORIES.keys())
+    assert keys.index("regression_risk") < keys.index("correctness")
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(db_session: AsyncSession):
+    """When tasks carry regression_risk in both human_cats and sr_failed, the dashboard
+    surfaces a non-zero hit_rate on the regression_risk axis."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window (5 tasks): 3 hits, 2 misses on regression_risk
+    for i in range(3):
+        t = _make_sr_task(
+            project.id, age_days=2,
+            human_cats={"regression_risk": 1},
+            sr_failed_cats=["regression_risk"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(
+            project.id, age_days=2,
+            human_cats={"regression_risk": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window (5 tasks): all hits
+    for i in range(5):
+        t = _make_sr_task(
+            project.id, age_days=20,
+            human_cats={"regression_risk": 1},
+            sr_failed_cats=["regression_risk"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert "regression_risk" in result["categories"], (
+        "regression_risk axis must be wired through compute_sr_catch_rate_trends"
+    )
+    cat = result["categories"]["regression_risk"]
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    assert cat["miss_rate"] == round(1 - 3 / 5, 3)
+    assert cat["previous_hit_rate"] == 1.0
+
+
 @pytest.mark.asyncio
 async def test_compute_sr_catch_rate_trends_per_task_type_breakdown(db_session: AsyncSession):
     """by_task_type contains correct hit/miss rates per (task_type, category)."""

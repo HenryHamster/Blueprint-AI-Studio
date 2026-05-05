@@ -27,8 +27,11 @@ export function formatSelfReviewBlindSpots(
           typeof (f as FindingRaw).description === 'string',
       )
     : [];
+  const blindSpots = Array.isArray(selfReviewOutcome.blind_spots)
+    ? (selfReviewOutcome.blind_spots as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
+    : [];
   const incomplete = categories.includes('incomplete_review');
-  if (!incomplete && truncatedFilesRead.length === 0 && reviewerFindings.length === 0) return '';
+  if (!incomplete && truncatedFilesRead.length === 0 && reviewerFindings.length === 0 && blindSpots.length === 0) return '';
 
   const verifiedSet = new Set(truncatedFilesRead);
   const unverified = changedFilePaths.filter(p => p && !verifiedSet.has(p));
@@ -57,5 +60,12 @@ export function formatSelfReviewBlindSpots(
       sorted.map(f => `  - [${String(f.severity)}] ${String(f.category)}: ${String(f.description)}`).join('\n'),
     );
   }
-  return lines.join('\n') + '\n\n';
+  let blindSpotsBlock = '';
+  if (blindSpots.length > 0) {
+    const capped = blindSpots.slice(0, 5).map(s => (s.length > 200 ? s.slice(0, 200) + '…' : s));
+    blindSpotsBlock =
+      `\n\n**Author-flagged uncertainty (verify each):**\n` +
+      capped.map(s => `- ${s}`).join('\n');
+  }
+  return lines.join('\n') + blindSpotsBlock + '\n\n';
 }

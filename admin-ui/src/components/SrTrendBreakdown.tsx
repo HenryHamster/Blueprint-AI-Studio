@@ -42,6 +42,26 @@ function trendColorClass(t: SrCategoryTrend['trend']): string {
   return 'text-neutral-500';
 }
 
+function calculateMissRateDelta(c: SrCategoryTrend): number | null {
+  if (c.current_hit_rate == null || c.previous_hit_rate == null) return null;
+  const currentMiss = 1 - c.current_hit_rate;
+  const previousMiss = 1 - c.previous_hit_rate;
+  return currentMiss - previousMiss;
+}
+
+function deltaColorClass(delta: number): string {
+  if (delta > 0.005) return 'text-red-400'; // regression
+  if (delta < -0.005) return 'text-emerald-400'; // improvement
+  return 'text-neutral-500'; // stable
+}
+
+function formatDelta(delta: number): string {
+  const pp = Math.round(delta * 100);
+  if (pp > 0) return `+${pp}pp`;
+  if (pp < 0) return `−${Math.abs(pp)}pp`;
+  return '±0pp';
+}
+
 function trendStroke(t: SrCategoryTrend['trend']): string {
   if (t === 'decreasing') return '#f87171';
   if (t === 'increasing') return '#34d399';
@@ -190,6 +210,8 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
             const miss = deriveMissRate(c);
             const wmiss = c.weighted_miss_rate;
             const color = trendColorClass(c.trend);
+            const delta = calculateMissRateDelta(c);
+            const deltaColor = delta != null ? deltaColorClass(delta) : '';
             return (
               <div key={cat} className="flex items-center gap-2 text-[10px]">
                 <span className="text-neutral-300 truncate flex-1" title={cat}>
@@ -198,6 +220,11 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
                 <span className={`font-mono font-bold tabular-nums ${color}`}>
                   {miss != null ? `${Math.round(miss * 100)}%` : '–'}
                 </span>
+                {delta != null && (
+                  <span className={`font-mono tabular-nums text-xs ${deltaColor}`} title="cycle-over-cycle change">
+                    {formatDelta(delta)}
+                  </span>
+                )}
                 {wmiss != null && (
                   <span className="font-mono tabular-nums text-neutral-500" title="severity-weighted miss rate">
                     {`w:${Math.round(wmiss * 100)}%`}
@@ -227,6 +254,8 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
         const miss = deriveMissRate(c);
         const wmiss = c.weighted_miss_rate;
         const color = trendColorClass(c.trend);
+        const delta = calculateMissRateDelta(c);
+        const deltaColor = delta != null ? deltaColorClass(delta) : '';
         return (
           <div key={cat} className="flex items-center gap-1.5 text-[10px]">
             <span className="text-neutral-500">·</span>
@@ -234,6 +263,11 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
             <span className={`font-mono ${color}`}>
               {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
             </span>
+            {delta != null && (
+              <span className={`font-mono text-xs ${deltaColor}`} title="cycle-over-cycle change">
+                {formatDelta(delta)}
+              </span>
+            )}
             {wmiss != null && (
               <span className="font-mono text-neutral-500" title="severity-weighted miss rate">
                 {`w:${Math.round(wmiss * 100)}%`}

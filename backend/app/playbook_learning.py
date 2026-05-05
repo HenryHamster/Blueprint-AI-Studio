@@ -81,6 +81,19 @@ _FILE_PATH_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 _REVIEW_CATEGORIES: dict[str, list[str]] = {
+    # NOTE: regression_risk MUST come first — _categorize_review_issues_keyword uses
+    # first-match-wins, and the broader 'test' keyword in test-coverage and the
+    # 'assertion'/'invariant' keywords in correctness would otherwise capture
+    # regression-flavored phrases like "broke test_foo" or "previously-passing
+    # assertion now fails". The key spelling matches the agent's self-review
+    # check_results category in agent/src/prompt.ts (underscore form).
+    "regression_risk": [
+        "regress", "regression", "regresses", "regressed",
+        "previously passing", "previously-passing", "was passing",
+        "broke the test", "breaks the test", "broke test", "breaks test",
+        "broken test", "broke a test", "breaks a test",
+        "now failing", "no longer passes", "no longer works",
+    ],
     "test-coverage": [
         "test", "coverage", "assert", "unit test", "integration test",
         "spec", "test case", "test suite", "missing test", "untested",

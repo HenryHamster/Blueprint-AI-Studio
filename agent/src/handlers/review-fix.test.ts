@@ -970,6 +970,70 @@ describe('handleFix — runCodeChangeTask delegation', () => {
   });
 });
 
+// ── handleFix: self-review blind-spots surfacing ────────────────────────────
+describe('handleFix — self-review blind-spots surfacing', () => {
+  it('passes task.context._self_review_outcome and the changed-file path list to formatSelfReviewBlindSpots, and prepends the returned section to the prompt', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('FIX_BLIND_SPOTS_MARKER\n\n');
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-only')) {
+        return 'agent/src/prompts/self-review.ts\nagent/src/handlers/review-fix.ts';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    const outcome = {
+      verdict: 'PASS',
+      blind_spots: ['unsure about the retry path'],
+    };
+    await handleFix(
+      'task-fix-blind',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 99, prompt: 'address review feedback' },
+      { context: { scope: 'small', _self_review_outcome: outcome } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(promptMod.formatSelfReviewBlindSpots).toHaveBeenCalledWith(
+      outcome,
+      ['agent/src/prompts/self-review.ts', 'agent/src/handlers/review-fix.ts'],
+    );
+    expect(capturedFixPrompt()).toContain('FIX_BLIND_SPOTS_MARKER');
+  });
+
+  it('falls back to _planned_files + related_files when the diff is empty (no materialized PR diff)', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('');
+    // git diff --name-only returns '' (default mock) — fallback path triggers.
+
+    await handleFix(
+      'task-fix-fallback',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 100, prompt: 'address review feedback', related_files: ['payload-related.ts'] },
+      { context: { scope: 'small', _planned_files: ['planned-a.ts'], related_files: ['ctx-related.ts'] } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(promptMod.formatSelfReviewBlindSpots).toHaveBeenCalledWith(
+      undefined,
+      ['planned-a.ts', 'ctx-related.ts'],
+    );
+  });
+
+  it('does not prepend anything when formatSelfReviewBlindSpots returns ""', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('');
+
+    await handleFix(
+      'task-fix-empty',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 101, prompt: 'address review feedback' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(capturedFixPrompt()).not.toContain('Author-flagged uncertainty');
+    expect(capturedFixPrompt()).not.toContain('Self-review coverage');
+  });
+});
+
 describe('handleFix — code-change helper guidance is in prompt', () => {
   // The prompt now MUST tell Claude about ./check + ./pr + ./done + ./fail. If
   // CODE_CHANGE_HELPER_GUIDANCE drops out of handleFix, Claude has no way to

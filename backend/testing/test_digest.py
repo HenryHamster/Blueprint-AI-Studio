@@ -2880,6 +2880,61 @@ async def test_first_attempt_success_rate_breakdowns(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
+async def test_first_attempt_by_review_category_includes_regression_risk(
+    client: AsyncClient, db_session
+):
+    """regression_risk in _first_attempt_rejection_categories surfaces in the digest's
+    first_attempt_by_review_category breakdown without being silently dropped."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    prev = _prev_ts()
+
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_succeeded": True, "scope": "small"},
+    ))
+    db_session.add(make_task(
+        project_id=project.id, status=TaskStatus.COMPLETED,
+        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        payloads=[{"type": "fix"}],
+        context={
+            "_first_attempt_succeeded": False,
+            "scope": "small",
+            "_first_attempt_rejection_categories": {"regression_risk": 1},
+        },
+    ))
+    # Previous window: needed so trend computes without errors.
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.FAILED,
+            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": False, "scope": "small"},
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    fa = response.json()["first_attempt_success_rate"]
+
+    by_cat = fa["first_attempt_by_review_category"]
+    assert "regression_risk" in by_cat, (
+        "regression_risk must surface in first_attempt_by_review_category"
+    )
+    # by_review_category is the fraction of first-attempt-rejected tasks that
+    # flagged this category. We have one such task and it flagged regression_risk,
+    # so the share is 1.0 — the value isn't the interesting bit; the key being
+    # present (no silent drop) is.
+    assert by_cat["regression_risk"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db_session):
     """trend_history entries include failed_by_taxonomy counts parallel to failed_by_class."""
     project = make_project()
@@ -6866,3 +6921,112 @@ async def test_digest_self_review_skip_rate_by_task_type_breakdown(
     assert skip_rate["by_task_type"]["create"]["skipped_count"] == 2
     assert skip_rate["by_task_type"]["create"]["rate"] == 0.4
     assert "fix" not in skip_rate["by_task_type"]
+
+
+# ---------------------------------------------------------------------------
+# Fresh-reviewer effectiveness metric
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_fresh_reviewer_effectiveness_empty(client: AsyncClient):
+    """No tasks → fresh_reviewer_effectiveness present with zero sample_size and null rates."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    fre = response.json()["fresh_reviewer_effectiveness"]
+    assert fre is not None
+    assert fre["fresh_reviewer_sample_size"] == 0
+    assert fre["fresh_reviewer_first_attempt_approval_rate"] is None
+    assert fre["baseline_first_attempt_approval_rate"] is None
+    assert fre["per_category_hit_rate"] == {}
+    assert fre["reviewer_finding_added_value"] == {}
+    assert fre["prediction_sample_size"] == 0
+
+
+@pytest.mark.asyncio
+async def test_digest_fresh_reviewer_effectiveness_approval_rate_lift(
+    client: AsyncClient, db_session
+):
+    """Tasks with reviewer_findings have a separate approval rate from those without."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 tasks with fresh-reviewer findings: both approved on first attempt
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_succeeded": True,
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {},
+                    "blind_spots": [],
+                    "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
+                },
+            },
+        ))
+    # 2 tasks without fresh-reviewer: both rejected on first attempt
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_succeeded": False,
+                "_self_review_outcome": {"verdict": "pass", "check_results": {}, "blind_spots": []},
+            },
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    fre = response.json()["fresh_reviewer_effectiveness"]
+    assert fre["fresh_reviewer_sample_size"] == 2
+    assert fre["fresh_reviewer_first_attempt_approval_rate"] == 1.0
+    assert fre["baseline_first_attempt_approval_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_digest_fresh_reviewer_effectiveness_per_category_hit_rate(
+    client: AsyncClient, db_session
+):
+    """per_category_hit_rate reports confirmed fraction; reviewer_finding_added_value
+    counts categories fresh-reviewer caught that the agent missed and human confirmed."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 tasks where fresh-reviewer flagged "correctness" and human confirmed it too.
+    # Agent self-review passed correctness (so it counts as added value).
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_succeeded": False,
+                "_first_attempt_rejection_categories": ["correctness"],
+                "_self_review_outcome": {
+                    "verdict": "fail",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [{"category": "correctness", "severity": "CRITICAL", "description": "y"}],
+                },
+            },
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    fre = response.json()["fresh_reviewer_effectiveness"]
+    assert fre["fresh_reviewer_sample_size"] == 3
+    assert fre["prediction_sample_size"] == 3
+    # 3/3 correctness findings confirmed → hit rate 1.0
+    assert fre["per_category_hit_rate"]["correctness"] == 1.0
+    # agent passed correctness, reviewer flagged it, human confirmed → added value
+    assert fre["reviewer_finding_added_value"].get("correctness", 0) == 3

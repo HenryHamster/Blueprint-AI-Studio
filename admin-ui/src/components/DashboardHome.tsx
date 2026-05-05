@@ -225,6 +225,14 @@ interface DigestData {
     sample_size: number;
     by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
   } | null;
+  fresh_reviewer_effectiveness?: {
+    fresh_reviewer_sample_size: number;
+    fresh_reviewer_first_attempt_approval_rate: number | null;
+    baseline_first_attempt_approval_rate: number | null;
+    per_category_hit_rate: Record<string, number>;
+    reviewer_finding_added_value: Record<string, number>;
+    prediction_sample_size: number;
+  } | null;
   median_cost_per_merged_pr?: number | null;
   prediction_calibration_factor?: number | null;
   prediction_calibration_note?: string | null;
@@ -878,7 +886,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null) && (
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.fresh_reviewer_effectiveness != null) && (
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
               <div className="flex flex-wrap gap-3">
@@ -959,6 +967,31 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   trends={digest?.self_review_prediction_accuracy_trends}
                   variant="card"
                 />
+                {digest?.fresh_reviewer_effectiveness != null && (() => {
+                  const fre = digest.fresh_reviewer_effectiveness!;
+                  const n = fre.fresh_reviewer_sample_size;
+                  const freRate = fre.fresh_reviewer_first_attempt_approval_rate;
+                  const baseRate = fre.baseline_first_attempt_approval_rate;
+                  const lift = freRate != null && baseRate != null ? freRate - baseRate : null;
+                  const freColor = freRate != null ? (freRate >= 0.8 ? 'text-emerald-400' : freRate >= 0.5 ? 'text-amber-400' : 'text-red-400') : 'text-neutral-300';
+                  const liftColor = lift == null ? 'text-neutral-400' : lift >= 0.05 ? 'text-emerald-400' : lift >= 0 ? 'text-amber-400' : 'text-red-400';
+                  return (
+                    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">FR Approval Lift</p>
+                      {n < 5 ? (
+                        <p className="text-xs text-neutral-500">n={n} — too small</p>
+                      ) : (
+                        <>
+                          <p className={`text-xl font-bold font-mono ${freColor}`}>{freRate != null ? `${Math.round(freRate * 100)}%` : '--'}</p>
+                          {lift != null && (
+                            <p className={`text-[9px] mt-0.5 ${liftColor}`}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp vs baseline</p>
+                          )}
+                          <p className="text-[9px] text-neutral-600 mt-0.5">n={n}</p>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </section>
           )}

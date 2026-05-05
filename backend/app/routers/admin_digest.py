@@ -182,6 +182,68 @@ def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, A
     }
 
 
+def _compute_fresh_reviewer_effectiveness(terminal_tasks: List[Task]) -> "Dict[str, Any]":
+    """Compute fresh-reviewer pass effectiveness: approval rate lift and per-category
+    hit rate (did human confirm what fresh-reviewer flagged?). Always returns a dict
+    so callers can check sample_size before trusting rates.
+    """
+    code_change_tasks = [
+        t for t in terminal_tasks
+        if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
+        and "_first_attempt_succeeded" in (t.context or {})
+    ]
+    tasks_with_reviewer = [
+        t for t in code_change_tasks
+        if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+    ]
+    tasks_without_reviewer = [
+        t for t in code_change_tasks
+        if not (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+    ]
+
+    def _fa_rate(tasks: List[Task]) -> "float | None":
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        return round(sum(1 for t in measured if t.context["_first_attempt_succeeded"]) / len(measured), 2)
+
+    tasks_with_both = [
+        t for t in tasks_with_reviewer
+        if "_first_attempt_rejection_categories" in (t.context or {})
+    ]
+    cat_flagged: Dict[str, int] = {}
+    cat_confirmed: Dict[str, int] = {}
+    cat_added_value: Dict[str, int] = {}
+    for t in tasks_with_both:
+        ctx = t.context or {}
+        findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        agent_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        for finding in findings:
+            cat = finding.get("category") if isinstance(finding, dict) else None
+            if not cat:
+                continue
+            cat_flagged[cat] = cat_flagged.get(cat, 0) + 1
+            if cat in human_cats:
+                cat_confirmed[cat] = cat_confirmed.get(cat, 0) + 1
+            if cat not in agent_failed and cat in human_cats:
+                cat_added_value[cat] = cat_added_value.get(cat, 0) + 1
+
+    return {
+        "fresh_reviewer_sample_size": len(tasks_with_reviewer),
+        "fresh_reviewer_first_attempt_approval_rate": _fa_rate(tasks_with_reviewer),
+        "baseline_first_attempt_approval_rate": _fa_rate(tasks_without_reviewer),
+        "per_category_hit_rate": {
+            cat: round(cat_confirmed.get(cat, 0) / total, 3)
+            for cat, total in cat_flagged.items()
+            if total >= 2
+        },
+        "reviewer_finding_added_value": dict(cat_added_value),
+        "prediction_sample_size": len(tasks_with_both),
+    }
+
+
 def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
     """Compute self-review effectiveness, prediction accuracy, and review accuracy
     from a list of terminal tasks. Returns dict with three keys, each None when
@@ -237,11 +299,13 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
         and "_first_attempt_rejection_categories" in (t.context or {})
     ]
     self_review_prediction_accuracy = _compute_sr_prediction_accuracy(tasks_with_both)
+    fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
 
     return {
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "review_accuracy": review_accuracy,
+        "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
     }
 
 
@@ -3735,6 +3799,7 @@ async def _compute_digest(
         "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
         "self_review_skip_rate": _self_review_skip_rate,
         "review_accuracy": _review_quality["review_accuracy"],
+        "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),

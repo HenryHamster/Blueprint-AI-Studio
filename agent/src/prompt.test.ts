@@ -1769,6 +1769,64 @@ describe('formatProjectContext', () => {
     expect(criticalIdx).toBeGreaterThan(correctnessIdx);
   });
 
+  it('shows trajectory hint when previous_hit_rate and current_hit_rate are present', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': {
+            miss_rate: 0.3,
+            current_hit_rate: 0.7,
+            previous_hit_rate: 0.8,
+            trend: 'decreasing',
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Self-Review Blind Spots');
+    // Should show trajectory: 20% → 30% (−10pp regressing)
+    expect(result).toContain('last cycle: 20%');
+    expect(result).toContain('now: 30%');
+    expect(result).toContain('−10pp');
+  });
+
+  it('highlights regression when trend is decreasing', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': {
+            miss_rate: 0.4,
+            current_hit_rate: 0.6,
+            previous_hit_rate: 0.7,
+            trend: 'decreasing',
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('⚠ Regression: scrutinize extra carefully');
+    expect(result).toContain('regressing');
+  });
+
+  it('shows improvement when trajectory indicates lower miss rate', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'correctness': {
+            miss_rate: 0.2,
+            current_hit_rate: 0.8,
+            previous_hit_rate: 0.6,
+            trend: 'increasing',
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('last cycle: 40%');
+    expect(result).toContain('now: 20%');
+    expect(result).toContain('+20pp improving');
+  });
+
   it('includes co-change budget note for medium-scope tasks', () => {
     const ctx = { cochange_files: ['src/foo.ts', 'src/bar.ts'] };
     const result = formatProjectContext(ctx, 'create', 'medium', '', 3);
@@ -3090,6 +3148,126 @@ describe('formatSelfReviewBlindSpots', () => {
     const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts']);
     expect(out).toContain('Files the self-review verified');
     expect(out).not.toContain('Files NOT verified by self-review');
+  });
+
+  it('renders blind_spots verbatim under the Author-flagged uncertainty heading', () => {
+    const outcome = {
+      verdict: 'PASS',
+      truncated_files_read: ['a.ts'],
+      blind_spots: ['unsure about the retry path', 'verify the cache key shape'],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts']);
+    expect(out).toContain('**Author-flagged uncertainty (verify each):**');
+    expect(out).toContain('- unsure about the retry path');
+    expect(out).toContain('- verify the cache key shape');
+  });
+
+  it('caps blind_spots at 5 entries', () => {
+    const outcome = {
+      verdict: 'PASS',
+      truncated_files_read: ['a.ts'],
+      blind_spots: ['s1', 's2', 's3', 's4', 's5', 's6', 's7'],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts']);
+    expect(out).toContain('- s1');
+    expect(out).toContain('- s5');
+    expect(out).not.toContain('- s6');
+    expect(out).not.toContain('- s7');
+  });
+
+  it('truncates individual blind_spot lines over 200 chars', () => {
+    const longLine = 'x'.repeat(500);
+    const outcome = {
+      verdict: 'PASS',
+      truncated_files_read: ['a.ts'],
+      blind_spots: [longLine],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts']);
+    expect(out).toContain('x'.repeat(200) + '…');
+    expect(out).not.toContain('x'.repeat(201));
+  });
+
+  it('omits the Author-flagged section when blind_spots is missing/empty/non-array', () => {
+    const baseOutcome = { verdict: 'PASS', truncated_files_read: ['a.ts'] };
+    expect(formatSelfReviewBlindSpots(baseOutcome, ['a.ts'])).not.toContain('Author-flagged uncertainty');
+    expect(formatSelfReviewBlindSpots({ ...baseOutcome, blind_spots: [] }, ['a.ts'])).not.toContain('Author-flagged uncertainty');
+    expect(formatSelfReviewBlindSpots({ ...baseOutcome, blind_spots: 'not an array' }, ['a.ts'])).not.toContain('Author-flagged uncertainty');
+    expect(formatSelfReviewBlindSpots({ ...baseOutcome, blind_spots: [123, null, ''] }, ['a.ts'])).not.toContain('Author-flagged uncertainty');
+  });
+
+  it('returns empty string when blind_spots and all other signals are absent', () => {
+    const outcome = { verdict: 'PASS', categories: [], truncated_files_read: [], blind_spots: [] };
+    expect(formatSelfReviewBlindSpots(outcome, ['a.ts'])).toBe('');
+  });
+
+  it('renders blind_spots when it is the only signal present', () => {
+    const outcome = { verdict: 'PASS', blind_spots: ['only-uncertainty'] };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts']);
+    expect(out).toContain('Author-flagged uncertainty');
+    expect(out).toContain('- only-uncertainty');
+  });
+
+  it('coexists with truncated_files_read and reviewer_findings sections', () => {
+    const outcome = {
+      verdict: 'PASS',
+      truncated_files_read: ['a.ts'],
+      reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'oops' }],
+      blind_spots: ['author-uncertainty'],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts']);
+    expect(out).toContain('Files the self-review verified');
+    expect(out).toContain('Files NOT verified by self-review');
+    expect(out).toContain('Fresh-reviewer findings');
+    expect(out).toContain('Author-flagged uncertainty');
+    expect(out).toContain('- author-uncertainty');
+  });
+
+  it('e2e: schema-documented truncated_files_read flows into reviewer prompt with unverified files listed', () => {
+    // Mirrors a self-review JSON an agent would now produce after the schema
+    // documents truncated_files_read: verified two of three changed files.
+    const outcome = {
+      verdict: 'pass',
+      fixes_applied: false,
+      check_results: { correctness: { passed: true } },
+      blind_spots: ['did not re-read c.ts after retry'],
+      truncated_files_read: ['a.ts', 'b.ts'],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts', 'c.ts']);
+    expect(out).toContain('Files NOT verified by self-review (prioritize careful review of these)');
+    expect(out).toMatch(/Files NOT verified by self-review[^\n]*\n {2}- c\.ts/);
+    expect(out).not.toMatch(/Files NOT verified[^\n]*\n( {2}- [ab]\.ts\n)* {2}- [ab]\.ts/);
+  });
+
+  it('e2e: schema-documented categories: ["incomplete_review"] surfaces INCOMPLETE warning to reviewer', () => {
+    const outcome = {
+      verdict: 'pass',
+      fixes_applied: false,
+      check_results: { correctness: { passed: true } },
+      blind_spots: [],
+      truncated_files_read: ['a.ts', 'b.ts'],
+      categories: ['incomplete_review'],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts', 'c.ts']);
+    expect(out).toContain('INCOMPLETE');
+    expect(out).toContain('Files NOT verified by self-review (prioritize careful review of these)');
+    expect(out).toContain('- c.ts');
+  });
+});
+
+describe('CODE_CHANGE_HELPER_GUIDANCE — truncated_files_read & incomplete_review schema', () => {
+  it('documents truncated_files_read in the schema block', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('truncated_files_read');
+  });
+
+  it('documents the incomplete_review categories marker', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('incomplete_review');
+  });
+
+  it('explains truncated_files_read as a subset of changed files (verification-only)', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/truncated_files_read[\s\S]*subset/);
   });
 });
 

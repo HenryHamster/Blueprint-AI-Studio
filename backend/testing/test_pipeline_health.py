@@ -968,6 +968,35 @@ async def test_self_review_prediction_accuracy_trends_returned_when_present():
 
 
 @pytest.mark.asyncio
+async def test_self_review_prediction_accuracy_trends_surfaces_regression_risk():
+    """The regression_risk axis flows through compute_pipeline_health_summary unchanged."""
+    sr_trends = {
+        "computed_at": "2026-04-15T00:00:00",
+        "categories": {
+            "regression_risk": {
+                "current_hit_rate": 0.5,
+                "previous_hit_rate": 0.2,
+                "miss_rate": 0.5,
+                "trend": "increasing",
+                "rate_history": [0.2, 0.5],
+            },
+        },
+    }
+    project = make_project(directions=[], design_doc={"sr_catch_rate_trends": sr_trends})
+    session = _make_mock_session(tasks=[], project=project)
+
+    result = await compute_pipeline_health_summary(session, uuid.uuid4())
+
+    trends = result["self_review_prediction_accuracy_trends"]
+    assert trends is not None
+    assert "regression_risk" in trends["categories"]
+    cat = trends["categories"]["regression_risk"]
+    assert cat["current_hit_rate"] == 0.5
+    assert cat["previous_hit_rate"] == 0.2
+    assert cat["trend"] == "increasing"
+
+
+@pytest.mark.asyncio
 async def test_return_structure_includes_self_review_prediction_accuracy_trends():
     """Result always contains self_review_prediction_accuracy_trends key."""
     session = _make_mock_session(tasks=[], project=make_project(directions=[]))
