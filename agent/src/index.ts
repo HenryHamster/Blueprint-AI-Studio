@@ -3695,6 +3695,19 @@ async function main() {
       const vmInstanceId = process.env.VM_INSTANCE_ID;
       if (!vmInstanceId) break;
 
+      // Clear TASK_ID for the duration of the warm-poll. While poll is
+      // running, the prior task is already in EVALUATING server-side, so
+      // any SIGTERM hitting the agent process (e.g. orchestrator decided
+      // to delete the VM because there's no follow-up work) would
+      // otherwise fire _crashReport and overwrite the prior task's
+      // latest_status_message with "[FATAL:SIGTERM] VM shutting down" —
+      // healthy work that's just sitting in EVALUATING gets mislabeled as
+      // a fatal failure and downstream classify_failure tags it
+      // AGENT_TIMEOUT. With TASK_ID empty, _crashReport's `if (taskId)`
+      // gate skips the heartbeat. The 'claim' branch below restores
+      // TASK_ID to the new task before any code that could crash.
+      process.env.TASK_ID = '';
+
       let pollResult: PollResult;
       try {
         pollResult = await pollForNextRole({
