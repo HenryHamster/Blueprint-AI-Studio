@@ -112,8 +112,23 @@ class MigratePayload(_PromptRequired):
     pass
 
 
+class RecentChangesContext(BaseModel):
+    """Serialized deploy/git context for investigation payloads.
+
+    Populated at spawn time so the investigation VM (which has no repo
+    access) can reference what shipped recently.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    deployed_at: str | None = None
+    current_sha: str | None = None
+    commits: list[str] = Field(default_factory=list)
+    commit_count: int = 0
+
+
 class InvestigatePayload(_PromptRequired):
-    pass
+    recent_changes: RecentChangesContext | None = None
 
 
 # ---------------------------------------------------------------------------

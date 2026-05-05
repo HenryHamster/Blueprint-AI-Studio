@@ -2126,6 +2126,8 @@ async def compute_sr_catch_rate_trends(
         categories[cat] = {
             "current_hit_rate": current_hit_rate,
             "previous_hit_rate": previous_hit_rate,
+            "current_human_count": int(curr.get("human_count") or 0),
+            "previous_human_count": int(prev.get("human_count") or 0),
             "miss_rate": miss_rate,
             "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
@@ -2393,6 +2395,8 @@ async def check_fix_loop_divergence_regression(
 
     await post_fix_loop_divergence_regression_message(session, project_id, regressions)
     doc["fix_loop_divergence_alerted_window"] = window_key
+    doc["fix_loop_divergence_regressions"] = regressions
+    doc["fix_loop_divergence_detected_at"] = now.isoformat()
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)

@@ -7,17 +7,23 @@ import asyncio
 import ctypes
 import logging
 import os
+import uuid
 import warnings
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Dict
 
-from sqlalchemy import func as _func, text as _text
+from sqlalchemy import cast as _cast
+from sqlalchemy import func as _func
+from sqlalchemy import text as _text
+from sqlalchemy.dialects.postgresql import JSONB as _JSONB
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal, init_db
-from app.models import AllowedUser, Alert, AlertSeverity, Project
+from app.models import AllowedUser, Alert, AlertSeverity, Project, Task, TaskHistory, TaskStatus
+from app.payload_schemas import validate_internal_payload
 from app.time_utils import _utcnow
 
 # Session-scoped advisory lock ID for background-leader election.
@@ -25,6 +31,126 @@ from app.time_utils import _utcnow
 _BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
 
 logger = logging.getLogger("blueprint")
+
+
+async def _spawn_crash_investigations(
+    *,
+    service_name: str,
+    cause_str: str,
+    exc: BaseException | None,
+    crash_count: int,
+    inflight: Dict[str, str],
+) -> None:
+    """Spawn one investigate task per project when a service hits the crash-episode threshold.
+
+    Deduplicates via the in-memory `inflight` dict (cleared on stability reset) and a
+    DB containment query so a process restart doesn't double-spawn. At most one
+    in-flight crash investigation per (service, project) is kept alive.
+    """
+    exc_type = type(exc).__name__ if exc is not None else "CancelledError"
+
+    reaper_stats_str = ""
+    if service_name == "reaper":
+        try:
+            from app.reaper import get_reaper_stats  # noqa: PLC0415
+            stats = get_reaper_stats()
+            reaper_stats_str = (
+                f"\nReaper telemetry: cycles_completed={stats['cycles_completed_total']}, "
+                f"last_cycle_age={stats['last_cycle_age_seconds']:.1f}s"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    prompt = (
+        f"The background service '{service_name}' has crashed {crash_count} times "
+        f"in the last 10 minutes.\n"
+        f"Exception type: {exc_type}\n"
+        f"Exception message: {cause_str[:500]}"
+        f"{reaper_stats_str}\n\n"
+        f"Diagnose the root cause of these repeated crashes. Examine the service's "
+        f"source code (backend/app/{service_name}.py or related files) and recent "
+        f"commits to that area. If the crash cannot be reproduced from a code read "
+        f"alone, still produce a structured diagnosis JSON with 'confidence': 'low' "
+        f"and 'recommended_fix': 'manual escalation required — operator review needed'. "
+        f"Output a JSON object with keys: summary, root_cause, recommended_fix, "
+        f"severity, confidence, affected_files."
+    )
+
+    active_statuses = (
+        TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+    )
+    spawned_count = 0
+    async with AsyncSessionLocal() as session:
+        projects = (await session.execute(
+            select(Project).options(load_only(Project.id))
+        )).scalars().all()
+
+        for project in projects:
+            pid_str = str(project.id)
+            if pid_str in inflight:
+                continue
+            # DB dedup: skip if an active crash investigation already exists for this service+project
+            existing = (await session.execute(
+                select(Task.id).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(active_statuses),
+                    Task.context.op("@>")(_cast(
+                        {"spawned_by": "crash_investigation", "service_name": service_name},
+                        _JSONB,
+                    )),
+                )
+            )).first()
+            if existing:
+                inflight[pid_str] = str(existing[0])
+                continue
+
+            payload = validate_internal_payload(
+                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                "lifecycle:crash_investigation",
+            )
+            new_task = Task(
+                project_id=project.id,
+                title=f"Investigate repeated crash: {service_name} service",
+                description=(
+                    f"Service '{service_name}' crashed {crash_count} times in 10 min. "
+                    f"Exception: {exc_type}"
+                )[:500],
+                payloads=[payload],
+                context={
+                    "spawned_by": "crash_investigation",
+                    "service_name": service_name,
+                    "regression_class": f"background_service_crash:{service_name}",
+                    "exception_type": exc_type,
+                    "exception_message": cause_str[:500],
+                    "diagnosis_trigger": "background_service_crash",
+                    "crash_count": crash_count,
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+            session.add(new_task)
+            session.add(TaskHistory(
+                task_id=new_task.id,
+                action="SPAWNED",
+                details={
+                    "spawned_by": "CRASH_INVESTIGATION",
+                    "service_name": service_name,
+                    "crash_count": crash_count,
+                },
+            ))
+            await session.flush()
+            inflight[pid_str] = str(new_task.id)
+            spawned_count += 1
+            logger.info(
+                "[MONITOR] Spawned crash investigation for service '%s' "
+                "(project=%s, crashes=%d, task=%s)",
+                service_name, pid_str, crash_count, new_task.id,
+            )
+
+        if spawned_count:
+            await session.commit()
 
 
 async def _seed_initial_admin():
@@ -222,6 +348,10 @@ async def lifespan(app):
         # death-detection branch below can include it in the alert/log instead of
         # the useless "Exception: None" that a bare cancellation produces.
         cancel_reasons: Dict[str, str] = {}
+        # Crash-episode tracking: timestamps of recent crashes per service, and
+        # in-flight investigation task IDs per (service, project_id).
+        crash_timestamps: Dict[str, list] = {}  # name -> [datetime, ...]
+        _inflight_crash_investigations: Dict[str, Dict[str, str]] = {}  # name -> {pid_str: task_id_str}
         task_factories = {
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
@@ -310,6 +440,32 @@ async def lifespan(app):
                                 await alert_session.commit()
                         except Exception as alert_exc:
                             logger.warning(f"[MONITOR] Failed to create crash alert: {alert_exc}")
+
+                        # Track crash timestamp and check episode threshold.
+                        now_ts = _utcnow()
+                        ts_list = crash_timestamps.setdefault(name, [])
+                        ts_list.append(now_ts)
+                        # Prune timestamps outside the 10-minute episode window
+                        cutoff = now_ts - timedelta(seconds=600)
+                        crash_timestamps[name] = [ts for ts in ts_list if ts >= cutoff]
+                        # Spawn an investigate task when 3+ crashes occur in 10 min
+                        _CRASH_EPISODE_THRESHOLD = 3
+                        if len(crash_timestamps[name]) >= _CRASH_EPISODE_THRESHOLD:
+                            inflight = _inflight_crash_investigations.setdefault(name, {})
+                            try:
+                                await _spawn_crash_investigations(
+                                    service_name=name,
+                                    cause_str=cause_str,
+                                    exc=exc,
+                                    crash_count=len(crash_timestamps[name]),
+                                    inflight=inflight,
+                                )
+                            except Exception as ci_exc:
+                                logger.warning(
+                                    "[MONITOR] Failed to spawn crash investigations for '%s': %s",
+                                    name, ci_exc,
+                                )
+
                         factory = task_factories.get(name)
                         # Always restart cancelled tasks too — the watchdog
                         # above intentionally cancels hung tasks expecting
@@ -325,6 +481,8 @@ async def lifespan(app):
                             # Reset attempts if last restart was >5 min ago (ran long enough to be stable)
                             if state["last_restart"] and (now - state["last_restart"]).total_seconds() > 300:
                                 state["attempts"] = 0
+                                crash_timestamps.pop(name, None)
+                                _inflight_crash_investigations.pop(name, None)
                             backoff = min(2 ** state["attempts"], 300)  # 1s, 2s, 4s, ... cap 5min
                             if backoff > 1:
                                 logger.warning(f"[MONITOR] Backing off {backoff}s before restarting {name} (attempt #{state['attempts'] + 1})")

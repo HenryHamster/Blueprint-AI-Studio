@@ -64,8 +64,8 @@ async def register_github_pat(
     try:
         secret_name = await store_user_secret(current_user["user_id"], "github-pat", req.pat)
     except Exception as e:
-        logger.warning(f"[PAT] Secret Manager unavailable, storing PAT directly in DB: {e}")
-        secret_name = req.pat  # Fallback: store raw token in DB
+        logger.error(f"[PAT] Secret Manager unavailable: {e}")
+        raise HTTPException(status_code=503, detail="Secret storage temporarily unavailable, please retry")
 
     stmt = select(UserIntegration).where(UserIntegration.user_id == current_user["user_id"])
     integration = (await session.execute(stmt)).scalars().first()

@@ -14,6 +14,11 @@ export function buildAnalysisPrompt(opts: {
   totalFileBudget?: number;
   directionConcurrentFiles?: string[];
   cochangeFiles?: string[];
+  recentChanges?: {
+    deployedAt?: string;
+    mergedPrCount?: number;
+    commits?: string[];
+  };
   diagnosisContext?: {
     rootCause?: string;
     recommendedFix?: string;
@@ -47,6 +52,9 @@ export function buildAnalysisPrompt(opts: {
   const cochangeBlock = opts.cochangeFiles && opts.cochangeFiles.length > 0
     ? `\n## Historically co-changed files (consider including in your plan if relevant to this change)\nThese files have frequently been modified together with this task's related files in past merged PRs. Use this as a hint when deciding which files belong in your **Files to change** list — include ones that genuinely need to change for this task, and deprioritize the rest so you stay within the file budget.\n${opts.cochangeFiles.map(f => `- ${f}`).join('\n')}\n`
     : '';
+  const recentChangesBlock = opts.recentChanges && (opts.recentChanges.deployedAt || opts.recentChanges.mergedPrCount !== undefined || (opts.recentChanges.commits && opts.recentChanges.commits.length > 0))
+    ? `\n## Recent Changes\n${opts.recentChanges.deployedAt ? `- Most recent deploy: ${opts.recentChanges.deployedAt}` : '- Most recent deploy: unknown'}${typeof opts.recentChanges.mergedPrCount === 'number' ? `\n- Merged PRs in window: ${opts.recentChanges.mergedPrCount}` : ''}${opts.recentChanges.commits && opts.recentChanges.commits.length > 0 ? `\n- Commits in window:\n${opts.recentChanges.commits.slice(0, 30).map(c => `  - ${c.slice(0, 180)}`).join('\n')}` : ''}\n`
+    : '';
   const titleLine = opts.taskTitle ? `**Title:** ${opts.taskTitle}\n\n` : '';
   const limitClause = typeof opts.fileLimit === 'number'
     ? ` Aim for ${opts.fileLimit} or fewer files; if you cannot stay at or below ${opts.fileLimit}, list only the smallest viable set and note in **Implementation approach** what was deferred.`
@@ -61,7 +69,7 @@ export function buildAnalysisPrompt(opts: {
   return `${opts.fileTree}${filesList}You are performing a pre-implementation analysis for a medium-scope task. This is a READ-ONLY pass — do not modify any files.
 
 ## Task
-${titleLine}${opts.rawPrompt.slice(0, 1500)}${diagnosisBlock}${narrowingBlock}${concurrentBlock}${cochangeBlock}
+${titleLine}${opts.rawPrompt.slice(0, 1500)}${recentChangesBlock}${diagnosisBlock}${narrowingBlock}${concurrentBlock}${cochangeBlock}
 
 ## Instructions
 
@@ -176,4 +184,3 @@ export function parseAnalysisPlanTestFiles(analysisOutput: string): string[] {
     /^\s*\*\*Tests at risk of breaking\*\*/i,
   ]);
 }
-

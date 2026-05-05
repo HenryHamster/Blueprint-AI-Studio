@@ -889,6 +889,15 @@ class DeploymentState(SQLModel, table=True):
     direction_streak_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
     # Persisted pipeline events ring buffer — alert windows survive restarts
     pipeline_events_state: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
+    # Previous deploy tracking — populated when a new deploy supersedes the
+    # current one. Lets RecentChangesContext builders compute the commit range
+    # (prior_deploy_sha..current_sha) without a live git checkout.
+    prior_deploy_sha: Optional[str] = Field(default=None)
+    prior_deployed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
     # Timestamp when HALTED state was entered — used for auto-recovery timer
     halted_at: Optional[datetime] = Field(
         default=None,

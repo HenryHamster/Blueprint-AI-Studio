@@ -25,6 +25,7 @@ from app.models import (
     ResidualRemediationCase, ResidualRemediationCaseStatus,
     RegressionRemediationCase, RegressionCaseStatus,
     StrategicCycle,
+    Alert, AlertSeverity,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
@@ -4537,6 +4538,120 @@ async def list_sr_missed_retrospectives(
         })
 
     return {"items": items, "total": total}
+
+
+@router.get("/pipeline-regressions")
+async def get_pipeline_regressions(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate active pipeline regression signals with autonomous loop response status.
+
+    Reads flags already written by the existing detectors (sr_catch_rate_trends_alert,
+    fix_loop_divergence_alerted_window, Alert table) — does not re-implement detection.
+    Returns an empty regressions list when the system is healthy. Field names match
+    the PipelineRegression interface consumed by admin-ui PipelineRegressionsPanel.
+    """
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    doc = project.design_doc or {}
+    now = datetime.utcnow()
+    regressions: List[Dict[str, Any]] = []
+
+    # SR catch-rate regression signals — regression_class uses the colon form the
+    # dispatcher actually persists (pipeline_regression_dispatcher.py:306).
+    sr_alert = doc.get("sr_catch_rate_trends_alert") or {}
+    for cat in list(sr_alert.get("categories") or []):
+        cat_data = ((doc.get("sr_catch_rate_trends") or {}).get("categories") or {}).get(cat) or {}
+        regressions.append({
+            "signal_name": f"SR catch-rate regression: {cat}",
+            "regression_class": f"sr_catch_rate:{cat}",
+            "detected_at": sr_alert.get("computed_at"),
+            "severity": "warning",
+            "current_rate": cat_data.get("current_hit_rate"),
+            "prior_rate": cat_data.get("previous_hit_rate"),
+            "resolved": False,
+            "resolved_at": None,
+        })
+
+    # Fix-loop divergence regression signals — colon form per dispatcher line 394.
+    iso_year, iso_week, _ = now.isocalendar()
+    if doc.get("fix_loop_divergence_alerted_window") == f"{iso_year}-W{iso_week:02d}":
+        for reg in list(doc.get("fix_loop_divergence_regressions") or []):
+            loop = reg.get("loop", "unknown")
+            regressions.append({
+                "signal_name": f"Fix-loop divergence regression: {loop} loop",
+                "regression_class": f"fix_loop_divergence:{loop}",
+                "detected_at": doc.get("fix_loop_divergence_detected_at"),
+                "severity": "warning",
+                "current_rate": reg.get("current_rate"),
+                "prior_rate": reg.get("prior_rate"),
+                "resolved": False,
+                "resolved_at": None,
+            })
+
+    # Background service crash signals — undismissed ERROR alerts in last 48h.
+    crash_cutoff = now - timedelta(hours=48)
+    crash_rows = (await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.severity == AlertSeverity.ERROR,
+            Alert.created_at >= crash_cutoff,
+            Alert.dismissed_at.is_(None),
+        ).order_by(Alert.created_at.desc()).limit(10)
+    )).scalars().all()
+    _CRASH_TITLE_PREFIX = "Background service crashed: "
+    for alert in crash_rows:
+        if alert.title and alert.title.startswith(_CRASH_TITLE_PREFIX):
+            service_name = alert.title[len(_CRASH_TITLE_PREFIX):].strip() or "unknown"
+            reg_class = f"background_service_crash:{service_name}"
+        else:
+            reg_class = "background_service_crash"
+        regressions.append({
+            "signal_name": alert.title,
+            "regression_class": reg_class,
+            "detected_at": alert.created_at.isoformat() if alert.created_at else None,
+            "severity": "critical",
+            "current_rate": None,
+            "prior_rate": None,
+            "resolved": False,
+            "resolved_at": None,
+        })
+
+    # Enrich each regression with the status of any spawned investigation task.
+    # Includes both pipeline_regression_dispatcher tasks (SR/fix-loop classes) and
+    # crash_investigation tasks spawned by lifecycle._spawn_crash_investigations.
+    if regressions:
+        dispatcher_tasks = (await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.context["spawned_by"].as_string().in_(
+                    ("pipeline_regression_dispatcher", "crash_investigation")
+                ),
+                Task.created_at >= now - timedelta(hours=48),
+            ).options(load_only(Task.id, Task.title, Task.status, Task.context))
+            .order_by(Task.created_at.desc()).limit(50)
+        )).scalars().all()
+        by_class: Dict[str, Task] = {}
+        for t in dispatcher_tasks:
+            rc = (t.context or {}).get("regression_class")
+            if rc and rc not in by_class:
+                by_class[rc] = t
+        for r in regressions:
+            task = by_class.get(r["regression_class"])
+            if task is None:
+                r["spawned_task_id"] = None
+                r["spawned_task_status"] = None
+                r["spawned_task_title"] = None
+            else:
+                r["spawned_task_id"] = str(task.id)
+                r["spawned_task_status"] = task.status.value if hasattr(task.status, "value") else str(task.status)
+                r["spawned_task_title"] = task.title
+
+    return {"project_id": str(project_id), "regressions": regressions, "healthy": len(regressions) == 0}
 
 
 @router.get("/projects/{project_id}/sr-blind-spots")

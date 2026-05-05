@@ -21,6 +21,7 @@ import {
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
 import { WaitingBadge, CompletionRow, SkeletonRow } from './catchupRows';
 import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
+import { PipelineRegressionsPanel } from './DashboardHome';
 
 interface NeedsAttentionItem {
   task_id: string;
@@ -753,6 +754,12 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </div>
                   )}
                 </div>
+              )}
+              {/* Pipeline regressions — compact inline variant */}
+              {selectedProjectId && (
+                <ErrorBoundary level="widget">
+                  <PipelineRegressionsPanel projectId={selectedProjectId} />
+                </ErrorBoundary>
               )}
               {/* Stats row */}
               <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">

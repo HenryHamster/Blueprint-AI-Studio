@@ -1180,6 +1180,7 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
     concurrent cap of 2 to avoid flooding the pipeline.
     """
     from app.autonomous_research import _recent_investigation_exists  # noqa: PLC0415
+    from app.autonomous_research_diagnosis import _get_recent_changes_context  # noqa: PLC0415
 
     if not _shared_state.persistent_anomalies:
         return 0
@@ -1187,6 +1188,12 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
     system_active = await _count_active_proactive_investigations(session)
     if system_active >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
         return 0
+
+    try:
+        recent_changes = await _get_recent_changes_context(session)
+    except Exception:
+        logger.debug("[ANOMALY_SWEEP] failed to fetch recent_changes context; omitting")
+        recent_changes = {}
 
     spawned = 0
     for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
@@ -1239,7 +1246,8 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
                 "and recommend a fix. Produce the structured diagnosis JSON report."
             )
             payload = validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                {"type": "investigate", "prompt": prompt, "base_branch": "main",
+                 "recent_changes": recent_changes or {}},
                 "anomaly_detection:proactive_pattern_investigation",
             )
             new_task = Task(
@@ -1301,6 +1309,7 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
     ``_count_active_proactive_investigations``.
     """
     from app.autonomous_research import _recent_investigation_exists  # noqa: PLC0415
+    from app.autonomous_research_diagnosis import _get_recent_changes_context  # noqa: PLC0415
 
     if not _shared_state.persistent_anomalies:
         return 0
@@ -1308,6 +1317,12 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
     system_active = await _count_active_proactive_investigations(session)
     if system_active >= _PROACTIVE_INVESTIGATION_SYSTEM_CAP:
         return 0
+
+    try:
+        recent_changes = await _get_recent_changes_context(session)
+    except Exception:
+        logger.debug("[ANOMALY_SWEEP] failed to fetch recent_changes context; omitting")
+        recent_changes = {}
 
     spawned = 0
     for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
@@ -1357,7 +1372,8 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 "JSON report."
             )
             payload = validate_internal_payload(
-                {"type": "investigate", "prompt": prompt, "base_branch": "main"},
+                {"type": "investigate", "prompt": prompt, "base_branch": "main",
+                 "recent_changes": recent_changes or {}},
                 "anomaly_detection:proactive_intra_direction_investigation",
             )
             new_task = Task(

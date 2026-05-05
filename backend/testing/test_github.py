@@ -128,6 +128,44 @@ async def test_post_github_pat_unauthorized(client, mocker):
     assert response.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_post_github_pat_secret_manager_outage_returns_503(client, db_session, mocker):
+    """
+    When Secret Manager is unavailable during PAT registration, the endpoint
+    must return HTTP 503 and must NOT persist the raw PAT in the database.
+    """
+    from sqlmodel import select as sql_select
+    from app.models import UserIntegration
+
+    mocker.patch(
+        "app.routers.github.validate_fine_grained_pat",
+        return_value={"user": "testuser", "status": "valid"},
+    )
+    mocker.patch(
+        "app.routers.github.store_user_secret",
+        side_effect=Exception("Secret Manager connection refused"),
+    )
+
+    response = await client.post(
+        "/api/github/pat",
+        json={"pat": "github_pat_valid_token_abc123"},
+    )
+
+    assert response.status_code == 503
+    # The app's HTTPException handler in app/main.py reshapes HTTPException
+    # responses to {"error": {"code", "message"}} (not the FastAPI default
+    # {"detail": ...}), so we assert on the wrapped shape.
+    body = response.json()
+    assert body["error"]["code"] == 503
+    assert "unavailable" in body["error"]["message"].lower()
+
+    # Confirm no UserIntegration row was written
+    result = await db_session.execute(
+        sql_select(UserIntegration).where(UserIntegration.user_id == "test-user-123")
+    )
+    assert result.scalars().first() is None
+
+
 # ---------------------------------------------------------------------------
 # Edge-case tests: merge_pull_request, get_check_runs, rate-limiting, expiry
 # ---------------------------------------------------------------------------

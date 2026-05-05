@@ -603,6 +603,12 @@ Rules:
   });
 }
 
+function formatRecentChanges(recentChanges: unknown): string {
+  if (!recentChanges) return '';
+  const text = typeof recentChanges === 'string' ? recentChanges.trim() : JSON.stringify(recentChanges, null, 2);
+  return text ? `\n\nRecent changes:\n${text.slice(0, 4096)}` : '';
+}
+
 // ── Handler: Investigate (analyze issue, output structured diagnosis report) ──
 export async function handleInvestigate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -632,11 +638,13 @@ export async function handleInvestigate(
   const disallowedTools = configureAgentPermissions('investigate');
   const investigateRetryContext = buildRetryContext(task);
   const investigateFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  const recentChangesSection = formatRecentChanges(payload.recent_changes);
 
   const investigatePrompt = `${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
+Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
 Issue to investigate:
-${userPrompt}
+${userPrompt}${recentChangesSection}
 
 Instructions:
 1. Read relevant source files to understand the codebase and locate the root cause of the issue.

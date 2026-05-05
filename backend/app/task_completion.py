@@ -2535,6 +2535,51 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
                 task.id,
                 spawned_child.id,
             )
+    elif spawn_remediation and (task.context or {}).get("spawned_by") == "crash_investigation":
+        # Crash investigations have no linked direction — spawn remediation directly.
+        spawned_child = await _spawn_investigation_remediation(
+            task=task,
+            direction_id=None,
+            summary=summary,
+            root_cause=root_cause,
+            recommended_fix=recommended_fix,
+            severity=severity,
+            confidence=confidence,
+            affected_paths=affected_paths,
+            remediation_attempts=0,
+            session=session,
+        )
+    elif (
+        spawn_remediation
+        and direction is None
+        and (task.context or {}).get("spawned_by") == "pipeline_regression_dispatcher"
+    ):
+        # Pipeline-regression investigations are not direction-anchored — the
+        # regression is system-wide. We still want the remediation chain to
+        # ship a fix; pass a synthetic direction_id keyed off the regression
+        # class so _record_remediation_outcome can stamp something traceable
+        # without requiring a real Direction row.
+        synthetic_direction = (
+            f"pipeline_regression:{(task.context or {}).get('regression_class') or 'unknown'}"
+        )
+        spawned_child = await _spawn_investigation_remediation(
+            task=task,
+            direction_id=synthetic_direction,
+            summary=summary,
+            root_cause=root_cause,
+            recommended_fix=recommended_fix,
+            severity=severity,
+            confidence=confidence,
+            affected_paths=affected_paths,
+            remediation_attempts=0,
+            session=session,
+        )
+        if spawned_child is not None:
+            logger.info(
+                "[REGRESSION_DISPATCHER] Spawned remediation %s from pipeline "
+                "regression investigation %s (class=%s)",
+                spawned_child.id, task.id, synthetic_direction,
+            )
 
     # Update direction state
     if direction is not None and project is not None:
@@ -2734,7 +2779,7 @@ def _calculate_remediation_scope(
 async def _spawn_investigation_remediation(
     *,
     task: Task,
-    direction_id: str,
+    direction_id: Optional[str],
     summary: str,
     root_cause: str,
     recommended_fix: str,
@@ -2781,8 +2826,6 @@ async def _spawn_investigation_remediation(
         "original_diagnosis_task_id": str(
             parent_ctx.get("original_diagnosis_task_id") or task.id
         ),
-        "diagnosed_direction_id": direction_id,
-        "direction_id": direction_id,
         "severity": severity_tag,
         "diagnosis_confidence": confidence if confidence in ("high", "medium") else "high",
         "related_files": affected_paths[:25],
@@ -2791,6 +2834,9 @@ async def _spawn_investigation_remediation(
         "diagnosis_recommended_fix": recommended_fix[:2000],
         "scope": scope,
     }
+    if direction_id:
+        remediation_context["diagnosed_direction_id"] = direction_id
+        remediation_context["direction_id"] = direction_id
     error_fingerprint = parent_ctx.get("error_fingerprint")
     if not error_fingerprint:
         fps = parent_ctx.get("failure_fingerprints") or []

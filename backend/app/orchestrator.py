@@ -187,6 +187,7 @@ _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
+_last_regression_dispatch: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
 _last_post_commit_sweep: datetime = _utcnow()
@@ -932,6 +933,32 @@ async def orchestrator_worker():
             if (_utcnow() - _last_anomaly_state_persist).total_seconds() >= 60:
                 await _persist_self_healing_state_bundle()
                 _last_anomaly_state_persist = _utcnow()
+
+            # Pipeline-regression dispatcher — same 60s cadence as the
+            # self-healing state bundle. Iterates per project, evaluates
+            # subscribed pipeline-wide regression signals (SR catch-rate,
+            # fix-loop divergence, success-rate trend) and spawns one
+            # investigate task per tripped class. Wrapped to never crash
+            # the orchestrator on dispatcher exceptions.
+            global _last_regression_dispatch
+            if (_utcnow() - _last_regression_dispatch).total_seconds() >= 60:
+                from app.pipeline_regression_dispatcher import run_once as _run_regression_dispatcher  # noqa: PLC0415
+                try:
+                    async with AsyncSessionLocal() as _rd_session:
+                        _projects = (await _rd_session.execute(
+                            select(Project).options(load_only(Project.id))
+                        )).scalars().all()
+                        for _proj in _projects:
+                            try:
+                                await _run_regression_dispatcher(_rd_session, _proj.id)
+                            except Exception:
+                                logger.exception(
+                                    "[REGRESSION_DISPATCHER] run_once failed for project %s",
+                                    _proj.id,
+                                )
+                except Exception:
+                    logger.exception("[REGRESSION_DISPATCHER] outer dispatch loop failed")
+                _last_regression_dispatch = _utcnow()
 
             # Independent anomaly maintenance — expires stale entries and restores
             # pipeline adjustments without depending on autonomous research cycles.

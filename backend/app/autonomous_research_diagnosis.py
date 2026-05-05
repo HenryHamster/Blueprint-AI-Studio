@@ -6,13 +6,14 @@ so existing callers (``direction_lifecycle`` and tests that import it from
 there) continue to work unchanged.
 """
 import logging
+import subprocess
 import uuid
 from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import Project, Task, TaskHistory, TaskStatus
+from app.models import DeploymentState, Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.strategic_completion import _is_code_failure_pause_reason
@@ -24,6 +25,69 @@ logger = logging.getLogger(__name__)
 # direction cooldown so a direction that bounces between saturation/unproductive
 # states within a week still gets one fresh diagnosis per pause event.
 _UNPRODUCTIVE_DIAGNOSIS_DEDUP_HOURS = 24
+
+_RECENT_CHANGES_COMMIT_CAP = 30
+_RECENT_CHANGES_BYTES_CAP = 4096
+
+
+async def _get_recent_changes_context(session: AsyncSession) -> dict:
+    """Fetch deploy timestamp and recent git commits for investigation payloads.
+
+    Serializes the data at spawn time so the investigation VM (which has no
+    repo access) can reference what shipped recently.
+    """
+    deploy_row = (await session.execute(
+        select(DeploymentState).where(DeploymentState.id == 1)
+    )).scalars().first()
+
+    deployed_at_iso = deploy_row.deployed_at.isoformat() if deploy_row else None
+    current_sha = (deploy_row.current_sha or "") if deploy_row else ""
+    prior_sha = (getattr(deploy_row, "prior_deploy_sha", None) or "") if deploy_row else ""
+
+    commits: list[str] = []
+    if deployed_at_iso:
+        # Prefer the explicit prior_deploy_sha..current_sha range when both shas
+        # are recorded — it gives a precise commit list independent of the
+        # checkout's wall-clock state. Fall back to --since=deployed_at when the
+        # prior sha hasn't been captured yet (first deploy after the migration).
+        if prior_sha and current_sha and prior_sha != current_sha:
+            log_args = [
+                "git", "log", "--oneline", f"-{_RECENT_CHANGES_COMMIT_CAP}",
+                f"{prior_sha}..{current_sha}",
+            ]
+        else:
+            log_args = [
+                "git", "log", "--oneline", f"-{_RECENT_CHANGES_COMMIT_CAP}",
+                f"--since={deployed_at_iso}",
+            ]
+        try:
+            result = subprocess.run(
+                log_args,
+                capture_output=True, text=True, timeout=10,
+            )
+            raw = result.stdout.strip()
+            if raw:
+                # Trim to byte cap before splitting to avoid huge payloads.
+                commits = raw[:_RECENT_CHANGES_BYTES_CAP].splitlines()
+            elif result.returncode != 0:
+                # Backend pods normally don't ship the git checkout; surface the
+                # failure at WARNING so prod regressions in this signal are visible.
+                logger.warning(
+                    "[DIAGNOSIS] git log returned non-zero (rc=%s) — "
+                    "recent_changes block will be empty: %s",
+                    result.returncode, (result.stderr or "").strip()[:200],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[DIAGNOSIS] git log failed; omitting commit list: %s", exc,
+            )
+
+    return {
+        "deployed_at": deployed_at_iso,
+        "current_sha": current_sha or None,
+        "commits": commits,
+        "commit_count": len(commits),
+    }
 
 
 async def _spawn_direction_diagnosis(
@@ -255,13 +319,29 @@ async def _spawn_unproductive_diagnosis(
         for e in history[-5:]
     ) or "- (no research history)"
     direction_text = (direction.get("text") or "")[:200]
+
+    recent_changes = await _get_recent_changes_context(session)
+    changes_lines = ""
+    if recent_changes.get("deployed_at"):
+        changes_lines = (
+            f"\n\nRecent changes (since deploy at {recent_changes['deployed_at']}"
+            + (f", sha {recent_changes['current_sha']}" if recent_changes.get("current_sha") else "")
+            + f"):\n"
+            + (
+                "\n".join(f"  {c}" for c in recent_changes["commits"])
+                if recent_changes["commits"]
+                else "  (no commits found since last deploy)"
+            )
+        )
+
     prompt = (
         f"A research direction was auto-paused for non-code reasons.\n\n"
         f"Direction: {direction_text}\n"
         f"Pause reason: {pause_reason}\n"
         f"Auto-pause count: {direction.get('auto_pause_count', 0)}\n\n"
         f"Recent cycles (tasks_created / completed / failed / merged / scope):\n"
-        f"{recent_lines}\n\n"
+        f"{recent_lines}"
+        f"{changes_lines}\n\n"
         f"Investigate why this direction is not producing merged PRs. Consider:\n"
         f"- Is the direction's goal already substantially met by existing code?\n"
         f"- Are spawned findings too narrow, too broad, or irrelevant to the goal?\n"
@@ -270,7 +350,10 @@ async def _spawn_unproductive_diagnosis(
         f"Recommend one of: retire direction, reshape goal text, adjust scope targeting, or resume."
     )
     payload = validate_internal_payload(
-        {"type": "investigate", "prompt": prompt, "base_branch": "main", "effort": "low"},
+        {
+            "type": "investigate", "prompt": prompt, "base_branch": "main", "effort": "low",
+            "recent_changes": recent_changes,
+        },
         "autonomous_research_diagnosis:unproductive",
     )
     new_task = Task(
