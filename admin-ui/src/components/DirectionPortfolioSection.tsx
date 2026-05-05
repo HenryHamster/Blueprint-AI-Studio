@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { STAGE_DROPOUT_LABELS, TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
+import { StrategicAuditPanel } from './StrategicAuditPanel';
 
 export interface DirectionProgress {
   direction_id: string;
@@ -55,6 +56,7 @@ interface DirectionPortfolioSectionProps {
   predictionCalibrationSampleCount?: number | null;
   medianCostPerMergedPr?: number | null;
   onDirectionClick?: (directionId: string) => void;
+  projectId?: string | null;
 }
 
 function priorityBadge(p: string) {
@@ -177,6 +179,7 @@ export function DirectionPortfolioSection({
   predictionCalibrationSampleCount,
   medianCostPerMergedPr,
   onDirectionClick,
+  projectId,
 }: DirectionPortfolioSectionProps) {
   return (
     <section>
@@ -312,6 +315,7 @@ export function DirectionPortfolioSection({
           </div>
         </>
       )}
+      {!!projectId && <StrategicAuditPanel projectId={projectId} />}
     </section>
   );
 }

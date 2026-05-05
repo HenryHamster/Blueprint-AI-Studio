@@ -23,8 +23,10 @@ from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
     MaxPlanAccount,
     ResidualRemediationCase, ResidualRemediationCaseStatus,
+    StrategicCycle,
 )
 from app.auth import get_current_user, require_admin
+from app.admin import _get_user_project_with_role
 from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app.direction_metrics import _compute_direction_quality_score
@@ -3999,6 +4001,211 @@ async def get_fix_loop_convergence(
         "lint": _aggregate_loop(per_loop["lint"]),
         "test": _aggregate_loop(per_loop["test"]),
         "check": _aggregate_loop(per_loop["check"]),
+    }
+
+
+_MAX_RETIREMENT_CRITIQUES = 100
+
+
+@router.get("/projects/{project_id}/retirement-critiques")
+async def get_retirement_critiques(
+    project_id: uuid.UUID,
+    limit: int = Query(default=25, ge=1, le=_MAX_RETIREMENT_CRITIQUES),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return recent retirement critiques stored across StrategicCycle rows.
+
+    Each StrategicCycle may carry a list of retirement critiques written by the
+    strategic agent when it retires directions. Returns the most recent `limit`
+    critiques across the last 20 completed cycles, ordered newest-cycle-first.
+    """
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+
+    result = await session.execute(
+        select(StrategicCycle)
+        .options(load_only(StrategicCycle.id, StrategicCycle.cycle_metadata, StrategicCycle.created_at))
+        .where(StrategicCycle.project_id == project_id)
+        .order_by(StrategicCycle.created_at.desc())
+        .limit(20)
+    )
+    cycles = result.scalars().all()
+
+    critiques_out: list[dict] = []
+    for cycle in cycles:
+        if len(critiques_out) >= limit:
+            break
+        raw = cycle.cycle_metadata or {}
+        critiques = raw.get("retirement_critiques", [])
+        if not isinstance(critiques, list):
+            continue
+        for c in critiques:
+            if not isinstance(c, dict):
+                continue
+            if c.get("no_eligible_retirements"):
+                continue
+            critiques_out.append({
+                "direction_id": c.get("direction_id"),
+                "what_it_addressed": c.get("what_it_addressed", ""),
+                "pattern_that_produced_it": c.get("pattern_that_produced_it", ""),
+                "lesson": c.get("lesson", ""),
+                "cycle_id": cycle.id,
+                "cycle_created_at": cycle.created_at.isoformat() if cycle.created_at else None,
+            })
+            if len(critiques_out) >= limit:
+                break
+
+    return {"critiques": critiques_out, "total": len(critiques_out)}
+
+
+_MAX_ACTIONABILITY_CYCLES = 50
+
+
+@router.get("/projects/{project_id}/research-actionability")
+async def get_research_actionability(
+    project_id: uuid.UUID,
+    cycles: int = Query(default=10, ge=1, le=_MAX_ACTIONABILITY_CYCLES),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return actionability grade distribution + merge outcome by grade tier.
+
+    Scans research task plan_output for the most recent `cycles` completed
+    strategic cycles (by StrategicCycle.created_at). For each finding, records
+    its actionability_grade and whether it spawned a follow-on task whose PR
+    landed.
+
+    Merge linkage heuristic: a finding is counted as "tasked" when a non-research
+    task in the same project shares its direction_id and was created strictly
+    after the research task that produced the finding (research tasks are
+    excluded from the follow-on set so a research task does not self-attribute).
+    It is counted as "merged" when that follow-on task is COMPLETED and its
+    `context['pr_merged']` flag is True — that flag is set by the merge pipeline
+    only after a PULL_REQUEST artifact is actually merged, so it is a reliable
+    proxy for "has a merged-PR artifact." This is conservative — it under-counts
+    rather than over-counts.
+    """
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+
+    # Determine time window from the N most recent strategic cycles.
+    cycle_result = await session.execute(
+        select(StrategicCycle)
+        .options(load_only(StrategicCycle.id, StrategicCycle.created_at))
+        .where(StrategicCycle.project_id == project_id)
+        .order_by(StrategicCycle.created_at.desc())
+        .limit(cycles)
+    )
+    recent_cycles = cycle_result.scalars().all()
+    if recent_cycles:
+        oldest_cycle_at = min(c.created_at for c in recent_cycles if c.created_at)
+    else:
+        oldest_cycle_at = _utcnow() - timedelta(days=30)
+
+    # Fetch completed research tasks within the window. The payload-type filter
+    # is essential: plan_output is also written by non-research task types
+    # (planning, etc.) and would otherwise leak into the grade distribution.
+    research_result = await session.execute(
+        select(Task)
+        .options(load_only(Task.id, Task.plan_output, Task.created_at, Task.context))
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= oldest_cycle_at,
+            Task.plan_output.isnot(None),
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+        .order_by(Task.created_at.desc())
+        .limit(500)
+    )
+    research_tasks = research_result.scalars().all()
+
+    # Collect direction_ids that appear in findings, plus the earliest research
+    # task per direction (so follow-on attribution requires created_at > that).
+    finding_direction_ids: set[str] = set()
+    findings_by_dir: dict[str, list[dict]] = {}
+    grade_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    dir_research_first_at: dict[str, datetime] = {}
+    research_task_ids: set[uuid.UUID] = set()
+
+    for t in research_tasks:
+        research_task_ids.add(t.id)
+        raw = t.plan_output
+        if not isinstance(raw, list):
+            continue
+        for f in raw:
+            if not isinstance(f, dict) or not f.get("title"):
+                continue
+            grade = f.get("actionability_grade", "MEDIUM")
+            if grade not in grade_counts:
+                grade = "MEDIUM"
+            grade_counts[grade] += 1
+            dir_id = f.get("direction_id")
+            if dir_id:
+                key = str(dir_id)
+                finding_direction_ids.add(key)
+                findings_by_dir.setdefault(key, []).append({"grade": grade})
+                if t.created_at is not None:
+                    prev = dir_research_first_at.get(key)
+                    if prev is None or t.created_at < prev:
+                        dir_research_first_at[key] = t.created_at
+
+    # Fetch follow-on tasks (same project, after oldest_cycle_at). We pull
+    # payloads so we can exclude research-type tasks below.
+    followon_result = await session.execute(
+        select(Task)
+        .options(load_only(Task.id, Task.status, Task.context, Task.created_at, Task.payloads))
+        .where(
+            Task.project_id == project_id,
+            Task.created_at >= oldest_cycle_at,
+        )
+        .limit(2000)
+    )
+    followon_tasks = followon_result.scalars().all()
+
+    # Build a map: direction_id → {tasked: bool, merged: bool}
+    dir_outcome: dict[str, dict] = {}
+    for t in followon_tasks:
+        # Exclude research tasks themselves — they carry direction_id in context
+        # (see research_completion.py:1721) and would otherwise self-attribute.
+        if t.id in research_task_ids:
+            continue
+        t_type = (t.first_payload or {}).get("type")
+        if t_type == "research":
+            continue
+        ctx = t.context or {}
+        dir_id = ctx.get("direction_id") or ctx.get("related_direction_id")
+        if not dir_id or str(dir_id) not in finding_direction_ids:
+            continue
+        key = str(dir_id)
+        # Only count follow-ons created strictly after the research task that
+        # produced the finding for this direction.
+        research_at = dir_research_first_at.get(key)
+        if research_at is not None and t.created_at is not None and t.created_at <= research_at:
+            continue
+        entry = dir_outcome.setdefault(key, {"tasked": False, "merged": False})
+        entry["tasked"] = True
+        if t.status == TaskStatus.COMPLETED and ctx.get("pr_merged") is True:
+            entry["merged"] = True
+
+    # Aggregate tasked/merged counts by grade.
+    grade_tasked: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    grade_merged: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for dir_id, findings in findings_by_dir.items():
+        outcome = dir_outcome.get(dir_id, {})
+        for f in findings:
+            g = f["grade"]
+            if outcome.get("tasked"):
+                grade_tasked[g] = grade_tasked.get(g, 0) + 1
+            if outcome.get("merged"):
+                grade_merged[g] = grade_merged.get(g, 0) + 1
+
+    total = sum(grade_counts.values())
+    return {
+        "cycles_scanned": len(recent_cycles),
+        "total_findings": total,
+        "grade_distribution": grade_counts,
+        "grade_tasked": grade_tasked,
+        "grade_merged": grade_merged,
     }
 
 

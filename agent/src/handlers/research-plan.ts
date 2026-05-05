@@ -2205,11 +2205,16 @@ ${analysisText.slice(0, 50_000)}
         /"op"\s*:\s*"set_running_update"/.test(allOutput)
         || /\.\/strategic\s+set-running-update\b/.test(allOutput)
         || /Running update set/i.test(allOutput);
+      const retirementCritiquesSetInOutput =
+        /"op"\s*:\s*"set_retirement_critiques"/.test(allOutput)
+        || /\.\/strategic\s+set-retirement-critiques\b/.test(allOutput)
+        || /Retirement critiques recorded/i.test(allOutput);
 
-      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput)) {
+      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput || !retirementCritiquesSetInOutput)) {
         const missing: string[] = [];
         if (!problemModelSetInOutput) missing.push('./strategic set-problem-model');
         if (!runningUpdateSetInOutput) missing.push('./strategic set-running-update');
+        if (!retirementCritiquesSetInOutput) missing.push('./strategic set-retirement-critiques');
         sendLog(ws, `\n[WARNING] Strategic executor completed but required calls missing: ${missing.join(', ')}. Retrying...\n`);
         const retryInstructions = [
           'Your previous attempt did not call one or more REQUIRED commands.',
@@ -2219,6 +2224,7 @@ ${analysisText.slice(0, 50_000)}
           'Run these NOW using data from the analysis:',
           !problemModelSetInOutput ? `- ./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"  (if file missing: construct from analysis grounded in the managed project — NEVER self-describe)` : '',
           !runningUpdateSetInOutput ? `- ./strategic set-running-update /tmp/running_update_${taskId}.md  (if file missing: write a single clean markdown doc to that path first — describe the managed project's current state, NEVER self-describe)` : '',
+          !retirementCritiquesSetInOutput ? `- ./strategic set-retirement-critiques '[{"direction_id":"d-xxx","what_it_addressed":"...","pattern_that_produced_it":"...","lesson":"..."}]'  OR  ./strategic set-retirement-critiques '{"no_eligible_retirements": true}'  (one of these two payloads, depending on whether there are retired directions to critique)` : '',
           '',
           'Nothing else.',
         ].filter(Boolean).join('\n');

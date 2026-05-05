@@ -1218,6 +1218,52 @@ describe('buildThinkerPrompt', () => {
   });
 });
 
+describe('Strategic executor set-retirement-critiques verification', () => {
+  // Helper to detect if set-retirement-critiques was called (matches the patterns in research-plan.ts)
+  const wasRetirementCritiquesSet = (output: string): boolean => {
+    return /"op"\s*:\s*"set_retirement_critiques"/.test(output)
+      || /\.\/strategic\s+set-retirement-critiques\b/.test(output)
+      || /Retirement critiques recorded/i.test(output);
+  };
+
+  it('detects JSON op form of set-retirement-critiques call', () => {
+    const output = 'Response: {"op":"set_retirement_critiques","status":"ok"}';
+    expect(wasRetirementCritiquesSet(output)).toBe(true);
+  });
+
+  it('detects CLI invocation form of set-retirement-critiques call', () => {
+    const output = 'Now running: ./strategic set-retirement-critiques \'[...]\'';
+    expect(wasRetirementCritiquesSet(output)).toBe(true);
+  });
+
+  it('detects success message form of set-retirement-critiques call', () => {
+    const output = 'Retirement critiques recorded successfully (3 critiques processed).';
+    expect(wasRetirementCritiquesSet(output)).toBe(true);
+  });
+
+  it('detects success message form case-insensitively', () => {
+    const output = 'RETIREMENT CRITIQUES RECORDED at 2026-05-05T10:00:00Z';
+    expect(wasRetirementCritiquesSet(output)).toBe(true);
+  });
+
+  it('returns false when set-retirement-critiques is not present in output', () => {
+    const output = 'Some other output without the required call.';
+    expect(wasRetirementCritiquesSet(output)).toBe(false);
+  });
+
+  it('returns false for partial matches that do not indicate the call was made', () => {
+    const output = 'Consider using set-retirement-critiques in your next analysis.';
+    expect(wasRetirementCritiquesSet(output)).toBe(false);
+  });
+
+  it('detects set-retirement-critiques with both JSON payload forms in mixed output', () => {
+    const outputWithArray = 'Response: {"op":"set_retirement_critiques","payload":[{"direction_id":"d-1"}]}';
+    const outputWithSentinel = 'Response: {"op":"set_retirement_critiques","payload":{"no_eligible_retirements":true}}';
+    expect(wasRetirementCritiquesSet(outputWithArray)).toBe(true);
+    expect(wasRetirementCritiquesSet(outputWithSentinel)).toBe(true);
+  });
+});
+
 // ── runThinkerWithGate ────────────────────────────────────────────────────────
 
 describe('runThinkerWithGate', () => {

@@ -81,6 +81,10 @@ vi.mock('recharts', () => ({
   Area: () => null,
 }));
 
+vi.mock('./StrategicAuditPanel', () => ({
+  StrategicAuditPanel: () => null,
+}));
+
 function jsonResponse(data: unknown): Response {
   return {
     ok: true,

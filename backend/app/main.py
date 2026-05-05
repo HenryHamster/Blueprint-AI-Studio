@@ -1610,6 +1610,8 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
 
 from app.strategic_completion import (  # noqa: E402
+    _find_matching_direction,
+    _is_direction_duplicate,
     _normalize_recommended_mode,
 )
 
@@ -2054,15 +2056,32 @@ async def strategic_operation(
         raw_priority = data.get("priority", "medium")
         priority = raw_priority if raw_priority in ("high", "medium", "low") else "medium"
         rationale = _cap_str(data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings)
+        raw_dedup_reasoning = data.get("dedup_reasoning")
         directions = list(project.directions or [])
-        # Dedup: skip if same text exists
-        if any(d.get("text", "").strip().lower() == text.lower() for d in directions if d.get("status") in ("active", "proposed")):
+        # Dedup: skip if semantically similar direction already exists
+        _rejected_proposals = list((project.vision or {}).get("rejected_proposals") or [])
+        if _is_direction_duplicate(text, directions, _rejected_proposals):
+            if isinstance(raw_dedup_reasoning, dict):
+                distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                if distinction:
+                    logger.warning(
+                        "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
+                        "distinction='%s'; matched text='%s'; project=%s",
+                        distinction[:200], text[:60], project.id,
+                    )
+            matched = _find_matching_direction(text, directions)
+            if matched:
+                logger.info(
+                    "[STRATEGIC] API path: rejecting semantic duplicate direction '%s' for project %s — "
+                    "matched existing direction '%s' (status=%s)",
+                    text[:60], project.id, (matched.get("text") or "")[:60], matched.get("status"),
+                )
             ctx = task.context or {}
             task.context = {**ctx, "_strategic_api_called": True}
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
-            return JSONResponse(content=_resp({"status": "skipped", "reason": "duplicate"}), status_code=409)
+            return JSONResponse(content=_resp({"status": "skipped", "reason": "semantic_duplicate"}), status_code=409)
         success_evidence = str(data.get("success_evidence", "")).strip()
         retirement_condition = str(data.get("retirement_condition", "")).strip()
         if not success_evidence or not retirement_condition:
@@ -2095,6 +2114,16 @@ async def strategic_operation(
         impl_constraints = str(data.get("implementation_constraints", "")).strip()
         if impl_constraints:
             new_dir["context"]["implementation_constraints"] = impl_constraints[:_DIR_FIELD_MAX]
+        if isinstance(raw_dedup_reasoning, dict):
+            dr: dict = {}
+            closest = raw_dedup_reasoning.get("closest_directions")
+            if isinstance(closest, list):
+                dr["closest_directions"] = closest[:3]
+            distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+            if distinction:
+                dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+            if dr:
+                new_dir["context"]["dedup_reasoning"] = dr
         if data.get("system_id"):
             new_dir["system_id"] = _cap_str(data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings)
         if data.get("paths"):

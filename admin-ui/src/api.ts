@@ -120,6 +120,50 @@ export async function fetchAutonomyDebug(projectId: string): Promise<unknown> {
   return res.json();
 }
 
+export interface RetirementCritique {
+  direction_id: string | null;
+  what_it_addressed: string;
+  pattern_that_produced_it: string;
+  lesson: string;
+  cycle_id: string;
+  cycle_created_at: string | null;
+}
+
+export interface RetirementCritiquesResponse {
+  critiques: RetirementCritique[];
+  total: number;
+}
+
+export async function fetchRetirementCritiques(
+  projectId: string,
+  limit = 25,
+): Promise<RetirementCritiquesResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/retirement-critiques?limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch retirement critiques: ${res.status}`);
+  return res.json();
+}
+
+export interface ActionabilityResponse {
+  cycles_scanned: number;
+  total_findings: number;
+  grade_distribution: Record<string, number>;
+  grade_tasked: Record<string, number>;
+  grade_merged: Record<string, number>;
+}
+
+export async function fetchResearchActionability(
+  projectId: string,
+  cycles = 10,
+): Promise<ActionabilityResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/research-actionability?cycles=${cycles}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch research actionability: ${res.status}`);
+  return res.json();
+}
+
 export interface SrMissedRetrospectivesResponse {
   items: import('./components/SrTrendBreakdown').SrMissedTask[];
   total: number;

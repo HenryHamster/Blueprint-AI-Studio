@@ -445,6 +445,12 @@ def _check_direction_completion(direction: dict) -> str | None:
 
 _RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
 
+_DIRECTION_DEDUP_STOPWORDS = frozenset({
+    'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
+    'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
+    'feat', 'fix', 'refactor', 'add', 'update', 'improve',
+})
+
 
 def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejected_proposals: list) -> bool:
     """Return True if proposal_text overlaps with an existing or recently rejected direction.
@@ -453,15 +459,12 @@ def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejec
     non-stopword tokens) to catch paraphrased retirements. Active directions keep
     the default threshold of 4.
     """
-    STOPWORDS = {'the', 'a', 'an', 'to', 'for', 'and', 'or', 'in', 'of', 'is', 'it',
-                 'this', 'that', 'with', 'by', 'we', 'should', 'be', 'are', 'on', 'as',
-                 'feat', 'fix', 'refactor', 'add', 'update', 'improve'}
-    words = set(proposal_text.lower().split()) - STOPWORDS
+    words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     if len(words) < 2:
         return False
     for d in existing_directions:
         existing_text = (d.get("text") or "").lower()
-        existing_words = set(existing_text.split()) - STOPWORDS
+        existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
         threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
         if len(words & existing_words) >= threshold:
             return True
@@ -469,10 +472,31 @@ def _is_direction_duplicate(proposal_text: str, existing_directions: list, rejec
     for entry in rejected_proposals:
         if entry.get("rejected_at", "") < cutoff:
             continue
-        rejected_words = set((entry.get("text") or "").lower().split()) - STOPWORDS
+        rejected_words = set((entry.get("text") or "").lower().split()) - _DIRECTION_DEDUP_STOPWORDS
         if len(words & rejected_words) >= 4:
             return True
     return False
+
+
+def _find_matching_direction(proposal_text: str, existing_directions: list) -> dict | None:
+    """Return the direction that triggered the dup-match, using the same
+    tokenization/threshold as `_is_direction_duplicate`.
+
+    Used purely for diagnostic logging when a proposal is rejected. Falls back
+    to None if no direction passes the threshold (e.g. when the rejection came
+    from a recently-rejected proposal rather than an existing direction).
+    """
+    text_lower = proposal_text.lower().strip()
+    words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+    for d in existing_directions:
+        existing_text = (d.get("text") or "").lower().strip()
+        if existing_text == text_lower:
+            return d
+        existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
+        threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
+        if len(words & existing_words) >= threshold:
+            return d
+    return None
 
 
 async def _check_direction_starvation(
@@ -1030,12 +1054,27 @@ async def _handle_strategic_completion(
                 if len(text) > STRATEGIC_DIRECTION_TEXT_MAX:
                     logger.warning(f"[STRATEGIC] Task {task.id}: truncating direction text {len(text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars")
                 text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
-                # Dedup: skip if an active/proposed direction has very similar text
-                text_lower = text.lower()
-                if any(d.get("status") in ("active", "proposed") and
-                       d.get("text", "").lower().strip() == text_lower
-                       for d in directions):
-                    logger.info(f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}")
+                # Dedup: skip if a semantically similar direction already exists
+                raw_dedup_reasoning = op_entry.get("dedup_reasoning")
+                _rejected_proposals = list((project.vision or {}).get("rejected_proposals") or [])
+                if _is_direction_duplicate(text, directions, _rejected_proposals):
+                    if isinstance(raw_dedup_reasoning, dict):
+                        distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                        if distinction:
+                            logger.warning(
+                                "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
+                                "agent claimed distinction='%s'; matched text='%s'; project=%s",
+                                distinction[:200], text[:60], project.id,
+                            )
+                    matched = _find_matching_direction(text, directions)
+                    if matched:
+                        logger.info(
+                            "[STRATEGIC] Skipping semantic duplicate direction '%s' for project %s — "
+                            "matched existing direction '%s' (status=%s)",
+                            text[:60], project.id, (matched.get("text") or "")[:60], matched.get("status"),
+                        )
+                    else:
+                        logger.info(f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}")
                     continue
                 success_evidence = str(op_entry.get("success_evidence", "")).strip()
                 retirement_condition = str(op_entry.get("retirement_condition", "")).strip()
@@ -1063,6 +1102,16 @@ async def _handle_strategic_completion(
                 impl_constraints = str(op_entry.get("implementation_constraints", "")).strip()
                 if impl_constraints:
                     new_dir["context"]["implementation_constraints"] = impl_constraints[:_DIR_FIELD_MAX]
+                if isinstance(raw_dedup_reasoning, dict):
+                    dr: dict = {}
+                    closest = raw_dedup_reasoning.get("closest_directions")
+                    if isinstance(closest, list):
+                        dr["closest_directions"] = closest[:3]
+                    distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                    if distinction:
+                        dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                    if dr:
+                        new_dir["context"]["dedup_reasoning"] = dr
                 if op_entry.get("source"):
                     new_dir["source"] = str(op_entry["source"])[:64]
                 if op_entry.get("paths"):

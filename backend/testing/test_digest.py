@@ -6702,6 +6702,338 @@ async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
 
 
 # ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/retirement-critiques
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retirement_critiques_returns_critiques(client: AsyncClient, db_session):
+    """Critiques stored in StrategicCycle.cycle_metadata are returned, newest cycle first."""
+    from app.models import StrategicCycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    m = make_membership(project.id)
+    db_session.add(m)
+
+    cycle = StrategicCycle(
+        id="cycle-audit-1",
+        project_id=project.id,
+        cycle_metadata={
+            "retirement_critiques": [
+                {
+                    "direction_id": "dir-abc",
+                    "what_it_addressed": "Reduce DB queries",
+                    "pattern_that_produced_it": "Overly broad direction",
+                    "lesson": "Scope directions tightly",
+                },
+                {
+                    "direction_id": "dir-def",
+                    "what_it_addressed": "Improve test coverage",
+                    "pattern_that_produced_it": "Coverage gaps",
+                    "lesson": "Target specific modules",
+                },
+            ]
+        },
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/retirement-critiques")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    critiques = data["critiques"]
+    assert len(critiques) == 2
+    assert critiques[0]["direction_id"] == "dir-abc"
+    assert critiques[0]["what_it_addressed"] == "Reduce DB queries"
+    assert critiques[0]["lesson"] == "Scope directions tightly"
+    assert critiques[0]["cycle_id"] == "cycle-audit-1"
+    assert critiques[1]["direction_id"] == "dir-def"
+
+
+@pytest.mark.asyncio
+async def test_retirement_critiques_empty_when_no_cycles(client: AsyncClient, db_session):
+    """Project with no strategic cycles returns empty critiques list."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    m = make_membership(project.id)
+    db_session.add(m)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/retirement-critiques")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 0
+    assert data["critiques"] == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_critiques_skips_sentinel_entries(client: AsyncClient, db_session):
+    """Entries with no_eligible_retirements=True are excluded from results."""
+    from app.models import StrategicCycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    m = make_membership(project.id)
+    db_session.add(m)
+
+    cycle = StrategicCycle(
+        id="cycle-audit-sentinel",
+        project_id=project.id,
+        cycle_metadata={
+            "retirement_critiques": [
+                {"no_eligible_retirements": True},
+                {
+                    "direction_id": "dir-real",
+                    "what_it_addressed": "Real work",
+                    "pattern_that_produced_it": "Pattern",
+                    "lesson": "Lesson",
+                },
+            ]
+        },
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/retirement-critiques")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["critiques"][0]["direction_id"] == "dir-real"
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/research-actionability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_grade_distribution(client: AsyncClient, db_session):
+    """Grade distribution is computed from research task plan_output findings."""
+    from app.models import StrategicCycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    m = make_membership(project.id)
+    db_session.add(m)
+
+    cycle = StrategicCycle(id="cycle-action-1", project_id=project.id)
+    db_session.add(cycle)
+
+    research_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[
+            {"title": "Finding A", "actionability_grade": "HIGH", "direction_id": "dir-h1"},
+            {"title": "Finding B", "actionability_grade": "HIGH", "direction_id": "dir-h2"},
+            {"title": "Finding C", "actionability_grade": "MEDIUM", "direction_id": "dir-m1"},
+            {"title": "Finding D", "actionability_grade": "LOW", "direction_id": "dir-l1"},
+        ],
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_findings"] == 4
+    assert data["grade_distribution"]["HIGH"] == 2
+    assert data["grade_distribution"]["MEDIUM"] == 1
+    assert data["grade_distribution"]["LOW"] == 1
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_empty_project(client: AsyncClient, db_session):
+    """Project with no research tasks returns zero counts."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    m = make_membership(project.id)
+    db_session.add(m)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_findings"] == 0
+    assert data["grade_distribution"] == {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_excludes_non_research_plan_output(
+    client: AsyncClient, db_session
+):
+    """plan_output on non-research task types must NOT leak into the grade distribution."""
+    from app.models import StrategicCycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    db_session.add(StrategicCycle(id="cycle-action-typefilter", project_id=project.id))
+
+    # Real research task — counted.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[
+            {"title": "Real finding", "actionability_grade": "HIGH", "direction_id": "dir-real"},
+        ],
+    ))
+    # Non-research task that also wrote plan_output — must be excluded.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        plan_output=[
+            {"title": "Bogus finding", "actionability_grade": "HIGH", "direction_id": "dir-bogus"},
+            {"title": "Bogus 2", "actionability_grade": "MEDIUM", "direction_id": "dir-bogus2"},
+        ],
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "planning"}],
+        plan_output=[
+            {"title": "Planner output", "actionability_grade": "LOW", "direction_id": "dir-plan"},
+        ],
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_findings"] == 1
+    assert data["grade_distribution"] == {"HIGH": 1, "MEDIUM": 0, "LOW": 0}
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_research_task_does_not_self_attribute(
+    client: AsyncClient, db_session
+):
+    """A research task whose context carries direction_id must not count as its own follow-on."""
+    from app.models import StrategicCycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    db_session.add(StrategicCycle(id="cycle-action-self", project_id=project.id))
+
+    # Research task with direction_id in context (canonical pattern from
+    # research_completion.py:1721) and pr_merged accidentally truthy in
+    # context. Without the self-exclusion, this would mark the direction as
+    # both tasked and merged.
+    research_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"direction_id": "dir-self", "pr_merged": True},
+        plan_output=[
+            {"title": "Self-attribution probe", "actionability_grade": "HIGH",
+             "direction_id": "dir-self"},
+        ],
+    )
+    db_session.add(research_task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    # Distribution still records the finding...
+    assert data["grade_distribution"]["HIGH"] == 1
+    # ...but the research task itself must not register as the follow-on.
+    assert data["grade_tasked"]["HIGH"] == 0
+    assert data["grade_merged"]["HIGH"] == 0
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_merge_requires_pr_merged_flag(
+    client: AsyncClient, db_session
+):
+    """Merge attribution requires `context['pr_merged'] is True`, not just COMPLETED."""
+    from app.models import StrategicCycle
+    from datetime import timedelta as _td
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    research_at = _utcnow() - _td(hours=2)
+    db_session.add(StrategicCycle(
+        id="cycle-action-merge", project_id=project.id, created_at=research_at - _td(hours=2),
+    ))
+    research_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        created_at=research_at,
+        plan_output=[
+            {"title": "Merged path", "actionability_grade": "HIGH", "direction_id": "dir-merged"},
+            {"title": "Tasked-but-not-merged", "actionability_grade": "HIGH",
+             "direction_id": "dir-tasked"},
+            {"title": "Untouched", "actionability_grade": "MEDIUM", "direction_id": "dir-cold"},
+        ],
+    )
+    db_session.add(research_task)
+
+    # Follow-on for dir-merged: COMPLETED + pr_merged=True → merged.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=research_at + _td(minutes=30),
+        context={"direction_id": "dir-merged", "pr_merged": True},
+    ))
+    # Follow-on for dir-tasked: COMPLETED but NO pr_merged → tasked only.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=research_at + _td(minutes=30),
+        context={"direction_id": "dir-tasked"},
+    ))
+    # Follow-on for dir-merged created BEFORE the research task — must not count.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=research_at - _td(hours=1),
+        context={"direction_id": "dir-cold", "pr_merged": True},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["grade_tasked"]["HIGH"] == 2  # dir-merged + dir-tasked
+    assert data["grade_merged"]["HIGH"] == 1  # only dir-merged
+    # dir-cold's pre-research follow-on must not register.
+    assert data["grade_tasked"]["MEDIUM"] == 0
+    assert data["grade_merged"]["MEDIUM"] == 0
 # Self-review skip-rate metric
 # ---------------------------------------------------------------------------
 

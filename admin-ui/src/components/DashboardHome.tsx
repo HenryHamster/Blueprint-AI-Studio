@@ -1211,6 +1211,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             predictionCalibrationSampleCount={digest?.prediction_calibration_sample_count}
             medianCostPerMergedPr={digest?.median_cost_per_merged_pr}
             onDirectionClick={onDirectionClick}
+            projectId={selectedProjectId}
           />
 
           {/* Section 2b: Scope Conversion Rates */}

@@ -1,6 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+
+vi.mock('./StrategicAuditPanel', () => ({
+  StrategicAuditPanel: () => null,
+}));
+
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
 
 function makeDirection(overrides: Partial<DirectionProgress> = {}): DirectionProgress {

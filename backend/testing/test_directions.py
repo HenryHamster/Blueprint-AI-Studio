@@ -2740,8 +2740,8 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
     mocker.patch("app.main.provision_agent_vm", return_value=None)
 
     existing_dirs = [
-        {"id": "d-dup001", "text": "Improve test coverage", "status": "active", "priority": "medium",
-         "notes": [], "research_history": []}
+        {"id": "d-dup001", "text": "Increase automated test coverage across all service modules",
+         "status": "active", "priority": "medium", "notes": [], "research_history": []}
     ]
     project = Project(
         name="P-strategic-dup",
@@ -2777,7 +2777,9 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
             resp = await ac.post(
                 "/api/agent/strategic",
                 json={"op": "create_direction", "task_id": task_id,
-                      "data": {"text": "Improve test coverage", "priority": "high"}},
+                      "data": {"text": "Increase automated test coverage across all service modules",
+                               "priority": "high", "success_evidence": "Coverage above 80%",
+                               "retirement_condition": "Coverage stable for 2 cycles"}},
             )
         assert resp.status_code == 409, resp.text
         body = resp.json()

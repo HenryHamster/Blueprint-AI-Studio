@@ -1880,3 +1880,381 @@ async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
     await db_session.refresh(cycle)
     meta = cycle.cycle_metadata or {}
     assert meta.get("retirement_critiques") == {"no_eligible_retirements": True}
+
+
+# ── dedup_reasoning persistence ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(db_session, mocker):
+    """dedup_reasoning dict is stored in direction.context on a successful fallback-path create."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="DR1", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Migrate auth service to OAuth2",
+            "priority": "medium",
+            "success_evidence": "All auth tests pass",
+            "retirement_condition": "OAuth2 flow live for 3 cycles",
+            "dedup_reasoning": {
+                "closest_directions": ["Improve login flow", "Add SSO support"],
+                "distinction": "Targets the auth backend protocol, not the UI flow",
+            },
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if "OAuth2" in d.get("text", "")]
+    assert len(dirs) == 1, "Direction should have been created"
+    ctx = dirs[0].get("context") or {}
+    dr = ctx.get("dedup_reasoning")
+    assert dr is not None, "dedup_reasoning should be stored in context"
+    assert dr["closest_directions"] == ["Improve login flow", "Add SSO support"]
+    assert dr["distinction"] == "Targets the auth backend protocol, not the UI flow"
+
+
+@pytest.mark.asyncio
+async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
+    """Omitting dedup_reasoning entirely causes no error — direction is created normally."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="DR2", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Reduce p99 API latency",
+            "priority": "high",
+            "success_evidence": "p99 < 200ms",
+            "retirement_condition": "3 cycles below target",
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if "latency" in d.get("text", "").lower()]
+    assert len(dirs) == 1, "Direction should have been created without dedup_reasoning"
+    ctx = dirs[0].get("context") or {}
+    assert "dedup_reasoning" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(db_session, mocker, caplog):
+    """When a duplicate is rejected AND dedup_reasoning.distinction was supplied, a structured warning is logged."""
+    import json
+    import logging
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    existing_dir = {
+        "id": "d-existing1",
+        "text": "Migrate auth service to OAuth2",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+    }
+    project = Project(
+        name="DR3", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[existing_dir],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Migrate auth service to OAuth2",
+            "priority": "medium",
+            "success_evidence": "All auth tests pass",
+            "retirement_condition": "OAuth2 flow live for 3 cycles",
+            "dedup_reasoning": {
+                "closest_directions": ["d-existing1"],
+                "distinction": "This one focuses on the token refresh path specifically",
+            },
+        }],
+    })
+    with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
+        await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if d.get("id") != "d-existing1"]
+    assert len(dirs) == 0, "Duplicate should have been rejected"
+    assert any("STRATEGIC_DEDUP_DISAGREEMENT" in r.message for r in caplog.records), (
+        "Warning with STRATEGIC_DEDUP_DISAGREEMENT should have been emitted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
+    """closest_directions is capped at 3 items; distinction is capped at 500 chars."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="DR4", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    long_distinction = "x" * 600
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Consolidate logging infrastructure",
+            "priority": "low",
+            "success_evidence": "Single log sink used everywhere",
+            "retirement_condition": "All services use unified sink for 2 cycles",
+            "dedup_reasoning": {
+                "closest_directions": ["dir-a", "dir-b", "dir-c", "dir-d", "dir-e"],
+                "distinction": long_distinction,
+            },
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dirs = [d for d in (project.directions or []) if "logging" in d.get("text", "").lower()]
+    assert len(dirs) == 1
+    ctx = dirs[0].get("context") or {}
+    dr = ctx.get("dedup_reasoning") or {}
+    assert len(dr["closest_directions"]) == 3, "closest_directions should be capped at 3"
+    assert len(dr["distinction"]) == 500, "distinction should be capped at 500 chars"
+
+
+# ── Semantic dedup on direction creates ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(db_session, mocker):
+    """Fallback path: paraphrased active direction is blocked by semantic dedup."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    existing_dir = {
+        "id": "d-active1",
+        "text": "Migrate authentication service towards OAuth2 token standard",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+    }
+    project = Project(
+        name="SD1", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[existing_dir],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Paraphrase of the existing direction (4+ non-stopword words overlap)
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Transition authentication service OAuth2 token implementation",
+            "priority": "medium",
+            "success_evidence": "All auth flows use OAuth2",
+            "retirement_condition": "OAuth2 live for 3 cycles",
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-active1"]
+    assert len(new_dirs) == 0, "Paraphrased duplicate should have been blocked"
+
+
+@pytest.mark.asyncio
+async def test_semantic_dedup_blocks_paraphrased_retired_direction_fallback(db_session, mocker):
+    """Fallback path: paraphrased retired direction is blocked by tighter (3-word) threshold."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    retired_dir = {
+        "id": "d-ret1",
+        "text": "Consolidate logging pipeline centralized aggregation",
+        "status": "retired",
+        "priority": "low",
+        "notes": [],
+        "research_history": [],
+    }
+    project = Project(
+        name="SD2", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[retired_dir],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Paraphrase with 3 overlapping non-stopword words (tighter retired threshold)
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Consolidate logging pipeline distributed system",
+            "priority": "low",
+            "success_evidence": "Single log pipeline in place",
+            "retirement_condition": "Pipeline stable for 2 cycles",
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-ret1"]
+    assert len(new_dirs) == 0, "Paraphrased retired duplicate should have been blocked"
+
+
+@pytest.mark.asyncio
+async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, mocker):
+    """Fallback path: genuinely distinct direction passes through semantic dedup."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    existing_dir = {
+        "id": "d-existing2",
+        "text": "Migrate authentication service towards OAuth2 token standard",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+    }
+    project = Project(
+        name="SD3", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[existing_dir],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Genuinely distinct — no meaningful word overlap with existing
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [{
+            "op": "create",
+            "text": "Reduce database query latency via connection pooling",
+            "priority": "high",
+            "success_evidence": "p99 query time below 50ms",
+            "retirement_condition": "Latency stable for 2 cycles",
+        }],
+    })
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-existing2"]
+    assert len(new_dirs) == 1, "Distinct direction should have been created"
