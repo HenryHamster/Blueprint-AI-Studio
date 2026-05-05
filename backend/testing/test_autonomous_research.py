@@ -525,6 +525,136 @@ async def test_pipelining_allows_first_extra_when_no_prior(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_failed_resurrection_eligible_blocks_direction(db_session):
+    """Regression for race 2026-05-05 (3d4bc05a + 88c7d5c8 on d-3878da01):
+    reaper marks an infra-failed task FAILED at T+0; ~5s later the autonomous
+    spawn loop fires and saw no active research on the direction → spawned a
+    duplicate; ~60s later the reaper resurrected the original FAILED task,
+    leaving two parallel research cycles on the same direction.
+
+    Fix: include FAILED-but-resurrection-eligible tasks in the active_research
+    SELECT so they keep blocking the direction until the reaper either
+    resurrects them (back to QUEUED, still blocks) or 2h elapses (matches
+    reaper.py:_infra_lookback)."""
+    project = Project(
+        name="FAILED resurrection-eligible blocks",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-resur001")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # FAILED + within 2h lookback + AGENT_TIMEOUT (in INFRA_CLASSES) +
+    # never resurrected. This is the exact shape of 3d4bc05a's row when
+    # the duplicate spawn fired in production.
+    failed = Task(
+        project_id=project.id,
+        title="Research: failed but eligible",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-resur001"}],
+        context={"failure_category": "AGENT_TIMEOUT"},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 1, (
+        "FAILED + resurrection-eligible must keep the direction busy until "
+        "reaper resolves it (resurrect or age-out at 2h)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_already_resurrected_does_not_block_direction(db_session):
+    """Once a FAILED task has been resurrected once (_resurrection_count=1),
+    the reaper will not resurrect it again — so it shouldn't keep blocking
+    the direction. Genuinely-dead-after-second-attempt tasks should let
+    the next research cycle run."""
+    project = Project(
+        name="FAILED already-resurrected releases",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-resur002")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = Task(
+        project_id=project.id,
+        title="Research: already resurrected once",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-resur002"}],
+        # Already resurrected once; reaper.py:1818 skips on _resurrection_count>=1
+        context={"failure_category": "AGENT_TIMEOUT", "_resurrection_count": 1},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 2, (
+        "Already-resurrected FAILED task should NOT block — reaper won't "
+        "resurrect it again, so direction is free for new research"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_non_infra_does_not_block_direction(db_session):
+    """A FAILED task with a non-infra failure class (e.g., CODE_ERROR) is
+    not eligible for resurrection — the reaper would not bring it back —
+    so it should not keep the direction busy. This matches reaper.py:1816
+    which only resurrects failure_category in INFRA_CLASSES."""
+    project = Project(
+        name="FAILED non-infra releases",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-resur003")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    failed = Task(
+        project_id=project.id,
+        title="Research: failed with code error",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-resur003"}],
+        context={"failure_category": "CODE_ERROR"},
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(failed)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 2, (
+        "Non-infra FAILED task should NOT block — reaper won't resurrect "
+        "CODE_ERROR / OOM / pr_closed_unmerged failures"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. _spawn_research_task — Rate Limits
 # ─────────────────────────────────────────────────────────────────────────────

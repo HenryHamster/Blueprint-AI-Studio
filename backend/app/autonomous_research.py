@@ -119,14 +119,42 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Build set of direction IDs that already have an active research cycle.
     # Include EVALUATING — the agent is done but children are still merging,
     # so the direction is still being worked on and shouldn't be re-spawned.
+    #
+    # Also include FAILED-but-resurrection-eligible tasks. The reaper's
+    # Step 5 sweep at reaper.py:~1782 resurrects infra-class FAILED tasks
+    # within a 2h lookback once infrastructure recovers. Without this
+    # branch, a brief gap opens between "reaper marks FAILED" and "reaper
+    # resurrects" — typically ~60s — during which active_research returns
+    # empty and the autonomous-spawn loop slips a duplicate research onto
+    # the same direction. Production 2026-05-05 (3d4bc05a + 88c7d5c8 on
+    # d-3878da01): 5s after reaper marked 3d4bc05a FAILED, the spawn loop
+    # fired 88c7d5c8 on the same direction; reaper resurrected 3d4bc05a
+    # 66s later, leaving two parallel research cycles. Match the reaper's
+    # own resurrection criteria here so the windows align exactly:
+    #   - Task.updated_at within 2h (matches _infra_lookback)
+    #   - failure_category in INFRA_CLASSES (resurrection-eligible class)
+    #   - _resurrection_count not yet set (can still be resurrected once)
+    # Genuinely-dead tasks (CODE_ERROR / OOM / pr_closed_unmerged /
+    # already-resurrected) won't match and won't block.
+    from sqlalchemy import or_, and_  # noqa: PLC0415
+    from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
     busy_direction_ids: set = set()
+    resurrection_lookback = now - timedelta(hours=2)
     active_research = (await session.execute(
         select(Task).where(
             Task.project_id == project.id,
-            Task.status.in_([
-                TaskStatus.QUEUED, TaskStatus.PROVISIONING,
-                TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
-            ]),
+            or_(
+                Task.status.in_([
+                    TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+                ]),
+                and_(
+                    Task.status == TaskStatus.FAILED,
+                    Task.updated_at >= resurrection_lookback,
+                    Task.context["failure_category"].as_string().in_(list(INFRA_CLASSES)),
+                    ~Task.context.has_key("_resurrection_count"),
+                ),
+            ),
         )
     )).scalars().all()
     evaluating_timeout_minutes = _runtime_config.get("evaluating_pipeline_timeout_minutes", 30)

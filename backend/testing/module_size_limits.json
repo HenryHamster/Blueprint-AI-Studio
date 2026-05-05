@@ -17,7 +17,7 @@
     "routers/agent.py": 3100,
     "services.py": 2150,
     "routers/agent_status.py": 2400,
-    "autonomous_research.py": 2100,
+    "autonomous_research.py": 2150,
     "research_completion.py": 2050,
     "strategic_completion.py": 1500,
     "rollup_management.py": 2150,
