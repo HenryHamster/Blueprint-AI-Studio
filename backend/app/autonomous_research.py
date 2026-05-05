@@ -130,6 +130,36 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
     )).scalars().all()
     evaluating_timeout_minutes = _runtime_config.get("evaluating_pipeline_timeout_minutes", 30)
+
+    # Pipelining cap: when a long-EVALUATING parent triggers the staleness
+    # skip below, we still want to allow at most ONE additional pipelined
+    # research per direction within the configured window. Without this,
+    # every spawn cycle (~6 min) saw the same EVALUATING-stale parent and
+    # spawned a fresh research — the parent's updated_at never bumps, so
+    # the skip stays armed and pipelining is uncapped (incident
+    # 2026-05-04: research 779af581 stuck EVALUATING for 17.8h triggered
+    # three duplicate research spawns at 22:50/22:56/23:07 on direction
+    # d-3878da01, all manually cancelled). The window default of 240 min
+    # accounts for legitimately long-running research/merge cycles where
+    # a second concurrent spawn would risk big merge conflicts.
+    pipelining_window_minutes = _runtime_config.get(
+        "research_pipelining_window_minutes", 240,
+    )
+    pipelining_cutoff = now - timedelta(minutes=pipelining_window_minutes)
+    recently_spawned = (await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.created_at >= pipelining_cutoff,
+        )
+    )).scalars().all()
+    recent_research_by_direction: dict[str, list] = {}
+    for rt in recently_spawned:
+        rpayload = rt.first_payload
+        if rpayload.get("type") == "research":
+            rdid = rpayload.get("current_direction_id")
+            if rdid:
+                recent_research_by_direction.setdefault(rdid, []).append(rt.id)
+
     for t in active_research:
         payload = t.first_payload
         if payload.get("type") == "research":
@@ -140,14 +170,25 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 continue
             # Pipeline new research alongside long-EVALUATING parents: once children
             # have been merging past the timeout, allow a fresh cycle on the same
-            # direction. Dedup in research_completion handles overlapping findings.
+            # direction. Capped at 1 additional spawn per pipelining window so
+            # truly stuck parents (e.g., 17h EVALUATING) don't get a fresh spawn
+            # every cycle. Dedup in research_completion handles overlapping
+            # findings on the one allowed pipelined spawn.
             if t.status == TaskStatus.EVALUATING and t.updated_at:
                 updated = t.updated_at
                 if updated.tzinfo is not None:
                     updated = updated.replace(tzinfo=None)
                 age_minutes = (now - updated).total_seconds() / 60
                 if age_minutes >= evaluating_timeout_minutes:
-                    continue
+                    # Count OTHER recent research on this direction (any
+                    # status, including CANCELLED) — exclude self.
+                    recent_others = [
+                        rid for rid in recent_research_by_direction.get(current_did, [])
+                        if rid != t.id
+                    ]
+                    if not recent_others:
+                        continue  # No prior pipelined spawn — allow one
+                    # Already pipelined within the window — treat as busy.
             busy_direction_ids.add(current_did)
 
     active_directions = await _process_direction_lifecycle(

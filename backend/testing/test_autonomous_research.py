@@ -413,6 +413,118 @@ async def test_evaluating_releases_direction_after_timeout(db_session):
     assert len(research) == 2, "Stale EVALUATING should allow pipelined new research"
 
 
+@pytest.mark.asyncio
+async def test_pipelining_capped_at_one_extra_per_window(db_session):
+    """Regression for incident 2026-05-04: when a long-EVALUATING parent is
+    stuck (e.g., 17.8h) and stays EVALUATING-stale, the spawn loop used to
+    spawn a fresh research every cycle (~6 min) on the same direction —
+    each new spawn doesn't bump the parent's updated_at, so the staleness
+    skip stays armed. Direction d-3878da01 had 779af581 stuck and three
+    duplicate spawns (8e15d86a / 872f848c / bfbaf4d3), all manually cancelled.
+
+    Fix: cap pipelining at 1 additional research per direction within the
+    pipelining window (default 240 min). Recent CANCELLED research counts
+    against the cap so cancel-respawn loops can't bypass it."""
+    from app.shared_state import runtime_config as _runtime_config
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    _runtime_config["research_pipelining_window_minutes"] = 240
+    project = Project(
+        name="Pipelining Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipecap")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Stuck EVALUATING parent (stale > 30min — would normally allow pipelining).
+    parent = Task(
+        project_id=project.id,
+        title="Research: stuck parent",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-pipecap"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    # Already-spawned pipelined research (CANCELLED — but recent, within window).
+    pipelined = Task(
+        project_id=project.id,
+        title="Research: pipelined recently, then cancelled",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-pipecap"}],
+        status=TaskStatus.CANCELLED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(pipelined)
+    await db_session.commit()
+
+    # Backdate parent's updated_at to make EVALUATING look stale.
+    from sqlalchemy import update as _update
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(_update(Task).where(Task.id == parent.id).values(updated_at=stale))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 2, (
+        f"Pipelining must be capped at 1 extra per direction per window "
+        f"(parent + 1 prior pipelined = 2 total; expected no new spawn). "
+        f"Got {len(research)} research tasks."
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipelining_allows_first_extra_when_no_prior(db_session):
+    """Confirms the cap doesn't over-block: when the parent is EVALUATING-stale
+    and NO other recent research exists on this direction, the FIRST pipelined
+    spawn is allowed (cap is at 1 extra, not 0)."""
+    from app.shared_state import runtime_config as _runtime_config
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    _runtime_config["research_pipelining_window_minutes"] = 240
+    project = Project(
+        name="Pipelining First Extra Allowed",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipefirst")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Research: stuck, no prior pipelined",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main",
+                   "current_direction_id": "d-pipefirst"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    from sqlalchemy import update as _update
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(_update(Task).where(Task.id == parent.id).values(updated_at=stale))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 2, (
+        "First pipelined spawn must be allowed when no prior pipelined research exists"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. _spawn_research_task — Rate Limits
 # ─────────────────────────────────────────────────────────────────────────────
