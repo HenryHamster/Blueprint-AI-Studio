@@ -2,6 +2,7 @@ import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
+import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
@@ -564,6 +565,15 @@ export function HeaderBar(props: HeaderBarProps) {
               </span>
             )}
           </button>
+        </div>
+
+        {/* Mobile-only autonomy control — full MetricsBar is desktop-only, but autonomy on/off must be reachable on mobile */}
+        <div className="md:hidden flex items-center mr-1">
+          <AutonomousStatus
+            onRefreshTasks={onRefresh}
+            wsRef={wsRef}
+            pauseReason={props.deployState?.reason ?? null}
+          />
         </div>
 
         {/* Mobile overflow menu — hidden on desktop */}
