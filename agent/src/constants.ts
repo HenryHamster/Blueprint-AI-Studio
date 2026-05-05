@@ -101,6 +101,26 @@ export const TEST_BASELINE_DOCKER_TIMEOUT = 600_000;
 // Self-review loop
 export const MAX_SELF_REVIEW_ATTEMPTS = 2;
 
+// Divergence detection thresholds for lint/test fix loops.
+// These are intentionally conservative — false-positive abandons waste more
+// than burning 1-2 extra iterations. Tune as data accumulates.
+// Jaccard: two consecutive error pairs must both be ≥ threshold to trigger.
+// 0.8 (not 0.7) to avoid false-positives from boilerplate tokens shared across
+// all failures of a given runner (e.g. "[npm test (root)]:" prefix inflates
+// Jaccard similarity for short errors that actually differ semantically).
+export const FIX_LOOP_JACCARD_THRESHOLD = 0.8;
+// Diff revert: fraction of prior iteration's added lines that must vanish in
+// the current iteration before flagging as a revert.
+export const FIX_LOOP_DIFF_REVERT_THRESHOLD = 0.8;
+
+// Check-runaway watchdog thresholds for Claude-driven code-change flows.
+// Intentionally lenient vs. wrapper-driven loops — Claude has more context per
+// attempt, so false-positive kills are more expensive. Tune after observing
+// dashboard data. Set DISABLE_CHECK_RUNAWAY_WATCHDOG=1 to disable entirely.
+export const MAX_CLAUDE_CHECK_INVOCATIONS = 10; // hard ceiling: kill regardless of pattern
+export const CHECK_RUNAWAY_MIN_INVOCATIONS = 6; // minimum calls before consecutive-failure check
+export const CHECK_RUNAWAY_CONSECUTIVE_FAILURES = 3; // last-N failures triggers kill
+
 // Scope overflow detection — 2× the upper bound of each scope range
 export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
   small: 6,   // small expects 1-3 files; warn at >6

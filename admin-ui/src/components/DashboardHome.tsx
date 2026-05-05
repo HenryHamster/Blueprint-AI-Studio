@@ -20,6 +20,7 @@ import { MediumScopeWidget, type MediumScopeMeasurement } from './MediumScopeWid
 import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
 import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget';
+import { FixLoopConvergenceWidget } from './FixLoopConvergenceWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
@@ -816,6 +817,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
           {/* Section 1d3: Task Duration Percentiles */}
           {!loading && <TaskDurationWidget data={taskDurationStats} />}
+
+          {/* Section 1d4: Fix-Loop Convergence */}
+          {!loading && <FixLoopConvergenceWidget />}
 
           {/* Section 1d2: Review Rejection Reason Breakdown */}
           {!loading && (() => {

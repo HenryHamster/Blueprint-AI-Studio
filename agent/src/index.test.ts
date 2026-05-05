@@ -69,8 +69,12 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
+import {
+  drainFixLoopEventBuffer,
+  _resetFixLoopEventStateForTesting,
+} from './fix-loop-events.js';
 import { MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS, TOOL_USE_STALL_TIMEOUT_MS, CLAUDE_STREAM_STALL_MS } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -595,6 +599,7 @@ describe('errorFingerprint', () => {
 
 describe('lintFixLoop early exit on identical errors', () => {
   beforeEach(() => {
+    _resetFixLoopEventStateForTesting();
     vi.mocked(execFileSync).mockReset();
     vi.mocked(spawn).mockImplementation(() => {
       const proc = {
@@ -638,6 +643,250 @@ describe('lintFixLoop early exit on identical errors', () => {
     await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
     const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
     expect(npmCalls).toBe(MAX_LINT_FIX_ATTEMPTS);  // tracks the constant rather than hardcoding 3
+  });
+
+  it('emits one fix-loop telemetry event per iteration with terminal exit_reason on the final attempt', async () => {
+    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') {
+        callCount++;
+        throw new Error(`eslint error variant ${callCount}`);
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    const events = drainFixLoopEventBuffer();
+    expect(events.length).toBe(MAX_LINT_FIX_ATTEMPTS);
+    expect(events.map(e => e.iteration)).toEqual(
+      Array.from({ length: MAX_LINT_FIX_ATTEMPTS }, (_, i) => i + 1),
+    );
+    expect(events.every(e => e.loop === 'lint')).toBe(true);
+    expect(events.every(e => e.source === 'agent_emitted')).toBe(true);
+    // All but the last are mid-loop (in_progress); the last is terminal.
+    for (let i = 0; i < events.length - 1; i++) {
+      expect(events[i].exit_reason).toBe('in_progress');
+    }
+    expect(events[events.length - 1].exit_reason).toBe('max_attempts');
+    // Each event carries an error_tail and a fingerprint hash.
+    expect(events[0].error_tail).toContain('eslint');
+    expect(events[0].fingerprint_hash).toMatch(/^[0-9a-f]{16}$/);
+  });
+});
+
+// ── jaccardSimilarity unit tests ─────────────────────────────────────────────
+describe('jaccardSimilarity', () => {
+  it('returns 1 for identical strings', () => {
+    expect(jaccardSimilarity('foo bar baz', 'foo bar baz')).toBe(1);
+  });
+
+  it('returns 0 for completely disjoint strings', () => {
+    expect(jaccardSimilarity('alpha beta', 'gamma delta')).toBe(0);
+  });
+
+  it('returns 1 for two empty strings', () => {
+    expect(jaccardSimilarity('', '')).toBe(1);
+  });
+
+  it('returns a value ≥ 0.7 for near-identical errors differing only in a line number', () => {
+    const a = 'TypeError foo is undefined at line 42 in bar ts';
+    const b = 'TypeError foo is undefined at line 47 in bar ts';
+    expect(jaccardSimilarity(a, b)).toBeGreaterThanOrEqual(0.7);
+  });
+
+  it('returns a value < 0.7 for clearly different errors', () => {
+    const a = 'TypeError foo is undefined at line 42';
+    const b = 'SyntaxError unexpected token semicolon in completely different module';
+    expect(jaccardSimilarity(a, b)).toBeLessThan(0.7);
+  });
+});
+
+// ── detectLoopDivergence unit tests ──────────────────────────────────────────
+describe('detectLoopDivergence', () => {
+  it('returns null when history has fewer than 3 entries', () => {
+    expect(detectLoopDivergence(['fp1', 'fp2'], ['e1', 'e2'], null, null)).toBeNull();
+  });
+
+  it('detects oscillation: A -> B -> A fingerprint pattern', () => {
+    const fps = ['fpA', 'fpB', 'fpA'];
+    const errs = ['error A text', 'error B text', 'error A text'];
+    expect(detectLoopDivergence(fps, errs, null, null)).toBe('divergence_oscillation');
+  });
+
+  it('detects Jaccard-similar errors across two consecutive pairs', () => {
+    // Each error differs by only 1 token out of 10 — Jaccard ≈ 9/11 ≈ 0.82 > threshold
+    const base = 'TypeError property foo undefined at baz module context error';
+    const errs = [`${base} one`, `${base} two`, `${base} thr`];
+    const fps = errs.map((_e, i) => `fp${i}`);  // all distinct fingerprints
+    expect(detectLoopDivergence(fps, errs, null, null)).toBe('divergence_similar_error');
+  });
+
+  it('detects diff revert when ≥ 80% of previous iteration lines vanish', () => {
+    const prevDiff = { added: new Set(['line_a', 'line_b', 'line_c', 'line_d', 'line_e']), removed: new Set<string>() };
+    const currDiff = { added: new Set(['line_x']), removed: new Set<string>() };  // all prev lines gone
+    const fps = ['fp1', 'fp2', 'fp3'];
+    const errs = ['error 1', 'error 2', 'error 3'];
+    expect(detectLoopDivergence(fps, errs, prevDiff, currDiff)).toBe('divergence_diff_revert');
+  });
+
+  it('does not flag diff revert when < 80% of previous lines vanish', () => {
+    const prevDiff = { added: new Set(['line_a', 'line_b', 'line_c', 'line_d', 'line_e']), removed: new Set<string>() };
+    const currDiff = { added: new Set(['line_a', 'line_b', 'line_x']), removed: new Set<string>() };  // 3/5 = 60% gone
+    const fps = ['fp1', 'fp2', 'fp3'];
+    const errs = ['error 1', 'error 2', 'error 3'];
+    expect(detectLoopDivergence(fps, errs, prevDiff, currDiff)).toBeNull();
+  });
+});
+
+// ── lintFixLoop divergence detection ─────────────────────────────────────────
+describe('lintFixLoop divergence detection', () => {
+  const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
+
+  beforeEach(() => {
+    _resetFixLoopEventStateForTesting();
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execSync).mockReset();
+    vi.mocked(execSync).mockReturnValue('');
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') setImmediate(() => { cb(0); });
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+  });
+
+  it('exits with divergence_oscillation when errors oscillate A→B→A', async () => {
+    const errors = ['eslint: no-unused-vars unique_A', 'eslint: missing-semicolon unique_B', 'eslint: no-unused-vars unique_A'];
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.exitReason).toBe('divergence_oscillation');
+    const events = drainFixLoopEventBuffer();
+    expect(events.some(e => e.exit_reason === 'divergence_oscillation')).toBe(true);
+  });
+
+  it('exits with divergence_similar_error when errors are Jaccard-similar across 3 iterations', async () => {
+    // Each error differs by 1 token out of 10 — Jaccard ≈ 9/11 ≈ 0.82 > 0.8 threshold.
+    // The unique suffixes ensure fingerprints differ (no early_unchanged trigger).
+    const base = 'TypeError property foo undefined at baz module context error';
+    const errors = [`${base} alpha`, `${base} bravo`, `${base} charlie`];
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.exitReason).toBe('divergence_similar_error');
+    const events = drainFixLoopEventBuffer();
+    expect(events.some(e => e.exit_reason === 'divergence_similar_error')).toBe(true);
+  });
+
+  it('exits with divergence_diff_revert when second Claude iteration reverts first', async () => {
+    const errors = ['Error alpha unique_one', 'Error beta unique_two', 'Error gamma unique_three'];
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+    // First diff capture: prevDiff has 5 added lines
+    // Second diff capture: currDiff has none of those lines (full revert)
+    let diffCallCount = 0;
+    vi.mocked(execSync).mockImplementation((cmd: unknown) => {
+      if (typeof cmd === 'string' && cmd.includes('git diff HEAD --no-color')) {
+        diffCallCount++;
+        if (diffCallCount === 1) return '+line_a\n+line_b\n+line_c\n+line_d\n+line_e\n';
+        return '+line_x\n+line_y\n';  // all 5 prev lines gone — 100% revert
+      }
+      return '';
+    });
+
+    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.exitReason).toBe('divergence_diff_revert');
+    const events = drainFixLoopEventBuffer();
+    expect(events.some(e => e.exit_reason === 'divergence_diff_revert')).toBe(true);
+  });
+
+  it('does not fire divergence on first 2 iterations — needs 3 entries in history', async () => {
+    // With only 2 distinct errors (A then B then B again), early_unchanged fires at attempt 2
+    // because B==B; divergence never gets to check (history has only 2 entries when B first appears).
+    const errors = ['Error alpha unique_A', 'Error bravo unique_B'];
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    // early_unchanged fires at attempt 2 (B == B); divergence never triggered
+    expect(result.exitReason).toBe('early_unchanged');
+  });
+});
+
+// ── testFixLoop divergence detection ─────────────────────────────────────────
+describe('testFixLoop divergence detection', () => {
+  const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+
+  beforeEach(() => {
+    _resetFixLoopEventStateForTesting();
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execSync).mockReset();
+    vi.mocked(execSync).mockReturnValue('');
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('exits with divergence_oscillation when test failures oscillate A→B→A', async () => {
+    const errorA = 'FAIL test.ts > alpha unique_error_A';
+    const errorB = 'FAIL test.ts > beta unique_error_B';
+    const errorSequence = [errorA, errorB, errorA];
+    let callCount = 0;
+    vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
+      const cmdStr = String(cmd);
+      const args = Array.isArray(argsRaw) ? argsRaw.map(String) : [];
+      const isNpmInstall = cmdStr === 'npm' && (args[0] === 'ci' || args[0] === 'install');
+      const stderrCbs: ((d: Buffer) => void)[] = [];
+      const failStderr = (!isNpmInstall && cmdStr === 'npm') ? errorSequence[Math.min(callCount++, errorSequence.length - 1)] : null;
+      const proc = {
+        pid: 100 + callCount,
+        stderr: {
+          on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+            if (event === 'data') stderrCbs.push(cb);
+          }),
+        },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              if (failStderr !== null) for (const scb of stderrCbs) scb(Buffer.from(failStderr));
+              cb(failStderr !== null ? 1 : 0);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    const events = drainFixLoopEventBuffer();
+    expect(events.some(e => e.exit_reason === 'divergence_oscillation')).toBe(true);
   });
 });
 

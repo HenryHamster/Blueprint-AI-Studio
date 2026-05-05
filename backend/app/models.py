@@ -314,6 +314,18 @@ class Task(SQLModel, table=True):
     # Shared memory/context for the agent during execution
     context: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")))
 
+    # Per-task fix-loop telemetry. Shape:
+    #   {"lint": [FixLoopAttempt, ...], "test": [...], "check": [...]}
+    # Each FixLoopAttempt is a loose dict validated at the ingest boundary by
+    # ``app.fix_loop_telemetry.FixLoopEventIn`` (loop, iteration, fingerprint_hash,
+    # error_tail, change_summary, exit_reason, source, started_at, ended_at).
+    # Append-or-replace by (loop, iteration); each per-loop list capped so a
+    # runaway can't blow the column up. JSONB rather than a side table because
+    # the per-task attempt count is small (single digits typical, ~50 max
+    # capped) and the column is read together with the rest of Task on the
+    # admin drilldown endpoint.
+    fix_loop_history: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")))
+
     # Stores parsed plan output from plan-type tasks (for debugging/admin visibility)
     plan_output: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSONB, nullable=True))
 

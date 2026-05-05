@@ -2313,6 +2313,21 @@ async def agent_heartbeat(
             # the column-counter optimisation we just made.
             task.context = ctx
 
+    if req.fix_loop_events:
+        # Fold optional fix-loop telemetry events into Task.fix_loop_history.
+        # Validation lives at the Pydantic boundary (FixLoopEventIn); invalid
+        # entries are dropped silently so a malformed event from a forward-rolled
+        # agent doesn't 422 the whole heartbeat.
+        from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events  # noqa: PLC0415
+        validated: list[FixLoopEventIn] = []
+        for raw in req.fix_loop_events:
+            try:
+                validated.append(FixLoopEventIn(**raw))
+            except Exception as exc:
+                logger.info("[FIX_LOOP] dropping invalid event for task %s: %s", req.task_id, exc)
+        if validated:
+            apply_fix_loop_events(task, validated)
+
     session.add(task)
     await session.commit()
 

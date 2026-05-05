@@ -58,6 +58,11 @@ class AgentStatusPayload(BaseModel):
     # (review_pipeline cap-enforcer drops excess); each verify list capped
     # 10 entries; each string fields capped to keep context lean.
     fix_agent_responses: List[Dict[str, Any]] | None = Field(None, max_length=5)
+    # Fix-loop telemetry events. Same shape as HeartbeatRequest.fix_loop_events;
+    # accepting on the status endpoint too lets the agent flush a final
+    # terminal event on the same call as a PR open / failure update.
+    # Validated by ``app.fix_loop_telemetry``.
+    fix_loop_events: List[Dict[str, Any]] | None = Field(None, max_length=20)
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -89,6 +94,12 @@ class HeartbeatRequest(BaseModel):
     # heartbeat's value serves as a post-mortem when the reaper later kills
     # the task for heartbeat silence (AGENT_TIMEOUT diagnosis).
     tool_trace: List[ToolTraceEntry] | None = None
+    # Fix-loop telemetry events emitted by the agent each iteration of a
+    # lint/test/check fix loop. Validated by ``app.fix_loop_telemetry``;
+    # piggybacks on heartbeat so we don't need a separate ingest endpoint.
+    # Optional + capped so older agents that don't emit this continue to
+    # work, and a runaway loop can't burst-emit thousands per heartbeat.
+    fix_loop_events: List[Dict[str, Any]] | None = Field(None, max_length=20)
 
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

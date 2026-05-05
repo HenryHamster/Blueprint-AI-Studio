@@ -991,6 +991,40 @@ async def get_project_system_maturity(
     ]
 
 
+# GET /api/admin/tasks/{task_id}/fix-loop-history
+# ---------------------------------------------------------------------------
+
+@router.get("/tasks/{task_id}/fix-loop-history")
+async def get_task_fix_loop_history(
+    task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the fix-loop telemetry persisted on a task.
+
+    Per-loop attempt arrays + a small summary block (attempts count and
+    last_exit_reason for lint/test/check). Auth follows the surrounding
+    project drilldown pattern: load the task, then verify the caller has
+    access to its project.
+    """
+    from app.fix_loop_telemetry import summarize_fix_loop_history  # noqa: PLC0415
+
+    task = (await session.execute(
+        select(Task).where(Task.id == task_id)
+    )).scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    await _get_user_project(task.project_id, current_user["user_id"], session)
+
+    history = task.fix_loop_history or {}
+    return {
+        "task_id": str(task.id),
+        "fix_loop_history": history,
+        "summary": summarize_fix_loop_history(history),
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /api/admin/projects/{project_id}/recent-findings
 # ---------------------------------------------------------------------------

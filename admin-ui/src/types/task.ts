@@ -59,6 +59,19 @@ export interface Task {
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
   estimated_cost_usd?: number | null;
+  fix_loop_history?: Record<string, FixLoopAttempt[]> | null;
+}
+
+export interface FixLoopAttempt {
+  loop: string;
+  iteration: number;
+  fingerprint_hash?: string | null;
+  error_tail?: string | null;
+  change_summary?: string | null;
+  exit_reason?: string | null;
+  source?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
 }
 
 export interface SerialConsoleResponse {

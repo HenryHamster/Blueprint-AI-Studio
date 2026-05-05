@@ -3740,3 +3740,113 @@ async def _compute_digest(
         "prediction_calibration_note": prediction_calibration["note"] if prediction_calibration else None,
         "prediction_calibration_sample_count": prediction_calibration["sample_count"] if prediction_calibration else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fix-loop convergence aggregate endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/fix-loop-convergence")
+async def get_fix_loop_convergence(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate fix-loop telemetry across recently-completed/failed tasks.
+
+    Returns per-loop average iterations, convergence rate, divergence reason
+    histogram, and iteration-count distribution suitable for the dashboard
+    convergence widget.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(Task.id, Task.project_id, Task.status, Task.fix_loop_history))
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    result = await session.execute(stmt)
+    tasks = result.scalars().all()
+
+    # Only consider tasks that have at least one fix-loop event recorded.
+    tasks_with_history = [t for t in tasks if t.fix_loop_history]
+
+    loop_names = ("lint", "test", "check")
+
+    # Per-loop bucket: list of (iterations, exit_reason) tuples
+    per_loop: Dict[str, List[tuple]] = {l: [] for l in loop_names}
+
+    for task in tasks_with_history:
+        history = task.fix_loop_history or {}
+        for loop in loop_names:
+            bucket = history.get(loop) or []
+            if not bucket:
+                continue
+            iterations = len(bucket)
+            # Terminal exit reason is the last non-in_progress entry, else last entry.
+            last_exit: Optional[str] = None
+            for ev in reversed(bucket):
+                reason = ev.get("exit_reason") if isinstance(ev, dict) else None
+                if reason and reason != "in_progress":
+                    last_exit = reason
+                    break
+            if last_exit is None and bucket:
+                last_exit = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+            per_loop[loop].append((iterations, last_exit))
+
+    def _aggregate_loop(entries: List[tuple]) -> Dict[str, Any]:
+        if not entries:
+            return {
+                "task_count": 0,
+                "avg_iterations": None,
+                "convergence_rate": None,
+                "exit_reason_counts": {},
+                "iteration_distribution": {},
+            }
+        total_tasks = len(entries)
+        total_iterations = sum(n for n, _ in entries)
+        avg_iterations = round(total_iterations / total_tasks, 2)
+
+        converged = sum(1 for _, r in entries if r == "passed")
+        convergence_rate = round(converged / total_tasks, 3)
+
+        exit_reason_counts: Dict[str, int] = {}
+        for _, reason in entries:
+            key = reason or "unknown"
+            exit_reason_counts[key] = exit_reason_counts.get(key, 0) + 1
+
+        # Iteration distribution: bucket by count (1, 2, 3, 4+)
+        dist: Dict[str, int] = {"1": 0, "2": 0, "3": 0, "4+": 0}
+        for n, _ in entries:
+            if n == 1:
+                dist["1"] += 1
+            elif n == 2:
+                dist["2"] += 1
+            elif n == 3:
+                dist["3"] += 1
+            else:
+                dist["4+"] += 1
+
+        return {
+            "task_count": total_tasks,
+            "avg_iterations": avg_iterations,
+            "convergence_rate": convergence_rate,
+            "exit_reason_counts": exit_reason_counts,
+            "iteration_distribution": dist,
+        }
+
+    return {
+        "window_hours": hours,
+        "tasks_scanned": len(tasks),
+        "tasks_with_fix_loops": len(tasks_with_history),
+        "lint": _aggregate_loop(per_loop["lint"]),
+        "test": _aggregate_loop(per_loop["test"]),
+        "check": _aggregate_loop(per_loop["check"]),
+    }

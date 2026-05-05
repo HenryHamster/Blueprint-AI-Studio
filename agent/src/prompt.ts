@@ -568,17 +568,15 @@ cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
 OP="\${1:-}"
 shift || true
-[ "$OP" != "open" ] && { echo "Usage: ./pr open --title <title> --body <body> [--skip-check]"; exit 2; }
+[ "$OP" != "open" ] && { echo "Usage: ./pr open --title <title> --body <body> [--with-tests]"; exit 2; }
 
 TITLE=""
 BODY=""
-SKIP_CHECK=0
 WITH_TESTS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --title) TITLE="$2"; shift 2 ;;
     --body) BODY="$2"; shift 2 ;;
-    --skip-check) SKIP_CHECK=1; shift ;;
     --with-tests) WITH_TESTS=1; shift ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -586,23 +584,37 @@ done
 
 [ -z "$TITLE" ] && { echo "Error: --title is required" >&2; exit 2; }
 
+${cfg.testsOnMainBranch ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
+# The agent must not be able to skip backend tests on main-branch tasks.
+_BASE_GATE="${cfg.baseBranch}"
+_CMT_GATE=""
+if git rev-parse --verify "origin/$_BASE_GATE" >/dev/null 2>&1; then
+  _CMT_GATE=$(git diff --name-only "origin/$_BASE_GATE...HEAD" 2>/dev/null || true)
+elif git rev-parse --verify "$_BASE_GATE" >/dev/null 2>&1; then
+  _CMT_GATE=$(git diff --name-only "$_BASE_GATE...HEAD" 2>/dev/null || true)
+fi
+_UNC_GATE=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
+_CHG_GATE=$(printf '%s\\n%s\\n' "$_CMT_GATE" "$_UNC_GATE" | sort -u | grep -v '^$' || true)
+if printf '%s\\n' "$_CHG_GATE" | grep -q '^backend/'; then
+  echo "[pr] backend/ touched on main — forcing WITH_TESTS=1 (mandatory test gate)"
+  WITH_TESTS=1
+fi
+` : ''}
 # 1. Run ./check as gate (lint always; tests on main branch when --with-tests
 #    OR on review-fix path that touches backend changes).
-if [ "$SKIP_CHECK" = "0" ]; then
-  # Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
-  # aborts on an empty array expansion, so just call ./check directly.
-  if [ "$WITH_TESTS" = "1" ]; then
-    if ! ./check test; then
-      echo ""
-      echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
-      exit 1
-    fi
-  else
-    if ! ./check; then
-      echo ""
-      echo "[pr] ./check failed — fix lint/build then re-run ./pr open."
-      exit 1
-    fi
+# Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
+# aborts on an empty array expansion, so just call ./check directly.
+if [ "$WITH_TESTS" = "1" ]; then
+  if ! ./check test; then
+    echo ""
+    echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
+    exit 1
+  fi
+else
+  if ! ./check; then
+    echo ""
+    echo "[pr] ./check failed — fix lint/build then re-run ./pr open."
+    exit 1
   fi
 fi
 

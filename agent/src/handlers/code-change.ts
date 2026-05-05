@@ -107,7 +107,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   //    making edits, running ./check until green, and calling ./pr open
   //    + ./done to ship.
   const { exitCode, allOutput } = await runClaudeCode(
-    prompt, ws, statusRef, model, effort, disallowedTools,
+    prompt, ws, statusRef, model, effort, disallowedTools, true,
   );
 
   // 2b. Rotate OAuth credentials if Claude refreshed its tokens during

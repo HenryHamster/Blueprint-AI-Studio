@@ -52,7 +52,6 @@ export interface StandardHandlerOpts {
   noChangesMessage?: string;
   runLintFix?: boolean;
   runTestFix?: boolean;
-  failOnTestFailure?: boolean;
   captureBaseline?: boolean;
   runSelfReview?: boolean;
   runSmallScopeAnalysis?: boolean;
@@ -153,9 +152,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     runSmallScopeAnalysis = false,
     includeTaskTypeHints = true,
   } = opts;
-  // commitPrefix, prTitlePrefix, runLintFix, failOnTestFailure, runSelfReview,
-  // lintContext, issueReference, relatedFiles, runMigrationCheck are no
-  // longer wrapper-driven (Claude owns its own loop via ./check + ./pr).
+  // commitPrefix, prTitlePrefix, runLintFix, runSelfReview, lintContext,
+  // issueReference, relatedFiles, runMigrationCheck are no longer
+  // wrapper-driven (Claude owns its own loop via ./check + ./pr).
   // They remain in StandardHandlerOpts so existing call-sites compile but
   // are intentionally ignored here.
 
@@ -466,7 +465,6 @@ export async function handleCreate(
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
-    failOnTestFailure: true,
     captureBaseline: true,
     runSelfReview: true,
     runSmallScopeAnalysis: true,
@@ -535,7 +533,6 @@ ${rp}`,
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,
-    failOnTestFailure: true,
     captureBaseline: true,
     runSelfReview: true,
     lintContext: 'the refactored code',

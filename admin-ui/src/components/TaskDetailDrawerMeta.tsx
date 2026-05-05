@@ -6,6 +6,7 @@ import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
 import { authGet, API_BASE_URL, fetchTaskSerialConsole } from '../api';
 import type { SerialConsoleResponse } from '../types/task';
+import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
@@ -815,6 +816,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </div>
         </>
       )}
+
+      <TaskFixLoopPanel taskId={task.id} />
 
       {task.history && task.history.length > 0 && (
         <>

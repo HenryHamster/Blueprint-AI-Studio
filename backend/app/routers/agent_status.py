@@ -757,6 +757,19 @@ async def update_agent_status(
         ctx['_file_change_details'] = payload.file_change_details[:50]
         task.context = ctx
         flag_modified(task, 'context')
+    if payload.fix_loop_events:
+        # Fold optional fix-loop telemetry events into Task.fix_loop_history.
+        # Same loose-validation pattern as the heartbeat path: invalid entries
+        # log + drop instead of 422'ing the whole status update.
+        from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events  # noqa: PLC0415
+        validated: list[FixLoopEventIn] = []
+        for raw in payload.fix_loop_events:
+            try:
+                validated.append(FixLoopEventIn(**raw))
+            except Exception as exc:
+                logger.info("[FIX_LOOP] dropping invalid event for task %s: %s", payload.task_id, exc)
+        if validated:
+            apply_fix_loop_events(task, validated)
     session.add(task)
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts).

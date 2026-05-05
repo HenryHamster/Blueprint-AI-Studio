@@ -18,6 +18,20 @@ import {
   PRIOR_ATTEMPT_DIVERGENCE,
 } from './prompt.js';
 import {
+  type FixLoopEvent,
+  type FixLoopExitReason,
+  type FixLoopName,
+  pushFixLoopEvent,
+  drainFixLoopEventBuffer,
+  requeueFixLoopEvents,
+  resetCheckSynthesizerState,
+  synthesizeCheckFixLoopEvents,
+  fingerprintHash,
+  isCheckInvocation,
+  recordCheckOutcome,
+  getCheckRunawayStatus,
+} from './fix-loop-events.js';
+import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
   STALE_RESULT_RETRY_BASE_MS, STALE_RESULT_RETRY_MAX_MS,
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
@@ -33,6 +47,8 @@ import {
   RUFF_TIMEOUT,
   TEST_RUNNER_TIMEOUT, TEST_RUNNER_DOCKER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
   claudeTimeoutForEffort, MAX_OUTPUT_BYTES, TOOL_USE_STALL_TIMEOUT_MS,
+  FIX_LOOP_JACCARD_THRESHOLD, FIX_LOOP_DIFF_REVERT_THRESHOLD,
+  MAX_CLAUDE_CHECK_INVOCATIONS, CHECK_RUNAWAY_MIN_INVOCATIONS, CHECK_RUNAWAY_CONSECUTIVE_FAILURES,
 } from './constants.js';
 
 // ── Failure categories ───────────────────────────────────────────────────────
@@ -639,6 +655,20 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
   // ourselves (the same VM ran the prior role and is now running this one).
   // On cold roles there is no prior, so we send null.
   telemetry.prior_role_vm_id = isWarmStart ? (process.env.VM_INSTANCE_ID || null) : null;
+  // Final flush of any buffered fix-loop events before the terminal status
+  // post lands — heartbeats are best-effort, so this is the safety net that
+  // guarantees the per-task fix_loop_history is at least eventually accurate.
+  // Merge with any events the caller already passed in (rare, but explicit).
+  const flushedEvents = collectFixLoopEventsForFlush();
+  let mergedFixLoopEvents: unknown = (payload as { fix_loop_events?: unknown }).fix_loop_events;
+  if (flushedEvents.length > 0) {
+    const merged = Array.isArray(mergedFixLoopEvents)
+      ? [...(mergedFixLoopEvents as unknown[]), ...flushedEvents]
+      : flushedEvents;
+    // Backend caps the field at 20 per request — drop oldest first so the
+    // most recent terminal events (e.g. exit_reason='passed') always land.
+    mergedFixLoopEvents = merged.length > 20 ? merged.slice(-20) : merged;
+  }
   return {
     provider: PROVIDER,
     auth_mode: AUTH_MODE,
@@ -648,6 +678,7 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
     ...telemetry,
     ...payload,
     ...statusFlagsForTask(taskId),
+    ...(mergedFixLoopEvents !== undefined ? { fix_loop_events: mergedFixLoopEvents } : {}),
   };
 }
 
@@ -899,6 +930,25 @@ export function snapshotToolTrace(): ToolTraceEntry[] {
   return _toolTrace.slice();
 }
 
+// Drain accumulated fix-loop events for a heartbeat / status post. Also
+// runs the Claude-driven `./check` synthesizer over the current tool-trace
+// snapshot — it pushes any new events into the same buffer so a single
+// drain returns wrapper-emitted + synthesized events together.
+//
+// Capped at the backend's per-request limit (20). When more accumulate
+// between heartbeats, the buffer itself drops the oldest, so callers see
+// at most MAX_BUFFERED_EVENTS here.
+export function collectFixLoopEventsForFlush(): FixLoopEvent[] {
+  try {
+    const synthesized = synthesizeCheckFixLoopEvents(snapshotToolTrace());
+    for (const ev of synthesized) pushFixLoopEvent(ev);
+  } catch (e) {
+    // Synthesizer failures must not break the heartbeat. Log and carry on.
+    log(`fix-loop synthesizer failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return drainFixLoopEventBuffer();
+}
+
 /**
  * Clear the tool-trace ring buffer.
  *
@@ -986,19 +1036,26 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
   // unhandledRejection event, the agent just goes silent until the orchestrator
   // reaper kills it minutes later with no forensic record.
   (async () => {
+    const metrics = collectMetrics();
+    const fix_loop_events = collectFixLoopEventsForFlush();
     const start = Date.now();
     try {
-      const metrics = collectMetrics();
       await apiPost('/api/agent/heartbeat', {
         task_id: taskId,
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
         tool_trace: snapshotToolTrace(),
+        ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
       log(`Initial heartbeat failed: ${String(e)}`);
       traceHeartbeat('initial', start, Date.now(), 'err', String(e));
+      // Re-queue drained-but-undelivered events so the next heartbeat (or
+      // terminal status post) can carry them. Without this, a transient
+      // POST failure on the first tick silently drops the events emitted
+      // since the agent started.
+      if (fix_loop_events.length > 0) requeueFixLoopEvents(fix_loop_events);
     }
   })().catch((e: unknown) => { log(`Initial heartbeat outer error: ${String(e)}`); });
 
@@ -1010,15 +1067,16 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
     }
     heartbeatInFlight = true;
     const start = Date.now();
-    try {
-      const metrics = collectMetrics();
-      // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
-      if (metrics.cgroup_mb && metrics.cgroup_limit_mb) {
-        const memPct = metrics.cgroup_mb / metrics.cgroup_limit_mb;
-        if (memPct > 0.85) {
-          log(`WARNING: Memory at ${(memPct * 100).toFixed(0)}% of cgroup limit (${metrics.cgroup_mb}MB / ${metrics.cgroup_limit_mb}MB) — OOM kill imminent`);
-        }
+    const metrics = collectMetrics();
+    // Proactive OOM warning — SIGKILL from cgroup can't be caught, so warn while we still can
+    if (metrics.cgroup_mb && metrics.cgroup_limit_mb) {
+      const memPct = metrics.cgroup_mb / metrics.cgroup_limit_mb;
+      if (memPct > 0.85) {
+        log(`WARNING: Memory at ${(memPct * 100).toFixed(0)}% of cgroup limit (${metrics.cgroup_mb}MB / ${metrics.cgroup_limit_mb}MB) — OOM kill imminent`);
       }
+    }
+    const fix_loop_events = collectFixLoopEventsForFlush();
+    try {
       // Tighter heartbeat-specific retry/timeout (10s × 2 vs default 30s × 5).
       // Holding the in-flight mutex through the full 150s+ default chain on a
       // sustained 5xx run starves subsequent setInterval ticks — so the
@@ -1029,11 +1087,16 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         status_message: `[${metrics.heap_used_mb}MB] ${getMessage()}`,
         metrics,
         tool_trace: snapshotToolTrace(),
+        ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
       log(`Heartbeat failed: ${String(e)}`);
       traceHeartbeat('periodic', start, Date.now(), 'err', String(e));
+      // Re-queue drained events so a transient POST failure doesn't silently
+      // lose this tick's fix-loop telemetry. The next heartbeat (or the
+      // terminal status post) carries them.
+      if (fix_loop_events.length > 0) requeueFixLoopEvents(fix_loop_events);
       // 409 = row temporarily locked (skip_locked) — retry once after 5s.
       // Silently dropping heartbeats can let last_heartbeat go stale if the
       // status endpoint holds its FOR UPDATE lock for multiple heartbeat cycles.
@@ -1667,6 +1730,112 @@ export function errorFingerprint(msg: string): string {
   return msg.replace(/\s+/g, ' ').trim().slice(0, 2000);
 }
 
+// ── Divergence detection helpers ─────────────────────────────────────────────
+
+const _TOKEN_RE = /\w+/g;
+
+/** Jaccard token-set similarity between two strings. Range [0,1]. */
+export function jaccardSimilarity(a: string, b: string): number {
+  const tokA = new Set(a.toLowerCase().match(_TOKEN_RE) ?? []);
+  const tokB = new Set(b.toLowerCase().match(_TOKEN_RE) ?? []);
+  if (tokA.size === 0 && tokB.size === 0) return 1;
+  if (tokA.size === 0 || tokB.size === 0) return 0;
+  let intersection = 0;
+  for (const t of tokA) if (tokB.has(t)) intersection++;
+  return intersection / (tokA.size + tokB.size - intersection);
+}
+
+interface DiffLines { added: Set<string>; removed: Set<string> }
+
+/** Capture the set of added/removed lines in the working tree vs HEAD. */
+function captureDiffLines(): DiffLines {
+  const added = new Set<string>();
+  const removed = new Set<string>();
+  try {
+    const raw = execSync('git diff HEAD --no-color', { cwd: WORKSPACE, timeout: 10_000 }).toString();
+    let count = 0;
+    for (const line of raw.split('\n')) {
+      if (++count > 5000) break;
+      const content = line.slice(1).trim();
+      if (!content) continue;
+      if (line.startsWith('+') && !line.startsWith('+++')) added.add(content);
+      else if (line.startsWith('-') && !line.startsWith('---')) removed.add(content);
+    }
+  } catch { /* git unavailable or clean tree */ }
+  return { added, removed };
+}
+
+/**
+ * True when currDiff substantially undoes prevDiff — meaning that a large
+ * fraction of prevDiff's added lines have vanished in currDiff.
+ */
+function detectDiffRevert(prev: DiffLines, curr: DiffLines, threshold: number): boolean {
+  if (prev.added.size === 0) return false;
+  let vanished = 0;
+  for (const line of prev.added) if (!curr.added.has(line)) vanished++;
+  return vanished / prev.added.size >= threshold;
+}
+
+type DivergenceReason = 'divergence_oscillation' | 'divergence_similar_error' | 'divergence_diff_revert';
+
+/**
+ * Check for three divergence patterns after at least 3 fix iterations.
+ * Returns the first detected reason, or null if none found.
+ * Conservative: does not fire until fingerprintHistory has ≥ 3 entries.
+ */
+export function detectLoopDivergence(
+  fingerprintHistory: string[],
+  errorTextHistory: string[],
+  prevDiff: DiffLines | null,
+  currDiff: DiffLines | null,
+): DivergenceReason | null {
+  if (fingerprintHistory.length < 3) return null;
+  const N = fingerprintHistory.length - 1;
+
+  // Oscillation: error A -> error B -> error A (fingerprint repeats at N-2)
+  if (fingerprintHistory[N] === fingerprintHistory[N - 2] && fingerprintHistory[N - 1] !== fingerprintHistory[N]) {
+    return 'divergence_oscillation';
+  }
+
+  // Jaccard: both consecutive error pairs are semantically near-identical
+  const j1 = jaccardSimilarity(errorTextHistory[N], errorTextHistory[N - 1]);
+  const j2 = jaccardSimilarity(errorTextHistory[N - 1], errorTextHistory[N - 2]);
+  if (j1 >= FIX_LOOP_JACCARD_THRESHOLD && j2 >= FIX_LOOP_JACCARD_THRESHOLD) {
+    return 'divergence_similar_error';
+  }
+
+  // Diff revert: last Claude iteration substantially undid the previous one
+  if (prevDiff !== null && currDiff !== null && detectDiffRevert(prevDiff, currDiff, FIX_LOOP_DIFF_REVERT_THRESHOLD)) {
+    return 'divergence_diff_revert';
+  }
+
+  return null;
+}
+
+// Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
+// so lintFixLoop and testFixLoop record identical-shaped events; the buffer
+// drain on the next heartbeat flushes them to the backend.
+function emitWrapperFixLoopEvent(opts: {
+  loop: FixLoopName;
+  iteration: number;
+  errorMessage: string;
+  exitReason: FixLoopExitReason;
+  startedAt: string;
+}): void {
+  const fingerprint = errorFingerprint(opts.errorMessage);
+  pushFixLoopEvent({
+    loop: opts.loop,
+    iteration: opts.iteration,
+    fingerprint_hash: fingerprintHash(fingerprint),
+    error_tail: opts.errorMessage.slice(-800),
+    change_summary: captureFixIterationDiffStat(),
+    exit_reason: opts.exitReason,
+    source: 'agent_emitted',
+    started_at: opts.startedAt,
+    ended_at: new Date().toISOString(),
+  });
+}
+
 /** Run lint checks in a loop, asking Claude to fix failures up to MAX_LINT_FIX_ATTEMPTS times. */
 // Snapshot the cumulative working-tree change against task-start HEAD. Used
 // by the within-task fix loops to give the next iteration's prompt visibility
@@ -1693,8 +1862,8 @@ export interface LintFixLoopResult {
   passed: boolean;
   /** Last lint error message (tail). Set when passed=false; undefined on success. */
   lastErrorTail?: string;
-  /** Why the loop stopped. ``early_unchanged`` = same-fingerprint exit; ``max_attempts`` = ran out. */
-  exitReason?: 'early_unchanged' | 'max_attempts';
+  /** Why the loop stopped. */
+  exitReason?: 'early_unchanged' | 'max_attempts' | 'divergence_oscillation' | 'divergence_similar_error' | 'divergence_diff_revert';
   /** Per-attempt diff/error history, useful for downstream diagnosis. */
   attempts: FixAttempt[];
 }
@@ -1704,22 +1873,57 @@ export async function lintFixLoop(
   context: string = 'the code you just wrote', model?: string, effort?: string,
   buildConfig?: BuildConfig
 ): Promise<LintFixLoopResult> {
-  let prevFingerprint: string | null = null;
+  const fingerprintHistory: string[] = [];
+  const errorTextHistory: string[] = [];
   const prevAttempts: FixAttempt[] = [];
   let lastErrorTail: string | undefined;
+  let prevDiff: DiffLines | null = null;
+  let currDiff: DiffLines | null = null;
   for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
+    const iterStartedAt = new Date().toISOString();
     try {
       statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
       runProjectLintChecks(changedPaths, ws, buildConfig);
+      emitWrapperFixLoopEvent({
+        loop: 'lint', iteration: attempt + 1, errorMessage: '',
+        exitReason: 'passed', startedAt: iterStartedAt,
+      });
       return { passed: true, attempts: prevAttempts };
     } catch (lintErr: unknown) {
       const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
       lastErrorTail = msg;
       const fingerprint = errorFingerprint(msg);
-      if (prevFingerprint !== null && fingerprint === prevFingerprint) {
+      // Early exit: byte-identical consecutive error (existing behaviour).
+      if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
+        emitWrapperFixLoopEvent({
+          loop: 'lint', iteration: attempt + 1, errorMessage: msg,
+          exitReason: 'early_unchanged', startedAt: iterStartedAt,
+        });
         sendLog(ws, `Lint error unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
         return { passed: false, lastErrorTail, exitReason: 'early_unchanged', attempts: prevAttempts };
       }
+      fingerprintHistory.push(fingerprint);
+      errorTextHistory.push(msg);
+      // Divergence detection: oscillation, Jaccard-similar errors, diff revert.
+      // Requires ≥ 3 iterations of history to avoid false-positive abandons.
+      const divergence = detectLoopDivergence(fingerprintHistory, errorTextHistory, prevDiff, currDiff);
+      if (divergence !== null) {
+        emitWrapperFixLoopEvent({
+          loop: 'lint', iteration: attempt + 1, errorMessage: msg,
+          exitReason: divergence, startedAt: iterStartedAt,
+        });
+        sendLog(ws, `Lint fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
+        return { passed: false, lastErrorTail, exitReason: divergence, attempts: prevAttempts };
+      }
+      // Final iteration with a non-duplicate failure means the budget ran
+      // out; mark it terminal so downstream telemetry sees the actual exit
+      // reason rather than an orphaned in_progress.
+      const isLastAttempt = attempt === MAX_LINT_FIX_ATTEMPTS - 1;
+      emitWrapperFixLoopEvent({
+        loop: 'lint', iteration: attempt + 1, errorMessage: msg,
+        exitReason: isLastAttempt ? 'max_attempts' : 'in_progress',
+        startedAt: iterStartedAt,
+      });
       // On retry (attempt >= 1), record what the previous Claude call
       // actually did + the failure that persisted, so the next iteration's
       // prompt can pivot away from approaches that didn't work.
@@ -1730,13 +1934,14 @@ export async function lintFixLoop(
           errorTail: msg.slice(-800),
         });
       }
-      prevFingerprint = fingerprint;
       sendLog(ws, `Pre-commit check failed (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
       const historySection = prevAttempts.length > 0 ? `${formatFixIterationHistory(prevAttempts)}\n\n` : '';
       const guidanceSuffix = attempt >= 1 ? buildFixLoopGuidanceSuffix() : '';
       const fixPrompt = `${historySection}The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}${guidanceSuffix}`;
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
+      prevDiff = currDiff;
+      currDiff = captureDiffLines();
     }
   }
   sendLog(ws, `WARNING: Lint checks still failing after ${MAX_LINT_FIX_ATTEMPTS} attempts.\n`);
@@ -2270,12 +2475,16 @@ export async function testFixLoop(
     sendLog(ws, 'No pytest-compatible runner found for targeted CI failures — falling back to detected test runner(s).\n');
   }
 
-  let prevFingerprint: string | null = null;
+  const fingerprintHistory: string[] = [];
+  const errorTextHistory: string[] = [];
   const prevAttempts: FixAttempt[] = [];
+  let prevDiff: DiffLines | null = null;
+  let currDiff: DiffLines | null = null;
   const maxFixAttempts = Math.max(0, options.maxFixAttempts ?? MAX_TEST_FIX_ATTEMPTS);
   const totalAttempts = maxFixAttempts + 1;
   const phasePrefix = options.phaseLabel ? `${options.phaseLabel}: ` : '';
   for (let attempt = 0; attempt <= maxFixAttempts; attempt++) {
+    const iterStartedAt = new Date().toISOString();
     statusRef.value = attempt === 0 ? `${phasePrefix}Running test suite...` : `${phasePrefix}Re-running tests (attempt ${attempt + 1}/${totalAttempts})...`;
     sendLog(ws, `${phasePrefix}Running tests (attempt ${attempt + 1}/${totalAttempts})...\n`);
 
@@ -2384,6 +2593,10 @@ export async function testFixLoop(
         sendLog(ws, `Tests could not run — setup failed for all runners. Not invoking fix loop.\n${summary}\n`);
         return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: summary };
       }
+      emitWrapperFixLoopEvent({
+        loop: 'test', iteration: attempt + 1, errorMessage: '',
+        exitReason: 'passed', startedAt: iterStartedAt,
+      });
       sendLog(ws, 'All tests passed.\n');
       return { passed: true, testFailuresDetected: false };
     }
@@ -2430,8 +2643,26 @@ export async function testFixLoop(
 
     const combinedFailures = fixableFailures.map(renderFailure).join('\n\n');
     const fingerprint = errorFingerprint(combinedFailures);
-    if (prevFingerprint !== null && fingerprint === prevFingerprint) {
+    // Early exit: byte-identical consecutive failure (existing behaviour).
+    if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
+      emitWrapperFixLoopEvent({
+        loop: 'test', iteration: attempt + 1, errorMessage: combinedFailures,
+        exitReason: 'early_unchanged', startedAt: iterStartedAt,
+      });
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
+      const failureSummary = combinedFailures.slice(-8000);
+      return { passed: false, testFailuresDetected: true, failureSummary };
+    }
+    fingerprintHistory.push(fingerprint);
+    errorTextHistory.push(combinedFailures);
+    // Divergence detection: oscillation, Jaccard-similar errors, diff revert.
+    const divergence = detectLoopDivergence(fingerprintHistory, errorTextHistory, prevDiff, currDiff);
+    if (divergence !== null) {
+      emitWrapperFixLoopEvent({
+        loop: 'test', iteration: attempt + 1, errorMessage: combinedFailures,
+        exitReason: divergence, startedAt: iterStartedAt,
+      });
+      sendLog(ws, `Test fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
       const failureSummary = combinedFailures.slice(-8000);
       return { passed: false, testFailuresDetected: true, failureSummary };
     }
@@ -2445,8 +2676,11 @@ export async function testFixLoop(
         errorTail: combinedFailures.slice(-800),
       });
     }
-    prevFingerprint = fingerprint;
     if (attempt < maxFixAttempts) {
+      emitWrapperFixLoopEvent({
+        loop: 'test', iteration: attempt + 1, errorMessage: combinedFailures,
+        exitReason: 'in_progress', startedAt: iterStartedAt,
+      });
       const preExistingHint = preExistingNote ? ' (pre-existing failures excluded)' : '';
       sendLog(ws, `${phasePrefix}Tests failed (attempt ${attempt + 1}/${totalAttempts})${preExistingHint}:\n${combinedFailures.slice(-LOG_TAIL_BYTES)}\nClaude will attempt to fix...\n`);
       const analysisSections = analysisContext ? condensedAnalysisSections(analysisContext) : '';
@@ -2491,7 +2725,13 @@ export async function testFixLoop(
         : `${historySection}${analysisPrefix}${guidance}\n\nAll test failures (baseline skipped — pre-existing failures are also fair game on this task):\n\n${combinedFailures.slice(-LOG_TAIL_BYTES)}${guidanceSuffix}`;
       await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
       git(['add', '-A']);
+      prevDiff = currDiff;
+      currDiff = captureDiffLines();
     } else {
+      emitWrapperFixLoopEvent({
+        loop: 'test', iteration: attempt + 1, errorMessage: combinedFailures,
+        exitReason: 'max_attempts', startedAt: iterStartedAt,
+      });
       const exhaustedMessage = maxFixAttempts === 0
         ? `${phasePrefix}Tests failed during focused verification.\n`
         : `WARNING: ${phasePrefix}Tests still failing after ${maxFixAttempts} fix attempts. Proceeding with commit.\n`;
@@ -2504,7 +2744,7 @@ export async function testFixLoop(
 }
 
 // ── Claude Code Runner (shared by all handlers) ─────────────────────────────
-interface ClaudeOutputBlock { type: string; text?: string; name?: string; input?: unknown }
+interface ClaudeOutputBlock { type: string; text?: string; name?: string; id?: string; input?: unknown }
 interface ClaudeOutput {
   type: string;
   message?: { content: ClaudeOutputBlock[] };
@@ -2794,13 +3034,13 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
   }
 }
 
-export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[]): Promise<{
+export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
-  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools);
+  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
 }
 
-export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[]): Promise<{
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
   const runner = getProviderRunner();
@@ -2816,6 +3056,9 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // the corresponding tool-result (user event) arrives.
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
+  // Check-runaway watchdog: tracks allOutput offset when a ./check tool_use fires
+  // so the outcome can be parsed from the subsequent user (tool_result) event.
+  let lastCheckOutputOffset = -1;
 
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
@@ -2997,6 +3240,39 @@ echo ""
       }
     }, 60_000);
 
+    // Check-runaway watchdog: polls every 60s to detect Claude-driven ./check
+    // loops that spin without convergence. Only active for code-change flows
+    // (enableCheckWatchdog). Disable via DISABLE_CHECK_RUNAWAY_WATCHDOG=1.
+    let checkRunawayWatchdog: NodeJS.Timeout | null = null;
+    if (enableCheckWatchdog && !process.env.DISABLE_CHECK_RUNAWAY_WATCHDOG) {
+      checkRunawayWatchdog = setInterval(() => {
+        if (!processGroupStillOwned()) {
+          if (checkRunawayWatchdog) { clearInterval(checkRunawayWatchdog); checkRunawayWatchdog = null; }
+          return;
+        }
+        const { totalChecks, shouldTrigger } = getCheckRunawayStatus(
+          CHECK_RUNAWAY_MIN_INVOCATIONS, CHECK_RUNAWAY_CONSECUTIVE_FAILURES,
+        );
+        let triggerReason: string | null = null;
+        if (totalChecks >= MAX_CLAUDE_CHECK_INVOCATIONS) {
+          triggerReason = `hard ceiling: ${totalChecks}/${MAX_CLAUDE_CHECK_INVOCATIONS} ./check calls in one session`;
+        } else if (shouldTrigger) {
+          triggerReason = `${CHECK_RUNAWAY_CONSECUTIVE_FAILURES} consecutive ./check failures after ${totalChecks} calls`;
+        }
+        if (triggerReason === null) return;
+        sendLog(ws, `\n[runtime] check-runaway watchdog: ${triggerReason} — sending SIGTERM\n`);
+        if (checkRunawayWatchdog) { clearInterval(checkRunawayWatchdog); checkRunawayWatchdog = null; }
+        const pid = originalPid;
+        if (pid !== undefined) {
+          try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+          forceKillTimer = setTimeout(() => {
+            if (!processGroupStillOwned()) return;
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+          }, PROCESS_KILL_GRACE_MS);
+        }
+      }, 60_000);
+    }
+
     if (!child.stdout || !child.stderr) {
       throw new Error('spawn returned no stdio streams');
     }
@@ -3073,6 +3349,12 @@ echo ""
                   recordToolUse(strVal(block.name), block.input);
                   toolInFlight = true;
                   lastToolUseAt = Date.now();
+                  if (enableCheckWatchdog && strVal(block.name) === 'Bash') {
+                    const inputPreview = JSON.stringify(block.input).slice(0, 200);
+                    if (isCheckInvocation(inputPreview)) {
+                      lastCheckOutputOffset = allOutput.length;
+                    }
+                  }
                 }
               }
             } else if (objType === 'result') {
@@ -3114,7 +3396,18 @@ echo ""
               stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
             } else if (objType === 'system' || objType === 'user') {
               // user event carries tool results back to the model — tool is no longer in-flight.
-              if (objType === 'user') toolInFlight = false;
+              if (objType === 'user') {
+                toolInFlight = false;
+                // If a ./check call was pending, parse its outcome from the JSON in
+                // allOutput since we set lastCheckOutputOffset. The bash stdout flows
+                // through the user event's JSON content, so [check].*FAILED appears
+                // as a substring in the JSON-encoded tool_result text.
+                if (enableCheckWatchdog && lastCheckOutputOffset >= 0) {
+                  const slice = allOutput.slice(lastCheckOutputOffset);
+                  recordCheckOutcome(!/\[check\].*FAILED/.test(slice));
+                  lastCheckOutputOffset = -1;
+                }
+              }
             } else if (objType) {
               // Unknown type: log so we don't silently drop information.
               sendLog(ws, `[claude-stream unknown type: ${objType}]\n`);
@@ -3175,6 +3468,7 @@ echo ""
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
       if (stallWatchdog) clearTimeout(stallWatchdog);
       if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
+      if (checkRunawayWatchdog) { clearInterval(checkRunawayWatchdog); checkRunawayWatchdog = null; }
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
@@ -3188,6 +3482,7 @@ echo ""
       if (resultGraceTimer) clearTimeout(resultGraceTimer);
       if (stallWatchdog) clearTimeout(stallWatchdog);
       if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
+      if (checkRunawayWatchdog) { clearInterval(checkRunawayWatchdog); checkRunawayWatchdog = null; }
       // Phase 1: unregister now that we know the child exited; reset routine
       // doesn't need to chase a dead PID.
       if (typeof originalPid === 'number') {
@@ -3458,6 +3753,10 @@ async function main() {
       // — without this, the next agent's heartbeat surfaces prior-role tool
       // uses and the reaper's death-trace conflates two roles' work.
       clearToolTrace();
+      // Same rationale for the `./check` synthesizer's monotonic state:
+      // without a reset, the next role's synthesized iterations continue
+      // numbering from the prior role and carry a stale started_at.
+      resetCheckSynthesizerState();
     }
   } finally {
     // Workspace teardown happens once at process exit, not per-role —
