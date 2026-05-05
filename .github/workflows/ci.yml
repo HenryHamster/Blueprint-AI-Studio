@@ -1,12 +1,21 @@
 name: CI
 
+# Trigger on PR events only — branch-protection requires PR CI to pass before
+# merge, so the previous post-merge `push: branches: [main]` run was redundant
+# and ~50% of CI minutes were duplicate. Re-add the push trigger if integration
+# issues from merge-time semantic conflicts start slipping past PR CI.
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
-  push:
-    branches: [main]
   workflow_dispatch:
+
+# Cancel superseded runs when a new commit lands on the same PR. Autonomous
+# fix iterations sometimes push 2-3 commits in quick succession; without this
+# every commit's CI runs to completion and burns minutes on a stale tree.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
