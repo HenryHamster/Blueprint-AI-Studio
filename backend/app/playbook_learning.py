@@ -8,6 +8,10 @@ agent-written entries.
 Threshold and window are configurable via runtime_config:
   auto_playbook_threshold  (default 3)
   auto_playbook_window_days (default 7)
+
+`cache_first_attempt_classification` is intended to be invoked at
+first-review-rejection time by the lifecycle pipeline (sibling cluster wires it
+in) so subsequent reads from admin_digest can skip the keyword scan.
 """
 import json
 import logging
@@ -27,7 +31,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Task, Project, TaskStatus, _utcnow
+from app.models import Task, Project, StrategicCycle, TaskStatus, _utcnow
 
 # ---------------------------------------------------------------------------
 # Lifecycle constants
@@ -758,15 +762,9 @@ async def _maybe_auto_playbook(
 # Review-feedback extraction
 # ---------------------------------------------------------------------------
 
-def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
-    """Scan review_history entries and bucket issues by category.
-
-    Returns a mapping of {category_name: [{"desc": ..., "severity": ..., "iteration": ...}]}.
-    Only CRITICAL/MAJOR/MINOR severity issues are considered.
-    Each issue is assigned to the *first* matching category.
-    """
+def _categorize_review_issues_keyword(review_history: list) -> dict[str, list[dict]]:
+    """Keyword-match implementation of review issue categorization (always offline)."""
     buckets: dict[str, list[dict]] = {}
-
     for entry in review_history:
         issues = entry.get("issues") or []
         for issue in issues:
@@ -784,14 +782,163 @@ def _categorize_review_issues(review_history: list) -> dict[str, list[dict]]:
                         "iteration": entry.get("iteration", 0),
                     })
                     matched = True
-                    break  # first matching category wins
+                    break
             if not matched:
                 buckets.setdefault("other", []).append({
                     "desc": desc,
                     "severity": severity,
                     "iteration": entry.get("iteration", 0),
                 })
+    return buckets
 
+
+def _categorize_review_issues(
+    review_history: list,
+    cached: Optional[dict] = None,
+) -> dict[str, list[dict]]:
+    """Scan review_history entries and bucket issues by category.
+
+    Returns a mapping of {category_name: [{"desc": ..., "severity": ..., "iteration": ...}]}.
+    Only CRITICAL/MAJOR/MINOR severity issues are considered.
+    Each issue is assigned to the *first* matching category.
+
+    When `cached` is provided it is returned verbatim (the LLM path already ran).
+    """
+    if cached is not None:
+        return cached
+    return _categorize_review_issues_keyword(review_history)
+
+
+_VALID_CATEGORIES = set(_REVIEW_CATEGORIES.keys()) | {"other"}
+_LLM_CATEGORIZE_MODEL = "claude-haiku-4-5-20251001"
+_LLM_CATEGORIZE_TIMEOUT = 10.0
+
+
+async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dict]]:
+    """LLM-backed categorizer with keyword fallback.
+
+    Accepts a flat list of {"description": str, "severity": str, "iteration": int}
+    and returns the same bucketed shape as _categorize_review_issues.
+    Falls back to keyword classification on any failure.
+    """
+    if os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1":
+        # Build synthetic review_history from flat issue list so keyword helper can scan it.
+        return _categorize_review_issues_keyword(
+            [{"iteration": i.get("iteration", 0), "issues": [{"description": i.get("description", ""), "severity": i.get("severity", "")}]}
+             for i in issues]
+        )
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        logger.info("categorize_review_issues_llm: no ANTHROPIC_API_KEY, using keyword fallback")
+        return _keyword_from_flat(issues)
+
+    valid_cats = sorted(_VALID_CATEGORIES)
+    prompt = (
+        "You are a code-review classifier. Categorise each issue below into exactly one of "
+        f"these categories: {', '.join(valid_cats)}.\n\n"
+        "Respond with ONLY valid JSON in this exact shape (no markdown, no commentary):\n"
+        '{"classifications": [{"index": 0, "category": "..."}]}\n\n'
+        "Issues (0-indexed):\n"
+        + "\n".join(f"{i}. [{item.get('severity','')}] {item.get('description','')}"
+                   for i, item in enumerate(issues))
+    )
+
+    for attempt in range(2):
+        try:
+            import anthropic as _anthropic  # noqa: PLC0415 — optional heavy dep
+
+            client = _anthropic.AsyncAnthropic(api_key=api_key)
+            resp = await client.messages.create(
+                model=_LLM_CATEGORIZE_MODEL,
+                max_tokens=512,
+                timeout=_LLM_CATEGORIZE_TIMEOUT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            data = json.loads(raw)
+            classifications = data["classifications"]
+            # Validate all categories before committing.
+            for c in classifications:
+                if c["category"] not in _VALID_CATEGORIES:
+                    raise ValueError(f"unknown category: {c['category']!r}")
+            # Build buckets.
+            buckets: dict[str, list[dict]] = {}
+            for c in classifications:
+                idx = c["index"]
+                if idx < 0 or idx >= len(issues):
+                    continue
+                item = issues[idx]
+                severity = (item.get("severity") or "").upper()
+                if severity not in ("CRITICAL", "MAJOR", "MINOR"):
+                    continue
+                cat = c["category"]
+                buckets.setdefault(cat, []).append({
+                    "desc": (item.get("description") or "").strip(),
+                    "severity": severity,
+                    "iteration": item.get("iteration", 0),
+                })
+            return buckets
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            if attempt == 0:
+                logger.info("categorize_review_issues_llm: parse error %s, retrying once", exc)
+                continue
+            logger.info("categorize_review_issues_llm: parse error on retry, using keyword fallback")
+            break
+        except Exception as exc:  # network, auth, timeout, import error
+            logger.info("categorize_review_issues_llm: exception %s, using keyword fallback", exc)
+            break
+
+    return _keyword_from_flat(issues)
+
+
+def _keyword_from_flat(issues: list[dict]) -> dict[str, list[dict]]:
+    """Convert flat issue list to synthetic review_history then run keyword classifier."""
+    synthetic = [
+        {
+            "iteration": item.get("iteration", 0),
+            "issues": [{"description": item.get("description", ""), "severity": item.get("severity", "")}],
+        }
+        for item in issues
+    ]
+    return _categorize_review_issues_keyword(synthetic)
+
+
+async def cache_first_attempt_classification(
+    task_context: dict,
+    issues: list[dict],
+) -> dict:
+    """Run LLM categoriser (keyword fallback inside) and cache result in task_context.
+
+    Writes task_context['_first_attempt_categorized_issues'] = {"buckets": {...},
+    "_classification_method": "llm" | "keyword"} and returns the bucket dict.
+
+    Intended to be invoked at first-review-rejection time by the lifecycle pipeline.
+    """
+    # Determine method before calling so we can record it.
+    if (
+        os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1"
+        or not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    ):
+        method = "keyword"
+        buckets = _keyword_from_flat(issues)
+    else:
+        try:
+            import anthropic as _anthropic  # noqa: PLC0415
+
+            # Attempt LLM; if result equals keyword fallback we still flag it as llm
+            # (the LLM path ran, even if it happened to agree with keyword).
+            _anthropic  # just ensure importable before we call the full helper
+            buckets = await categorize_review_issues_llm(issues)
+            method = "llm"
+        except Exception:
+            buckets = _keyword_from_flat(issues)
+            method = "keyword"
+
+    task_context["_first_attempt_categorized_issues"] = {
+        "buckets": buckets,
+        "_classification_method": method,
+    }
     return buckets
 
 
@@ -1733,55 +1880,94 @@ async def compute_review_effectiveness(
 # since SR data is sparser.
 _MIN_SR_SAMPLE = 5
 
+# Example-collection caps for miss-example surfacing in the agent prompt.
+_EXAMPLE_MAX_PER_CAT = 3
+_EXAMPLE_MAX_CATS = 5
+_EXAMPLE_MAX_DESC_LEN = 100
+
+# Tokens that indicate a description may contain sensitive material.
+# Case-insensitive substring match; keep as tuple for fast `in` checks.
+_SENSITIVE_TOKENS: tuple[str, ...] = (
+    "password", "secret", "credential", "api_key", "apikey",
+    "bearer", "authorization:", "private_key", "sk-ant-", "eyJ",
+)
+
+_URL_RE = re.compile(r'https?://\S+')
+_PR_REF_RE = re.compile(r'\b(?:PR|pr)\s*#?\s*\d+\b|#\s*\d+\b')
+
+
+def _is_sensitive_desc(desc: str) -> bool:
+    """Return True if *desc* appears to mention credentials or secrets."""
+    lower = desc.lower()
+    return any(tok in lower for tok in _SENSITIVE_TOKENS)
+
+
+def _clean_example_desc(desc: str) -> Optional[str]:
+    """Strip URLs and PR refs, collapse whitespace, truncate to _EXAMPLE_MAX_DESC_LEN."""
+    desc = _URL_RE.sub("", desc)
+    desc = _PR_REF_RE.sub("", desc)
+    desc = " ".join(desc.split())
+    if not desc:
+        return None
+    if len(desc) > _EXAMPLE_MAX_DESC_LEN:
+        desc = desc[: _EXAMPLE_MAX_DESC_LEN - 3].rstrip() + "..."
+    return desc
+
+
+def _finalize_examples(raw_examples: list[dict]) -> list[dict]:
+    """Sort by severity (CRITICAL first), filter sensitive, clean, deduplicate, cap."""
+    _sev_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
+    sorted_ex = sorted(raw_examples, key=lambda x: _sev_order.get(x["severity"], 3))
+    seen: set[str] = set()
+    result: list[dict] = []
+    for ex in sorted_ex:
+        cleaned = _clean_example_desc(ex["desc"])
+        if not cleaned or _is_sensitive_desc(cleaned):
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append({"severity": ex["severity"], "desc": cleaned})
+        if len(result) >= _EXAMPLE_MAX_PER_CAT:
+            break
+    return result
+
 
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
     all_tasks: list,
 ) -> Optional[dict[str, Any]]:
-    """Compare SR prediction hit-rate per category across two consecutive 14-day windows.
+    """Compare SR prediction hit-rate per category, bucketed by strategic cycle.
 
-    For each canonical category found in ``_first_attempt_rejection_categories``,
-    computes the fraction of tasks where the self-review also flagged that category
-    (``prediction_hit_rate``) and the complement (``miss_rate``) for both the
-    current and previous 14-day windows, then classifies the trend.
+    Primary mode: uses the two most recently COMPLETED strategic cycles as
+    "current" and "previous" buckets (tasks keyed by ``strategic_cycle_id``).
+    Rolls further back through completed cycles if either bucket has fewer than
+    :data:`_MIN_SR_SAMPLE` qualifying tasks (both ``_self_review_outcome`` and
+    ``_first_attempt_rejection_categories`` present).
 
-    Returns ``None`` when either window has fewer than :data:`_MIN_SR_SAMPLE`
-    tasks with both fields present.
+    Fallback mode: when fewer than two completed cycles exist *or* no pair of
+    consecutive cycles has enough tasks, falls back to the existing 14-day
+    calendar windows so the metric is non-blank during onboarding and for
+    tasks that were never assigned a ``strategic_cycle_id``.
 
     **Side effect**: writes the result to ``project.design_doc["sr_catch_rate_trends"]``
     and maintains a per-category ``rate_history`` list (capped at 5 entries).
     """
     now = _utcnow()
-    cutoff_14d = now - timedelta(days=14)
-    cutoff_28d = now - timedelta(days=28)
 
     def _naive(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
-    cutoff_14d_n = _naive(cutoff_14d)
-    cutoff_28d_n = _naive(cutoff_28d)
-    sentinel_n = datetime(9999, 12, 31)
-
-    def _split_sr(
-        tasks: list, start: datetime, end: datetime
+    def _stats_for_tasks(
+        tasks: list,
     ) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]]]:
-        """Return (task_count_with_both, {cat: {hit_count, human_count, w_hit, w_total}}, {task_type: {cat: {hit_count, human_count}}}).
-
-        Includes tasks where SR ran (has _self_review_outcome) and human rejected
-        (has _first_attempt_rejection_categories), even when check_results is empty
-        — empty check_results means SR passed everything and thus missed all human cats.
-        """
+        """Compute SR stats for a pre-filtered task list (no date filtering)."""
         _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
         count = 0
         cat_stats: dict[str, dict] = {}
         type_cat_stats: dict[str, dict[str, dict]] = {}
         for t in tasks:
-            if not t.created_at:
-                continue
-            ts = t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
-            if not (start <= ts < end):
-                continue
             ctx = t.context or {}
             if "_self_review_outcome" not in ctx:
                 continue
@@ -1793,31 +1979,97 @@ async def compute_sr_catch_rate_trends(
             sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
             rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
             cat_weights: dict[str, int] = {}
+            rev_cats: dict[str, list[dict]] = {}
             if rev_hist:
-                for cat, issues in _categorize_review_issues(rev_hist).items():
-                    cat_weights[cat] = max(_sw.get(i["severity"], 1) for i in issues)
+                rev_cats = _categorize_review_issues(rev_hist)
+                for cat_name, issues in rev_cats.items():
+                    cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
             task_type = t.first_payload.get("type", "")
             for cat in human_cats:
                 if cat not in cat_stats:
-                    cat_stats[cat] = {"hit_count": 0, "human_count": 0, "w_hit": 0.0, "w_total": 0.0}
+                    cat_stats[cat] = {
+                        "hit_count": 0, "human_count": 0,
+                        "w_hit": 0.0, "w_total": 0.0,
+                        "miss_examples": [],
+                    }
                 cat_stats[cat]["human_count"] += 1
                 w = cat_weights.get(cat, 1)
                 cat_stats[cat]["w_total"] += w
                 if cat in sr_failed:
                     cat_stats[cat]["hit_count"] += 1
                     cat_stats[cat]["w_hit"] += w
+                else:
+                    for issue in rev_cats.get(cat, []):
+                        cat_stats[cat]["miss_examples"].append(
+                            {"desc": issue["desc"], "severity": issue["severity"]}
+                        )
                 if task_type:
                     if task_type not in type_cat_stats:
                         type_cat_stats[task_type] = {}
                     if cat not in type_cat_stats[task_type]:
-                        type_cat_stats[task_type][cat] = {"hit_count": 0, "human_count": 0}
+                        type_cat_stats[task_type][cat] = {
+                            "hit_count": 0, "human_count": 0, "miss_examples": [],
+                        }
                     type_cat_stats[task_type][cat]["human_count"] += 1
                     if cat in sr_failed:
                         type_cat_stats[task_type][cat]["hit_count"] += 1
+                    else:
+                        for issue in rev_cats.get(cat, []):
+                            type_cat_stats[task_type][cat]["miss_examples"].append(
+                                {"desc": issue["desc"], "severity": issue["severity"]}
+                            )
         return count, cat_stats, type_cat_stats
 
-    current_count, current_stats, current_type_stats = _split_sr(all_tasks, cutoff_14d_n, sentinel_n)
-    previous_count, previous_stats, _ = _split_sr(all_tasks, cutoff_28d_n, cutoff_14d_n)
+    # --- Cycle-based bucketing (primary mode) ---
+    use_cycle_mode = False
+    current_cycle_id: Optional[str] = None
+    previous_cycle_id: Optional[str] = None
+    current_count = 0
+    previous_count = 0
+    current_stats: dict[str, dict] = {}
+    previous_stats: dict[str, dict] = {}
+    current_type_stats: dict[str, dict[str, dict]] = {}
+
+    cycle_stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+
+    if len(cycle_rows) >= 2:
+        task_by_cycle: dict[str, list] = {}
+        for t in all_tasks:
+            cid = getattr(t, "strategic_cycle_id", None)
+            if cid:
+                task_by_cycle.setdefault(cid, []).append(t)
+        for i in range(len(cycle_rows) - 1):
+            c_cycle = cycle_rows[i]
+            p_cycle = cycle_rows[i + 1]
+            c_count, c_stats, c_type_stats = _stats_for_tasks(task_by_cycle.get(c_cycle.id, []))
+            p_count, p_stats, _ = _stats_for_tasks(task_by_cycle.get(p_cycle.id, []))
+            if c_count >= _MIN_SR_SAMPLE and p_count >= _MIN_SR_SAMPLE:
+                use_cycle_mode = True
+                current_cycle_id = c_cycle.id
+                previous_cycle_id = p_cycle.id
+                current_count = c_count
+                previous_count = p_count
+                current_stats = c_stats
+                previous_stats = p_stats
+                current_type_stats = c_type_stats
+                break
+
+    if not use_cycle_mode:
+        # Calendar fallback for onboarding / tasks without strategic_cycle_id.
+        cutoff_14d_n = _naive(now - timedelta(days=14))
+        cutoff_28d_n = _naive(now - timedelta(days=28))
+        sentinel_n = datetime(9999, 12, 31)
+        cal_current = [t for t in all_tasks if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n]
+        cal_previous = [t for t in all_tasks if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n]
+        current_count, current_stats, current_type_stats = _stats_for_tasks(cal_current)
+        previous_count, previous_stats, _ = _stats_for_tasks(cal_previous)
 
     if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
         return None
@@ -1866,6 +2118,20 @@ async def compute_sr_catch_rate_trends(
             "trend": trend,
         }
 
+    # Attach miss examples to top-_EXAMPLE_MAX_CATS categories by weighted_miss_rate.
+    top_cats_for_examples = sorted(
+        all_cats,
+        key=lambda c: (
+            categories[c].get("weighted_miss_rate") or 0.0
+        ),
+        reverse=True,
+    )[: _EXAMPLE_MAX_CATS]
+    for cat in top_cats_for_examples:
+        raw = (current_stats.get(cat) or {}).get("miss_examples", [])
+        examples = _finalize_examples(raw)
+        if examples:
+            categories[cat]["examples"] = examples
+
     project = await session.get(Project, project_id)
     if not project:
         return None
@@ -1875,7 +2141,10 @@ async def compute_sr_catch_rate_trends(
     existing_computed_at: Optional[str] = existing.get("computed_at")
 
     is_new_window = True
-    if existing_computed_at:
+    if use_cycle_mode:
+        # In cycle mode a new window = new current cycle id.
+        is_new_window = existing.get("current_cycle_id") != current_cycle_id
+    elif existing_computed_at:
         try:
             last_dt = datetime.fromisoformat(existing_computed_at)
             is_new_window = (now - last_dt).days >= 14
@@ -1900,16 +2169,24 @@ async def compute_sr_catch_rate_trends(
             if stats["human_count"] < _MIN_SR_SAMPLE:
                 continue
             hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
-            type_cats[cat] = {
+            raw_ex = stats.get("miss_examples", [])
+            ex = _finalize_examples(raw_ex)
+            entry: dict[str, Any] = {
                 "hit_rate": hit_rate,
                 "miss_rate": round(1 - hit_rate, 3),
                 "sample_count": stats["human_count"],
             }
+            if ex:
+                entry["examples"] = ex
+            type_cats[cat] = entry
         if type_cats:
             by_task_type[ttype] = type_cats
 
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
+        "bucket_mode": "cycle" if use_cycle_mode else "calendar",
+        "current_cycle_id": current_cycle_id,
+        "previous_cycle_id": previous_cycle_id,
         "categories": categories,
         "by_task_type": by_task_type,
     }
@@ -1937,14 +2214,19 @@ async def compute_sr_catch_rate_trends(
             if data.get("trend") == "decreasing"
         }
         if regressing:
-            # Dedup: skip if same regressing set already alerted within this 14-day window.
+            # Dedup: in cycle mode key off cycle_id; in calendar mode use 14-day window.
             alert_state: dict = dict(doc.get("sr_catch_rate_trends_alert") or {})
             alert_computed_at: Optional[str] = alert_state.get("computed_at")
             alerted_cats: list = list(alert_state.get("categories") or [])
             current_regressing_cats = sorted(regressing.keys())
 
             already_alerted = False
-            if alert_computed_at:
+            if use_cycle_mode:
+                already_alerted = (
+                    alert_state.get("cycle_id") == current_cycle_id
+                    and alerted_cats == current_regressing_cats
+                )
+            elif alert_computed_at:
                 try:
                     last_alert_dt = datetime.fromisoformat(alert_computed_at)
                     if (now - last_alert_dt).days < 14 and alerted_cats == current_regressing_cats:
@@ -1989,6 +2271,7 @@ async def compute_sr_catch_rate_trends(
 
                 doc["sr_catch_rate_trends_alert"] = {
                     "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
                     "categories": current_regressing_cats,
                 }
                 project.design_doc = doc

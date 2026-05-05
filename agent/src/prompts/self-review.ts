@@ -3,6 +3,8 @@
 // re-read. When self-review was flagged incomplete_review (diff truncated and
 // the retry still reported zero files read), the reviewer needs to scrutinize
 // unverified files — the self-review's PASS verdict did not examine them.
+// Also surfaces reviewer_findings written by the fresh-reviewer pass when
+// project_metadata.enable_fresh_reviewer is enabled (see standard.ts).
 // Returns '' when no self-review outcome is present or nothing is worth
 // surfacing.
 export function formatSelfReviewBlindSpots(
@@ -16,8 +18,17 @@ export function formatSelfReviewBlindSpots(
   const truncatedFilesRead = Array.isArray(selfReviewOutcome.truncated_files_read)
     ? (selfReviewOutcome.truncated_files_read as unknown[]).filter((f): f is string => typeof f === 'string')
     : [];
+  type FindingRaw = Record<string, unknown>;
+  const reviewerFindings = Array.isArray(selfReviewOutcome.reviewer_findings)
+    ? (selfReviewOutcome.reviewer_findings as unknown[]).filter(
+        (f): f is FindingRaw =>
+          typeof f === 'object' && f !== null &&
+          typeof (f as FindingRaw).category === 'string' &&
+          typeof (f as FindingRaw).description === 'string',
+      )
+    : [];
   const incomplete = categories.includes('incomplete_review');
-  if (!incomplete && truncatedFilesRead.length === 0) return '';
+  if (!incomplete && truncatedFilesRead.length === 0 && reviewerFindings.length === 0) return '';
 
   const verifiedSet = new Set(truncatedFilesRead);
   const unverified = changedFilePaths.filter(p => p && !verifiedSet.has(p));
@@ -33,6 +44,18 @@ export function formatSelfReviewBlindSpots(
   }
   if (unverified.length > 0) {
     lines.push(`- Files NOT verified by self-review (prioritize careful review of these):\n${unverified.map(f => `  - ${f}`).join('\n')}`);
+  }
+  if (reviewerFindings.length > 0) {
+    const sevOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
+    const sorted = [...reviewerFindings].sort((a, b) => {
+      const ai = sevOrder.indexOf(String(a.severity));
+      const bi = sevOrder.indexOf(String(b.severity));
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    lines.push(
+      `- Fresh-reviewer findings (a second read-only session flagged these before ./done — verify each was addressed or is a false positive):\n` +
+      sorted.map(f => `  - [${String(f.severity)}] ${String(f.category)}: ${String(f.description)}`).join('\n'),
+    );
   }
   return lines.join('\n') + '\n\n';
 }

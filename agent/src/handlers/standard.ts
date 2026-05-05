@@ -121,6 +121,107 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
   return lines.join('\n');
 }
 
+const FRESH_REVIEWER_MIN_LINES = 20;
+
+/**
+ * Runs a second read-only Claude session to review the current diff as an
+ * adversarial reviewer. Findings are merged into /tmp/self_review_<taskId>.json:
+ * reviewer-flagged categories override passing self-attestations, and findings
+ * appear in a new `reviewer_findings` array. Skips automatically for tiny diffs
+ * or when the diff file is unavailable.
+ */
+export async function runFreshReviewerPass(
+  taskId: string,
+  taskTitle: string,
+  taskDescription: string,
+  relatedFiles: string[],
+  ws: WebSocket | null,
+  statusRef: { value: string },
+  model?: string,
+): Promise<void> {
+  let baseCommit = '';
+  try { baseCommit = fs.readFileSync(`/tmp/base_commit_${taskId}`, 'utf-8').trim(); } catch { /* ok */ }
+  let diff = '';
+  try {
+    diff = git(['diff', ...(baseCommit ? [`${baseCommit}..HEAD`] : ['HEAD~1..HEAD']), '--unified=3']);
+  } catch { /* no prior commit */ }
+  if (!diff) return;
+
+  const changed = diff.split('\n').filter(l => /^[+-]/.test(l) && !/^[+-]{3}/.test(l)).length;
+  if (changed < FRESH_REVIEWER_MIN_LINES) {
+    sendLog(ws, `[FreshReview] Diff too small (${changed} lines) — skipping reviewer pass.\n`);
+    return;
+  }
+
+  sendLog(ws, `[FreshReview] Running fresh-reviewer pass (${changed} changed lines)...\n`);
+  const prevStatus = statusRef.value;
+  statusRef.value = 'Running fresh-reviewer pass...';
+
+  const MAX_DIFF = 20_000;
+  const diffSnippet = diff.length > MAX_DIFF ? diff.slice(0, MAX_DIFF) + '\n...[truncated]' : diff;
+  const prompt = `You are reviewing a PR for a colleague. The author thinks it is done. Find what they missed.
+
+Task: ${taskTitle}
+Description: ${taskDescription.slice(0, 800)}
+Declared scope: ${relatedFiles.join(', ') || 'unspecified'}
+
+Diff:
+${diffSnippet}
+
+Check specifically for:
+- regression_risk: removed exports, changed defaults, removed null guards, broken contracts
+- scope-drift: changes outside declared scope files
+- correctness: logic bugs, off-by-one errors, race conditions, edge cases
+- error-handling: unhandled exceptions, missing null checks, async error paths
+
+Output ONLY a JSON object:
+{"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}]}
+Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage
+If no issues found: {"reviewer_findings": []}`;
+
+  const { exitCode, lastResultText } = await runClaudeCode(
+    prompt, ws, statusRef, model, 'low',
+    ['Write', 'Edit', 'NotebookEdit'],
+  );
+  statusRef.value = prevStatus;
+
+  if (exitCode !== 0) {
+    sendLog(ws, '[FreshReview] Reviewer session failed — skipping merge.\n');
+    return;
+  }
+
+  const parsed = extractSelfReviewJson(lastResultText);
+  if (!parsed || !Array.isArray(parsed.reviewer_findings)) {
+    sendLog(ws, '[FreshReview] No parseable findings — skipping merge.\n');
+    return;
+  }
+
+  const findings = parsed.reviewer_findings as Array<{ category: string; severity: string; description: string }>;
+  sendLog(ws, `[FreshReview] ${findings.length} reviewer finding(s).\n`);
+
+  const srPath = `/tmp/self_review_${taskId}.json`;
+  let sr: Record<string, unknown> = {};
+  try { sr = JSON.parse(fs.readFileSync(srPath, 'utf-8')) as Record<string, unknown>; } catch { /* may not exist */ }
+
+  const checkResults = (sr.check_results as Record<string, Record<string, unknown>> | undefined) ?? {};
+  const checkResultsLookup = checkResults as Record<string, Record<string, unknown> | undefined>;
+  for (const f of findings) {
+    const existing = checkResultsLookup[f.category];
+    if (!existing || existing.passed === true) {
+      checkResults[f.category] = { passed: false, issue: `[reviewer] ${f.description}` };
+    }
+  }
+  sr.reviewer_findings = findings;
+  sr.check_results = checkResults;
+
+  try {
+    fs.writeFileSync(srPath, JSON.stringify(sr, null, 2), { mode: 0o644 });
+    sendLog(ws, '[FreshReview] Reviewer findings merged into self-review JSON.\n');
+  } catch (e) {
+    sendLog(ws, `[FreshReview] Failed to write self-review: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+}
+
 /**
  * Extracts the structured self-review JSON object from the agent's output.
  * Looks for a ```json ... ``` code fence first, then falls back to finding
@@ -399,6 +500,19 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     noChangesMessage,
     analysisContext,
   });
+
+  // Fresh reviewer pass: read-only second session to catch what the implementing
+  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
+  // Skipped for auto-remediation tasks (their job IS to fix what a reviewer would flag).
+  const projectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  if (projectMeta?.enable_fresh_reviewer === true && !isAutoRemediation) {
+    const reviewerRelatedFiles = (
+      (payload.related_files as string[] | undefined) ||
+      ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+      []
+    );
+    await runFreshReviewerPass(taskId, taskTitle, rawPrompt, reviewerRelatedFiles, ws, statusRef, model);
+  }
 }
 
 // ── Handler: Create (default — make changes, push, open PR) ─────────────────

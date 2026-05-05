@@ -156,7 +156,12 @@ def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, A
         total_sr_failed += len(sr_failed)
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: Dict[str, int] = {}
-        if rev_hist:
+        cached_entry = ctx.get("_first_attempt_categorized_issues")
+        cached_buckets = (cached_entry or {}).get("buckets") if cached_entry else None
+        if cached_buckets:
+            for cat, issues in _categorize_review_issues(rev_hist, cached=cached_buckets).items():
+                cat_weights[cat] = max(_SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues)
+        elif rev_hist:
             for cat, issues in _categorize_review_issues(rev_hist).items():
                 cat_weights[cat] = max(_SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues)
         for cat in human_cats:

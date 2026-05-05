@@ -1697,6 +1697,78 @@ describe('formatProjectContext', () => {
     expect(bIdx).toBeLessThan(cIdx);
   });
 
+  it('renders example issues in SR blind spots block when examples present', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': {
+            miss_rate: 0.8,
+            examples: [
+              { severity: 'MAJOR', desc: 'Missing null check in handler' },
+              { severity: 'MINOR', desc: 'Unhandled async error' },
+            ],
+          },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Self-Review Blind Spots');
+    expect(result).toContain('[MAJOR] Missing null check in handler');
+    expect(result).toContain('[MINOR] Unhandled async error');
+  });
+
+  it('falls back to percentage-only line per category when examples absent', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': { miss_rate: 0.8 },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Self-Review Blind Spots');
+    expect(result).toContain('error-handling');
+    expect(result).toContain('80% missed');
+    expect(result).not.toContain('[MAJOR]');
+    expect(result).not.toContain('[MINOR]');
+  });
+
+  it('falls back to percentage-only when examples is empty array', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': { miss_rate: 0.8, examples: [] },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('error-handling');
+    expect(result).toContain('80% missed');
+    expect(result).not.toContain('[MAJOR]');
+  });
+
+  it('still renders category line even when its examples are missing', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'correctness': { miss_rate: 0.9 },
+          'error-handling': { miss_rate: 0.7, examples: [{ severity: 'CRITICAL', desc: 'Off-by-one in loop' }] },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    // Both categories should appear
+    expect(result).toContain('correctness');
+    expect(result).toContain('error-handling');
+    // Only the one with examples shows severity tag
+    expect(result).toContain('[CRITICAL] Off-by-one in loop');
+    // correctness has no examples so no tags for it
+    const correctnessIdx = result.indexOf('correctness');
+    const criticalIdx = result.indexOf('[CRITICAL]');
+    // CRITICAL tag should appear after correctness bullet
+    expect(criticalIdx).toBeGreaterThan(correctnessIdx);
+  });
+
   it('includes co-change budget note for medium-scope tasks', () => {
     const ctx = { cochange_files: ['src/foo.ts', 'src/bar.ts'] };
     const result = formatProjectContext(ctx, 'create', 'medium', '', 3);

@@ -9,6 +9,7 @@ import {
   snapshotToolTrace, extractInvestigatedFiles,
 } from '../index.js';
 import { runCodeChangeTask } from './code-change.js';
+import { runFreshReviewerPass } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
@@ -1239,4 +1240,12 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
   });
+
+  // Fresh reviewer pass: read-only second session to catch issues the fix
+  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
+  const fixProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  if (fixProjectMeta?.enable_fresh_reviewer === true) {
+    const fixTaskTitle = strVal(task.title) || originalPrompt.slice(0, 80) || 'Fix task';
+    await runFreshReviewerPass(taskId, fixTaskTitle, originalPrompt || prompt, fixRelatedFiles, ws, statusRef, model);
+  }
 }

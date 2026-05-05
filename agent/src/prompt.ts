@@ -1103,6 +1103,23 @@ Schema:
 fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`
 envelope is acceptable when you have nothing useful to record, but the
 file MUST exist for code-change tasks.
+
+**Fresh-reviewer pass (when enabled):** After your session ends, a second
+read-only Claude session may run and augment the self-review JSON with a
+\`reviewer_findings\` array. Reviewer-flagged categories override passing
+self-attestations in \`check_results\`. The final JSON shape is:
+\`\`\`json
+{
+  "verdict": "pass" | "fail",
+  "fixes_applied": true | false,
+  "check_results": { "<category>": { "passed": true | false, "issue": "..." } },
+  "blind_spots": ["..."],
+  "reviewer_findings": [{ "category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..." }]
+}
+\`\`\`
+If you see CRITICAL entries in \`reviewer_findings\` when you re-read the file
+before \`./done\`, triage them: fix what's valid, record false positives in
+\`blind_spots\`.
 `;
 
 export const PLAYBOOK_GUIDANCE = `

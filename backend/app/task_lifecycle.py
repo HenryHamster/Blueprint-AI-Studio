@@ -2564,7 +2564,7 @@ async def _process_post_commit(
                     review_iteration = review_loop.get("iteration", 1)
                     if review_iteration == 1 and issues and original_task_id:
                         try:
-                            from app.playbook_learning import _categorize_review_issues
+                            from app.playbook_learning import cache_first_attempt_classification
                             rh_items = [
                                 {"description": i.get("description", ""),
                                  "severity": i.get("severity", "minor"),
@@ -2572,23 +2572,22 @@ async def _process_post_commit(
                                 for i in issues if i.get("description")
                             ]
                             if rh_items:
-                                buckets = _categorize_review_issues(rh_items)
-                                rejection_cats = {cat: len(items) for cat, items in buckets.items() if items}
-                                if rejection_cats:
-                                    minor_only = all(
-                                        (i.get("severity", "minor") or "minor").lower() == "minor"
-                                        for i in issues if i.get("description")
-                                    )
-                                    orig_task = await session.get(Task, uuid.UUID(original_task_id))
-                                    if orig_task:
-                                        orig_task.context = {
-                                            **(orig_task.context or {}),
-                                            "_first_attempt_rejection_categories": rejection_cats,
-                                            "_first_attempt_minor_only": minor_only,
-                                        }
-                                        flag_modified(orig_task, "context")
-                                        session.add(orig_task)
-                                        await session.commit()
+                                orig_task = await session.get(Task, uuid.UUID(original_task_id))
+                                if orig_task:
+                                    task_ctx = dict(orig_task.context or {})
+                                    buckets = await cache_first_attempt_classification(task_ctx, rh_items)
+                                    rejection_cats = {cat: len(items) for cat, items in buckets.items() if items}
+                                    if rejection_cats:
+                                        minor_only = all(
+                                            (i.get("severity", "minor") or "minor").lower() == "minor"
+                                            for i in issues if i.get("description")
+                                        )
+                                        task_ctx["_first_attempt_rejection_categories"] = rejection_cats
+                                        task_ctx["_first_attempt_minor_only"] = minor_only
+                                    orig_task.context = task_ctx
+                                    flag_modified(orig_task, "context")
+                                    session.add(orig_task)
+                                    await session.commit()
                         except Exception as _cat_e:
                             logger.warning(f"[REVIEW PIPELINE] Failed to record first-attempt rejection categories: {_cat_e}")
                     action_taken = True

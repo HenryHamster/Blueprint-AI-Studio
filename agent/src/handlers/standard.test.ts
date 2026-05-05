@@ -112,7 +112,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass } from './standard.js';
 import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -1295,6 +1295,68 @@ describe('runCodeChangeTask marker detection', () => {
     expect(unlinkPaths).toContain(`/tmp/done_${TASK_ID}`);
     expect(unlinkPaths).toContain(`/tmp/fail_${TASK_ID}`);
     expect(unlinkPaths).toContain(`/tmp/pr_url_${TASK_ID}`);
+  });
+});
+
+// ── runFreshReviewerPass ──────────────────────────────────────────────────────
+describe('runFreshReviewerPass', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('skips reviewer pass when diff is below minimum line threshold', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue('+one\n-one'); // only 2 changed lines
+    await runFreshReviewerPass('t1', 'Title', 'Desc', [], null, { value: '' });
+    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('runs reviewer pass and merges findings into self-review JSON', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: '{"reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "off-by-one"}]}',
+    });
+    const { default: fs } = await import('fs');
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('self_review_t2')) {
+        return '{"verdict":"pass","check_results":{"correctness":{"passed":true}}}';
+      }
+      return '';
+    });
+    await runFreshReviewerPass('t2', 'Title', 'Desc', ['src/foo.ts'], null, { value: '' });
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls;
+    const srWrite = writeCalls.find(c => (c[0] as string).includes('self_review_t2'));
+    expect(srWrite).toBeDefined();
+    const srContent = srWrite?.[1] as string | undefined;
+    expect(srContent).toBeDefined();
+    const written = JSON.parse(srContent ?? '{}') as Record<string, unknown>;
+    expect((written.reviewer_findings as unknown[]).length).toBe(1);
+    const checkResults = written.check_results as Record<string, { passed: boolean }>;
+    expect(checkResults.correctness.passed).toBe(false);
+  });
+
+  it('falls back gracefully when reviewer session exits non-zero', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: '', lastResultText: '' });
+    const { default: fs } = await import('fs');
+    await runFreshReviewerPass('t3', 'Title', 'Desc', [], null, { value: '' });
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalledWith(
+      expect.stringContaining('self_review_t3'), expect.anything(), expect.anything(),
+    );
+  });
+
+  it('falls back gracefully when reviewer output is unparseable', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: 'not json' });
+    const { default: fs } = await import('fs');
+    await runFreshReviewerPass('t4', 'Title', 'Desc', [], null, { value: '' });
+    expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalledWith(
+      expect.stringContaining('self_review_t4'), expect.anything(), expect.anything(),
+    );
   });
 });
 

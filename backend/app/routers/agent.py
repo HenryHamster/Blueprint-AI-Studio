@@ -2022,8 +2022,16 @@ async def claim_task(
         try:
             sr_trends = (project_for_playbook.design_doc or {}).get("sr_catch_rate_trends")
             if sr_trends and isinstance(sr_trends.get("categories"), dict):
+                def _cat_entry(data: dict) -> dict:
+                    entry: dict = {"miss_rate": data["miss_rate"]}
+                    if isinstance(data.get("weighted_miss_rate"), (int, float)):
+                        entry["weighted_miss_rate"] = data["weighted_miss_rate"]
+                    if isinstance(data.get("examples"), list) and data["examples"]:
+                        entry["examples"] = data["examples"]
+                    return entry
+
                 cats = {
-                    cat: {"miss_rate": data["miss_rate"]}
+                    cat: _cat_entry(data)
                     for cat, data in sr_trends["categories"].items()
                     if isinstance(data, dict) and isinstance(data.get("miss_rate"), (int, float))
                 }
@@ -2034,7 +2042,7 @@ async def claim_task(
                         type_cats = by_task_type[task_type]
                         if isinstance(type_cats, dict):
                             catch_rate_payload["for_task_type"] = {
-                                cat: {"miss_rate": cdata["miss_rate"]}
+                                cat: _cat_entry(cdata)
                                 for cat, cdata in type_cats.items()
                                 if isinstance(cdata, dict) and isinstance(cdata.get("miss_rate"), (int, float))
                             }

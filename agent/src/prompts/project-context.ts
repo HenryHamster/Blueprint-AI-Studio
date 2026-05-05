@@ -351,7 +351,8 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   }
 
   // Build SR catch-rate blind spots block — only if budget allows
-  type SRCatchRateCategory = { miss_rate: number; weighted_miss_rate?: number };
+  type SRCatchRateExample = { severity: string; desc: string };
+  type SRCatchRateCategory = { miss_rate: number; weighted_miss_rate?: number; examples?: SRCatchRateExample[] };
   const srCatchRate = ctx.self_review_catch_rate as {
     categories?: Record<string, SRCatchRateCategory>;
     for_task_type?: Record<string, SRCatchRateCategory>;
@@ -368,28 +369,42 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate) - (a[1].weighted_miss_rate ?? a[1].miss_rate))
       .slice(0, 5);
     if (qualifying.length > 0) {
-      const catList = qualifying
-        .map(([cat, data]) => {
-          const rawPct = Math.round(data.miss_rate * 100);
-          if (data.weighted_miss_rate !== undefined) {
-            const wPct = Math.round(data.weighted_miss_rate * 100);
-            return `${cat} (${rawPct}% missed, ${wPct}% severity-weighted)`;
-          }
-          return `${cat} (${rawPct}% missed)`;
-        })
-        .join(', ');
       const scopeNote = srIsTypeFiltered && taskType
         ? ` (${taskType} tasks only)`
         : '';
-      const candidateLines = [
-        '### Self-Review Blind Spots',
-        `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny: ${catList}`,
-        '',
-      ];
-      const candidate = candidateLines.join('\n');
-      if (candidate.length <= budget) {
-        srBlindSpotLines = candidateLines;
-        budget -= candidate.length;
+
+      const buildCatLines = (withExamples: boolean): string[] => {
+        const lines: string[] = [
+          '### Self-Review Blind Spots',
+          `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny. Examples from recent tasks:`,
+        ];
+        for (const [cat, data] of qualifying) {
+          const rawPct = Math.round(data.miss_rate * 100);
+          const suffix = data.weighted_miss_rate !== undefined
+            ? ` (${rawPct}% missed, ${Math.round(data.weighted_miss_rate * 100)}% severity-weighted):`
+            : ` (${rawPct}% missed):`;
+          lines.push(`- ${cat}${suffix}`);
+          if (withExamples && data.examples && data.examples.length > 0) {
+            for (const ex of data.examples) {
+              lines.push(`  - [${ex.severity}] ${ex.desc}`);
+            }
+          } else if (!withExamples || !data.examples || data.examples.length === 0) {
+            // fallback: no sub-bullets for this category
+          }
+        }
+        lines.push('');
+        return lines;
+      };
+
+      // Try full block with examples first; fall back to percentages-only if over budget
+      for (const withEx of [true, false]) {
+        const candidateLines = buildCatLines(withEx);
+        const candidate = candidateLines.join('\n');
+        if (candidate.length <= budget) {
+          srBlindSpotLines = candidateLines;
+          budget -= candidate.length;
+          break;
+        }
       }
     }
   }

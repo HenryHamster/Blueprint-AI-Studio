@@ -17,6 +17,9 @@ export interface SrTaskTypeCategoryStats {
 
 export interface SrTrendData {
   computed_at?: string | null;
+  bucket_mode?: 'cycle' | 'calendar' | null;
+  current_cycle_id?: string | null;
+  previous_cycle_id?: string | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
 }
@@ -159,15 +162,29 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
 
+  const cycleLabel = (() => {
+    if (trends?.bucket_mode === 'cycle' && trends.current_cycle_id) {
+      const cur = trends.current_cycle_id.slice(-6);
+      const prev = trends.previous_cycle_id ? trends.previous_cycle_id.slice(-6) : '–';
+      return `cycle ${cur} vs ${prev}`;
+    }
+    return null;
+  })();
+
   if (variant === 'card') {
     return (
       <div
         data-testid="sr-trend-breakdown"
         className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]"
       >
-        <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">
-          SR Miss Rate by Category
-        </p>
+        <div className="flex items-baseline gap-2 mb-1">
+          <p className="text-[9px] text-neutral-500 uppercase tracking-wide">
+            SR Miss Rate by Category
+          </p>
+          {cycleLabel && (
+            <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>
+          )}
+        </div>
         <div className="flex flex-col gap-0.5">
           {entries.map(([cat, c]) => {
             const miss = deriveMissRate(c);

@@ -762,6 +762,19 @@ class StrategicCycle(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
 
+    @property
+    def completed_at(self) -> Optional[datetime]:
+        """Effective cycle completion time: phase2 if available, else phase1, else updated_at."""
+        return self.phase2_completed_at or self.phase1_completed_at or self.updated_at
+
+    def cycle_ref(self) -> Dict[str, Any]:
+        """Compact dict for embedding in stored results and API responses."""
+        return {
+            "id": self.id,
+            "started_at": self.phase1_started_at.isoformat() if self.phase1_started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
 
 class OrchestratorErrorAck(SQLModel, table=True):
     """Persistent acknowledgement of an orchestrator error bucket.

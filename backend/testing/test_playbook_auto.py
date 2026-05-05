@@ -1,4 +1,5 @@
 """Tests for automatic playbook entry creation from recurring failure patterns."""
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -3615,6 +3616,243 @@ async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sam
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for miss-example collection in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task_with_review(
+    project_id,
+    *,
+    age_days: float,
+    human_cats: dict,
+    sr_failed_cats: list,
+    review_issues: list,
+    task_type: str = "create",
+) -> "Task":
+    """Build a Task with review_history issues for example extraction."""
+    check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+    task = Task(
+        project_id=project_id,
+        title="SR task with review",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": human_cats,
+            "review_loop": {
+                "review_history": [
+                    {"iteration": 1, "issues": review_issues}
+                ]
+            },
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_example_issues_populated(db_session: AsyncSession):
+    """Examples are collected from review_history for missed categories."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    review_issue = {"description": "Missing null check in handler", "severity": "MAJOR"}
+    # 5 current tasks: SR missed error-handling (sr_failed_cats=[])
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+            review_issues=[review_issue],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 5 previous tasks
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["error-handling"]
+    assert "examples" in cat
+    assert len(cat["examples"]) >= 1
+    assert any("null check" in ex["desc"] for ex in cat["examples"])
+    assert all(ex["severity"] in ("CRITICAL", "MAJOR", "MINOR") for ex in cat["examples"])
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_examples_by_task_type_scoped(db_session: AsyncSession):
+    """Examples in by_task_type are drawn only from matching task types."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # "null check" is in error-handling keywords; "fallback" is also in error-handling
+    create_issue = {"description": "Missing null check in create handler", "severity": "MAJOR"}
+    fix_issue = {"description": "Unhandled exception in fix scenario", "severity": "MAJOR"}
+
+    # 5 'create' tasks missing error-handling
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            review_issues=[create_issue], task_type="create",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 5 'fix' tasks missing error-handling
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            review_issues=[fix_issue], task_type="fix",
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    by_type = result["by_task_type"]
+    assert "create" in by_type
+    assert "fix" in by_type
+    create_exs = by_type["create"]["error-handling"].get("examples", [])
+    fix_exs = by_type["fix"]["error-handling"].get("examples", [])
+    create_descs = [e["desc"] for e in create_exs]
+    fix_descs = [e["desc"] for e in fix_exs]
+    # create examples must contain create-specific text and not fix-specific text
+    assert any("null check" in d for d in create_descs)
+    assert not any("exception" in d for d in create_descs)
+    assert any("exception" in d for d in fix_descs)
+    assert not any("null check" in d for d in fix_descs)
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_sensitive_examples_dropped(db_session: AsyncSession):
+    """Descriptions containing sensitive tokens are excluded from examples."""
+    from app.playbook_learning import compute_sr_catch_rate_trends, _SENSITIVE_TOKENS
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Use a token from the list
+    sensitive_token = _SENSITIVE_TOKENS[0]  # e.g. "password"
+    review_issues = [
+        {"description": f"Leaked {sensitive_token} in logs", "severity": "CRITICAL"},
+        {"description": "Unhandled exception in handler", "severity": "MAJOR"},
+    ]
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            review_issues=review_issues,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    examples = result["categories"]["error-handling"].get("examples", [])
+    assert all(sensitive_token not in ex["desc"].lower() for ex in examples)
+    # The non-sensitive issue should still appear
+    assert any("Unhandled exception" in ex["desc"] for ex in examples)
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_descriptions_truncated_and_pr_stripped(db_session: AsyncSession):
+    """Descriptions are truncated to <=100 chars and PR refs / URLs are stripped."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    long_desc = "A" * 200  # 200 chars, should be truncated
+    pr_desc = "Fix regression introduced in PR #1234 — missing guard"
+    url_desc = "See https://example.com/issue/99 for context — unhandled null"
+    review_issues = [
+        {"description": long_desc, "severity": "MAJOR"},
+        {"description": pr_desc, "severity": "MAJOR"},
+        {"description": url_desc, "severity": "MINOR"},
+    ]
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            review_issues=review_issues,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    examples = result["categories"]["error-handling"].get("examples", [])
+    for ex in examples:
+        assert len(ex["desc"]) <= 100
+    pr_exs = [e for e in examples if "missing guard" in e["desc"]]
+    if pr_exs:
+        assert "PR" not in pr_exs[0]["desc"]
+        assert "#1234" not in pr_exs[0]["desc"]
+    url_exs = [e for e in examples if "unhandled null" in e["desc"]]
+    if url_exs:
+        assert "https://" not in url_exs[0]["desc"]
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_example_cap_per_category(db_session: AsyncSession):
+    """At most _EXAMPLE_MAX_PER_CAT examples are stored per category."""
+    from app.playbook_learning import compute_sr_catch_rate_trends, _EXAMPLE_MAX_PER_CAT
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Provide many distinct review issues per task
+    review_issues = [
+        {"description": f"Issue number {i}", "severity": "MAJOR"}
+        for i in range(10)
+    ]
+    for _ in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            review_issues=review_issues,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    examples = result["categories"]["error-handling"].get("examples", [])
+    assert len(examples) <= _EXAMPLE_MAX_PER_CAT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for regression notifications in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3734,3 +3972,363 @@ async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_incre
     assert trend in ("stable", "increasing")
     mock_post.assert_not_called()
     mock_dispatch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# LLM categorization helpers
+# ---------------------------------------------------------------------------
+
+
+def test_categorize_review_issues_keyword_scope_drift():
+    """_categorize_review_issues_keyword has the same behaviour as _categorize_review_issues."""
+    from app.playbook_learning import _categorize_review_issues_keyword
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {"description": "changes are too large for declared scope", "severity": "MAJOR"},
+            ],
+        }
+    ]
+    result = _categorize_review_issues_keyword(review_history)
+    assert "scope-drift" in result
+    assert len(result["scope-drift"]) == 1
+    assert result["scope-drift"][0]["severity"] == "MAJOR"
+    assert "other" not in result
+
+
+def test_categorize_review_issues_with_cached_returns_verbatim():
+    """When cached= is provided, _categorize_review_issues returns it without scanning history."""
+    from app.playbook_learning import _categorize_review_issues
+
+    # Nonsense review_history that would produce different buckets if scanned.
+    review_history = [
+        {"iteration": 1, "issues": [{"description": "test coverage missing", "severity": "MAJOR"}]}
+    ]
+    sentinel = {"correctness": [{"desc": "pre-computed", "severity": "CRITICAL", "iteration": 0}]}
+
+    result = _categorize_review_issues(review_history, cached=sentinel)
+    assert result is sentinel
+
+
+@pytest.mark.asyncio
+async def test_categorize_review_issues_llm_returns_correct_buckets():
+    """LLM helper correctly parses a valid JSON response and returns bucketed issues."""
+    from unittest.mock import MagicMock
+    from app.playbook_learning import categorize_review_issues_llm
+
+    issues = [
+        {"description": "missing unit tests", "severity": "MAJOR", "iteration": 1},
+        {"description": "SQL injection risk", "severity": "CRITICAL", "iteration": 1},
+    ]
+    fake_text = json.dumps(
+        {"classifications": [{"index": 0, "category": "test-coverage"}, {"index": 1, "category": "security"}]}
+    )
+
+    mock_content_item = MagicMock()
+    mock_content_item.text = fake_text
+    mock_resp = MagicMock()
+    mock_resp.content = [mock_content_item]
+
+    mock_create = AsyncMock(return_value=mock_resp)
+    mock_messages = MagicMock()
+    mock_messages.create = mock_create
+    mock_client = MagicMock()
+    mock_client.messages = mock_messages
+    mock_client_cls = MagicMock(return_value=mock_client)
+
+    import os
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""}):
+        with patch("anthropic.AsyncAnthropic", mock_client_cls):
+            result = await categorize_review_issues_llm(issues)
+
+    assert "test-coverage" in result
+    assert result["test-coverage"][0]["desc"] == "missing unit tests"
+    assert "security" in result
+    assert result["security"][0]["desc"] == "SQL injection risk"
+
+
+@pytest.mark.asyncio
+async def test_categorize_review_issues_llm_falls_back_on_api_error():
+    """On LLM exception the helper falls back to keyword classification."""
+    from unittest.mock import MagicMock
+    from app.playbook_learning import categorize_review_issues_llm, _keyword_from_flat
+
+    issues = [
+        {"description": "missing unit tests", "severity": "MAJOR", "iteration": 1},
+    ]
+
+    import os
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""}):
+        with patch("anthropic.AsyncAnthropic", MagicMock(side_effect=Exception("network error"))):
+            result = await categorize_review_issues_llm(issues)
+
+    expected = _keyword_from_flat(issues)
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_categorize_review_issues_llm_kill_switch():
+    """When DISABLE_LLM_REVIEW_CATEGORIZATION=1, no Anthropic client is constructed."""
+    from unittest.mock import MagicMock
+    from app.playbook_learning import categorize_review_issues_llm
+
+    issues = [
+        {"description": "missing unit tests", "severity": "MAJOR", "iteration": 1},
+    ]
+
+    import os
+    with patch.dict(os.environ, {"DISABLE_LLM_REVIEW_CATEGORIZATION": "1"}):
+        with patch("anthropic.AsyncAnthropic") as mock_cls:
+            result = await categorize_review_issues_llm(issues)
+            mock_cls.assert_not_called()
+
+    assert "test-coverage" in result
+
+
+@pytest.mark.asyncio
+async def test_cache_first_attempt_classification_writes_buckets_and_method():
+    """cache_first_attempt_classification writes buckets + _classification_method to context."""
+    from app.playbook_learning import cache_first_attempt_classification
+
+    issues = [{"description": "missing unit tests", "severity": "MAJOR", "iteration": 1}]
+    ctx: dict = {}
+
+    import os
+    with patch.dict(os.environ, {"DISABLE_LLM_REVIEW_CATEGORIZATION": "1"}):
+        buckets = await cache_first_attempt_classification(ctx, issues)
+
+    assert "_first_attempt_categorized_issues" in ctx
+    entry = ctx["_first_attempt_categorized_issues"]
+    assert "buckets" in entry
+    assert "_classification_method" in entry
+    assert entry["_classification_method"] in ("llm", "keyword")
+    assert buckets == entry["buckets"]
+    assert "test-coverage" in buckets
+
+
+def test_compute_sr_prediction_accuracy_uses_cached_categories():
+    """When _first_attempt_categorized_issues is present, _categorize_review_issues is not called."""
+    from app.routers.admin_digest import _compute_sr_prediction_accuracy
+    from app.playbook_learning import _categorize_review_issues
+    from app.models import Task, TaskStatus
+    import uuid
+
+    def _make_task_with_cache(cached_buckets):
+        t = Task(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            status=TaskStatus.COMPLETED,
+            prompt="test",
+            task_type="create",
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"test-coverage": {"passed": False}}
+                },
+                "_first_attempt_rejection_categories": {"test-coverage": 1},
+                "_first_attempt_categorized_issues": {
+                    "buckets": cached_buckets,
+                    "_classification_method": "llm",
+                },
+                "review_loop": {
+                    "review_history": [
+                        {"iteration": 1, "issues": [{"description": "logic error", "severity": "MAJOR"}]}
+                    ]
+                },
+            },
+        )
+        return t
+
+    cached = {"test-coverage": [{"desc": "from cache", "severity": "MAJOR", "iteration": 1}]}
+    tasks = [_make_task_with_cache(cached) for _ in range(5)]
+
+    call_count = {"n": 0}
+    original = _categorize_review_issues
+
+    def spy(review_history, cached=None):
+        if cached is None:
+            call_count["n"] += 1
+        return original(review_history, cached=cached)
+
+    with patch("app.routers.admin_digest._categorize_review_issues", side_effect=spy):
+        result = _compute_sr_prediction_accuracy(tasks)
+
+    assert result is not None
+    # The keyword scan should NOT have been called (cached path was taken for all 5 tasks).
+    assert call_count["n"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for cycle-based bucketing in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_cycle(project_id, *, age_days: float, outcome: str = "completed") -> "StrategicCycle":
+    from app.models import StrategicCycle
+    cycle = StrategicCycle(
+        id=uuid.uuid4().hex,
+        project_id=project_id,
+        outcome=outcome,
+    )
+    cycle.phase1_started_at = _utcnow() - timedelta(days=age_days)
+    return cycle
+
+
+@pytest.mark.asyncio
+async def test_cycle_bucketing_uses_strategic_cycle_id(db_session: AsyncSession):
+    """When two completed cycles exist, tasks are bucketed by strategic_cycle_id."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    c_cycle = _make_cycle(project.id, age_days=2)
+    p_cycle = _make_cycle(project.id, age_days=20)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+    await db_session.flush()
+
+    tasks = []
+    # Current cycle: 3/5 hit
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[])
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    # Previous cycle: 5/5 hit
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=19, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_cycle_id"] == c_cycle.id
+    assert result["previous_cycle_id"] == p_cycle.id
+    cat = result["categories"]["correctness"]
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    assert cat["previous_hit_rate"] == 1.0
+    assert cat["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
+async def test_cycle_bucketing_skips_underpopulated_cycle_rolls_further_back(db_session: AsyncSession):
+    """Skips a cycle pair where current bucket has < _MIN_SR_SAMPLE and uses N-1 / N-2."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    newest_cycle = _make_cycle(project.id, age_days=2)   # only 2 tasks — below threshold
+    mid_cycle = _make_cycle(project.id, age_days=20)     # 5 tasks
+    old_cycle = _make_cycle(project.id, age_days=40)     # 5 tasks
+    db_session.add(newest_cycle)
+    db_session.add(mid_cycle)
+    db_session.add(old_cycle)
+    await db_session.flush()
+
+    tasks = []
+    for i in range(2):  # newest: below threshold
+        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = newest_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):  # mid: 5 tasks (should become "current")
+        t = _make_sr_task(project.id, age_days=19, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = mid_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):  # old: 5 tasks (should become "previous")
+        t = _make_sr_task(project.id, age_days=39, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = old_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_cycle_id"] == mid_cycle.id
+    assert result["previous_cycle_id"] == old_cycle.id
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_calendar_windows_when_no_completed_cycles(db_session: AsyncSession):
+    """Falls back to 14-day calendar windows when no completed cycles exist."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    # Add an in-progress cycle only — no completed cycles.
+    in_progress_cycle = _make_cycle(project.id, age_days=2, outcome="in_progress")
+    db_session.add(in_progress_cycle)
+    await db_session.flush()
+
+    tasks = []
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "calendar"
+    assert result["current_cycle_id"] is None
+    assert "test-coverage" in result["categories"]
+
+
+@pytest.mark.asyncio
+async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession):
+    """Second call with same cycle_id + regressing cats does NOT re-fire notification."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    c_cycle = _make_cycle(project.id, age_days=2)
+    p_cycle = _make_cycle(project.id, age_days=20)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+
+    tasks = []
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[])
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=19, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert mock_post.call_count == 1
+
+    # Second call same cycle — dedup should suppress.
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post2, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    mock_post2.assert_not_called()
