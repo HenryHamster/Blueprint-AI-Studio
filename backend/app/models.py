@@ -613,19 +613,48 @@ def _on_status_message_set(target: Task, value, oldvalue, initiator):
 # main.py registers _terminated_task_ids.add here to revoke agent JWTs.
 _on_task_terminal_callbacks: list = []
 
+# Callbacks invoked when a task is revived from a terminal state OR set to
+# any non-terminal status. Used to clear any in-memory deny-lists populated
+# by terminal callbacks (notably ``_terminated_task_ids`` in agent.py).
+#
+# Production 2026-05-05: task 3d4bc05a was stuck in a claim 401 loop:
+#   1. A prior in-flight transition set status=FAILED (in memory) — fired
+#      terminal callback → ``_terminated_task_ids[task_id] = now``.
+#   2. The transaction was rolled back (e.g. agent_status playbook block
+#      poisoned the session), reverting the DB but leaving the cache
+#      populated.
+#   3. The reaper later requeued the task to QUEUED, the orchestrator
+#      committed PROVISIONING, but the cache stayed set — so every new
+#      VM's ``/api/agent/claim`` hit ``_terminated_task_ids`` and got 401
+#      "Task is no longer active", looping forever until the orchestrator
+#      revision restarted (wiping the in-memory cache).
+#
+# Firing revive callbacks on every non-terminal status set restores the
+# cache invariant so the agent can claim cleanly.
+_on_task_revive_callbacks: list = []
+
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
     if value and isinstance(oldvalue, str) and value != oldvalue:
         entry = {"t": _utcnow().isoformat(), "msg": f"Status changed: {oldvalue} → {value}"}
         target.status_log = ((target.status_log or []) + [entry])[-90:]
+        task_id = str(target.id)
         # Notify JWT revocation when task reaches terminal state
         if value in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
-            task_id = str(target.id)
             for cb in _on_task_terminal_callbacks:
                 try:
                     cb(task_id)
                 except Exception as e:
                     logger.error(f"[MODELS] Terminal callback failed for task {task_id}: {e}", exc_info=True)
+        else:
+            # Non-terminal status set (QUEUED, PROVISIONING, IN_PROGRESS,
+            # EVALUATING). Fire revive callbacks so any deny-list entries
+            # populated by an earlier terminal transition are cleared.
+            for cb in _on_task_revive_callbacks:
+                try:
+                    cb(task_id)
+                except Exception as e:
+                    logger.error(f"[MODELS] Revive callback failed for task {task_id}: {e}", exc_info=True)
 
 
 class AlertSeverity(str, Enum):

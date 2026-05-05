@@ -19,7 +19,7 @@ from app.auth import verify_agent_jwt, create_agent_token
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
     Project, Task, TaskStatus, TaskHistory, Artifact, ArtifactType,
-    UserIntegration, _on_task_terminal_callbacks, _utcnow,
+    UserIntegration, _on_task_terminal_callbacks, _on_task_revive_callbacks, _utcnow,
 )
 from app.time_utils import _to_naive_utc
 from app.schemas import (
@@ -94,6 +94,13 @@ async def _create_review_check_run_bg(
 _terminated_task_ids: dict[str, float] = {}
 _TERMINATED_TTL = 9 * 3600  # 9h — slightly longer than 8h JWT max lifetime
 _on_task_terminal_callbacks.append(lambda tid: _terminated_task_ids.__setitem__(tid, time.time()))
+# Production 2026-05-05: when a task is requeued (terminal → QUEUED, or any
+# in-flight set to a non-terminal status), drop the deny-list entry so the
+# next ``/api/agent/claim`` doesn't 401 with "Task is no longer active". The
+# cache could otherwise persist across the lifecycle of the orchestrator
+# revision, causing claim 401 loops. See models.py:_on_task_revive_callbacks
+# for the full rationale.
+_on_task_revive_callbacks.append(lambda tid: _terminated_task_ids.pop(tid, None))
 
 # Issue M3 (warm-VM continuity audit, deferred): JWTs for terminated tasks
 # remain valid for the JWT's full TTL (8h). The is_idempotent_path branch

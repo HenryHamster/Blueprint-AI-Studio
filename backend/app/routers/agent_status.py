@@ -1841,6 +1841,17 @@ async def update_agent_status(
         _task_id_str = str(task.id)
         _task_project_id_str = str(task.project_id)
         _task_type_str = (task.first_payload or {}).get("type", "unknown")
+        # Production 2026-05-05: the f"...{task.id}..." snapshot above
+        # protected log lines, but downstream business logic at
+        # line ~1973 (``failed_task_payload = task.first_payload``) and
+        # the auto-debug branch below also access ORM attributes
+        # (task.first_payload, task.context, task.title, task.created_by,
+        # task.parent_task_id, task.description) and crashed with the
+        # same MissingGreenlet at agent_status.py:1973 → models.py:470.
+        # Track whether any rollback below required us to refresh
+        # before the auto-debug branch reads. Set True at every
+        # rollback site in the metrics + playbook blocks.
+        _attrs_may_be_expired = False
 
         # Record first-attempt success metrics for playbook effectiveness tracking
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
@@ -1864,6 +1875,7 @@ async def update_agent_status(
                     # the early commit at ~1979) raises PendingRollbackError.
                     with contextlib.suppress(Exception):
                         await session.rollback()
+                    _attrs_may_be_expired = True
                 _ctx["_had_playbook"] = bool(_playbook_count)
                 _ctx["_had_arch_context"] = bool(_ctx.get("_had_arch_context"))
                 task.context = _ctx
@@ -1944,6 +1956,7 @@ async def update_agent_status(
                         # capture/learning").
                         with contextlib.suppress(Exception):
                             await session.rollback()
+                        _attrs_may_be_expired = True
             except Exception as _e:
                 logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {_task_id_str}: {_e}")
                 # WHY: the metrics block also touches session.get and session.add;
@@ -1952,6 +1965,7 @@ async def update_agent_status(
                 # Roll back so the early commit at ~1979 has a clean session.
                 with contextlib.suppress(Exception):
                     await session.rollback()
+                _attrs_may_be_expired = True
 
         # Auto-create playbook entries from recurring failure patterns
         if payload.status == TaskStatus.FAILED:
@@ -1968,6 +1982,24 @@ async def update_agent_status(
                 # back here so downstream commits land on a clean session.
                 with contextlib.suppress(Exception):
                     await session.rollback()
+                _attrs_may_be_expired = True
+
+        # Production 2026-05-05 fix: any rollback in the metrics block above
+        # (4 inner-except sites at lines ~1877, ~1957, ~1965; or this
+        # playbook block's except at ~1983) expires SQLAlchemy attribute
+        # state on the `task` object. The auto-debug branch below reads
+        # ``task.first_payload``, ``task.context``, ``task.title``,
+        # ``task.created_by``, ``task.parent_task_id``, ``task.description``,
+        # all of which would trigger sync lazy-load → asyncpg
+        # pool_pre_ping → MissingGreenlet → 500 (observed at
+        # agent_status.py:1973 → models.py:470 in production logs).
+        # Refresh once so downstream reads use freshly-loaded attrs.
+        # Best-effort: if refresh itself raises on a truly poisoned
+        # connection, the suppress preserves the prior behavior — the
+        # downstream attribute access will surface a clean error.
+        if _attrs_may_be_expired:
+            with contextlib.suppress(Exception):
+                await session.refresh(task)
 
         # Spawn a debug task for permanently failed tasks (retries exhausted)
         failed_task_payload = task.first_payload
