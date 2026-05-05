@@ -746,6 +746,13 @@ async def update_agent_status(
         normalized_failure_category = normalize_agent_failure_category(payload.failure_category, task)
         ctx = dict(task.context or {})
         ctx['failure_category'] = normalized_failure_category
+        # Preserve the raw lowercase agent label (e.g. "incomplete",
+        # "claude_code_failed") alongside the normalized class. Normalization
+        # collapses every CODE_ERROR sub-flavour into a single string, but
+        # retry-guidance routing in task_lifecycle.py needs the sub-category
+        # to distinguish "agent printed a diff but never shipped" (incomplete)
+        # from real build/test failures.
+        ctx['agent_failure_category_raw'] = payload.failure_category.strip().lower()
         task.context = ctx
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})

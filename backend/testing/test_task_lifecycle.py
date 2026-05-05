@@ -2463,6 +2463,41 @@ class TestBuildRetryPromptSuffix:
         assert "RETRY GUIDANCE" in guidance
         assert "unclassified" in guidance.lower()
 
+    def test_code_error_incomplete_emits_no_ship_guidance(self):
+        """Wrapper-fallback 'incomplete' (agent printed diff, never shipped) gets
+        bespoke retry guidance — bypasses keyword-based stage routing that would
+        otherwise mis-match 'build' on a diff body containing BuildConfig/etc."""
+        # Status message simulates the diff-fragment tail that agent_status.py
+        # captures. Without the special-case, _previous_failure_stage="build"
+        # would route to the irrelevant build-stage hint.
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR",
+            "interface ProjectBuildConfigSectionProps {\n  githubOwner: string;",
+            attempt=2, task_scope="small",
+            ctx={
+                "agent_failure_category_raw": "incomplete",
+                "_previous_failure_stage": "build",  # mis-derived; should be ignored
+            },
+        )
+        assert "printed a diff to stdout" in guidance
+        assert "./pr" in guidance and "./done" in guidance
+        # The build-stage guidance text must NOT have leaked through.
+        assert "Verify import paths" not in guidance
+
+    def test_code_error_incomplete_overrides_keyword_hints(self):
+        """'incomplete' raw label takes precedence over status-message keyword
+        hints — the agent didn't actually run tests/lint, so those hints would
+        be misleading."""
+        guidance, _ = _build_retry_prompt_suffix(
+            "CODE_ERROR", "diff text that mentions test_foo and eslint",
+            attempt=1, task_scope="small",
+            ctx={"agent_failure_category_raw": "incomplete"},
+        )
+        assert "printed a diff to stdout" in guidance
+        # Generic test/lint hint should not appear.
+        assert "Fix the specific failing tests" not in guidance
+        assert "Fix lint/type errors first" not in guidance
+
     def test_code_error_attempt_one_no_scope_override(self):
         _, override = _build_retry_prompt_suffix(
             "CODE_ERROR", "boom", attempt=1, task_scope="large", ctx={},

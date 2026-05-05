@@ -295,25 +295,48 @@ def _build_retry_prompt_suffix(
             scope_override = "medium"
 
     elif failure_class == "CODE_ERROR":
-        stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
-        if stage_guidance:
-            extra_guidance = "RETRY GUIDANCE: " + stage_guidance + "\n"
+        agent_raw = (ctx.get("agent_failure_category_raw") or "").lower()
+        # Wrapper-fallback "incomplete": the agent process exited without
+        # calling ./done|./fail|./pr — typically because the LLM printed a
+        # unified diff to stdout instead of using its editing tools. The
+        # status-message keyword detector frequently mis-matches "build" on
+        # diff bodies that mention BuildConfig/etc., producing irrelevant
+        # build-stage retry guidance. Short-circuit with a bespoke prompt
+        # before any keyword-based routing fires.
+        if agent_raw == "incomplete":
+            extra_guidance = (
+                "RETRY GUIDANCE: Your previous attempt printed a diff to stdout but never\n"
+                "applied any edits or shipped a PR. A unified diff printed as text does\n"
+                "NOT modify the repository. The wrapper observed zero file changes and\n"
+                "no ./done/./fail/./pr call, so it failed the task as 'incomplete'.\n"
+                "You MUST:\n"
+                "  - Use the file editing tools (Edit/Write/apply_patch) to actually\n"
+                "    apply changes to the working tree — do not just print a patch\n"
+                "  - Run the build/tests if the task requires verification\n"
+                "  - Open a PR via ./pr and call ./done to ship — OR call\n"
+                "    ./fail \"<reason>\" if the task fundamentally cannot be completed\n"
+                "Do NOT print a unified diff to stdout and exit.\n"
+            )
         else:
-            error_text = (original_status_message or "").lower()
-            hints = []
-            if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
-                hints.append("Fix the specific failing tests shown in the error log before making other changes.")
-            if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
-                hints.append("Fix lint/type errors first — run the linter before committing.")
-            if hints:
-                extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
+            stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(ctx.get("_previous_failure_stage") or "")
+            if stage_guidance:
+                extra_guidance = "RETRY GUIDANCE: " + stage_guidance + "\n"
             else:
-                extra_guidance = (
-                    "RETRY GUIDANCE: The previous attempt failed with an unclassified code error.\n"
-                    "- Verify changes compile and pass lint locally before committing\n"
-                    "- Check for import errors or missing dependencies\n"
-                    "- If the previous approach produced errors, try a simpler alternative\n"
-                )
+                error_text = (original_status_message or "").lower()
+                hints = []
+                if any(kw in error_text for kw in ["test", "assert", "pytest", "jest", "vitest"]):
+                    hints.append("Fix the specific failing tests shown in the error log before making other changes.")
+                if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
+                    hints.append("Fix lint/type errors first — run the linter before committing.")
+                if hints:
+                    extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
+                else:
+                    extra_guidance = (
+                        "RETRY GUIDANCE: The previous attempt failed with an unclassified code error.\n"
+                        "- Verify changes compile and pass lint locally before committing\n"
+                        "- Check for import errors or missing dependencies\n"
+                        "- If the previous approach produced errors, try a simpler alternative\n"
+                    )
         failing_tests = ctx.get("_previous_failing_tests", [])
         error_files = ctx.get("_previous_error_files", [])
         current_failing = _extract_failing_tests(original_status_message or "")
