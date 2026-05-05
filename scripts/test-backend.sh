@@ -39,6 +39,29 @@ for arg in "$@"; do
 done
 if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
 
+# --- Memory guard: refuse the full Docker+Postgres suite on memory-constrained
+# hosts (Blueprint's agent VM is e2-standard-2 = 8 GB and cannot fit the
+# build + sidecar + pytest peak alongside the agent + Claude subprocess —
+# tasks 53ef061b / b150b4d6 / b15b6813 all OOM'd here 2026-05-05). The
+# guard exits with a clear message instead of letting the OOM-killer fire
+# silently. CI and 16 GB+ dev machines pass through.
+# Bypass with ALLOW_LOW_MEM=1 (or pass --standalone, or specify test files).
+if [ -r /proc/meminfo ] && [ -z "${ALLOW_LOW_MEM:-}" ]; then
+  AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
+  IS_FULL_SUITE=1
+  for arg in "$@"; do
+    case "$arg" in
+      --standalone|-k|*.py|*::*) IS_FULL_SUITE=0 ;;
+    esac
+  done
+  if [ "$IS_FULL_SUITE" = "1" ] && [ "$AVAIL_MB" -lt 4096 ]; then
+    echo "ERROR: Available memory ${AVAIL_MB}MB is below 4GB — full suite will likely OOM." >&2
+    echo "  Use --standalone for a lightweight pass (3 invariant files, no DB)," >&2
+    echo "  or pass a specific test file (testing/test_<x>.py), or set ALLOW_LOW_MEM=1." >&2
+    exit 2
+  fi
+fi
+
 # --- Fetch warm testmon cache from orphan branch (best-effort) ---
 # CI on main refreshes the orphan testmon-cache branch with a vacuumed
 # .testmondata. Pulling it lets pytest --testmon-forceselect skip tests

@@ -531,7 +531,15 @@ if touches backend/; then
     echo "[check] ruff not installed, skipping backend lint"
   fi
   if [ "$WITH_TESTS" = "1" ] && [ "${cfg.testsOnMainBranch ? '1' : '0'}" = "1" ]; then
-    run "backend pytest" bash -c 'bash scripts/test-backend.sh --postgres 2>&1 | tail -200'
+    # --standalone --no-postgres: agent VM is e2-standard-2 (8 GB) and
+    # cannot fit Docker build + Postgres sidecar + full pytest suite +
+    # agent + Claude subprocess in memory. The full suite OOMs (exit
+    # 137) during the mandatory pre-PR gate (53ef061b, b150b4d6, b15b6813
+    # all died this way 2026-05-05). Standalone runs the 3 invariant
+    # files (security, pipeline, invariants) which catch file-size
+    # breaches, security regressions, and basic pipeline assertions —
+    # the rest is CI's job.
+    run "backend pytest" bash -c 'bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
   fi
 fi
 
@@ -987,17 +995,18 @@ the workspace, executable):
   green. If your changes don't touch admin-ui/, agent/, or backend/,
   \`./check\` returns PASS without running anything — that's expected
   for pure-docs tasks.
-- \`./check test\` — same plus the FULL Docker backend test suite (~5-8min).
-  Reserve this for **cross-cutting changes** — migrations, model
-  schema changes, refactors that touch many modules, dependency bumps.
-  For everything else (targeted features, isolated fixes, single-module
-  edits): run only the relevant test file(s) directly via
-  \`bash scripts/test-backend.sh testing/test_<your_module>.py\` to
-  verify your changes don't regress what you touched. CI runs the full
-  suite on the PR after \`./pr open\`, so a redundant full-suite run
-  here is wasted compute that risks subprocess timeout — which kills
-  the task before it can open the PR (production 2026-05-05: lost a
-  completed implementation that way).
+- \`./check test\` — same plus a **lightweight standalone backend test
+  pass** (3 invariant files, ~30s). This VM is 8 GB; the FULL Docker
+  + Postgres pytest suite OOMs here (production 2026-05-05: tasks
+  53ef061b, b150b4d6, b15b6813 all died at exit 137 during this gate).
+  CI runs the full suite on the PR after \`./pr open\`, so this local
+  gate is just a smoke check — file-size guardrails, security regs,
+  pipeline invariants. **For full suite runs use
+  \`bash scripts/test-backend.sh --standalone --no-postgres\`** — calling
+  \`scripts/test-backend.sh\` with no test-file argument runs the full
+  suite and OOMs. Specific test files are fine with default Postgres:
+  \`bash scripts/test-backend.sh testing/test_<module>.py\` fits in
+  headroom (the memory guard auto-exempts single-file runs).
 - \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
   commits any pending changes, pushes to the work branch (force-with-lease
   retry built in), creates a PR (or pushes updates to an existing one for
