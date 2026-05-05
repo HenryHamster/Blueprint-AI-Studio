@@ -672,6 +672,27 @@ describe('test baseline capture', () => {
     await handleDeps(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();
   });
+
+  it('writes test_baseline file when captureTestBaseline returns a non-null set', async () => {
+    const { writeFileSync } = await import('fs');
+    vi.mocked(captureTestBaseline).mockResolvedValue(new Set(['test A', 'test B']));
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const baselineCalls = vi.mocked(writeFileSync).mock.calls.filter(c => String(c[0]).includes('test_baseline_'));
+    expect(baselineCalls).toHaveLength(1);
+    expect(baselineCalls[0][0]).toBe(`/tmp/test_baseline_${TASK_ID}.json`);
+    expect(baselineCalls[0][1]).toContain('test A');
+  });
+
+  it('does not write test_baseline file when captureTestBaseline returns null', async () => {
+    const { writeFileSync } = await import('fs');
+    vi.mocked(writeFileSync).mockClear();
+    vi.mocked(captureTestBaseline).mockResolvedValue(null);
+    const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const baselineCalls = vi.mocked(writeFileSync).mock.calls.filter(c => String(c[0]).includes('test_baseline_'));
+    expect(baselineCalls).toHaveLength(0);
+  });
 });
 
 // ── Two-phase analysis for medium-scope tasks ────────────────────────────────

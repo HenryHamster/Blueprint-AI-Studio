@@ -3290,13 +3290,14 @@ def _make_sr_task(
     age_days: float,
     human_cats: dict,
     sr_failed_cats: list,
+    task_type: str = "create",
 ) -> Task:
     """Build a Task with both _self_review_outcome.check_results and _first_attempt_rejection_categories."""
     check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
     task = Task(
         project_id=project_id,
         title="SR task",
-        payloads=[{"type": "create", "prompt": "do something"}],
+        payloads=[{"type": task_type, "prompt": "do something"}],
         status=TaskStatus.COMPLETED,
         context={
             "_self_review_outcome": {"check_results": check_results},
@@ -3460,3 +3461,153 @@ async def test_compute_sr_catch_rate_trends_persists_to_design_doc(db_session: A
     stored = project.design_doc["sr_catch_rate_trends"]
     assert "computed_at" in stored
     assert "categories" in stored
+    assert "by_task_type" in stored
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _categorize_review_issues — scope-drift bucket
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_categorize_review_issues_scope_drift_keyword_routes_correctly():
+    """Review comments containing scope-drift keywords are bucketed under scope-drift."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {
+                    "description": "changes are too large for declared scope",
+                    "severity": "MAJOR",
+                },
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "scope-drift" in result
+    assert len(result["scope-drift"]) == 1
+    assert result["scope-drift"][0]["severity"] == "MAJOR"
+
+
+def test_categorize_review_issues_out_of_scope_routes_to_scope_drift():
+    """'out of scope' phrasing also routes to scope-drift bucket."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {
+                    "description": "This change includes unrelated changes beyond scope",
+                    "severity": "MINOR",
+                },
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "scope-drift" in result
+    assert len(result["scope-drift"]) == 1
+
+
+def test_categorize_review_issues_scope_drift_not_in_other_bucket():
+    """Scope-drift issue should not appear in the 'other' bucket."""
+    from app.playbook_learning import _categorize_review_issues
+
+    review_history = [
+        {
+            "iteration": 1,
+            "issues": [
+                {
+                    "description": "diff size is much too large, beyond scope of this task",
+                    "severity": "CRITICAL",
+                },
+            ],
+        }
+    ]
+
+    result = _categorize_review_issues(review_history)
+
+    assert "scope-drift" in result
+    assert "other" not in result
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_per_task_type_breakdown(db_session: AsyncSession):
+    """by_task_type contains correct hit/miss rates per (task_type, category)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 'create' tasks — 4 hits on test-coverage
+    for i in range(4):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"], task_type="create")
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[], task_type="create")
+    db_session.add(t)
+    tasks.append(t)
+    # Current window: 5 'fix' tasks — 2 hits on test-coverage
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"], task_type="fix")
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[], task_type="fix")
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks needed for overall threshold
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    by_type = result["by_task_type"]
+    assert "create" in by_type
+    assert "fix" in by_type
+    create_cat = by_type["create"]["test-coverage"]
+    assert create_cat["hit_rate"] == round(4 / 5, 3)
+    assert create_cat["miss_rate"] == round(1 / 5, 3)
+    assert create_cat["sample_count"] == 5
+    fix_cat = by_type["fix"]["test-coverage"]
+    assert fix_cat["hit_rate"] == round(2 / 5, 3)
+    assert fix_cat["miss_rate"] == round(3 / 5, 3)
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sample(db_session: AsyncSession):
+    """Cells with fewer than 5 samples per (task_type, category) are omitted from by_task_type."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 'create' tasks (meets threshold), 4 'fix' tasks (below threshold)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"], task_type="create")
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(4):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"], task_type="fix")
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    by_type = result["by_task_type"]
+    assert "create" in by_type
+    assert "fix" not in by_type

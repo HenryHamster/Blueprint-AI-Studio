@@ -1027,6 +1027,45 @@ backend review vocabulary — must match exactly):
 - \`performance\` — N+1 queries, missing indexes, memory leaks, slow paths
 - \`architecture\` — coupling, abstraction boundaries, pattern violations
 - \`test-coverage\` — missing tests for new behavior, untested edge cases
+- \`scope-drift\` — diff materially exceeds the declared task scope (see thresholds below)
+- \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
+
+**Scope-drift check (required for code-change tasks):**
+Run \`git diff --stat HEAD\` (or \`git diff --stat <base>..HEAD\` if you know the base) and count
+total changed lines (insertions + deletions) and the number of files touched.
+Compare against the task's declared scope using these thresholds:
+
+| Scope  | Max lines | Max files |
+|--------|-----------|-----------|
+| small  | 50        | 2         |
+| medium | 200       | 5         |
+| large  | 800       | 15        |
+
+If the diff exceeds the threshold for the declared scope, record \`scope-drift\` in
+\`check_results\` with \`passed: false\` and an \`issue\` field explaining the overage (e.g.
+"small task shipped 312 changed lines across 6 files — threshold is 50 lines / 2 files").
+If within bounds, record \`scope-drift\` with \`passed: true\`. The check does NOT block
+\`./done\` — it is informational and feeds the catch-rate dashboard.
+
+**Regression-risk check (conditional on baseline availability):**
+Before calling \`./done\`, check whether \`/tmp/test_baseline_\${TASK_ID}.json\` exists
+(where TASK_ID is the value from the ORCHESTRATOR env, also printed at the top of
+your session context). If the file exists, it contains a JSON array of test names that
+were already failing BEFORE your changes — these are pre-existing failures, not
+regressions. Compare this list against any test failures surfaced by your most recent
+\`./check test\` or \`./check\` run:
+
+- If a test is now failing AND its name does NOT appear in the baseline array, that is a
+  regression introduced by your changes. Record \`regression_risk\` in \`check_results\`
+  with \`passed: false\` and an \`issue\` naming the affected test(s) and your assessment
+  of whether the failure is caused by your changes or is pre-existing/unrelated.
+- If all current failures appear in the baseline (or there are no failures), record
+  \`regression_risk\` with \`passed: true\`.
+- If the baseline file does not exist (fix tasks, non-main branches, auto-remediation),
+  omit \`regression_risk\` from \`check_results\` entirely.
+
+Like \`scope-drift\`, this check does NOT block \`./done\` — it is informational and feeds
+the catch-rate dashboard.
 
 Schema:
 

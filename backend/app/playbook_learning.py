@@ -114,6 +114,11 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
         "edge case", "boundary", "race condition", "deadlock", "missing import",
         "undefined", "null reference", "assertion", "invariant", "constraint",
     ],
+    "scope-drift": [
+        "scope", "scope drift", "diff size", "too large", "too many files",
+        "bloat", "beyond scope", "out of scope", "unrelated changes",
+        "exceeds scope", "scope creep", "too broad", "unrelated files",
+    ],
 }
 
 logger = logging.getLogger(__name__)
@@ -1760,15 +1765,17 @@ async def compute_sr_catch_rate_trends(
 
     def _split_sr(
         tasks: list, start: datetime, end: datetime
-    ) -> tuple[int, dict[str, dict]]:
-        """Return (task_count_with_both, {cat: {hit_count, human_count}}).
+    ) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]]]:
+        """Return (task_count_with_both, {cat: {hit_count, human_count, w_hit, w_total}}, {task_type: {cat: {hit_count, human_count}}}).
 
         Includes tasks where SR ran (has _self_review_outcome) and human rejected
         (has _first_attempt_rejection_categories), even when check_results is empty
         — empty check_results means SR passed everything and thus missed all human cats.
         """
+        _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
         count = 0
         cat_stats: dict[str, dict] = {}
+        type_cat_stats: dict[str, dict[str, dict]] = {}
         for t in tasks:
             if not t.created_at:
                 continue
@@ -1784,16 +1791,33 @@ async def compute_sr_catch_rate_trends(
             count += 1
             check_results = ctx["_self_review_outcome"].get("check_results") or {}
             sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+            cat_weights: dict[str, int] = {}
+            if rev_hist:
+                for cat, issues in _categorize_review_issues(rev_hist).items():
+                    cat_weights[cat] = max(_sw.get(i["severity"], 1) for i in issues)
+            task_type = t.first_payload.get("type", "")
             for cat in human_cats:
                 if cat not in cat_stats:
-                    cat_stats[cat] = {"hit_count": 0, "human_count": 0}
+                    cat_stats[cat] = {"hit_count": 0, "human_count": 0, "w_hit": 0.0, "w_total": 0.0}
                 cat_stats[cat]["human_count"] += 1
+                w = cat_weights.get(cat, 1)
+                cat_stats[cat]["w_total"] += w
                 if cat in sr_failed:
                     cat_stats[cat]["hit_count"] += 1
-        return count, cat_stats
+                    cat_stats[cat]["w_hit"] += w
+                if task_type:
+                    if task_type not in type_cat_stats:
+                        type_cat_stats[task_type] = {}
+                    if cat not in type_cat_stats[task_type]:
+                        type_cat_stats[task_type][cat] = {"hit_count": 0, "human_count": 0}
+                    type_cat_stats[task_type][cat]["human_count"] += 1
+                    if cat in sr_failed:
+                        type_cat_stats[task_type][cat]["hit_count"] += 1
+        return count, cat_stats, type_cat_stats
 
-    current_count, current_stats = _split_sr(all_tasks, cutoff_14d_n, sentinel_n)
-    previous_count, previous_stats = _split_sr(all_tasks, cutoff_28d_n, cutoff_14d_n)
+    current_count, current_stats, current_type_stats = _split_sr(all_tasks, cutoff_14d_n, sentinel_n)
+    previous_count, previous_stats, _ = _split_sr(all_tasks, cutoff_28d_n, cutoff_14d_n)
 
     if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
         return None
@@ -1802,10 +1826,11 @@ async def compute_sr_catch_rate_trends(
     if not all_cats:
         return None
 
+    _empty_cat: dict[str, Any] = {"hit_count": 0, "human_count": 0, "w_hit": 0.0, "w_total": 0.0}
     categories: dict[str, Any] = {}
     for cat in all_cats:
-        curr = current_stats.get(cat, {"hit_count": 0, "human_count": 0})
-        prev = previous_stats.get(cat, {"hit_count": 0, "human_count": 0})
+        curr = current_stats.get(cat, _empty_cat)
+        prev = previous_stats.get(cat, _empty_cat)
         current_hit_rate = (
             round(curr["hit_count"] / curr["human_count"], 3)
             if curr["human_count"] > 0 else None
@@ -1829,10 +1854,15 @@ async def compute_sr_catch_rate_trends(
         else:
             trend = "stable"
 
+        w_total = curr.get("w_total", 0.0)
+        weighted_miss_rate = (
+            round(1.0 - curr["w_hit"] / w_total, 3) if w_total > 0 else miss_rate
+        )
         categories[cat] = {
             "current_hit_rate": current_hit_rate,
             "previous_hit_rate": previous_hit_rate,
             "miss_rate": miss_rate,
+            "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
         }
 
@@ -1861,9 +1891,27 @@ async def compute_sr_catch_rate_trends(
             rate_history = rate_history[-5:]
         data["rate_history"] = rate_history
 
+    # Compute per-task-type category breakdown from current window only.
+    # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
+    by_task_type: dict[str, dict[str, Any]] = {}
+    for ttype, tcat_stats in current_type_stats.items():
+        type_cats: dict[str, Any] = {}
+        for cat, stats in tcat_stats.items():
+            if stats["human_count"] < _MIN_SR_SAMPLE:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            type_cats[cat] = {
+                "hit_rate": hit_rate,
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+            }
+        if type_cats:
+            by_task_type[ttype] = type_cats
+
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
         "categories": categories,
+        "by_task_type": by_task_type,
     }
 
     doc["sr_catch_rate_trends"] = result

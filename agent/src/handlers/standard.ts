@@ -1,4 +1,5 @@
 import { execFileSync } from 'child_process';
+import fs from 'fs';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
@@ -209,7 +210,18 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
       []
     );
-    await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
+    const baselineFailures = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
+    if (baselineFailures !== null) {
+      try {
+        fs.writeFileSync(
+          `/tmp/test_baseline_${taskId}.json`,
+          JSON.stringify(Array.from(baselineFailures)),
+          { mode: 0o644 },
+        );
+      } catch (e) {
+        sendLog(ws, `[Baseline] Failed to write baseline file: ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
   } else if (isAutoRemediation) {
     sendLog(ws, '[Baseline] Skipped — this is an auto-remediation task; all failures are fair game.\n');
   }

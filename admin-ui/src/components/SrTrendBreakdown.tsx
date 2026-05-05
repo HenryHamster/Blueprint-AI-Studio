@@ -4,13 +4,20 @@ export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;
   miss_rate?: number | null;
+  weighted_miss_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   rate_history?: number[];
+}
+
+export interface SrTaskTypeCategoryStats {
+  miss_rate: number;
+  sample_count: number;
 }
 
 export interface SrTrendData {
   computed_at?: string | null;
   categories?: Record<string, SrCategoryTrend> | null;
+  by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
 }
 
 function trendPriority(t: SrCategoryTrend['trend']): number {
@@ -96,10 +103,38 @@ function sortedEntries(
     const pa = trendPriority(a.trend);
     const pb = trendPriority(b.trend);
     if (pa !== pb) return pa - pb;
-    const ma = deriveMissRate(a) ?? 0;
-    const mb = deriveMissRate(b) ?? 0;
+    // Sort by severity-weighted miss rate when available — high-impact misses first
+    const ma = a.weighted_miss_rate ?? deriveMissRate(a) ?? 0;
+    const mb = b.weighted_miss_rate ?? deriveMissRate(b) ?? 0;
     return mb - ma;
   });
+}
+
+function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<string, SrTaskTypeCategoryStats>> }) {
+  const types = Object.keys(byTaskType).sort();
+  if (types.length === 0) return null;
+  return (
+    <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60">
+      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Task Type</p>
+      {types.map(ttype => {
+        const cats = byTaskType[ttype];
+        const sorted = Object.entries(cats).sort(([, a], [, b]) => b.miss_rate - a.miss_rate);
+        return (
+          <div key={ttype} className="flex items-start gap-1 text-[10px] mb-0.5">
+            <span className="text-neutral-400 w-12 shrink-0 font-medium">{ttype}</span>
+            <span className="text-neutral-500 flex flex-wrap gap-x-1.5 gap-y-0">
+              {sorted.map(([cat, stats]) => (
+                <span key={cat} title={`${stats.sample_count} samples`}>
+                  <span className="text-neutral-400">{cat}</span>{' '}
+                  <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                </span>
+              ))}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 interface SrTrendBreakdownProps {
@@ -124,6 +159,7 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
         <div className="flex flex-col gap-0.5">
           {entries.map(([cat, c]) => {
             const miss = deriveMissRate(c);
+            const wmiss = c.weighted_miss_rate;
             const color = trendColorClass(c.trend);
             return (
               <div key={cat} className="flex items-center gap-2 text-[10px]">
@@ -133,6 +169,11 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
                 <span className={`font-mono font-bold tabular-nums ${color}`}>
                   {miss != null ? `${Math.round(miss * 100)}%` : '–'}
                 </span>
+                {wmiss != null && (
+                  <span className="font-mono tabular-nums text-neutral-500" title="severity-weighted miss rate">
+                    {`w:${Math.round(wmiss * 100)}%`}
+                  </span>
+                )}
                 <TrendIcon trend={c.trend} />
                 <MissRateSparkline
                   history={c.rate_history ?? []}
@@ -144,6 +185,9 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
             );
           })}
         </div>
+        {trends?.by_task_type && Object.keys(trends.by_task_type).length > 0 && (
+          <ByTaskTypeSection byTaskType={trends.by_task_type} />
+        )}
       </div>
     );
   }
@@ -152,6 +196,7 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
     <div data-testid="sr-trend-breakdown" className="flex flex-col gap-0.5 ml-1">
       {entries.map(([cat, c]) => {
         const miss = deriveMissRate(c);
+        const wmiss = c.weighted_miss_rate;
         const color = trendColorClass(c.trend);
         return (
           <div key={cat} className="flex items-center gap-1.5 text-[10px]">
@@ -160,6 +205,11 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
             <span className={`font-mono ${color}`}>
               {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
             </span>
+            {wmiss != null && (
+              <span className="font-mono text-neutral-500" title="severity-weighted miss rate">
+                {`w:${Math.round(wmiss * 100)}%`}
+              </span>
+            )}
             <TrendIcon trend={c.trend} />
             <MissRateSparkline
               history={c.rate_history ?? []}

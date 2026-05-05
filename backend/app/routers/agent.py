@@ -2021,7 +2021,17 @@ async def claim_task(
                     if isinstance(data, dict) and isinstance(data.get("miss_rate"), (int, float))
                 }
                 if cats:
-                    response["project_context"]["self_review_catch_rate"] = {"categories": cats}
+                    catch_rate_payload: dict = {"categories": cats}
+                    by_task_type = sr_trends.get("by_task_type") or {}
+                    if isinstance(by_task_type, dict) and task_type in by_task_type:
+                        type_cats = by_task_type[task_type]
+                        if isinstance(type_cats, dict):
+                            catch_rate_payload["for_task_type"] = {
+                                cat: {"miss_rate": cdata["miss_rate"]}
+                                for cat, cdata in type_cats.items()
+                                if isinstance(cdata, dict) and isinstance(cdata.get("miss_rate"), (int, float))
+                            }
+                    response["project_context"]["self_review_catch_rate"] = catch_rate_payload
         except Exception:
             logger.exception("[AGENT] Failed to inject self_review_catch_rate (non-critical)")
 

@@ -351,21 +351,39 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   }
 
   // Build SR catch-rate blind spots block — only if budget allows
-  type SRCatchRateCategory = { miss_rate: number };
-  const srCatchRate = ctx.self_review_catch_rate as { categories?: Record<string, SRCatchRateCategory> } | null | undefined;
+  type SRCatchRateCategory = { miss_rate: number; weighted_miss_rate?: number };
+  const srCatchRate = ctx.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+    for_task_type?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
   let srBlindSpotLines: string[] = [];
-  if (srCatchRate?.categories && Object.keys(srCatchRate.categories).length > 0) {
-    const qualifying = Object.entries(srCatchRate.categories)
+  // Prefer task-type-specific rates when available — they reflect miss rates for this task type only
+  const forTaskType = srCatchRate?.for_task_type;
+  const srSource = (forTaskType && Object.keys(forTaskType).length > 0) ? forTaskType : srCatchRate?.categories;
+  const srIsTypeFiltered = srSource === forTaskType && !!forTaskType;
+  if (srSource && Object.keys(srSource).length > 0) {
+    const qualifying = Object.entries(srSource)
       .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
-      .sort((a, b) => b[1].miss_rate - a[1].miss_rate)
+      // sort by severity-weighted miss rate when available, so high-impact misses surface over trivial ones
+      .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate) - (a[1].weighted_miss_rate ?? a[1].miss_rate))
       .slice(0, 5);
     if (qualifying.length > 0) {
       const catList = qualifying
-        .map(([cat, data]) => `${cat} (${Math.round(data.miss_rate * 100)}% missed)`)
+        .map(([cat, data]) => {
+          const rawPct = Math.round(data.miss_rate * 100);
+          if (data.weighted_miss_rate !== undefined) {
+            const wPct = Math.round(data.weighted_miss_rate * 100);
+            return `${cat} (${rawPct}% missed, ${wPct}% severity-weighted)`;
+          }
+          return `${cat} (${rawPct}% missed)`;
+        })
         .join(', ');
+      const scopeNote = srIsTypeFiltered && taskType
+        ? ` (${taskType} tasks only)`
+        : '';
       const candidateLines = [
         '### Self-Review Blind Spots',
-        `Your past self-reviews missed issues in these categories — apply extra scrutiny: ${catList}`,
+        `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny: ${catList}`,
         '',
       ];
       const candidate = candidateLines.join('\n');

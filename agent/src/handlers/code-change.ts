@@ -76,6 +76,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     `/tmp/fix_responses_${taskId}.json`,
     `/tmp/self_review_${taskId}.json`,
     `/tmp/task_${taskId}_result.json`,
+    `/tmp/test_baseline_${taskId}.json`,
   ]) {
     try { fs.unlinkSync(f); } catch { /* not present — fine */ }
   }

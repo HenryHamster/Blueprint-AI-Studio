@@ -3059,3 +3059,50 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(doneScript).toContain('{self_review_outcome: $self_review}');
   });
 });
+
+describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
+  it('includes scope-drift in the canonical category list', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`scope-drift`');
+  });
+
+  it('includes scope threshold table for small scope', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('small');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('50');
+  });
+
+  it('includes scope threshold table for medium scope', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('medium');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('200');
+  });
+
+  it('includes scope threshold table for large scope', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('large');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('800');
+  });
+
+  it('instructs agent to run git diff --stat', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --stat');
+  });
+});
+
+describe('CODE_CHANGE_HELPER_GUIDANCE — regression_risk category', () => {
+  it('includes regression_risk in the canonical category list', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`regression_risk`');
+  });
+
+  it('references the test_baseline file path', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('test_baseline_');
+  });
+
+  it('instructs agent to omit check when baseline file is absent', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('omit');
+  });
+});

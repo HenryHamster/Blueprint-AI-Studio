@@ -31,8 +31,11 @@ from app.direction_outcomes import synthesize_prompt_quality_patterns
 from app.retry_budget import failure_class_history_classes
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
+from app.playbook_learning import _categorize_review_issues
 
 logger = logging.getLogger(__name__)
+
+_SR_SEVERITY_WEIGHTS: Dict[str, int] = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 
 
 router = APIRouter(
@@ -73,6 +76,7 @@ def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, A
     if len(tasks_with_both) < 5:
         return None
     total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
+    w_caught = w_missed = 0.0
     for t in tasks_with_both:
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
@@ -83,10 +87,24 @@ def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, A
         total_missed += len(human_cats - sr_failed)
         total_false += len(sr_failed - human_cats)
         total_sr_failed += len(sr_failed)
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        cat_weights: Dict[str, int] = {}
+        if rev_hist:
+            for cat, issues in _categorize_review_issues(rev_hist).items():
+                cat_weights[cat] = max(_SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues)
+        for cat in human_cats:
+            w = cat_weights.get(cat, 1)
+            if cat in sr_failed:
+                w_caught += w
+            else:
+                w_missed += w
+    total_w = w_caught + w_missed
     return {
         "prediction_hit_rate": round(total_overlap / total_human, 3) if total_human > 0 else None,
         "miss_rate": round(total_missed / total_human, 3) if total_human > 0 else None,
         "false_alarm_rate": round(total_false / total_sr_failed, 3) if total_sr_failed > 0 else None,
+        "weighted_hit_rate": round(w_caught / total_w, 3) if total_w > 0 else None,
+        "weighted_miss_rate": round(w_missed / total_w, 3) if total_w > 0 else None,
         "sample_size": len(tasks_with_both),
     }
 
@@ -874,6 +892,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             self_review_prediction_accuracy_trends = {
                 "computed_at": sr_trends.get("computed_at"),
                 "categories": sr_trends.get("categories") or {},
+                "by_task_type": sr_trends.get("by_task_type") or {},
             }
 
     direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
