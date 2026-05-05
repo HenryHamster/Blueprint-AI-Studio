@@ -7,7 +7,14 @@ from httpx import AsyncClient, ASGITransport
 from sqlmodel import select
 
 from app.main import app
-from app.models import Task, TaskStatus, ResidualRemediationCase, ResidualCaseStatus
+from app.models import (
+    Task,
+    TaskStatus,
+    ResidualRemediationCase,
+    ResidualCaseStatus,
+    RegressionRemediationCase,
+    RegressionCaseStatus,
+)
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import _stash_projected_task_fields
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -7421,3 +7428,128 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     assert themes.get("async error propagation not checked") == 1
     # Skipped envelope contributes no entries
     assert body["total_distinct_themes"] == 2
+
+# ── POST /regression-cases/{regression_class}/clear-manual-intervention ─────
+
+
+@pytest.mark.asyncio
+async def test_clear_regression_manual_intervention_transitions_to_active(
+    client: AsyncClient, db_session
+):
+    """POST clear-manual-intervention flips NEEDS_MANUAL_INTERVENTION→ACTIVE."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    regression_class = "sr_catch_rate_drop"
+    flagged_at = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        attempts=3,
+        needs_manual_intervention_at=flagged_at,
+        signal_snapshot_at_spawn={"value": 0.42, "threshold": 0.6, "window": "24h"},
+    )
+    db_session.add(case)
+    await db_session.commit()
+    last_seen_before = case.last_seen_at
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{regression_class}/clear-manual-intervention",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["regression_class"] == regression_class
+    assert data["status"] == "ACTIVE"
+    assert data["attempts"] == 3
+    assert data["needs_manual_intervention_at"] is None
+    assert "id" in data
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.needs_manual_intervention_at is None
+    # Cooldown timestamps preserved so dispatcher does not immediately re-spawn.
+    assert case.last_seen_at == last_seen_before
+    # Snapshot preserved across the transition.
+    assert case.signal_snapshot_at_spawn == {"value": 0.42, "threshold": 0.6, "window": "24h"}
+
+
+@pytest.mark.asyncio
+async def test_clear_regression_manual_intervention_404_when_missing(
+    client: AsyncClient, db_session
+):
+    """POST clear-manual-intervention returns 404 when no case row exists."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.post(
+        "/api/admin/regression-cases/no_such_class/clear-manual-intervention",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_clear_regression_manual_intervention_404_when_not_flagged(
+    client: AsyncClient, db_session
+):
+    """POST clear-manual-intervention returns 404 when case is ACTIVE (not flagged)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    regression_class = "fix_loop_divergence"
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/regression-cases/{regression_class}/clear-manual-intervention",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_regression_remediation_case_persists_close_loop_fields(db_session):
+    """Model accepts and round-trips the close-loop tracking fields added in 0074."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="pipeline_success_rate",
+        status=RegressionCaseStatus.MERGED,
+        attempts=2,
+        last_remediation_pr_number=4242,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={"value": 0.55, "threshold": 0.7},
+        signal_snapshot_at_merge={"value": 0.68, "threshold": 0.7},
+        fingerprint_to_fix_log=[
+            {"fingerprint": "abc123", "fix_pr_number": 4242, "closed_at": "2026-05-05T00:00:00Z"},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    assert case.attempts == 2
+    assert case.last_remediation_pr_number == 4242
+    assert case.last_remediation_result == "merged"
+    assert case.signal_snapshot_at_spawn["value"] == 0.55
+    assert case.signal_snapshot_at_merge["threshold"] == 0.7
+    assert len(case.fingerprint_to_fix_log) == 1
+    assert case.fingerprint_to_fix_log[0]["fix_pr_number"] == 4242

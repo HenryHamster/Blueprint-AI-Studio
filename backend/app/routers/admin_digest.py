@@ -23,6 +23,7 @@ from app.models import (
     Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
     MaxPlanAccount,
     ResidualRemediationCase, ResidualRemediationCaseStatus,
+    RegressionRemediationCase, RegressionCaseStatus,
     StrategicCycle,
 )
 from app.auth import get_current_user, require_admin
@@ -1404,6 +1405,47 @@ async def unsuspend_residual_case(
         "status": ResidualRemediationCaseStatus.ACTIVE,
         "consecutive_failure_count": 0,
         "suspended_at": None,
+    }
+
+
+@router.post("/regression-cases/{regression_class}/clear-manual-intervention")
+async def clear_regression_manual_intervention(
+    regression_class: str,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """Clear NEEDS_MANUAL_INTERVENTION on a RegressionRemediationCase.
+
+    Transitions status back to ACTIVE and clears needs_manual_intervention_at
+    so the dispatcher can resume spawning. Returns 404 if no case exists or
+    if the case is not currently NEEDS_MANUAL_INTERVENTION. Cooldown / last
+    timestamps are preserved so the next tick honors the existing window
+    rather than immediately re-spawning.
+    """
+    result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.regression_class == regression_class,
+        )
+    )
+    case = result.scalar_one_or_none()
+    if case is None or case.status != RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION:
+        raise HTTPException(
+            status_code=404,
+            detail="No NEEDS_MANUAL_INTERVENTION case found for this regression_class and project",
+        )
+    case.status = RegressionCaseStatus.ACTIVE
+    case.needs_manual_intervention_at = None
+    case.updated_at = _utcnow()
+    session.add(case)
+    await session.commit()
+    return {
+        "id": str(case.id),
+        "regression_class": regression_class,
+        "status": RegressionCaseStatus.ACTIVE,
+        "attempts": case.attempts,
+        "needs_manual_intervention_at": None,
     }
 
 

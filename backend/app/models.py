@@ -1206,3 +1206,93 @@ class SystemMaturity(SQLModel, table=True):
     )
 
 
+class RegressionCaseStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    MERGED = "MERGED"
+    CLOSED = "CLOSED"
+    NEEDS_MANUAL_INTERVENTION = "NEEDS_MANUAL_INTERVENTION"
+
+
+class RegressionRemediationCase(SQLModel, table=True):
+    """Persistent record for a regression fingerprint detected across agent runs.
+
+    Created or updated whenever a regression is detected; tracks the status
+    of remediation efforts and links to the most recent remediation task.
+    Lifecycle: ACTIVE → MERGED (PR merged, awaiting signal recheck) →
+    CLOSED (signal recovered) or back to ACTIVE (signal still tripped).
+    Status NEEDS_MANUAL_INTERVENTION suppresses dispatcher spawning until
+    cleared via admin endpoint; reached when attempts >= 3 with no recovery.
+    """
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    regression_class: str = Field(max_length=512)
+    status: str = Field(
+        default=RegressionCaseStatus.ACTIVE,
+        sa_column=Column(String, nullable=False, server_default=RegressionCaseStatus.ACTIVE),
+    )
+    first_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    last_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    hit_count: int = Field(default=1)
+    sample_message: Optional[str] = Field(default=None)
+    last_remediation_task_id: Optional[uuid.UUID] = Field(
+        default=None,
+        sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
+    )
+    # Close-loop tracking fields (added 0074). All nullable / default-0 / default-[]
+    # so existing rows backfilled by the migration server_default work without a
+    # Python-side touch. The dispatcher writes attempts/snapshots at spawn; the
+    # task_completion hook writes last_remediation_pr_number/result on merge;
+    # the per-tick recovery scan appends to fingerprint_to_fix_log on CLOSE.
+    attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    last_remediation_pr_number: Optional[int] = Field(default=None)
+    last_remediation_result: Optional[str] = Field(default=None)
+    signal_snapshot_at_spawn: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    signal_snapshot_at_merge: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    fingerprint_to_fix_log: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    needs_manual_intervention_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "regression_class",
+            name="ux_regressionremediationcase_project_class",
+        ),
+        Index(
+            "ix_regressionremediationcase_project_status_last_seen",
+            "project_id", "status", "last_seen_at",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'MERGED', 'CLOSED', 'NEEDS_MANUAL_INTERVENTION')",
+            name="ck_regressionremediationcase_status",
+        ),
+    )
+
+
