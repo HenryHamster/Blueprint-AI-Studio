@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -2442,7 +2442,7 @@ async def next_role(
             f"[NEXT-ROLE] Refusing warm-claim on doomed VM {req.vm_instance_id} "
             f"(delete reason={_delete_reason})"
         )
-        return JSONResponse(status_code=204, content=None)
+        return Response(status_code=204)
 
     # Look up a QUEUED task pinned to this VM.
     # R5-W2-B: lead the predicate with ``Task.context.has_key(...)`` so the
