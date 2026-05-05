@@ -65,7 +65,7 @@ class PostCommitLocked(Exception):
     """
 
 
-from app.failure_stage import (  # noqa: E402, F401 — re-exported for legacy callers/tests
+from app.failure_stage import (  # noqa: F401 — re-exported for legacy callers/tests
     _TRANSIENT_SCAN_ERROR_PATTERNS,
     _derive_failure_stage,
     _is_transient_scan_error,
@@ -195,7 +195,7 @@ def _build_retry_prompt_suffix(
     from ctx for CODE_ERROR hints.
     """
     extra_guidance = ""
-    scope_override: "str | None" = None
+    scope_override: str | None = None
 
     diagnosis_prefix = ""
     if ctx.get("diagnosis_task_id"):
@@ -812,7 +812,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # so retries don't each receive a fresh full iteration budget.
         try:
             prior_iter = int(
-                ((child_ctx.get("review_loop") or {}).get("iteration") or 0)
+                (child_ctx.get("review_loop") or {}).get("iteration") or 0
             )
             if prior_iter > 0:
                 clone_ctx["_prior_review_iterations_consumed"] = prior_iter
@@ -1012,8 +1012,8 @@ async def _spawn_ci_auto_remediation_followup(
     over a 24h window to avoid runaway loops on flapping checks.
     Returns True when an investigation is spawned.
     """
-    from datetime import timedelta  # noqa: PLC0415
-    from app.main import _utcnow  # noqa: PLC0415
+    from datetime import timedelta
+    from app.main import _utcnow
 
     ctx = task.context or {}
     branch = ctx.get("ci_failure_branch") or "main"
@@ -1177,7 +1177,7 @@ async def _process_post_commit(
                 # helper acquires Project first; if the task row is held it
                 # yields ``(project, None)`` and we retry. If the project is
                 # held it yields ``(None, None)`` and we retry as well.
-                from app.task_locking import lock_project_then_task  # noqa: PLC0415
+                from app.task_locking import lock_project_then_task
                 async with lock_project_then_task(
                     session, _peek_project_id, task_id, skip_locked=True,
                 ) as (_p, _t):
@@ -1325,7 +1325,7 @@ async def _process_post_commit(
             # only fires after 3 consecutive failures on a direction; this fires
             # per-task so one-off recurring defects still get diagnosed.
             try:
-                from app.autonomous_research import _spawn_task_failure_investigation  # noqa: PLC0415
+                from app.autonomous_research import _spawn_task_failure_investigation
                 await _spawn_task_failure_investigation(task, session)
             except Exception as _inv_exc:
                 logger.error(
@@ -1401,7 +1401,7 @@ async def _process_post_commit(
                             _aa_proj = (await session.execute(select(Project).where(Project.id == task.project_id))).scalars().first()
                             _aa_dir = next((d for d in (getattr(_aa_proj, "directions", None) or []) if d.get("id") == direction_id), None)
                             if _aa_dir:
-                                from app.direction_metrics import _compute_acceptance_rate  # noqa: PLC0415
+                                from app.direction_metrics import _compute_acceptance_rate
                                 acceptance = _compute_acceptance_rate(_aa_dir)
                         if (
                             0 < lines_changed <= max_lines
@@ -2323,7 +2323,7 @@ async def _process_post_commit(
                             merge_msg = merge_result.get("message", "unknown")
                             await create_pr_comment(gh_token, owner, repo, pr_number,
                                 f"**Blueprint Review Pipeline**: Merge blocked — {merge_msg}. Retrying with backoff.")
-                            from app import pause_clock  # noqa: PLC0415
+                            from app import pause_clock
                             try:
                                 _approve_files = [
                                     f.get("filename", "") for f in (
@@ -2550,7 +2550,7 @@ async def _process_post_commit(
                                 if _orig:
                                     _orig_loop = dict((_orig.context or {}).get("review_loop", {}) or {})
                                     if _orig_loop.get("ci_waiting"):
-                                        from app import pause_clock  # noqa: PLC0415
+                                        from app import pause_clock
                                         _orig_loop["ci_wait_started"] = _utcnow().isoformat()
                                         _orig_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
                                         _orig.context = {**(_orig.context or {}), "review_loop": _orig_loop}
@@ -2687,7 +2687,7 @@ async def _process_post_commit(
                     # review-side gate is open. Set review_approved explicitly even
                     # though the inherited review_loop should already carry it from
                     # the prior approval write.
-                    from app import pause_clock  # noqa: PLC0415
+                    from app import pause_clock
                     ci_loop = review_loop.copy()
                     ci_loop["ci_waiting"] = True
                     ci_loop["review_approved"] = True
@@ -2860,22 +2860,55 @@ async def _process_post_commit(
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.
         # Parent/logical tasks are updated to match the project outcome.
+        #
+        # 2026-05-05 fix: a QUEUED leaf task waiting on warm-handoff also has
+        # ``vm_instance_id=None`` (the warm target VM is in ``warm_target_vm_id``,
+        # the real ``vm_instance_id`` is set only at claim). Without the QUEUED
+        # exclusion below, an aggregation pass triggered by a sibling completing
+        # will sweep that QUEUED task into ``parent_tasks`` and force-FAIL it
+        # with "Project aggregation: child task failed" — the task never even
+        # ran. Real parent/logical tasks (research, plan) sit in EVALUATING
+        # after children spawn, never in QUEUED. Production incident: task
+        # 582a0210 force-failed at 19:47:30 while waiting on a warm-handoff
+        # from sibling 609b380c on agent-vm-540ee.
         all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
         all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
         executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
-        parent_tasks = [t for t in all_tasks if not t.vm_instance_id and t.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]]
+        parent_tasks = [
+            t for t in all_tasks
+            if not t.vm_instance_id
+            and t.status not in [
+                TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
+                TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+            ]
+        ]
 
         project_stmt = select(Project).where(Project.id == task.project_id)
         project = (await session.execute(project_stmt)).scalars().first()
 
         if project and project.status != ProjectStatus.CANCELLED and executable_statuses:
+            # 2026-05-05 fix: only transition project status when ALL executable
+            # tasks are terminal. Previously the ``any FAILED`` branch fired
+            # any time an old FAILED row sat in ``executable_statuses`` (which
+            # spans every task that ever had a VM, including stale FAILED
+            # tasks not yet auto-archived for up to 7 days). For autonomous
+            # projects with continuous work, that pinned the project at FAILED
+            # forever and re-fired the parent-aggregation sweep on every new
+            # task transition. Requiring all-terminal makes the aggregation a
+            # no-op for autonomous projects (always something in flight) while
+            # preserving finite-project semantics.
+            all_terminal = all(
+                s in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+                for s in executable_statuses
+            )
             new_project_status = None
-            if all(s == TaskStatus.COMPLETED for s in executable_statuses):
-                new_project_status = ProjectStatus.COMPLETED
-            elif any(s == TaskStatus.FAILED for s in executable_statuses):
-                new_project_status = ProjectStatus.FAILED
-            elif all(s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED] for s in executable_statuses):
-                new_project_status = ProjectStatus.CANCELLED
+            if all_terminal:
+                if all(s == TaskStatus.COMPLETED for s in executable_statuses):
+                    new_project_status = ProjectStatus.COMPLETED
+                elif any(s == TaskStatus.FAILED for s in executable_statuses):
+                    new_project_status = ProjectStatus.FAILED
+                elif all(s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED] for s in executable_statuses):
+                    new_project_status = ProjectStatus.CANCELLED
 
             if new_project_status:
                 project.status = new_project_status
@@ -2905,7 +2938,7 @@ async def _process_post_commit(
             if cycle_id and payload.status in (
                 TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
             ):
-                from app import strategic_cycle  # noqa: PLC0415
+                from app import strategic_cycle
                 cycle_row = await strategic_cycle.get(session, cycle_id)
                 if cycle_row is not None and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES:
                     task_type = task.first_payload.get("type", "")

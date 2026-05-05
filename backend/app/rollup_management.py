@@ -12,7 +12,6 @@ import logging
 import time
 import uuid
 from datetime import timedelta
-from typing import Optional
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
@@ -34,6 +33,17 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
+
+
+class _ParentMutatedDuringPRCreation(Exception):
+    """Sentinel: parent row was mutated by a peer during create_pull_request.
+
+    Inside ``_check_and_trigger_rollup``, when ``_relock_parent`` returns None
+    after the rollup PR has already been created on GitHub, the orphan-PR
+    rescue path in the outer except handler must persist the rollup_pr_number
+    marker via a fresh session, then bail — the rest of the handler depends
+    on ``parent`` being a live ORM instance, which it isn't here.
+    """
 
 
 # Module-level negative cache for PR-merge verification keyed by task.id.
@@ -155,7 +165,7 @@ async def _release_parent_lock(
 async def _relock_parent(
     session: AsyncSession,
     parent_id,
-    expected_snapshot: Optional[dict],
+    expected_snapshot: dict | None,
     *,
     parent_in_session: Task | None = None,
 ) -> Task | None:
@@ -238,8 +248,8 @@ def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
     never reach deploy_monitoring['task_results'] or the per-direction streak,
     so anomaly detection and direction-hold logic can't see them.
     """
-    from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.shared_state import record_direction_result  # noqa: PLC0415
+    from app.routers.agent_status import record_task_result
+    from app.shared_state import record_direction_result
     record_task_result(
         success=False,
         failure_class=failure_class,
@@ -328,7 +338,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     # the caller commits between fan-out calls.
     _last_negative = _pr_merge_negative_cache.get(task.id)
     if _last_negative is not None and (time.time() - _last_negative) < _PR_MERGE_NEGATIVE_TTL_S:
-        import app.shared_state as _ss  # noqa: PLC0415
+        import app.shared_state as _ss
         _ss.github_cache_hits["pr_merge_negative"] = _ss.github_cache_hits.get("pr_merge_negative", 0) + 1
         return False
 
@@ -388,7 +398,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 task.context = {**(task.context or {}), "pr_closed_unmerged": True}
                 task.status = TaskStatus.FAILED
                 task.latest_status_message = f"PR #{pr_number} closed without merging"
-                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                from app.failure_classification import classify_failure, persist_failure_category
                 _fc = classify_failure(task)
                 persist_failure_category(task, _fc)
                 _record_rollup_failure_signals(task, _fc)
@@ -545,7 +555,7 @@ def _build_rollup_pr_body(
         lines.append(f"**Direction:** {dir_label}{dir_suffix}")
 
     if children:
-        from collections import Counter  # noqa: PLC0415
+        from collections import Counter
         type_counts: Counter = Counter()
         total_cost: float = 0.0
         has_cost = False
@@ -556,7 +566,7 @@ def _build_rollup_pr_body(
             prov_at = getattr(c, "vm_provisioned_at", None)
             stop_at = getattr(c, "vm_stopped_at", None)
             if prov_at and stop_at:
-                from app.admin import SPOT_RATE, ON_DEMAND_RATE  # noqa: PLC0415
+                from app.admin import SPOT_RATE, ON_DEMAND_RATE
                 rate = SPOT_RATE if getattr(c, "vm_spot", False) else ON_DEMAND_RATE
                 total_cost += (stop_at - prov_at).total_seconds() * rate
                 has_cost = True
@@ -868,7 +878,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             # Nothing succeeded — fail the parent immediately
             parent.status = TaskStatus.FAILED
             parent.latest_status_message = f"{len(failed)} of {len(children)} subtask(s) failed, none succeeded"
-            from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+            from app.failure_classification import worst_child_failure_category, persist_failure_category
             _fc = worst_child_failure_category(failed)
             persist_failure_category(parent, _fc)
             _record_rollup_failure_signals(parent, _fc)
@@ -917,7 +927,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             parent.latest_status_message = (
                 f"{failed_count} of {len(children)} subtask(s) failed, none succeeded"
             )
-            from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+            from app.failure_classification import worst_child_failure_category, persist_failure_category
             _fc = worst_child_failure_category(failed_children)
             persist_failure_category(parent, _fc)
             _record_rollup_failure_signals(parent, _fc)
@@ -1214,8 +1224,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         )
                         rollup_pr_number = pr_result.get("number")
                         rollup_pr_url = pr_result.get("html_url", "")
-                        # Trigger orphan-PR rescue path
-                        raise Exception("Parent state changed during create_pull_request — deferring")
+                        # Trigger orphan-PR rescue path. The sentinel class lets
+                        # the outer handler short-circuit past the post-rescue
+                        # parent.context manipulation that would NPE here.
+                        raise _ParentMutatedDuringPRCreation(
+                            f"Parent {parent_id_local} mutated during create_pull_request — deferring"
+                        )
                     parent_ctx = parent.context or {}
 
                     # Empty diff — branches are identical, nothing to merge
@@ -1656,7 +1670,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             now = _utcnow()
                             first_deferred_at = parent_ctx.get("_merge_first_deferred_at") or now.isoformat()
                             try:
-                                from datetime import datetime as _dt  # noqa: PLC0415
+                                from datetime import datetime as _dt
                                 _first_dt = _dt.fromisoformat(first_deferred_at)
                                 elapsed_minutes = (now - _first_dt).total_seconds() / 60.0
                             except (TypeError, ValueError):
@@ -1852,7 +1866,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         if fix_task:
                             logger.error(f"[ROLLUP] Merge blocked for rollup PR #{rollup_pr_number}, spawned fix → task {fix_task.id}")
                         else:
-                            from app.review_pipeline import (  # noqa: PLC0415
+                            from app.review_pipeline import (
                                 SPAWN_REASON_KEY,
                                 SPAWN_REASON_DEFERRED,
                                 SPAWN_REASON_DEDUP,
@@ -1881,7 +1895,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     f"Rollup PR #{rollup_pr_number} merge blocked, fix not spawned "
                                     f"({spawn_reason or 'unknown'})"
                                 )
-                                from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                                from app.failure_classification import classify_failure, persist_failure_category
                                 _fc = classify_failure(parent)
                                 persist_failure_category(parent, _fc)
                                 _record_rollup_failure_signals(parent, _fc)
@@ -1919,7 +1933,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     if review_task:
                         logger.info(f"[ROLLUP] Spawned review for rollup PR #{rollup_pr_number} → task {review_task.id}")
                     else:
-                        from app.review_pipeline import (  # noqa: PLC0415
+                        from app.review_pipeline import (
                             SPAWN_REASON_KEY,
                             SPAWN_REASON_DEFERRED,
                             SPAWN_REASON_DEDUP,
@@ -1945,7 +1959,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"Rollup PR #{rollup_pr_number} created but review not spawned "
                                 f"({spawn_reason or 'unknown'})"
                             )
-                            from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                            from app.failure_classification import classify_failure, persist_failure_category
                             _fc = classify_failure(parent)
                             persist_failure_category(parent, _fc)
                             _record_rollup_failure_signals(parent, _fc)
@@ -1997,6 +2011,14 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             f"for parent {_err_parent_id}: {rescue_err}",
                             exc_info=True,
                         )
+                # Sentinel deferral: the rest of this handler (retry counter,
+                # status flip, failure classification, alert, post-handler
+                # finalization at line ~2049) all dereference ``parent``, which
+                # is None on this path. The rescue above already persisted the
+                # PR marker; the next sweep cycle re-enters with fresh parent
+                # state and resumes from the existing-PR branch.
+                if isinstance(e, _ParentMutatedDuringPRCreation):
+                    return
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
                 if isinstance(e, HTTPException) and e.status_code == 401 and _err_project_id is not None:
@@ -2028,7 +2050,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     parent.status = TaskStatus.FAILED
                     parent.context = _clear_rollup_transient_state(parent.context)
                     parent.latest_status_message = f"All {completed_count} subtasks done but rollup PR creation failed: {type(e).__name__}: {e!r}"[:500]
-                    from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
+                    from app.failure_classification import classify_failure, persist_failure_category
                     _fc = classify_failure(parent)
                     persist_failure_category(parent, _fc)
                     _record_rollup_failure_signals(parent, _fc)
@@ -2076,7 +2098,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         parent.status = TaskStatus.FAILED
         failed_count = sum(1 for s in child_statuses if s == TaskStatus.FAILED)
         parent.latest_status_message = f"{failed_count} of {len(children)} subtasks failed"
-        from app.failure_classification import worst_child_failure_category, persist_failure_category  # noqa: PLC0415
+        from app.failure_classification import worst_child_failure_category, persist_failure_category
         _failed_children = [c for c in children if c.status == TaskStatus.FAILED]
         _fc = worst_child_failure_category(_failed_children)
         persist_failure_category(parent, _fc)

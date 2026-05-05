@@ -1199,6 +1199,101 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(cle
     }
 
 
+@pytest.mark.asyncio
+async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(cleanup_db, mocker):
+    """Production 2026-05-05: when ``_relock_parent`` returns None after a peer
+    mutated the parent during ``create_pull_request``, the handler must (a)
+    persist the new PR marker via the orphan-PR rescue path so the next sweep
+    cycle resumes the existing PR, and (b) return without dereferencing
+    ``parent`` — which is None on this path. Prior to the sentinel-class fix,
+    the post-rescue retry-counter / status-flip code at line ~2020 NPE'd on
+    ``parent.context`` and the rollup ``github_webhook`` returned 500.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
+    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 7777,
+            "html_url": "https://github.com/owner/repo/pull/7777",
+            "empty_diff": False,
+        },
+    )
+
+    db_parent_mock = MagicMock()
+    db_parent_mock.context = {}
+    rescue_session = AsyncMock()
+    rescue_session.get = AsyncMock(return_value=db_parent_mock)
+    rescue_session.add = MagicMock()
+    rescue_session.commit = AsyncMock()
+    rescue_ctx = MagicMock()
+    rescue_ctx.__aenter__ = AsyncMock(return_value=rescue_session)
+    rescue_ctx.__aexit__ = AsyncMock(return_value=False)
+    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=rescue_ctx)
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db, project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/relock-none", "parent_base": "main"},
+        plan_output="some plan",
+    )
+    await _make_task(
+        cleanup_db, project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    # Force ``_relock_parent`` to return None on the call AFTER
+    # ``create_pull_request`` (the third call in this flow: pre-verify,
+    # pre-existing-PR-check, post-create). Returning None on the third
+    # call simulates a peer mutating the parent during the PR creation
+    # round-trip — the failure path the sentinel exception protects.
+    real_relock = __import__("app.rollup_management", fromlist=["_relock_parent"])._relock_parent
+    relock_calls = {"n": 0}
+
+    async def relock_returns_none_on_post_create(*args, **kwargs):
+        relock_calls["n"] += 1
+        if relock_calls["n"] == 3:
+            return None
+        return await real_relock(*args, **kwargs)
+
+    mocker.patch(
+        "app.rollup_management._relock_parent",
+        side_effect=relock_returns_none_on_post_create,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    # Must not raise — the AttributeError-on-NoneType bug surfaced as a
+    # 500 from /api/github/webhook in production.
+    child = (await cleanup_db.execute(
+        __import__("sqlmodel", fromlist=["select"]).select(Task).where(Task.parent_task_id == parent.id)
+    )).scalars().first()
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Rescue must have persisted the marker via the fresh session — this
+    # is what prevents a duplicate PR creation on the next sweep cycle.
+    rescue_session.get.assert_awaited_once()
+    get_args = rescue_session.get.await_args.args
+    assert get_args[0] is Task
+    assert get_args[1] == parent.id
+    rescue_session.add.assert_called_once_with(db_parent_mock)
+    rescue_session.commit.assert_awaited_once()
+    assert db_parent_mock.context.get("rollup_pr_number") == 7777
+    assert db_parent_mock.context.get("rollup_pr_url") == "https://github.com/owner/repo/pull/7777"
+
+
 # ── Error recovery: target/staging branch issues and all-cancelled ────────────
 
 @pytest.mark.asyncio

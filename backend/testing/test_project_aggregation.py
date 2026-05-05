@@ -74,19 +74,27 @@ def _run_aggregation(all_tasks, project):
     parent_tasks = [
         t for t in all_tasks
         if not t.vm_instance_id
-        and t.status not in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+        and t.status not in [
+            TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
+            TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED,
+        ]
     ]
 
     if not (project.status != ProjectStatus.CANCELLED and executable_statuses):
         return
 
+    all_terminal = all(
+        s in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+        for s in executable_statuses
+    )
     new_project_status = None
-    if all(s == TaskStatus.COMPLETED for s in executable_statuses):
-        new_project_status = ProjectStatus.COMPLETED
-    elif any(s == TaskStatus.FAILED for s in executable_statuses):
-        new_project_status = ProjectStatus.FAILED
-    elif all(s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED] for s in executable_statuses):
-        new_project_status = ProjectStatus.CANCELLED
+    if all_terminal:
+        if all(s == TaskStatus.COMPLETED for s in executable_statuses):
+            new_project_status = ProjectStatus.COMPLETED
+        elif any(s == TaskStatus.FAILED for s in executable_statuses):
+            new_project_status = ProjectStatus.FAILED
+        elif all(s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED] for s in executable_statuses):
+            new_project_status = ProjectStatus.CANCELLED
 
     if new_project_status:
         project.status = new_project_status
@@ -173,3 +181,65 @@ async def test_failed_message_overrides_stale_evaluating_message(db_session):
     _run_aggregation([child, parent], project)
 
     assert parent.latest_status_message == "Project aggregation: child task failed"
+
+
+@pytest.mark.asyncio
+async def test_inflight_work_blocks_premature_project_terminal_transition(db_session):
+    """For autonomous projects with continuous work, a single FAILED task must
+    not flip the project to FAILED while other tasks are still IN_PROGRESS or
+    PROVISIONING. Pre-fix, ``any FAILED in executable_statuses`` flipped the
+    project to FAILED on every status change, which then re-fired the parent-
+    aggregation sweep on every subsequent task transition.
+
+    The aggregation must require ALL executable tasks terminal before any
+    project-status flip — preserving finite-project semantics while making
+    the aggregation a no-op for autonomous projects (always something in
+    flight).
+    """
+    project = await _make_project(db_session)
+    failed_task = await _make_task(db_session, project.id, TaskStatus.FAILED, vm_instance_id="vm-1")
+    in_flight_task = await _make_task(db_session, project.id, TaskStatus.IN_PROGRESS, vm_instance_id="vm-2")
+    parent = await _make_task(db_session, project.id, TaskStatus.EVALUATING, vm_instance_id=None)
+
+    _run_aggregation([failed_task, in_flight_task, parent], project)
+
+    # Project must NOT have flipped — there's still in-flight work.
+    assert project.status != ProjectStatus.FAILED, (
+        f"Project flipped to FAILED while in-flight work remained; got "
+        f"{project.status}. Pre-fix bug: any historic FAILED would pin the "
+        f"project at FAILED regardless of ongoing work."
+    )
+    # Parent must NOT have been force-FAILed.
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_queued_leaf_awaiting_warm_handoff_not_swept_into_parent_aggregation(db_session):
+    """Production 2026-05-05 task 582a0210: a QUEUED leaf review task waiting on
+    warm-handoff has ``vm_instance_id=None`` (the warm target VM is in
+    ``warm_target_vm_id``, the real ``vm_instance_id`` is set only at claim).
+    Pre-fix, the aggregation logic mistook ``vm_instance_id=None`` for "logical
+    parent task" and force-FAILed the leaf with "Project aggregation: child
+    task failed" the instant a sibling completed and flipped the project to
+    FAILED — the QUEUED task never even got to run.
+
+    A QUEUED leaf must be left alone by aggregation; it's pending execution,
+    not a logical parent waiting for children.
+    """
+    project = await _make_project(db_session)
+    project.status = ProjectStatus.FAILED  # historic FAILED state pinning the project
+    failed_sibling = await _make_task(db_session, project.id, TaskStatus.FAILED, vm_instance_id="vm-1")
+    completing_sibling = await _make_task(db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-2")
+    # The QUEUED leaf — vm_instance_id is None because it's awaiting warm-claim.
+    queued_leaf = await _make_task(db_session, project.id, TaskStatus.QUEUED, vm_instance_id=None,
+                                   latest_status_message=None)
+
+    _run_aggregation([failed_sibling, completing_sibling, queued_leaf], project)
+
+    # The QUEUED leaf must NOT be force-FAILed by aggregation.
+    assert queued_leaf.status == TaskStatus.QUEUED, (
+        f"Expected QUEUED leaf to be left alone by aggregation; got "
+        f"{queued_leaf.status} with message {queued_leaf.latest_status_message!r}. "
+        f"This regresses production fix for task 582a0210."
+    )
+    assert queued_leaf.latest_status_message is None
