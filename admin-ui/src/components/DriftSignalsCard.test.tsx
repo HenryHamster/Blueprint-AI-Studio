@@ -244,12 +244,14 @@ describe('DriftSignalsCard', () => {
   });
 
   it('renders sparkline when drift_history has sufficient points', async () => {
+    // Shape mirrors backend /api/admin/drift-snapshot post-rename — see
+    // backend/testing/test_digest.py::test_drift_snapshot_response_shape_pinned.
     const driftHistory = [
-      { snapshot_at: '2026-04-22T00:00:00Z', claim_shipped_consistency: 0.8, over_claim_flag: false },
-      { snapshot_at: '2026-04-23T00:00:00Z', claim_shipped_consistency: 0.5, over_claim_flag: false },
-      { snapshot_at: '2026-04-24T00:00:00Z', claim_shipped_consistency: 0.3, over_claim_flag: true },
-      { snapshot_at: '2026-04-25T00:00:00Z', claim_shipped_consistency: 0.2, over_claim_flag: true },
-      { snapshot_at: '2026-04-26T00:00:00Z', claim_shipped_consistency: 0.1, over_claim_flag: true },
+      { snapshot_at: '2026-04-22T00:00:00Z', claim_shipped_consistency: 0.8, over_claim_flag: false, stalled_despite_churn_flag: false },
+      { snapshot_at: '2026-04-23T00:00:00Z', claim_shipped_consistency: 0.5, over_claim_flag: false, stalled_despite_churn_flag: false },
+      { snapshot_at: '2026-04-24T00:00:00Z', claim_shipped_consistency: 0.3, over_claim_flag: true, stalled_despite_churn_flag: false },
+      { snapshot_at: '2026-04-25T00:00:00Z', claim_shipped_consistency: 0.2, over_claim_flag: true, stalled_despite_churn_flag: false },
+      { snapshot_at: '2026-04-26T00:00:00Z', claim_shipped_consistency: 0.1, over_claim_flag: true, stalled_despite_churn_flag: false },
     ];
 
     apiFetchMock.mockResolvedValue(

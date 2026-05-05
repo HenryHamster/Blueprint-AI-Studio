@@ -6044,9 +6044,9 @@ async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, 
     assert "claim_shipped_consistency" in flagged
     assert "window_days" in data
     assert "generated_at" in data
-    # history field present; empty when no stored snapshots exist yet
-    assert "history" in flagged
-    assert isinstance(flagged["history"], list)
+    # drift_history field present; empty when no stored snapshots exist yet
+    assert "drift_history" in flagged
+    assert isinstance(flagged["drift_history"], list)
 
 
 @pytest.mark.asyncio
@@ -6098,7 +6098,7 @@ async def test_drift_snapshot_history_series_returned(client: AsyncClient, db_se
     assert data["flagged_count"] == 1
     flagged = data["flagged_directions"][0]
     assert flagged["direction_id"] == dir_id
-    history = flagged["history"]
+    history = flagged["drift_history"]
     assert isinstance(history, list)
     assert len(history) == 3
     # history is oldest-first (chronological order for sparkline)
@@ -6110,6 +6110,80 @@ async def test_drift_snapshot_history_series_returned(client: AsyncClient, db_se
     # chronological order: each snapshot_at >= previous
     times = [entry["snapshot_at"] for entry in history]
     assert times == sorted(times)
+
+
+@pytest.mark.asyncio
+async def test_drift_snapshot_response_shape_pinned(client: AsyncClient, db_session):
+    """Pin the exact key set on flagged_directions[i] and the per-direction history
+    entries so a future rename of either side fails CI immediately.
+
+    The asserted key set MUST mirror the frontend TypeScript interfaces
+    DriftDirection and DriftHistoryPoint in
+    admin-ui/src/components/DriftSignalsCard.tsx. If you change either side,
+    update both together — silent drift between server and client is the bug
+    class this test exists to catch.
+    """
+    from app.drift_detection import DirectionDriftSnapshot
+    from app.models import TaskStatus
+    from app.time_utils import _utcnow as _now
+    from datetime import timedelta
+
+    dir_id = "d-shape"
+    project = make_project(
+        directions=[{"id": dir_id, "text": "Shape pin", "status": "active", "priority": "high"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    base_time = _now() - timedelta(hours=3)
+    db_session.add(
+        DirectionDriftSnapshot(
+            project_id=project.id,
+            direction_id=dir_id,
+            snapshot_at=base_time,
+            claimed_changes_count=4,
+            actually_merged_prs=0,
+            claim_shipped_consistency=0.0,
+            over_claim_flag=True,
+            stalled_despite_churn_flag=False,
+        )
+    )
+    now = _now()
+    for _ in range(4):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"direction_id": dir_id, "shipped": True},
+                created_at=now - timedelta(hours=1),
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/drift-snapshot?project_id={project.id}")
+    assert response.status_code == 200
+    flagged = response.json()["flagged_directions"][0]
+
+    # Mirrors DriftDirection (extends DriftSignal) in DriftSignalsCard.tsx.
+    assert set(flagged.keys()) == {
+        "direction_id",
+        "direction_text",
+        "over_claim_flag",
+        "stalled_despite_churn_flag",
+        "claimed_changes_count",
+        "actually_merged_prs",
+        "claim_shipped_consistency",
+        "drift_history",
+    }
+    assert flagged["drift_history"], "expected at least one history entry from seeded snapshot"
+    # Mirrors DriftHistoryPoint in DriftSignalsCard.tsx.
+    assert set(flagged["drift_history"][0].keys()) == {
+        "snapshot_at",
+        "claim_shipped_consistency",
+        "over_claim_flag",
+        "stalled_despite_churn_flag",
+    }
 
 
 @pytest.mark.asyncio

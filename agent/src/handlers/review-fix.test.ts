@@ -1821,4 +1821,11 @@ describe('handleReview structural prompt invariants', () => {
     expect(calls.length).toBeGreaterThan(0);
     expect(calls[calls.length - 1][0]).not.toContain('Task lifecycle — you own it end-to-end');
   });
+
+  it('handleReview prompt contains task-type fingerprint: no informational-only verdict path', async () => {
+    await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[calls.length - 1][0]).toContain('There is no informational-only path');
+  });
 });

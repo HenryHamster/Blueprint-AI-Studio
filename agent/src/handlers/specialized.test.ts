@@ -940,4 +940,17 @@ describe('specialized handler structural prompt invariants', () => {
     expect(p).toContain('Use Grep/Glob for code search');              // DEFAULT_TOOL_GUIDANCE
     expect(p).not.toContain('Task lifecycle — you own it end-to-end'); // no CODE_CHANGE_HELPER_GUIDANCE
   });
+
+  it.each([
+    ['handleSecurityAudit', () => handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'OWASP Top 10'],
+    ['handlePerf',          () => handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'N+1 database queries'],
+    ['handleDebug',         () => handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'Do NOT make any code changes'],
+    ['handleInvestigate',   () => handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'Do NOT modify any files'],
+    ['handleSelfAudit',     () => handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'test_coverage'],
+    ['handleSmoketest',     () => handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'smoke test agent'],
+  ] as [string, () => Promise<void>, string][])('%s prompt contains task-type fingerprint phrase', async (_name, invoke, phrase) => {
+    await invoke();
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain(phrase);
+  });
 });

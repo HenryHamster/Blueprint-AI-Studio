@@ -156,4 +156,9 @@ describe('handleDesignDocUpdate', () => {
     const prompt = await capturePrompt();
     expect(prompt).not.toContain('Task lifecycle — you own it end-to-end');
   });
+
+  it('contains task-type fingerprint: Do NOT create files in the repo', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).toContain('Do NOT create files in the repo');
+  });
 });

@@ -6,6 +6,7 @@ interface DriftHistoryPoint {
   snapshot_at: string;
   claim_shipped_consistency: number;
   over_claim_flag: boolean;
+  stalled_despite_churn_flag: boolean;
 }
 
 interface DriftSignal {

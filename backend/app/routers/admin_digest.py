@@ -1604,7 +1604,7 @@ async def get_drift_snapshot(
             "claimed_changes_count": sig["claimed_changes_count"],
             "actually_merged_prs": sig["actually_merged_prs"],
             "claim_shipped_consistency": sig["claim_shipped_consistency"],
-            "history": history,
+            "drift_history": history,
         })
 
     return {

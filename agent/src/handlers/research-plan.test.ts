@@ -24,8 +24,33 @@ vi.mock('../index.js', () => ({
   getProviderRunner: vi.fn().mockReturnValue('claude'),
 }));
 
+vi.mock('child_process', () => ({
+  execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+}));
+
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return {
+    ...actual,
+    readClaudeMd: vi.fn().mockReturnValue(''),
+    buildContextPrefix: vi.fn().mockReturnValue(''),
+    buildFileTree: vi.fn().mockReturnValue(''),
+    configureAgentPermissions: vi.fn().mockReturnValue([]),
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
+    excludeAgentHelpers: vi.fn(),
+    buildRetryContext: vi.fn().mockReturnValue(''),
+    formatPlaybook: vi.fn().mockReturnValue(''),
+  };
+});
+
 import fs from 'fs';
-import { runClaudeCode, persistAndPostStatus } from '../index.js';
+import { runClaudeCode, persistAndPostStatus, getProviderRunner } from '../index.js';
+import { handlePlan, handleResearch } from './research-plan.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -1349,5 +1374,40 @@ describe('runThinkerWithGate', () => {
     const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
     expect(statusArg.status).toBe('FAILED');
     expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
+  });
+});
+
+// ── handlePlan / handleResearch task-specific prompt fingerprints ─────────────
+// Pins characteristic phrases in each handler's assembled prompt so a future
+// edit that drops a load-bearing instruction causes a test failure before merge.
+describe('handlePlan / handleResearch task-specific prompt fingerprints', () => {
+  const FP_TASK_ID = 'fp-task-001';
+  const FP_GH_TOKEN = 'gh-token';
+  const FP_OWNER = 'owner';
+  const FP_REPO = 'repo';
+  const FP_WS = null;
+  const FP_STATUS_REF = () => ({ value: '' });
+  const FP_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const FP_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('handlePlan prompt contains depends_on_indices (plan output schema cue)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('depends_on_indices');
+  });
+
+  it('handleResearch prompt contains "Explore aggressively" (read-only exploration directive)', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('Explore aggressively');
   });
 });
