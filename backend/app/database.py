@@ -187,6 +187,28 @@ async def init_db():
     pass
 
 async def get_session() -> AsyncSession: # type: ignore
-    """Dependency to provide a database session to FastAPI routes."""
-    async with AsyncSessionLocal() as session:
+    """Dependency to provide a database session to FastAPI routes.
+
+    The close path is wrapped to swallow ``InterfaceError("connection is closed")``
+    that surfaces when the underlying asyncpg socket died mid-request (Cloud Run
+    revision rollover, Cloud SQL failover, idle eviction). The disconnect listener
+    in ``_install_disconnect_invalidation`` has already invalidated the pool entry;
+    SQLAlchemy's session ``__aexit__`` then tries to roll back on the dead conn,
+    asyncpg's adapter raises ``cannot call Transaction.rollback(): the underlying
+    connection is closed``, which surfaces as a 500 on the request that already
+    succeeded application-side. Suppressing the cleanup-time error keeps the
+    response intact; the bad connection is gone from the pool either way.
+    """
+    from sqlalchemy.exc import InterfaceError as SAInterfaceError
+    session = AsyncSessionLocal()
+    try:
         yield session
+    finally:
+        try:
+            await session.close()
+        except SAInterfaceError as e:
+            msg = str(e).lower()
+            if "connection is closed" in msg or "connection does not exist" in msg:
+                logger.debug("[DB] Tolerating closed-connection during session close: %s", e)
+            else:
+                raise
