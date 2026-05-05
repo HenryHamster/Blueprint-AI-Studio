@@ -1,6 +1,7 @@
 """Tests for automatic playbook entry creation from recurring failure patterns."""
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -3611,3 +3612,125 @@ async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sam
     by_type = result["by_task_type"]
     assert "create" in by_type
     assert "fix" not in by_type
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for regression notifications in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_decreasing_task_set(project_id, db_session, tasks):
+    """Helper: 5 current tasks (3/5 hit) + 5 previous tasks (5/5 hit) → decreasing."""
+    for i in range(3):
+        t = _make_sr_task(project_id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project_id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project_id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_session: AsyncSession):
+    """A decreasing trend triggers post_failure_alert_message and dispatch_external_notification."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    _make_decreasing_task_set(project.id, db_session, tasks)
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["categories"]["test-coverage"]["trend"] == "decreasing"
+
+    mock_post.assert_called_once()
+    call_kwargs = mock_post.call_args
+    description = call_kwargs.args[2] if len(call_kwargs.args) >= 3 else call_kwargs.kwargs.get("description", "")
+    assert "test-coverage" in description
+    assert "→" in description
+
+    mock_dispatch.assert_called_once()
+    dispatch_kwargs = mock_dispatch.call_args
+    payload = dispatch_kwargs.kwargs.get("payload") or dispatch_kwargs.args[2]
+    assert dispatch_kwargs.kwargs.get("event_type") == "sr_catch_rate_regression" or dispatch_kwargs.args[1] == "sr_catch_rate_regression"
+    assert "regressing_categories" in payload
+    cats = payload["regressing_categories"]
+    assert len(cats) == 1
+    assert cats[0]["category"] == "test-coverage"
+    assert cats[0]["previous_hit_rate"] is not None
+    assert cats[0]["current_hit_rate"] is not None
+    assert cats[0]["sample_size"] > 0
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_regression_no_duplicate_in_same_window(db_session: AsyncSession):
+    """A second call with the same regressing categories in the same window does NOT re-post."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    project = await _make_project(db_session)
+    tasks = []
+    _make_decreasing_task_set(project.id, db_session, tasks)
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    # Verify alert state was persisted
+    await db_session.refresh(project)
+    assert "sr_catch_rate_trends_alert" in (project.design_doc or {})
+    assert mock_post.call_count == 1
+
+    # Second call in the same window — should be deduped
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post2, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    mock_post2.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_increasing(db_session: AsyncSession):
+    """No notification fires when no category is decreasing."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5/5 hit (stable/increasing vs previous 3/5)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(3):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(2):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    trend = result["categories"]["test-coverage"]["trend"]
+    assert trend in ("stable", "increasing")
+    mock_post.assert_not_called()
+    mock_dispatch.assert_not_called()

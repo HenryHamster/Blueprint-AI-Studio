@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
 
 export interface SrCategoryTrend {
@@ -137,6 +138,17 @@ function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<s
   );
 }
 
+export interface SrMissedTask {
+  task_id: string;
+  title: string;
+  task_type?: string | null;
+  scope?: string | null;
+  created_at?: string | null;
+  missed_categories: string[];
+  caught_categories: string[];
+  pr_url?: string | null;
+}
+
 interface SrTrendBreakdownProps {
   trends: SrTrendData | null | undefined;
   variant: 'card' | 'inline';
@@ -220,6 +232,107 @@ export function SrTrendBreakdown({ trends, variant }: SrTrendBreakdownProps) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+const WINDOW_OPTIONS: { label: string; days: number }[] = [
+  { label: '7d', days: 7 },
+  { label: '14d', days: 14 },
+  { label: '30d', days: 30 },
+];
+
+interface SrMissedRetrospectiveProps {
+  tasks: SrMissedTask[];
+  onTaskClick?: (taskId: string) => void;
+}
+
+export function SrMissedRetrospective({ tasks, onTaskClick }: SrMissedRetrospectiveProps) {
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState('');
+  const [windowDays, setWindowDays] = useState(14);
+  const [mountedAt] = useState(() => Date.now());
+
+  const allCategories = Array.from(new Set(tasks.flatMap(t => t.missed_categories))).sort();
+  const allTypes = Array.from(new Set(tasks.map(t => t.task_type).filter(Boolean) as string[])).sort();
+
+  const cutoff = mountedAt - windowDays * 86400_000;
+  const visible = tasks.filter(t => {
+    if (t.created_at && new Date(t.created_at).getTime() < cutoff) return false;
+    if (categoryFilter && !t.missed_categories.includes(categoryFilter)) return false;
+    if (typeFilter && t.task_type !== typeFilter) return false;
+    return true;
+  });
+
+  return (
+    <div data-testid="sr-missed-retrospective" className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2 text-[10px]">
+        <span className="text-neutral-500 uppercase tracking-wide">Time</span>
+        {WINDOW_OPTIONS.map(w => (
+          <button
+            key={w.days}
+            onClick={() => setWindowDays(w.days)}
+            className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
+          >{w.label}</button>
+        ))}
+        {allCategories.length > 0 && (
+          <select
+            value={categoryFilter}
+            onChange={e => setCategoryFilter(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+          >
+            <option value="">All categories</option>
+            {allCategories.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        )}
+        {allTypes.length > 0 && (
+          <select
+            value={typeFilter}
+            onChange={e => setTypeFilter(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300"
+          >
+            <option value="">All types</option>
+            {allTypes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        )}
+        <span className="text-neutral-600">{visible.length} task{visible.length !== 1 ? 's' : ''}</span>
+      </div>
+      {visible.length === 0 ? (
+        <p className="text-[10px] text-neutral-600 italic">No missed tasks for this filter.</p>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {visible.map(t => (
+            <div
+              key={t.task_id}
+              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
+              onClick={() => onTaskClick?.(t.task_id)}
+            >
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className="text-neutral-200 truncate flex-1 font-medium" title={t.title}>{t.title}</span>
+                {t.task_type && <span className="text-neutral-500 shrink-0">{t.task_type}</span>}
+                {t.scope && <span className="text-neutral-600 shrink-0">{t.scope}</span>}
+                {t.created_at && (
+                  <span className="text-neutral-600 shrink-0" title={t.created_at}>
+                    {new Date(t.created_at).toLocaleDateString()}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                {t.missed_categories.length > 0 && (
+                  <span className="text-red-400">
+                    missed: {t.missed_categories.join(', ')}
+                  </span>
+                )}
+                {t.caught_categories.length > 0 && (
+                  <span className="text-emerald-600">
+                    caught: {t.caught_categories.join(', ')}
+                  </span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

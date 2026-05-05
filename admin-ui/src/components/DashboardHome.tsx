@@ -219,6 +219,12 @@ interface DigestData {
     sample_size?: number | null;
   } | null;
   self_review_prediction_accuracy_trends?: SrTrendData | null;
+  self_review_skip_rate?: {
+    overall_rate: number;
+    skipped_count: number;
+    sample_size: number;
+    by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
+  } | null;
   median_cost_per_merged_pr?: number | null;
   prediction_calibration_factor?: number | null;
   prediction_calibration_note?: string | null;
@@ -849,7 +855,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null) && (
+          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null) && (
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
               <div className="flex flex-wrap gap-3">
@@ -905,6 +911,27 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                     )}
                   </div>
                 )}
+                {digest?.self_review_skip_rate != null && (() => {
+                  const skip = digest.self_review_skip_rate;
+                  const rate = skip.overall_rate;
+                  const color = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
+                  const byTypeEntries = Object.entries(skip.by_task_type ?? {});
+                  const tooltip = byTypeEntries.length
+                    ? byTypeEntries.map(([t, b]) => `${t}: ${Math.round(b.rate * 100)}% (n=${b.sample_size})`).join('\n')
+                    : undefined;
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+                      title={tooltip}
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Skip Rate</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {Math.round(rate * 100)}%
+                      </p>
+                      <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
+                    </div>
+                  );
+                })()}
                 <SrTrendBreakdown
                   trends={digest?.self_review_prediction_accuracy_trends}
                   variant="card"

@@ -238,6 +238,12 @@ interface DigestData {
     sample_size: number;
   } | null;
   self_review_prediction_accuracy_trends?: SrTrendData | null;
+  self_review_skip_rate?: {
+    overall_rate: number;
+    skipped_count: number;
+    sample_size: number;
+    by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
+  } | null;
   first_review_approval_rate?: {
     overall: number | null;
     sample_size: number;
@@ -2105,12 +2111,14 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 const spaTrends = digest.self_review_prediction_accuracy_trends;
                 const ra = digest.review_accuracy;
                 const fra = digest.first_review_approval_rate;
+                const skip = digest.self_review_skip_rate;
                 const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
                 const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
                 const hasSpaTrends = !!(spaTrends && spaTrends.categories && Object.keys(spaTrends.categories).length > 0);
                 const hasRa = ra && (ra.precision != null || ra.recall != null);
                 const hasFra = fra && fra.overall != null && fra.sample_size >= 5;
-                if (!hasSre && !hasSpa && !hasSpaTrends && !hasRa && !hasFra) return null;
+                const hasSkip = !!skip;
+                if (!hasSre && !hasSpa && !hasSpaTrends && !hasRa && !hasFra && !hasSkip) return null;
                 const fraOverall = fra?.overall;
                 const fraColor = fraOverall != null
                   ? (fraOverall >= 0.8 ? 'text-emerald-400' : fraOverall >= 0.5 ? 'text-amber-400' : 'text-red-400')
@@ -2160,6 +2168,25 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             <span className="text-[10px] text-neutral-500">· n={spa.sample_size}</span>
                           </div>
                         )}
+                        {skip && hasSkip && (() => {
+                          const rate = skip.overall_rate;
+                          const skipColor = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
+                          const byTypeEntries = Object.entries(skip.by_task_type ?? {});
+                          return (
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">SR Skip</span>
+                              <span className="text-[10px] text-neutral-400">
+                                rate <span className={skipColor}>{pct(rate)}</span>
+                              </span>
+                              <span className="text-[10px] text-neutral-500">· {skip.skipped_count}/{skip.sample_size}</span>
+                              {byTypeEntries.map(([ttype, b]) => (
+                                <span key={ttype} className="text-[10px] text-neutral-500">
+                                  · {ttype} <span className="text-neutral-300">{pct(b.rate)}</span> (n={b.sample_size})
+                                </span>
+                              ))}
+                            </div>
+                          );
+                        })()}
                         {hasSpaTrends && (
                           <div className="flex flex-col gap-0.5">
                             <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction by category</span>

@@ -1923,4 +1923,83 @@ async def compute_sr_catch_rate_trends(
         "[SR_CATCH_RATE_TRENDS] project=%s categories=%d",
         project_id, len(categories),
     )
+
+    # Fire notification when one or more categories are regressing.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        regressing = {
+            cat: data for cat, data in categories.items()
+            if data.get("trend") == "decreasing"
+        }
+        if regressing:
+            # Dedup: skip if same regressing set already alerted within this 14-day window.
+            alert_state: dict = dict(doc.get("sr_catch_rate_trends_alert") or {})
+            alert_computed_at: Optional[str] = alert_state.get("computed_at")
+            alerted_cats: list = list(alert_state.get("categories") or [])
+            current_regressing_cats = sorted(regressing.keys())
+
+            already_alerted = False
+            if alert_computed_at:
+                try:
+                    last_alert_dt = datetime.fromisoformat(alert_computed_at)
+                    if (now - last_alert_dt).days < 14 and alerted_cats == current_regressing_cats:
+                        already_alerted = True
+                except (ValueError, TypeError):
+                    pass
+
+            if not already_alerted:
+                lines = ["SR catch-rate regression detected:"]
+                for cat in current_regressing_cats:
+                    data = regressing[cat]
+                    prev = data.get("previous_hit_rate")
+                    curr_rate = data.get("current_hit_rate")
+                    sample = current_stats.get(cat, {}).get("human_count", 0)
+                    prev_str = f"{prev:.0%}" if prev is not None else "N/A"
+                    curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
+                    lines.append(f"  • {cat}: {prev_str} → {curr_str} (n={sample})")
+                description = "\n".join(lines)
+
+                await post_failure_alert_message(session, project_id, description)
+
+                webhook_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "regressing_categories": [
+                        {
+                            "category": cat,
+                            "previous_hit_rate": regressing[cat].get("previous_hit_rate"),
+                            "current_hit_rate": regressing[cat].get("current_hit_rate"),
+                            "sample_size": current_stats.get(cat, {}).get("human_count", 0),
+                        }
+                        for cat in current_regressing_cats
+                    ],
+                }
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_catch_rate_regression",
+                        payload=webhook_payload,
+                    )
+                )
+
+                doc["sr_catch_rate_trends_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "categories": current_regressing_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s regression_alert categories=%s",
+                    project_id, current_regressing_cats,
+                )
+    except Exception:
+        logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
+
     return result

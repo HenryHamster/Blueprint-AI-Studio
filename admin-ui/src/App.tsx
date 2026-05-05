@@ -11,7 +11,8 @@ import { ResearchBrowser } from './components/ResearchBrowser';
 import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
-import { fetchTask, apiFetch, API_BASE_URL } from './api';
+import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
+import { SrMissedRetrospective, type SrMissedTask } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsBanner } from './components/AlertsBanner';
@@ -140,6 +141,18 @@ export default function App() {
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
+
+  const [showSrMissed, setShowSrMissed] = useState(false);
+  const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
+  const [srMissedLoading, setSrMissedLoading] = useState(false);
+  useEffect(() => {
+    if (!showSrMissed || !selectedProjectId) return;
+    setSrMissedLoading(true);
+    fetchSrMissedRetrospectives(selectedProjectId, { days: 14, page_size: 200 })
+      .then(r => setSrMissedTasks(r.items))
+      .catch(() => {})
+      .finally(() => setSrMissedLoading(false));
+  }, [showSrMissed, selectedProjectId]);
 
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
@@ -687,6 +700,21 @@ export default function App() {
             <>
               <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} /></ErrorBoundary>
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
+              {s.selectedProjectId && (
+                <div className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+                  <button
+                    onClick={() => setShowSrMissed(v => !v)}
+                    className="text-xs font-medium text-neutral-400 hover:text-neutral-200"
+                  >
+                    Self-Review Missed Retrospectives {showSrMissed ? '▲' : '▼'}
+                  </button>
+                  {showSrMissed && (
+                    srMissedLoading
+                      ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
+                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} /></div>
+                  )}
+                </div>
+              )}
             </>
           ) : s.viewMode === 'kanban' ? (
             <ErrorBoundary level="panel">

@@ -68,6 +68,73 @@ def _stash_projected_task_fields(
     object.__setattr__(task, "_projected_completed_at_ts", completed_at_ts)
 
 
+_SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
+_SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
+
+
+def _is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
+    """A self-review outcome is a 'skip' when the agent emitted the
+    bash ./done fallback envelope: verdict=='unknown' with empty
+    check_results, or a blind_spots marker matching the fallback paths.
+    """
+    if not sro:
+        return False
+    blind_spots = sro.get("blind_spots") or []
+    for entry in blind_spots:
+        if isinstance(entry, str) and any(m in entry for m in _SR_SKIP_BLIND_SPOT_MARKERS):
+            return True
+    if sro.get("verdict") == "unknown" and not (sro.get("check_results") or {}):
+        return True
+    return False
+
+
+def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
+    """Share of code-change tasks (create/fix/refactor/migrate) where the
+    self-review JSON was missing or invalid. Detects the bash ./done
+    fallback envelope. Returns None when sample size < 5.
+    """
+    code_change_tasks: List[Task] = []
+    for t in terminal_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        if ttype in _SR_CODE_CHANGE_TYPES:
+            code_change_tasks.append(t)
+
+    if len(code_change_tasks) < 5:
+        return None
+
+    skipped_count = 0
+    by_type: Dict[str, Dict[str, int]] = {}
+    for t in code_change_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        is_skip = _is_skipped_sr_outcome(sro)
+        bucket = by_type.setdefault(ttype, {"skipped": 0, "total": 0})
+        bucket["total"] += 1
+        if is_skip:
+            skipped_count += 1
+            bucket["skipped"] += 1
+
+    by_task_type: Dict[str, Dict[str, Any]] = {}
+    for ttype, counts in by_type.items():
+        total = counts["total"]
+        if total < 5:
+            continue
+        by_task_type[ttype] = {
+            "rate": round(counts["skipped"] / total, 3),
+            "skipped_count": counts["skipped"],
+            "sample_size": total,
+        }
+
+    sample_size = len(code_change_tasks)
+    return {
+        "overall_rate": round(skipped_count / sample_size, 3),
+        "skipped_count": skipped_count,
+        "sample_size": sample_size,
+        "by_task_type": by_task_type,
+    }
+
+
 def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, Any] | None":
     """Compute self-review prediction accuracy from tasks that have both
     _self_review_outcome.check_results and _first_attempt_rejection_categories.
@@ -3607,6 +3674,7 @@ async def _compute_digest(
     recurring_patterns.sort(key=lambda x: x["occurrence_count"], reverse=True)
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
+    _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
     _first_attempt_success_rate = _compute_first_attempt_breakdowns(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
@@ -3659,6 +3727,7 @@ async def _compute_digest(
         "first_review_approval_rate": _first_review_approval_rate,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
         "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
+        "self_review_skip_rate": _self_review_skip_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
@@ -3850,3 +3919,104 @@ async def get_fix_loop_convergence(
         "test": _aggregate_loop(per_loop["test"]),
         "check": _aggregate_loop(per_loop["check"]),
     }
+
+
+@router.get("/projects/{project_id}/sr-missed-retrospectives")
+async def list_sr_missed_retrospectives(
+    project_id: uuid.UUID,
+    days: int = Query(14, ge=1, le=90),
+    category: Optional[str] = Query(None),
+    task_type: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """List code-change tasks where self-review passed a category that human review later flagged.
+
+    Useful for operator-driven learning: surface systematic blind spots so prompt
+    or check changes can target them.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(
+            Task.id, Task.title, Task.created_at, Task.context, Task.project_id, Task.payloads,
+        ))
+        .order_by(Task.created_at.desc())
+        .limit(2000)
+    )
+    result = await session.execute(stmt)
+    all_tasks = result.scalars().all()
+
+    # Filter to tasks that have both SR check results and human rejection categories
+    missed_tasks = []
+    for t in all_tasks:
+        ctx = t.context or {}
+        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        if not check_results:
+            continue
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
+        if not human_cats:
+            continue
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        missed = human_cats - sr_failed
+        if not missed:
+            continue
+        caught = human_cats & sr_failed
+        t_type = (t.first_payload or {}).get("type")
+        missed_tasks.append({
+            "_task": t,
+            "task_id": str(t.id),
+            "title": t.title or "",
+            "task_type": t_type,
+            "scope": ctx.get("scope"),
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "missed_categories": sorted(missed),
+            "caught_categories": sorted(caught),
+        })
+
+    # Apply optional filters
+    if category:
+        missed_tasks = [m for m in missed_tasks if category in m["missed_categories"]]
+    if task_type:
+        missed_tasks = [m for m in missed_tasks if m["task_type"] == task_type]
+
+    total = len(missed_tasks)
+    page_items = missed_tasks[page * page_size: (page + 1) * page_size]
+
+    # Batch-fetch PR artifacts for items on this page
+    page_task_ids = [uuid.UUID(m["task_id"]) for m in page_items]
+    pr_map: Dict[str, str] = {}
+    if page_task_ids:
+        art_result = await session.execute(
+            select(Artifact.task_id, Artifact.pr_url)
+            .where(
+                Artifact.task_id.in_(page_task_ids),
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            )
+        )
+        for row in art_result.all():
+            if row.pr_url:
+                pr_map[str(row.task_id)] = row.pr_url
+
+    items = []
+    for m in page_items:
+        items.append({
+            "task_id": m["task_id"],
+            "title": m["title"],
+            "task_type": m["task_type"],
+            "scope": m["scope"],
+            "created_at": m["created_at"],
+            "missed_categories": m["missed_categories"],
+            "caught_categories": m["caught_categories"],
+            "pr_url": pr_map.get(m["task_id"]),
+        })
+
+    return {"items": items, "total": total}

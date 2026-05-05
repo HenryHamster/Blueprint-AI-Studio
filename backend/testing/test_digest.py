@@ -6644,3 +6644,225 @@ async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
     assert dp["autonomous_prs_merged"] == 0
     assert dp["operator_action_count"] == 3
     assert dp["cost_per_merged_pr"] is None
+
+
+# ---------------------------------------------------------------------------
+# Self-review skip-rate metric
+# ---------------------------------------------------------------------------
+
+
+def _sr_skipped_envelope_unknown_verdict() -> dict:
+    return {"verdict": "unknown", "fixes_applied": False, "check_results": {}, "blind_spots": []}
+
+
+def _sr_skipped_envelope_blind_spot_marker(marker: str) -> dict:
+    return {"verdict": "unknown", "fixes_applied": False, "check_results": {}, "blind_spots": [marker]}
+
+
+def _sr_valid_outcome() -> dict:
+    return {
+        "verdict": "pass",
+        "fixes_applied": False,
+        "check_results": {"correctness": {"passed": True}},
+        "blind_spots": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_skip_rate_detects_skipped_envelope(client: AsyncClient, db_session):
+    """An unknown-verdict outcome with empty check_results counts as a skip."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 skipped (unknown verdict, empty check_results) + 2 valid → 5 code-change tasks
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        ))
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={"_self_review_outcome": _sr_valid_outcome()},
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    skip_rate = response.json()["self_review_skip_rate"]
+    assert skip_rate is not None
+    assert skip_rate["skipped_count"] == 3
+    assert skip_rate["sample_size"] == 5
+    assert skip_rate["overall_rate"] == 0.6
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_skip_rate_detects_blind_spot_marker(client: AsyncClient, db_session):
+    """blind_spots entries containing the fallback markers count as skips."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 parse-failure + 2 missing-file + 1 valid → 5 code-change tasks, 4 skipped
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "refactor"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
+                "self-review JSON parsing failed"
+            )},
+        ))
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "migrate"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
+                "self-review skipped — investigate"
+            )},
+        ))
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": _sr_valid_outcome()},
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    skip_rate = response.json()["self_review_skip_rate"]
+    assert skip_rate is not None
+    assert skip_rate["skipped_count"] == 4
+    assert skip_rate["sample_size"] == 5
+    assert skip_rate["overall_rate"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_skip_rate_excludes_non_code_change_types(
+    client: AsyncClient, db_session,
+):
+    """Review/research tasks are excluded from the denominator."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 5 code-change tasks: 1 skipped, 4 valid
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+    ))
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={"_self_review_outcome": _sr_valid_outcome()},
+        ))
+    # Non-code-change tasks with skipped envelopes — must NOT affect the metric
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        ))
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+    ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    skip_rate = response.json()["self_review_skip_rate"]
+    assert skip_rate is not None
+    assert skip_rate["sample_size"] == 5
+    assert skip_rate["skipped_count"] == 1
+    assert skip_rate["overall_rate"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_skip_rate_returns_none_below_min_sample(
+    client: AsyncClient, db_session,
+):
+    """Returns None when fewer than 5 code-change tasks are available."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 4 code-change tasks total → below threshold
+    for _ in range(4):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    assert response.json()["self_review_skip_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_skip_rate_by_task_type_breakdown(
+    client: AsyncClient, db_session,
+):
+    """by_task_type reports per-type rates only when that type has >=5 samples."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 5 create tasks: 2 skipped + 3 valid → eligible for by_task_type
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        ))
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_valid_outcome()},
+        ))
+    # 2 fix tasks → below per-type threshold; included in overall but not in by_task_type
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    skip_rate = response.json()["self_review_skip_rate"]
+    assert skip_rate is not None
+    assert skip_rate["sample_size"] == 7
+    assert skip_rate["skipped_count"] == 4
+    assert "create" in skip_rate["by_task_type"]
+    assert skip_rate["by_task_type"]["create"]["sample_size"] == 5
+    assert skip_rate["by_task_type"]["create"]["skipped_count"] == 2
+    assert skip_rate["by_task_type"]["create"]["rate"] == 0.4
+    assert "fix" not in skip_rate["by_task_type"]

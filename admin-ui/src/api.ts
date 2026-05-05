@@ -120,6 +120,34 @@ export async function fetchAutonomyDebug(projectId: string): Promise<unknown> {
   return res.json();
 }
 
+export interface SrMissedRetrospectivesResponse {
+  items: import('./components/SrTrendBreakdown').SrMissedTask[];
+  total: number;
+}
+
+export async function fetchSrMissedRetrospectives(
+  projectId: string,
+  params?: {
+    category?: string;
+    task_type?: string;
+    days?: number;
+    page?: number;
+    page_size?: number;
+  }
+): Promise<SrMissedRetrospectivesResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.category) searchParams.set('category', params.category);
+  if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  if (params?.page !== undefined) searchParams.set('page', String(params.page));
+  if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-missed-retrospectives${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch SR missed retrospectives: ${res.status}`);
+  return res.json();
+}
+
 export async function onboardProject(
   owner: string,
   repo: string,
