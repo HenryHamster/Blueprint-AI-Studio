@@ -228,6 +228,52 @@ async def _ensure_vm_deleted(task_or_vm_id, *, reason: str = "terminal_transitio
     logger.error(f"[VM CLEANUP] FAILED to delete VM {vm_id} after 3 attempts — will rely on cleanup sweep")
     return False
 
+
+# Strong references for fire-and-forget VM-delete tasks. asyncio.create_task
+# returns a weak handle — without holding a reference here, GC may collect
+# the coroutine mid-flight and the GCP delete is silently dropped.
+_background_vm_deletes: set[asyncio.Task] = set()
+
+
+def fire_and_forget_vm_delete(
+    task_or_vm_id, *, reason: str = "terminal_transition"
+) -> None:
+    """Schedule _ensure_vm_deleted in the background; release the caller's
+    row lock immediately.
+
+    Use from terminal-status request handlers (e.g. /api/agent/status). The
+    awaited form blocks the FOR UPDATE row lock for 60-90s during GCP I/O,
+    causing concurrent agent POSTs on the same row to receive 429 and
+    risking a lost-COMPLETED-commit if Cloud Run terminates the request
+    mid-block. Production incident 2026-05-05 task 04605f9d: agent posted
+    APPROVE verdict, handler held lock through GCP delete, retry got 429,
+    status update never committed, reaper swept work that had already
+    succeeded and re-ran the entire review.
+
+    The orchestrator-deleted marker is recorded synchronously by
+    _ensure_vm_deleted (line above) before its first await, so the reaper
+    sees the orchestrator's intent immediately even if the background
+    delete is delayed by event-loop pressure. Cleanup-sweep is the safety
+    net if the background task is dropped (Cloud Run shutdown mid-flight).
+    """
+    if isinstance(task_or_vm_id, Task):
+        vm_id = task_or_vm_id.vm_instance_id
+    else:
+        vm_id = task_or_vm_id
+    if not vm_id:
+        return
+    # Record marker synchronously before scheduling. _ensure_vm_deleted
+    # also writes this on its first non-await line, but writing here too
+    # closes the window where Cloud Run terminates the worker between
+    # create_task() and the event loop picking up the coroutine — a peer
+    # observing vm_status=DELETED during that window would otherwise
+    # misclassify the orchestrator action as spot-preemption.
+    _orchestrator_deleted_vms[vm_id] = (time.time(), reason)
+    bg = asyncio.create_task(_ensure_vm_deleted(vm_id, reason=reason))
+    _background_vm_deletes.add(bg)
+    bg.add_done_callback(_background_vm_deletes.discard)
+
+
 async def _get_actual_gcp_vm_count() -> int:
     """Count actual agent-vm-* instances across all GCP zones.
     Cached for _GCP_VM_CHECK_INTERVAL seconds to avoid API spam.

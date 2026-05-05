@@ -7408,3 +7408,127 @@ def test_handler_duration_secs_rejects_negative_at_schema_layer():
         handler_duration_secs=42.0,
     )
     assert ok.handler_duration_secs == 42.0
+
+
+# ── fire_and_forget_vm_delete: lock-window-break for terminal status ──
+# Production incident 2026-05-05 task 04605f9d (Review PR #3688): agent
+# posted APPROVE verdict. /api/agent/status handler held FOR UPDATE row
+# lock through ~60s of GCP delete I/O. Concurrent retry got 429; status
+# update never committed; reaper swept work that had already succeeded.
+# Fix: terminal-status handler schedules the GCP delete in the
+# background, releasing the row lock immediately. These tests pin the
+# load-bearing properties of that fix.
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_vm_delete_records_marker_synchronously():
+    """The orchestrator-initiated-delete marker must be written BEFORE
+    fire_and_forget_vm_delete returns, so the reaper observing
+    vm_status=DELETED in the window between create_task() and the
+    background coroutine running doesn't misclassify the orchestrator
+    action as spot preemption."""
+    import asyncio
+    from app.main import (
+        fire_and_forget_vm_delete,
+        _orchestrator_deleted_vms,
+        _background_vm_deletes,
+        is_orchestrator_initiated_delete,
+    )
+
+    vm_id = f"agent-vm-test-marker-{uuid.uuid4().hex[:8]}"
+    _orchestrator_deleted_vms.pop(vm_id, None)
+
+    # Snapshot the background-tasks set so we drain only what *this*
+    # test scheduled. The set is module-level and shared across tests;
+    # tasks from prior tests belong to prior pytest-asyncio loops and
+    # awaiting them raises "future belongs to a different loop".
+    pre_existing_tasks = set(_background_vm_deletes)
+
+    import app.main as main_mod
+    real_ensure = main_mod._ensure_vm_deleted
+    fired = asyncio.Event()
+    async def _stub(*args, **kwargs):
+        fired.set()
+        return True
+    main_mod._ensure_vm_deleted = _stub  # type: ignore[assignment]
+    try:
+        fire_and_forget_vm_delete(vm_id, reason="test_marker_sync")
+        # Synchronously, before yielding to the event loop, the marker
+        # must already be visible.
+        is_orch, reason = is_orchestrator_initiated_delete(vm_id)
+        assert is_orch is True
+        assert reason == "test_marker_sync"
+        # And the background coroutine must eventually run.
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    finally:
+        main_mod._ensure_vm_deleted = real_ensure
+        new_tasks = [t for t in _background_vm_deletes - pre_existing_tasks if not t.done()]
+        if new_tasks:
+            await asyncio.gather(*new_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_vm_delete_does_not_block_caller():
+    """The caller's row lock window must not include the GCP delete.
+    Even if _ensure_vm_deleted blocks for seconds, the synchronous
+    return from fire_and_forget_vm_delete must be near-instant — that
+    is the load-bearing property the lock-window-break depends on."""
+    import asyncio
+    import time
+    from app.main import fire_and_forget_vm_delete, _background_vm_deletes
+
+    pre_existing_tasks = set(_background_vm_deletes)
+
+    import app.main as main_mod
+    real_ensure = main_mod._ensure_vm_deleted
+
+    async def _slow_delete(*args, **kwargs):
+        # Simulate GCP delete latency. If fire_and_forget were
+        # accidentally awaited, the caller would block for 2 seconds.
+        await asyncio.sleep(2.0)
+        return True
+
+    main_mod._ensure_vm_deleted = _slow_delete  # type: ignore[assignment]
+    try:
+        vm_id = f"agent-vm-test-noblock-{uuid.uuid4().hex[:8]}"
+        t0 = time.monotonic()
+        fire_and_forget_vm_delete(vm_id, reason="test_noblock")
+        elapsed = time.monotonic() - t0
+        # Synchronous return — well below the 100ms budget.
+        assert elapsed < 0.1, (
+            f"fire_and_forget_vm_delete blocked caller for {elapsed*1000:.0f}ms; "
+            f"expected <100ms — would defeat the lock-window-break"
+        )
+    finally:
+        main_mod._ensure_vm_deleted = real_ensure
+        # Cancel rather than await — the slow sleep would block test
+        # teardown for 2s and we already proved the property we cared
+        # about (synchronous return).
+        new_tasks = [t for t in _background_vm_deletes - pre_existing_tasks if not t.done()]
+        for t in new_tasks:
+            t.cancel()
+        if new_tasks:
+            await asyncio.gather(*new_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_fire_and_forget_vm_delete_no_op_on_empty_vm_id():
+    """Defensive: a None or empty vm_id must not schedule a background
+    task (would crash on the first await inside _ensure_vm_deleted, but
+    the marker write would still leak an empty-string key)."""
+    from app.main import (
+        fire_and_forget_vm_delete,
+        _orchestrator_deleted_vms,
+        _background_vm_deletes,
+    )
+
+    before_count = len(_background_vm_deletes)
+    fire_and_forget_vm_delete(None, reason="test_empty")
+    fire_and_forget_vm_delete("", reason="test_empty")
+    after_count = len(_background_vm_deletes)
+    assert after_count == before_count, (
+        "fire_and_forget_vm_delete must not schedule a background task "
+        "for None/empty vm_id"
+    )
+    assert "" not in _orchestrator_deleted_vms, (
+        "fire_and_forget_vm_delete must not record a marker for empty vm_id"
+    )

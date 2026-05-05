@@ -1465,7 +1465,17 @@ async def update_agent_status(
             task.estimated_cost_usd = _estimated_cost
             await _check_daily_cost_ceiling(task, session)
         old_vm_id = task.vm_instance_id
-        await _ensure_vm_deleted(old_vm_id, reason="agent_completion")
+        # Fire-and-forget: awaiting _ensure_vm_deleted holds the FOR UPDATE
+        # row lock through 60-90s of GCP I/O. Concurrent /api/agent/status
+        # POSTs hit the held lock and 429, and Cloud Run instance termination
+        # mid-block loses the COMPLETED commit (reaper then re-runs work that
+        # already succeeded). Production incident 2026-05-05 task 04605f9d:
+        # APPROVE verdict written, status update never committed, full
+        # review re-executed on retry. The orchestrator-deleted marker is
+        # recorded synchronously inside _ensure_vm_deleted before its first
+        # await, so the reaper sees the orchestrator action immediately.
+        from app.main import fire_and_forget_vm_delete  # noqa: PLC0415
+        fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
         # Open-PR handoff: if a previous attempt already pushed a branch and
         # opened a PR, retrying from scratch will collide with the agent's
