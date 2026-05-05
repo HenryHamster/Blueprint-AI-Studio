@@ -611,6 +611,39 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             )
             continue
 
+        # Dedup: skip cloning if auto-remediation (debug → Fix: path) already spawned
+        # a replacement for this child and that replacement is still active.  Cloning
+        # here would produce two parallel tasks fixing the same thing (the race observed
+        # in task b15b6813: _requeue_parent_task clone + debug-auto-fix both fired,
+        # opened duplicate PRs, and the losing orphan burned its retry budget on an
+        # empty-diff conflict).  We check the marker written by agent_status.py when it
+        # creates the Fix: task; if the replacement failed/cancelled we fall through and
+        # let requeue handle it normally.
+        _debug_fix_id = (child.context or {}).get("_debug_fix_spawned_task_id")
+        if _debug_fix_id:
+            try:
+                _debug_fix_uuid = uuid.UUID(_debug_fix_id)
+                _debug_fix_task = (await session.execute(
+                    select(Task).where(
+                        Task.id == _debug_fix_uuid,
+                        Task.status.in_([
+                            TaskStatus.QUEUED, TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING,
+                        ]),
+                    )
+                )).scalar_one_or_none()
+                if _debug_fix_task is not None:
+                    logger.info(
+                        "[REQUEUE] Skipping clone of child %s — debug-fix task %s already active",
+                        str(child.id)[:8], _debug_fix_id[:8],
+                    )
+                    continue
+            except Exception:
+                logger.exception(
+                    "[REQUEUE] Failed to check debug-fix task for child %s — proceeding with clone",
+                    child.id,
+                )
+
         # Capture before cancellation — cancellation overwrites both
         child_extra_logs = (child.context or {}).get("last_error", "")
         failure_class = classify_failure(child, logs=child_extra_logs or None)

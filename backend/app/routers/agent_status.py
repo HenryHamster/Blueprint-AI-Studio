@@ -1058,33 +1058,75 @@ async def update_agent_status(
                 base_branch = (task.first_payload).get("base_branch", "main")
                 debug_title = task.title or ""
                 fix_title = debug_title.removeprefix("Debug: ") if debug_title.startswith("Debug: ") else debug_title
-                fix_task = Task(
-                    project_id=task.project_id,
-                    title=f"Fix: {fix_title}",
-                    description=debug_data["fix_prompt"],
-                    parent_task_id=task.parent_task_id or task.id,
-                    payloads=[_validate_internal_payload({
-                        "type": "create",
-                        "prompt": debug_data["fix_prompt"],
-                        "base_branch": base_branch,
-                    }, "main:debug_auto_fix")],
-                    context={
-                        "debug_task_id": str(task.id),
-                        "failed_task_id": failed_task_id,
-                        "root_cause": debug_data.get("root_cause", ""),
-                    },
-                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                    status=TaskStatus.QUEUED,
-                    created_by="ORCHESTRATOR",
-                )
-                session.add(fix_task)
-                await session.flush()
-                await broadcast_to_project(
-                    str(task.project_id),
-                    "task_updated",
-                    {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
-                )
-                logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
+
+                # Dedup: if _requeue_parent_task already replaced the failed task with a
+                # clone (marked by _replaced_by_task_id on the cancelled child), spawning
+                # a second Fix: replacement here creates duplicate work that races.
+                _failed_task_obj = None
+                _skip_fix_spawn = False
+                if failed_task_id:
+                    try:
+                        _failed_uuid = uuid.UUID(failed_task_id)
+                        _failed_task_obj = (await session.execute(
+                            select(Task).where(Task.id == _failed_uuid)
+                        )).scalar_one_or_none()
+                        if (
+                            _failed_task_obj is not None
+                            and _failed_task_obj.status == TaskStatus.CANCELLED
+                            and (_failed_task_obj.context or {}).get("_replaced_by_task_id")
+                        ):
+                            _skip_fix_spawn = True
+                            _replacement_id = (_failed_task_obj.context or {}).get("_replaced_by_task_id", "")
+                            logger.info(
+                                "[DEBUG] Skipping Fix: spawn — failed task %s already replaced "
+                                "by requeue (→ task %s)",
+                                failed_task_id[:8], _replacement_id[:8],
+                            )
+                    except Exception:
+                        logger.exception(
+                            "[DEBUG] Failed to check failed task status for dedup (debug task %s)",
+                            _task_id_str,
+                        )
+
+                if not _skip_fix_spawn:
+                    fix_task = Task(
+                        project_id=task.project_id,
+                        title=f"Fix: {fix_title}",
+                        description=debug_data["fix_prompt"],
+                        parent_task_id=task.parent_task_id or task.id,
+                        payloads=[_validate_internal_payload({
+                            "type": "create",
+                            "prompt": debug_data["fix_prompt"],
+                            "base_branch": base_branch,
+                        }, "main:debug_auto_fix")],
+                        context={
+                            "debug_task_id": str(task.id),
+                            "failed_task_id": failed_task_id,
+                            "root_cause": debug_data.get("root_cause", ""),
+                        },
+                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                        status=TaskStatus.QUEUED,
+                        created_by="ORCHESTRATOR",
+                    )
+                    session.add(fix_task)
+                    await session.flush()
+
+                    # Mark the failed task so _requeue_parent_task can see the debug-fix
+                    # path already claimed it and avoid spawning a second replacement.
+                    if _failed_task_obj is not None and _failed_task_obj.status == TaskStatus.FAILED:
+                        _failed_task_obj.context = {
+                            **(_failed_task_obj.context or {}),
+                            "_debug_fix_spawned_task_id": str(fix_task.id),
+                        }
+                        flag_modified(_failed_task_obj, "context")
+                        session.add(_failed_task_obj)
+
+                    await broadcast_to_project(
+                        str(task.project_id),
+                        "task_updated",
+                        {"task_id": str(fix_task.id), "status": TaskStatus.QUEUED, "title": fix_task.title}
+                    )
+                    logger.info(f"[DEBUG] Spawned fix task {fix_task.id} from debug analysis (high confidence)")
         except (json.JSONDecodeError, Exception) as e:
             logger.warning(f"[DEBUG] Failed to parse debug result for task {_task_id_str}: {e}", exc_info=True)
             # Same poisoning concern as the smoketest spawn block: the

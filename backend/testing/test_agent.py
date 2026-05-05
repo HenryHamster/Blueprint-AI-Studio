@@ -5825,6 +5825,152 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: Async
 
 
 @pytest.mark.asyncio
+async def test_debug_result_skips_fix_spawn_if_requeue_already_replaced(client: AsyncClient, db_session, mocker):
+    """DEBUG_RESULT high-confidence does NOT spawn Fix: when the failed task was
+    already CANCELLED+replaced by _requeue_parent_task (preventing duplicate work)."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    import json as _json
+
+    project = Project(name="Debug Dedup Test", user_id="test-user-debug-dedup")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The original failed create task — already cancelled+replaced by requeue
+    replacement_id = str(uuid.uuid4())
+    failed_task = Task(
+        project_id=project.id,
+        title="create: some feature",
+        payloads=[{"type": "create", "prompt": "do something", "base_branch": "main"}],
+        vm_instance_id="agent-vm-failed-orig",
+        status=TaskStatus.CANCELLED,
+        context={"_replaced_by_task_id": replacement_id},
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+    await db_session.refresh(failed_task)
+
+    # The debug task references the already-replaced failed task
+    debug_task = Task(
+        project_id=project.id,
+        title="Debug: create: some feature",
+        payloads=[{"type": "debug", "base_branch": "main"}],
+        vm_instance_id="agent-vm-debug-dedup",
+        status=TaskStatus.IN_PROGRESS,
+        context={"failed_task_id": str(failed_task.id)},
+    )
+    db_session.add(debug_task)
+    await db_session.commit()
+    await db_session.refresh(debug_task)
+
+    token = create_agent_token(str(debug_task.id), "agent-vm-debug-dedup")
+    payload = {
+        "task_id": str(debug_task.id),
+        "status": "COMPLETED",
+        "artifact_type": "DEBUG_RESULT",
+        "logs": _json.dumps({
+            "confidence": "high",
+            "fix_prompt": "Fix the thing",
+            "root_cause": "some root cause",
+        }),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    # No Fix: task should have been spawned — requeue already handled it
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != debug_task.id,
+            Task.id != failed_task.id,
+        )
+    )
+    extra_tasks = result.scalars().all()
+    assert extra_tasks == [], (
+        f"Expected no Fix: task to be spawned when requeue already replaced the failed task, "
+        f"got {[t.title for t in extra_tasks]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_debug_result_marks_failed_task_on_fix_spawn(client: AsyncClient, db_session, mocker):
+    """When Fix: task is spawned, _debug_fix_spawned_task_id is written on the failed
+    task's context so _requeue_parent_task can detect the debug-fix path and skip cloning."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    import json as _json
+
+    project = Project(name="Debug Mark Test", user_id="test-user-debug-mark")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The original failed create task — still FAILED (not yet replaced by requeue)
+    failed_task = Task(
+        project_id=project.id,
+        title="create: another feature",
+        payloads=[{"type": "create", "prompt": "do other thing", "base_branch": "main"}],
+        vm_instance_id="agent-vm-failed-mark",
+        status=TaskStatus.FAILED,
+        context={},
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+    await db_session.refresh(failed_task)
+
+    debug_task = Task(
+        project_id=project.id,
+        title="Debug: create: another feature",
+        payloads=[{"type": "debug", "base_branch": "main"}],
+        vm_instance_id="agent-vm-debug-mark",
+        status=TaskStatus.IN_PROGRESS,
+        context={"failed_task_id": str(failed_task.id)},
+    )
+    db_session.add(debug_task)
+    await db_session.commit()
+    await db_session.refresh(debug_task)
+
+    token = create_agent_token(str(debug_task.id), "agent-vm-debug-mark")
+    payload = {
+        "task_id": str(debug_task.id),
+        "status": "COMPLETED",
+        "artifact_type": "DEBUG_RESULT",
+        "logs": _json.dumps({
+            "confidence": "high",
+            "fix_prompt": "Fix the other thing",
+            "root_cause": "another root cause",
+        }),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    # A Fix: task should have been spawned
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != debug_task.id,
+            Task.id != failed_task.id,
+        )
+    )
+    fix_tasks = result.scalars().all()
+    assert len(fix_tasks) == 1
+    fix_task = fix_tasks[0]
+    assert fix_task.title == "Fix: create: another feature"
+
+    # The failed task should be marked with _debug_fix_spawned_task_id
+    await db_session.refresh(failed_task)
+    marked_id = (failed_task.context or {}).get("_debug_fix_spawned_task_id")
+    assert marked_id == str(fix_task.id), (
+        f"Expected failed task context._debug_fix_spawned_task_id={fix_task.id}, got {marked_id}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_injects_project_vision(client: AsyncClient, db_session):
     """Strategic vision is surfaced on the claim response so tactical agents
     can align their work to the project's stated purpose."""

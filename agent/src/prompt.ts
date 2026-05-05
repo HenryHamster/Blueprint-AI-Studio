@@ -576,7 +576,86 @@ cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
 OP="\${1:-}"
 shift || true
-[ "$OP" != "open" ] && { echo "Usage: ./pr open --title <title> --body <body> [--with-tests]"; exit 2; }
+
+# ── ./pr close --superseded-by <PR#> ─────────────────────────────────────────
+# Use when post-rebase conflict resolution leaves an empty diff because an
+# equivalent sibling PR already merged the same changes.  Closes the current PR
+# cleanly, posts a traceability comment, and writes /tmp/pr_url_<task_id> so
+# ./done can mark the task COMPLETED-via-supersession.
+if [ "$OP" = "close" ]; then
+  SUPERSEDED_BY=""
+  PR_NUMBER="${cfg.existingPrNumber !== undefined ? String(cfg.existingPrNumber) : ""}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --superseded-by) SUPERSEDED_BY="$2"; shift 2 ;;
+      --pr-number)     PR_NUMBER="$2";     shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # Fall back to PR URL written by a prior ./pr open in this session
+  if [ -z "$PR_NUMBER" ]; then
+    PR_URL_FILE="/tmp/pr_url_${cfg.taskId}"
+    if [ -s "$PR_URL_FILE" ]; then
+      PR_NUMBER=$(grep -oE '[0-9]+$' "$PR_URL_FILE" || true)
+    fi
+  fi
+  if [ -z "$PR_NUMBER" ]; then
+    echo "[pr close] No PR number available. Pass --pr-number <N> or run ./pr open first." >&2
+    exit 1
+  fi
+
+  API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+  TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+  TASK="${cfg.taskId}"
+
+  # Refresh GitHub token
+  TOKEN_RESP=$(curl -f -sS --max-time 30 \\
+    -H "X-Agent-Token: $TOKEN" \\
+    "$API/api/agent/github/token?task_id=$TASK") || {
+    echo "[pr close] Failed to fetch GitHub token from orchestrator" >&2
+    exit 1
+  }
+  GH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
+  if [ -z "$GH_TOKEN" ]; then
+    echo "[pr close] orchestrator returned no token: $TOKEN_RESP" >&2
+    exit 1
+  fi
+
+  # Close the PR via GitHub API
+  CLOSE_HTTP=$(curl -sS -o /tmp/pr_close_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+    -X PATCH "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/$PR_NUMBER" \\
+    -H "Authorization: token $GH_TOKEN" \\
+    -H "Accept: application/vnd.github+json" \\
+    -d '{"state":"closed"}') || CLOSE_HTTP="000"
+  if [ "$CLOSE_HTTP" != "200" ]; then
+    echo "[pr close] GitHub PATCH /pulls/$PR_NUMBER returned HTTP=$CLOSE_HTTP:" >&2
+    cat /tmp/pr_close_resp_${cfg.taskId} >&2
+    rm -f /tmp/pr_close_resp_${cfg.taskId}
+    exit 1
+  fi
+  rm -f /tmp/pr_close_resp_${cfg.taskId}
+
+  # Post supersession comment for traceability
+  if [ -n "$SUPERSEDED_BY" ]; then
+    COMMENT_BODY=$(jq -n --arg msg "Closing: equivalent changes already merged via PR #$SUPERSEDED_BY. No further action needed on this branch." '{body: $msg}')
+    curl -sS --max-time 30 \\
+      -X POST "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/issues/$PR_NUMBER/comments" \\
+      -H "Authorization: token $GH_TOKEN" \\
+      -H "Accept: application/vnd.github+json" \\
+      -d "$COMMENT_BODY" >/dev/null 2>&1 || true
+  fi
+  unset GH_TOKEN
+
+  PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/$PR_NUMBER"
+  echo "$PR_URL" > /tmp/pr_url_${cfg.taskId}
+  echo ""
+  echo "[pr] Closed PR #$PR_NUMBER\${SUPERSEDED_BY:+ (superseded by #$SUPERSEDED_BY)}"
+  echo "[pr] Next: ./done"
+  exit 0
+fi
+
+[ "$OP" != "open" ] && { echo "Usage: ./pr open --title <title> --body <body> [--with-tests]  |  ./pr close [--superseded-by <PR#>]"; exit 2; }
 
 TITLE=""
 BODY=""
@@ -640,7 +719,10 @@ fi
 # Anything to push?
 COMMITS_AHEAD=$(git rev-list --count "origin/${cfg.baseBranch}..HEAD" 2>/dev/null || echo 0)
 if [ "$COMMITS_AHEAD" = "0" ]; then
-  echo "[pr] No commits ahead of ${cfg.baseBranch} — nothing to push. Did you forget to make changes?"
+  echo "[pr] No commits ahead of ${cfg.baseBranch} — nothing to push."
+  echo "[pr] If this branch was superseded (a sibling PR already merged the same changes),"
+  echo "[pr] run:  ./pr close --superseded-by <winning-PR-number>"
+  echo "[pr] Otherwise make your changes and re-run ./pr open."
   exit 1
 fi
 

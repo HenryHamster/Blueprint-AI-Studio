@@ -2716,3 +2716,102 @@ class TestBuildRetryPromptSuffix:
         )
         assert guidance == ""
         assert override is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Double-spawn dedup: _requeue_parent_task skips cloning when debug-fix is active
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_requeue_skips_clone_when_debug_fix_active(tl_db):
+    """_requeue_parent_task does NOT clone a failed child when its context has
+    _debug_fix_spawned_task_id pointing to an active (QUEUED) Fix: task.
+
+    This prevents the duplicate-PR race: auto-remediation (debug → Fix: path)
+    and _requeue_parent_task both firing for the same failure, each opening a
+    separate PR on the same base branch."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+
+    # The active Fix: task spawned by the debug path
+    active_fix = await _make_task(
+        session, project.id,
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent.id,
+    )
+
+    # Failed child that references the active fix task
+    child = await _make_task(
+        session, project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_debug_fix_spawned_task_id": str(active_fix.id)},
+        latest_status_message="tests failed",
+    )
+
+    retried = await _requeue_parent_task(parent, session)
+
+    # The failed child should NOT have been cloned — debug-fix is already active
+    assert retried == 0, f"Expected 0 retried (debug-fix active), got {retried}"
+
+    # The failed child should still be FAILED (not cancelled), since we skipped it
+    await session.refresh(child)
+    assert child.status == TaskStatus.FAILED, (
+        f"Failed child should remain FAILED when debug-fix is active, got {child.status}"
+    )
+
+    # No additional tasks should have been spawned
+    result = await session.execute(
+        select(Task).where(
+            Task.parent_task_id == parent.id,
+            Task.id.notin_([child.id, active_fix.id]),
+        )
+    )
+    extra = result.scalars().all()
+    assert extra == [], f"Expected no new tasks spawned, got {[t.id for t in extra]}"
+
+
+@pytest.mark.asyncio
+async def test_requeue_proceeds_when_debug_fix_failed(tl_db):
+    """_requeue_parent_task DOES clone a failed child when its _debug_fix_spawned_task_id
+    points to a FAILED fix task.
+
+    The debug-fix path tried and failed, so requeue should take over and give
+    the task another attempt through the normal retry channel."""
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+
+    # The debug-spawned Fix: task has parent_task_id = child.id (not parent.id),
+    # so it is NOT a direct child of parent and won't be cloned by this requeue call.
+    # We use a separate project to make that clear.
+    failed_fix_id = uuid.uuid4()
+    failed_fix = Task(
+        id=failed_fix_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "fix it"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id="agent-vm-failed-fix",
+    )
+    session.add(failed_fix)
+    await session.commit()
+    await session.refresh(failed_fix)
+
+    # Failed child (direct child of parent) references the now-failed fix task
+    child = await _make_task(
+        session, project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"_debug_fix_spawned_task_id": str(failed_fix.id)},
+        latest_status_message="code error: tests failed",
+    )
+
+    retried = await _requeue_parent_task(parent, session)
+
+    # The failed child should have been cloned (debug-fix itself failed, requeue takes over)
+    assert retried == 1, f"Expected 1 retried (debug-fix itself failed), got {retried}"
+
+    await session.refresh(child)
+    assert child.status == TaskStatus.CANCELLED
