@@ -20,6 +20,7 @@ from app.failure_classification import (
     MIGRATION_ERROR,
     PROVISION_FAILURE,
     RATE_LIMIT,
+    BLOCKED_PRECONDITION,
     SCOPE_OVERFLOW,
     _external_api_subtype_from_message,
     _fingerprint_message,
@@ -488,6 +489,58 @@ class TestClassifyFailureScopeOverflow:
     def test_canonical_scope_overflow_in_context(self):
         t = _task("", {"failure_category": "SCOPE_OVERFLOW"})
         assert classify_failure(t) == SCOPE_OVERFLOW
+
+
+class TestClassifyFailureBlockedPrecondition:
+    """Production 2026-05-05: tasks 12679e04 + 79a4a5ec each burned a retry slot
+    on a missing-on-main dispatcher file. The agent surfaced "BLOCKER:" per the
+    prompt's instruction to pause; the classifier mapped that to CODE_ERROR
+    (because the agent emitted ``failure_category=CODE_ERROR`` alongside the
+    BLOCKER text), which counted as a real failure and re-spawned the parent.
+    The "BLOCKER:" prefix must override the agent_category fast-path."""
+
+    def test_uppercase_blocker_prefix(self):
+        t = _task(
+            "BLOCKER: backend/app/pipeline_regression_dispatcher.py does not exist on main",
+            {"failure_category": "CODE_ERROR"},
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_mixed_case_blocker_prefix(self):
+        t = _task(
+            "Blocker: backend/app/pipeline_regression_dispatcher.py is not present on main",
+            {"failure_category": "agent_self_failed"},
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_lowercase_blocker_prefix(self):
+        t = _task("blocker: missing upstream PR")
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_leading_whitespace_before_blocker_prefix(self):
+        t = _task("   BLOCKER: prompt depends on file not yet on main")
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_passing_mention_of_blocker_does_not_match(self):
+        """A passing mention of "blocker" inside an error trace does NOT route here —
+        only the leading-prefix style does. Anything else stays in its normal class."""
+        t = _task("AssertionError: expected blocker but got None")
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_high_confidence_for_blocker(self):
+        t = _task("BLOCKER: upstream rollup PR not yet merged")
+        result = classify_failure_with_confidence(t)
+        assert result.failure_class == BLOCKED_PRECONDITION
+        assert result.confidence >= 0.9
+
+    def test_in_all_failure_classes(self):
+        assert BLOCKED_PRECONDITION in ALL_FAILURE_CLASSES
+
+    def test_in_infra_classes(self):
+        """BLOCKED_PRECONDITION is infra-class so direction-health/research-productivity
+        analytics don't penalize the agent for correctly pausing."""
+        from app.failure_classification import INFRA_CLASSES
+        assert BLOCKED_PRECONDITION in INFRA_CLASSES
 
 
 class TestClassifyFailureFastPath:

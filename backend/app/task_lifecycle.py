@@ -584,6 +584,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     old_to_new: Dict[str, str] = {}
     cloned_pairs: list = []  # (original, clone)
     retried_count = 0
+    blocked_count = 0  # FAILED children skipped because of BLOCKED_PRECONDITION
 
     for child in children:
         if child.status != TaskStatus.FAILED:
@@ -648,6 +649,21 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         child_extra_logs = (child.context or {}).get("last_error", "")
         failure_class = classify_failure(child, logs=child_extra_logs or None)
         original_status_message = child.latest_status_message
+
+        # BLOCKED_PRECONDITION: agent surfaced a "BLOCKER:" message and paused
+        # because a precondition (referenced file/branch/PR) wasn't ready.
+        # Cloning would hit the same wall on the next attempt — the precondition
+        # has to land first. Skip the clone-and-retry path so the parent doesn't
+        # burn its requeue budget. Operator manually requeues once the upstream
+        # resolves (e.g. blocking rollup PR merges to main).
+        if failure_class == "BLOCKED_PRECONDITION":
+            logger.info(
+                f"[REQUEUE] Skipping child {str(child.id)[:8]} — BLOCKED_PRECONDITION "
+                f"({(original_status_message or '')[:120]!r}). Manual requeue once "
+                f"the upstream precondition resolves."
+            )
+            blocked_count += 1
+            continue
 
         # Skip retry if the current failure fingerprint matches the prior retry's
         # fingerprint — same code produced the same error, so retry is unlikely
@@ -893,15 +909,30 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         )
         if not has_completed and not has_active:
             # All children terminal and none succeeded — they're all CANCELLED
-            # (if any were FAILED, retried_count would be > 0).  Nothing to
-            # recover from; mark parent FAILED so reaper Step 4 stops looping.
-            from app.failure_classification import AGENT_TIMEOUT, persist_failure_category
-            parent.status = TaskStatus.FAILED
-            parent.latest_status_message = (
-                "No failed subtasks to retry and no successful subtasks to roll up"
+            # or skipped-FAILED (review_cap_exhausted, fix_loop_diverged,
+            # BLOCKED_PRECONDITION, identical-fingerprint). Mark parent FAILED
+            # with the right class so the reaper stops looping. Distinguish
+            # the BLOCKED_PRECONDITION case so operators see "held on upstream"
+            # rather than the generic "nothing to roll up" message.
+            from app.failure_classification import (
+                AGENT_TIMEOUT, BLOCKED_PRECONDITION, persist_failure_category,
             )
-            persist_failure_category(parent, AGENT_TIMEOUT)
-            _record_parent_failure(parent, AGENT_TIMEOUT)
+            parent.status = TaskStatus.FAILED
+            if blocked_count > 0 and blocked_count == sum(
+                1 for c in children if c.status == TaskStatus.FAILED
+            ):
+                parent_class = BLOCKED_PRECONDITION
+                parent.latest_status_message = (
+                    f"All {blocked_count} subtask(s) blocked on upstream precondition — "
+                    f"manual requeue once it resolves"
+                )
+            else:
+                parent_class = AGENT_TIMEOUT
+                parent.latest_status_message = (
+                    "No failed subtasks to retry and no successful subtasks to roll up"
+                )
+            persist_failure_category(parent, parent_class)
+            _record_parent_failure(parent, parent_class)
             session.add(parent)
             await session.commit()
             await _maybe_create_failure_alert(parent, session, parent.latest_status_message)
@@ -909,7 +940,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                                        {"task_id": str(parent.id), "status": TaskStatus.FAILED})
             logger.warning(
                 f"[REQUEUE] Parent {parent.id} has no failed children to retry and "
-                f"no successful ones to roll up — marking FAILED"
+                f"no successful ones to roll up — marking FAILED ({parent_class})"
             )
             return 0
         # Has a COMPLETED child (reaper Step 3 + rollup will re-evaluate) or

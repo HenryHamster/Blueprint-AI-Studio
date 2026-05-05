@@ -117,6 +117,16 @@ SCOPE_OVERFLOW = "SCOPE_OVERFLOW"
 # CODE_ERROR so auto-remediation can apply migration-specific fixes (rechain
 # down_revision, regenerate migration, bump EXPECTED_SCHEMA_REVISION).
 MIGRATION_ERROR = "MIGRATION_ERROR"
+# Agent surfaced a "BLOCKER:" message and stopped — a precondition (e.g. an
+# upstream rollup hasn't landed on main yet, a referenced file/PR doesn't
+# exist where the prompt expects it). The agent did the right thing by
+# refusing to proceed; this is NOT a code defect. Distinct class so the
+# parent-requeue loop in task_lifecycle.py skips the clone-and-retry path
+# instead of burning attempts on a task that will hit the same block until
+# the precondition resolves. Production case 2026-05-05: tasks 12679e04 +
+# 79a4a5ec each consumed a retry slot on a missing-on-main dispatcher file
+# that was waiting on an upstream rollup PR (#3768) to land.
+BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 
 
 # Substrings that uniquely identify migration-related failures. Kept narrow so
@@ -164,11 +174,13 @@ INFRA_CLASSES: frozenset[str] = frozenset({
     AGENT_TIMEOUT,
     EXTERNAL_API,
     SCOPE_OVERFLOW,
+    BLOCKED_PRECONDITION,
 })
 
 # Ordered tuple of all canonical failure classes for per-account health panel display.
 ALL_FAILURE_CLASSES: tuple[str, ...] = (
     CODE_ERROR, RATE_LIMIT, EXTERNAL_API, PROVISION_FAILURE, MIGRATION_ERROR, AGENT_TIMEOUT, SCOPE_OVERFLOW,
+    BLOCKED_PRECONDITION,
 )
 
 
@@ -826,7 +838,7 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     classify_failure_taxonomy() calls classify_failure() internally.
     """
     # Gate 1: only FAILED tasks contribute residual fingerprints.
-    from app.models import TaskStatus  # noqa: PLC0415 — lazy to avoid circular import
+    from app.models import TaskStatus
     task_status = getattr(task, 'status', None)
     if task_status != TaskStatus.FAILED:
         return
@@ -917,11 +929,11 @@ async def _upsert_residual_case_async(
     - IGNORED / RESOLVED → bump hit_count + last_seen_at; leave status alone.
     IntegrityError (concurrent INSERT race) is handled by retrying as an UPDATE.
     """
-    from app.database import AsyncSessionLocal  # noqa: PLC0415
-    from app.models import ResidualRemediationCase, ResidualCaseStatus  # noqa: PLC0415
-    from sqlalchemy import update as sa_update  # noqa: PLC0415
-    from sqlalchemy.exc import IntegrityError  # noqa: PLC0415
-    from sqlmodel import select  # noqa: PLC0415
+    from app.database import AsyncSessionLocal
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+    from sqlalchemy import update as sa_update
+    from sqlalchemy.exc import IntegrityError
+    from sqlmodel import select
 
     async def _atomic_increment(session, row_id, reopen: bool) -> None:
         """Increment hit_count atomically at the SQL layer (no read-modify-write)."""
@@ -1030,7 +1042,7 @@ def _schedule_residual_db_upsert(
     sample_message: str,
 ) -> None:
     """Schedule a fire-and-forget DB upsert when an event loop is running."""
-    import asyncio  # noqa: PLC0415
+    import asyncio
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(
@@ -1138,6 +1150,9 @@ def classify_failure_with_confidence(task: "Task", logs: str | None = None) -> F
         kw in combined_lower for kw in ("no heartbeat", "reaped", "never started", "cancelled:", "superseded")
     ):
         return FailureClassification(failure_class=failure_class, confidence=0.7)
+    if failure_class == BLOCKED_PRECONDITION:
+        # The "BLOCKER:" prefix is a deliberate agent signal — match is high-signal.
+        return FailureClassification(failure_class=failure_class, confidence=0.9)
     if failure_class == CODE_ERROR:
         return FailureClassification(failure_class=failure_class, confidence=0.5)
     return FailureClassification(failure_class=failure_class, confidence=0.7)
@@ -1145,7 +1160,18 @@ def classify_failure_with_confidence(task: "Task", logs: str | None = None) -> F
 
 def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     """Classify a task failure for deployment monitoring.
-    Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API"""
+    Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API,
+    RATE_LIMIT, SCOPE_OVERFLOW, MIGRATION_ERROR, BLOCKED_PRECONDITION."""
+
+    # BLOCKER: prefix — agent surfaced a precondition gap and paused per task
+    # instructions. Checked BEFORE the agent_category fast-path because the
+    # agent currently emits ``agent_self_failed`` / generic ``CODE_ERROR``
+    # alongside a "BLOCKER:" status message; the prefix is the deliberate
+    # signal that the task is held on an upstream, not broken. Routing here
+    # bypasses the clone-and-retry budget burn in _requeue_parent_task.
+    _status_msg_raw = (task.latest_status_message or "").lstrip()
+    if _status_msg_raw[:8].lower().startswith("blocker:"):
+        return BLOCKED_PRECONDITION
 
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the
