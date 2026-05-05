@@ -9,7 +9,6 @@ import time
 import urllib.parse
 from collections import OrderedDict
 from datetime import timedelta
-from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -89,8 +88,8 @@ async def register_github_pat(
 @limiter.limit("10/minute")
 async def github_oauth_authorize(
     request: Request,
-    redirect_uri: Optional[str] = Query(None),
-    current_user: dict = Depends(get_current_user)
+    redirect_uri: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Returns the GitHub OAuth URL. The frontend redirects the user there.
@@ -99,43 +98,47 @@ async def github_oauth_authorize(
     if not GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured (GITHUB_CLIENT_ID missing)")
 
-    # Default to ADMIN_UI_URL if not provided, but allow dynamic override (for localhost/PR previews).
-    # Validate redirect_uri against allowlist to prevent open redirect.
+    # Default to ADMIN_UI_URL when the caller did not pass one. A dynamic value is
+    # accepted so localhost dev and PR-preview hosts can come back to themselves,
+    # but it must clear an allowlist or we'd be a happy open-redirect helper.
     default_admin_url = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
-    if redirect_uri:
-        from urllib.parse import urlparse
-        parsed = urlparse(redirect_uri)
-        allowed_hosts = {urlparse(default_admin_url).netloc, "localhost", "127.0.0.1"}
-        if parsed.scheme not in ("http", "https") or parsed.netloc not in allowed_hosts:
+    admin_url = default_admin_url
+    if redirect_uri is not None and redirect_uri != "":
+        parsed_redirect = urllib.parse.urlparse(redirect_uri)
+        allowed_hosts = {
+            urllib.parse.urlparse(default_admin_url).netloc,
+            "localhost",
+            "127.0.0.1",
+        }
+        if (
+            parsed_redirect.scheme not in ("http", "https")
+            or parsed_redirect.netloc not in allowed_hosts
+        ):
             raise HTTPException(status_code=400, detail="Invalid redirect_uri: host not in allowlist")
         admin_url = redirect_uri
-    else:
-        admin_url = default_admin_url
 
-    # Sign a state token so the callback can verify which user initiated the flow
+    # Sign a state token so the callback can verify which user initiated the flow.
     import jwt as pyjwt
-    from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
-    state = pyjwt.encode(
-        {
-            "sub": current_user["user_id"],
-            "exp": _utcnow() + timedelta(minutes=10),
-            "type": "github_oauth",
-            "admin_url": admin_url
-        },
-        AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM
-    )
+    from app.auth import AGENT_JWT_ALGORITHM, AGENT_JWT_SECRET
+    state_claims: dict[str, object] = {
+        "type": "github_oauth",
+        "sub": current_user["user_id"],
+        "admin_url": admin_url,
+        "exp": _utcnow() + timedelta(minutes=10),
+    }
+    state = pyjwt.encode(state_claims, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
 
-    url = (
+    auth_url = (
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
         f"&state={state}"
         f"&allow_signup=false"
     )
-    orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
-    if orchestrator_url:
-        from urllib.parse import quote
-        url += f"&redirect_uri={quote(orchestrator_url + '/api/github/oauth/callback', safe='')}"
-    return {"url": url}
+    orch_base = (os.getenv("ORCHESTRATOR_URL") or "").rstrip("/")
+    if orch_base:
+        callback = f"{orch_base}/api/github/oauth/callback"
+        auth_url = f"{auth_url}&redirect_uri={urllib.parse.quote(callback, safe='')}"
+    return {"url": auth_url}
 
 
 @router.get("/oauth/callback")
@@ -151,30 +154,27 @@ async def github_oauth_callback(
     installations, and auto-registers them. This proves the user actually owns the
     GitHub account — no spoofing possible.
     """
-    # Verify the state token to identify the Firebase user who started the flow
+    # Decode the state token to identify which Firebase user kicked off the flow.
+    # Hoist the fallback URL up so we don't repeat the env lookup in every except.
     import jwt as pyjwt
-    from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
+    from app.auth import AGENT_JWT_ALGORITHM, AGENT_JWT_SECRET
+    fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
     try:
         state_payload = pyjwt.decode(state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM])
-        if state_payload.get("type") != "github_oauth":
-            # Can't even trust the state for a redirect URL here, use fallback
-            fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
-            return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
-
-        firebase_user_id = state_payload["sub"]
-        admin_url = state_payload.get("admin_url") or os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
     except pyjwt.ExpiredSignatureError:
-        fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
         return RedirectResponse(url=f"{fallback_admin}?github_error=state_expired")
     except pyjwt.PyJWTError:
-        fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
         return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
 
+    if state_payload.get("type") != "github_oauth":
+        return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
+    firebase_user_id = state_payload["sub"]
+    admin_url = state_payload.get("admin_url") or fallback_admin
+
     try:
-        # Exchange code for GitHub user access token
-        # redirect_uri must match what was passed in the authorize URL (if any)
-        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
-        callback_uri = (orchestrator_url + "/api/github/oauth/callback") if orchestrator_url else None
+        # GitHub requires the same redirect_uri here that was passed to /authorize.
+        orch_base = (os.getenv("ORCHESTRATOR_URL") or "").rstrip("/")
+        callback_uri = f"{orch_base}/api/github/oauth/callback" if orch_base else None
         token_data = await exchange_oauth_code(code, redirect_uri=callback_uri)
         user_token = token_data["access_token"]
 
@@ -184,21 +184,25 @@ async def github_oauth_callback(
         # Discover which of this App's installations the user can access
         installations = await get_user_installations(user_token)
         if not installations:
-            # If no installations found, try to help the user install the app
+            # No installations yet — try to bounce the user to the App's install
+            # page using its slug. If we can't look the slug up for any reason,
+            # surface a generic error to the admin UI instead.
+            install_redirect: str | None = None
             try:
                 from app.github import get_app_info
                 app_info = await get_app_info()
                 app_slug = app_info.get("slug")
                 if app_slug:
-                    # Redirect to the app installation page
-                    # We pass the state along so the user might eventually come back?
-                    # Actually GitHub App installation doesn't support state param in this way,
-                    # but it will redirect back to the "Setup URL" configured in the App settings.
-                    logger.info(f"[GITHUB OAUTH] No installations for user {firebase_user_id}, redirecting to app install: {app_slug}")
-                    return RedirectResponse(url=f"https://github.com/apps/{app_slug}/installations/new")
+                    install_redirect = f"https://github.com/apps/{app_slug}/installations/new"
+                    logger.info(
+                        "[GITHUB OAUTH] User %s has no installations; sending to install page for app %r",
+                        firebase_user_id, app_slug,
+                    )
             except Exception as app_err:
-                logger.warning(f"Failed to fetch app info for installation redirect: {app_err}")
+                logger.warning("Could not look up GitHub App slug for install redirect: %s", app_err)
 
+            if install_redirect:
+                return RedirectResponse(url=install_redirect)
             return RedirectResponse(url=f"{admin_url}?github_error=no_installations")
 
         # Store the first installation ID; collect all account names for display.
