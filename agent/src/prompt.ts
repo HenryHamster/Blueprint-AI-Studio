@@ -104,6 +104,19 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'debug': 'Search for known issues related to error patterns you discover. Use WebSearch to look up specific error messages or stack traces when local context is insufficient.',
 };
 
+// Task types that don't get generic TASK_TYPE_HINTS entries because they assemble
+// bespoke prompts in their handlers and don't append the generic hint dict. This
+// allowlist prevents regressions: new dispatch entries must either add a hint to
+// TASK_TYPE_HINTS or be explicitly opted-out here with justification.
+export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
+  'review',           // Uses review-fix.ts bespoke prompt assembly
+  'plan',             // Uses research-plan.ts bespoke prompt assembly
+  'research',         // Uses research-plan.ts bespoke prompt assembly
+  'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
+  'smoketest',        // Uses specialized.ts bespoke prompt assembly
+  'design_doc_update', // Uses design-doc.ts bespoke prompt assembly
+]);
+
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
 export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, string> {
   const dirs = buildConfig?.directories ?? [];
@@ -273,6 +286,14 @@ both the feature and the cleanup unshipped. Report-and-skip lets the
 feature land AND makes the debt visible for proper prioritization.
 `;
 
+// Canonical concatenation of the cross-cutting failure-guidance blocks
+// shared by code-change handlers (standard.ts, review-fix.ts fix path).
+// Centralized so block order, inclusion, and future additions only need
+// to change in one place.
+export function assembleFailureGuidanceBlocks(): string {
+  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING;
+}
+
 // Within-task fix-iteration history. Each retry attempt of the within-VM
 // lint/test fix loop currently spawns a fresh Claude subprocess with no
 // memory of what prior iterations tried. When the first attempt picks the
@@ -316,7 +337,7 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;
@@ -1128,6 +1149,7 @@ metrics, and reviewer-iteration priming.
 
 Use these canonical category IDs in \`check_results\` (drawn from the
 backend review vocabulary — must match exactly):
+<!-- vocabulary mirrored in backend/testing/test_invariants.py (TestPromptVocabularyParity) — keep parity -->
 - \`correctness\` — logic bugs, off-by-one errors, edge cases, race conditions
 - \`error-handling\` — unhandled exceptions, missing null checks, async errors
 - \`security\` — injection, XSS, CSRF, exposed secrets, unvalidated inputs

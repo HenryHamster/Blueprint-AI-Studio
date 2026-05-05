@@ -901,3 +901,43 @@ describe('handleSelfAudit — findings ingestion', () => {
     expect(promptArg).toContain('Audit ONLY these systems');
   });
 });
+
+// ── Structural prompt invariants (regression-detection) ───────────────────────
+// Pins the cross-cutting guidance blocks for every specialized handler.
+// A future PR that drops a block from prompt assembly will fail here before merging.
+describe('specialized handler structural prompt invariants', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('handleMigrate prompt includes all required code-change guidance blocks', async () => {
+    vi.mocked(git).mockImplementation((a: string[]) => a[0] === 'rev-parse' ? 'abc' : '');
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'add col' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedMigratePrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');        // CODE_CHANGE_HELPER_GUIDANCE
+    expect(p).toContain('./playbook set');                                 // PLAYBOOK_GUIDANCE
+    expect(p).toContain('Read The Failure Message Literally');             // READ_THE_FAILURE_MESSAGE
+    expect(p).toContain('Size Guardrails Are Advisory');                   // SIZE_GUARDRAIL_GUIDANCE
+    expect(p).toContain("If You're Retrying");                            // PRIOR_ATTEMPT_DIVERGENCE
+    expect(p).toContain('When You Find Bigger Problems Than Your Task');   // BEYOND_SCOPE_REPORTING
+    expect(p).toContain('Use Grep/Glob for code search');                 // DEFAULT_TOOL_GUIDANCE
+  });
+
+  it.each([
+    ['handleSecurityAudit', () => handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
+    ['handleSmoketest',     () => handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
+    ['handleDebug',         () => handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
+    ['handlePerf',          () => handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
+    ['handleInvestigate',   () => handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
+    ['handleSelfAudit',     () => handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
+  ] as [string, () => Promise<void>][])('%s prompt has PLAYBOOK_GUIDANCE + DEFAULT_TOOL_GUIDANCE, no CODE_CHANGE_HELPER_GUIDANCE', async (_name, invoke) => {
+    await invoke();
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('./playbook set');                              // PLAYBOOK_GUIDANCE
+    expect(p).toContain('Use Grep/Glob for code search');              // DEFAULT_TOOL_GUIDANCE
+    expect(p).not.toContain('Task lifecycle — you own it end-to-end'); // no CODE_CHANGE_HELPER_GUIDANCE
+  });
+});

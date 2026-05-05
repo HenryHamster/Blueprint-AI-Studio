@@ -49,6 +49,7 @@ import {
   extractTestConventions,
   getTaskTypeHints,
   TASK_TYPE_HINTS,
+  TASK_TYPES_WITHOUT_HINT,
   buildAnalysisPrompt,
   parseAnalysisPlanFiles,
   parseAnalysisPlanTestFiles,
@@ -63,6 +64,7 @@ import {
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
+import { handlers } from './handlers/index.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
 describe('formatPlaybook', () => {
@@ -3354,5 +3356,112 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — regression_risk category', () => {
   it('instructs agent to omit check when baseline file is absent', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('omit');
+  });
+});
+
+// ── TASK_TYPE_HINTS dispatch parity ───────────────────────────────────────
+describe('TASK_TYPE_HINTS dispatch parity', () => {
+  it('ensures every handler dispatch key is either in TASK_TYPE_HINTS or in TASK_TYPES_WITHOUT_HINT', () => {
+    const dispatchKeys = Object.keys(handlers).sort();
+    const hintsKeys = Object.keys(TASK_TYPE_HINTS);
+    const withoutHintKeys = Array.from(TASK_TYPES_WITHOUT_HINT).sort();
+
+    const offendingKeys = dispatchKeys.filter(
+      (key) => !hintsKeys.includes(key) && !withoutHintKeys.includes(key)
+    );
+
+    expect(offendingKeys, `Dispatch key(s) missing: ${offendingKeys.join(', ')}`).toStrictEqual([]);
+  });
+
+  it('ensures every TASK_TYPE_HINTS key corresponds to a real dispatch handler', () => {
+    const dispatchKeys = Object.keys(handlers);
+    const hintsKeys = Object.keys(TASK_TYPE_HINTS);
+
+    const orphanKeys = hintsKeys.filter((key) => !dispatchKeys.includes(key));
+
+    expect(orphanKeys, `Orphaned hint key(s): ${orphanKeys.join(', ')}`).toStrictEqual([]);
+  });
+
+  it('ensures TASK_TYPES_WITHOUT_HINT has no overlap with TASK_TYPE_HINTS and all entries are real dispatch keys', () => {
+    const dispatchKeys = Object.keys(handlers);
+    const hintsKeys = Object.keys(TASK_TYPE_HINTS);
+    const withoutHintKeys = Array.from(TASK_TYPES_WITHOUT_HINT);
+
+    const overlappingKeys = withoutHintKeys.filter((key) => hintsKeys.includes(key));
+    const nonDispatchKeys = withoutHintKeys.filter((key) => !dispatchKeys.includes(key));
+
+    expect(overlappingKeys, `Keys in both: ${overlappingKeys.join(', ')}`).toStrictEqual([]);
+    expect(nonDispatchKeys, `Orphaned allowlist key(s): ${nonDispatchKeys.join(', ')}`).toStrictEqual([]);
+  });
+});
+
+// ── Cross-cutting guidance-block fingerprints (structural invariants) ─────────
+// Handler tests in standard.test.ts, review-fix.test.ts, specialized.test.ts,
+// design-doc.test.ts, and research-plan.test.ts all detect dropped guidance
+// blocks via fingerprint strings (e.g. './playbook set'). These tests pin those
+// fingerprint strings to the source constants so a rename here fails immediately
+// rather than silently invalidating the downstream assertions.
+describe('cross-cutting guidance-block fingerprints — structural invariants for prompt.ts', () => {
+  it('PLAYBOOK_GUIDANCE contains fingerprint used by handler structural tests', async () => {
+    const { PLAYBOOK_GUIDANCE } = await import('./prompt.js');
+    expect(PLAYBOOK_GUIDANCE).toContain('./playbook set');
+  });
+
+  it('DEFAULT_TOOL_GUIDANCE contains fingerprint used by handler structural tests', async () => {
+    const { DEFAULT_TOOL_GUIDANCE } = await import('./prompt.js');
+    expect(DEFAULT_TOOL_GUIDANCE).toContain('Use Grep/Glob for code search');
+  });
+
+  it('CODE_CHANGE_HELPER_GUIDANCE contains fingerprint used by handler structural tests', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('READ_THE_FAILURE_MESSAGE contains section header fingerprint', async () => {
+    const { READ_THE_FAILURE_MESSAGE } = await import('./prompt.js');
+    expect(READ_THE_FAILURE_MESSAGE).toContain('Read The Failure Message Literally');
+  });
+
+  it('SIZE_GUARDRAIL_GUIDANCE contains section header fingerprint', async () => {
+    const { SIZE_GUARDRAIL_GUIDANCE } = await import('./prompt.js');
+    expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Size Guardrails Are Advisory');
+  });
+
+  it('PRIOR_ATTEMPT_DIVERGENCE contains section header fingerprint', async () => {
+    const { PRIOR_ATTEMPT_DIVERGENCE } = await import('./prompt.js');
+    expect(PRIOR_ATTEMPT_DIVERGENCE).toContain("If You're Retrying");
+  });
+
+  it('BEYOND_SCOPE_REPORTING contains section header fingerprint', async () => {
+    const { BEYOND_SCOPE_REPORTING } = await import('./prompt.js');
+    expect(BEYOND_SCOPE_REPORTING).toContain('When You Find Bigger Problems Than Your Task');
+  });
+});
+
+// ── assembleFailureGuidanceBlocks — structural invariants ─────────────────────
+// code-change handlers (standard.ts, review-fix.ts, specialized.ts) delegate to
+// assembleFailureGuidanceBlocks() for the four cross-cutting failure-guidance
+// blocks. Pins block inclusion and canonical order so a dropped block or
+// reordering is caught at change-time.
+describe('assembleFailureGuidanceBlocks — structural invariants', () => {
+  it('includes all 4 required failure-guidance blocks', async () => {
+    const { assembleFailureGuidanceBlocks } = await import('./prompt.js');
+    const blocks = assembleFailureGuidanceBlocks();
+    expect(blocks).toContain('Read The Failure Message Literally');    // READ_THE_FAILURE_MESSAGE
+    expect(blocks).toContain('Size Guardrails Are Advisory');          // SIZE_GUARDRAIL_GUIDANCE
+    expect(blocks).toContain("If You're Retrying");                    // PRIOR_ATTEMPT_DIVERGENCE
+    expect(blocks).toContain('When You Find Bigger Problems Than Your Task'); // BEYOND_SCOPE_REPORTING
+  });
+
+  it('assembles blocks in canonical order (READ > SIZE > PRIOR > BEYOND)', async () => {
+    const { assembleFailureGuidanceBlocks } = await import('./prompt.js');
+    const blocks = assembleFailureGuidanceBlocks();
+    const rfmIdx = blocks.indexOf('Read The Failure Message Literally');
+    const sgIdx  = blocks.indexOf('Size Guardrails Are Advisory');
+    const padIdx = blocks.indexOf("If You're Retrying");
+    const bsrIdx = blocks.indexOf('When You Find Bigger Problems Than Your Task');
+    expect(rfmIdx).toBeLessThan(sgIdx);
+    expect(sgIdx).toBeLessThan(padIdx);
+    expect(padIdx).toBeLessThan(bsrIdx);
   });
 });

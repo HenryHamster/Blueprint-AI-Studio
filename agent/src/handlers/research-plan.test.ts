@@ -1193,6 +1193,21 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('/tmp/research_progress_abc-456.md');
   });
 
+  it('includes PLAYBOOK_GUIDANCE (structural invariant: strategic_review class)', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('./playbook set');   // PLAYBOOK_GUIDANCE fingerprint
+  });
+
+  it('includes DEFAULT_TOOL_GUIDANCE (structural invariant: strategic_review class)', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('Use Grep/Glob for code search');  // DEFAULT_TOOL_GUIDANCE fingerprint
+  });
+
+  it('does not include CODE_CHANGE_HELPER_GUIDANCE (strategic_review is read-only)', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).not.toContain('Task lifecycle — you own it end-to-end');  // CODE_CHANGE_HELPER_GUIDANCE fingerprint
+  });
+
   it('fails detection: removing a required section header causes assertion to fail', () => {
     // Simulate a broken prompt where "## 1. State assessment" was accidentally removed
     const prompt = buildThinkerPrompt(base);

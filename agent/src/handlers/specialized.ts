@@ -10,7 +10,9 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed, JsonExtractionError } from '../json-extract.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
+  readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -93,7 +95,7 @@ Rules:
   const secTypeHints = getTaskTypeHints(secBuildConfig);
   const secTypeHint = secTypeHints['security_audit'] ? '\n\n' + secTypeHints['security_audit'] : '';
   statusRef.value = 'Running security audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -231,6 +233,7 @@ CRITICAL RULES:
   const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
     + migratePrompt + migrateFirstTaskSection
     + CODE_CHANGE_HELPER_GUIDANCE + PLAYBOOK_GUIDANCE
+    + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `
 
 ${DEFAULT_TOOL_GUIDANCE}`;
@@ -327,7 +330,7 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
 ${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running smoke tests...';
-  const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt + PLAYBOOK_GUIDANCE, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
   const smoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null;
@@ -576,7 +579,7 @@ Rules:
   const perfTypeHints = getTaskTypeHints(perfBuildConfig);
   const perfTypeHint = perfTypeHints['perf'] ? '\n\n' + perfTypeHints['perf'] : '';
   statusRef.value = 'Running performance analysis...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -851,7 +854,7 @@ Rules:
   const typeHints = getTaskTypeHints(buildConfig);
   const typeHint = typeHints['self_audit'] ? '\n\n' + typeHints['self_audit'] : '';
   statusRef.value = 'Running self audit...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).

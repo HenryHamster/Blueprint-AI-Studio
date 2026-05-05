@@ -130,4 +130,30 @@ describe('handleDesignDocUpdate', () => {
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('claude_code_failed');
   });
+
+  // ── Structural invariants (design_doc_update = research/planning class) ──────
+  // These pin the guidance blocks present in the prompt so a future PR that
+  // accidentally drops one causes a test failure before merging.
+
+  async function capturePrompt(): Promise<string> {
+    await handleDesignDocUpdate(
+      TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    return vi.mocked(runClaudeCode).mock.calls[0][0];
+  }
+
+  it('includes DEFAULT_TOOL_GUIDANCE (structural invariant: design_doc_update class)', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).toContain('Use Grep/Glob for code search');
+  });
+
+  it('includes PLAYBOOK_GUIDANCE (structural invariant: design_doc_update class)', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).toContain('./playbook set');
+  });
+
+  it('does not include CODE_CHANGE_HELPER_GUIDANCE (design_doc_update must not push code)', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).not.toContain('Task lifecycle — you own it end-to-end');
+  });
 });

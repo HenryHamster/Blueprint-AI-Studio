@@ -991,7 +991,11 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
 
-Before finishing, write /tmp/research_progress_${p.taskId}.md — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.`;
+Before finishing, write /tmp/research_progress_${p.taskId}.md — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
+
+${PLAYBOOK_GUIDANCE}
+
+${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────

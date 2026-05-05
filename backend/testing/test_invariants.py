@@ -1091,3 +1091,46 @@ class TestFailureClassificationInvariants:
             assert cls in INFRA_CLASSES or cls == CODE_ERROR, (
                 f"{cls!r} must be either CODE_ERROR or a member of INFRA_CLASSES"
             )
+
+
+# ── Prompt Vocabulary Parity ───────────────────────────────────────────────
+
+# MUST stay in sync with the bullet list under '## Required: self-review before `./done`'
+# in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE). Mirrored in backend for
+# invariant testing.
+AGENT_SELF_REVIEW_CATEGORIES = frozenset({
+    'correctness',
+    'error-handling',
+    'security',
+    'style-conventions',
+    'type-safety',
+    'documentation',
+    'performance',
+    'architecture',
+    'test-coverage',
+    'scope-drift',
+    'regression_risk',
+})
+
+class TestPromptVocabularyParity:
+    """Cross-check that agent self-review categories and backend categorizer
+    stay in sync. A PR that adds a new category to the agent prompt but forgets
+    to teach the backend categorizer about it will fail this test.
+    """
+
+    def test_agent_categories_in_backend_vocabulary(self):
+        """Agent self-review categories must be a subset of backend review vocabulary.
+
+        If this fails: a category was added to agent/src/prompt.ts (in CODE_CHANGE_HELPER_GUIDANCE,
+        under the '## Required: self-review' bullet list) but not to backend/app/playbook_learning.py
+        (_REVIEW_CATEGORIES dict). Add the missing category to _REVIEW_CATEGORIES with its keyword list.
+        """
+        from app.playbook_learning import _REVIEW_CATEGORIES
+        _valid_categories = set(_REVIEW_CATEGORIES.keys()) | {'other'}
+
+        missing = AGENT_SELF_REVIEW_CATEGORIES - _valid_categories
+        assert not missing, (
+            f"Agent self-review categories missing from backend categorizer: {sorted(missing)}. "
+            f"Add them to _REVIEW_CATEGORIES in backend/app/playbook_learning.py "
+            f"and to the agent bullet list in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE)."
+        )

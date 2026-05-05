@@ -1360,3 +1360,54 @@ describe('runFreshReviewerPass', () => {
   });
 });
 
+// ── Structural prompt invariants (regression-detection) ───────────────────────
+// Pins the cross-cutting guidance blocks that every code-change handler MUST
+// assemble into its prompt. A future PR that drops one of these constants from
+// runStandardHandler's finalPrompt assembly will fail here before merging.
+describe('code-change handler structural prompt invariants', () => {
+  const TASK = { title: 'T', description: '', context: {}, project_context: {} };
+  const PAYLOAD = { prompt: 'do something' };
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('handleCreate prompt includes all required code-change guidance blocks', async () => {
+    await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');       // CODE_CHANGE_HELPER_GUIDANCE
+    expect(p).toContain('./playbook set');                                // PLAYBOOK_GUIDANCE
+    expect(p).toContain('Read The Failure Message Literally');            // READ_THE_FAILURE_MESSAGE
+    expect(p).toContain('Size Guardrails Are Advisory');                  // SIZE_GUARDRAIL_GUIDANCE
+    expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE
+    expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
+    expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
+  });
+
+  it('handleRefactor prompt includes required code-change guidance blocks', async () => {
+    await handleRefactor(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('Use Grep/Glob for code search');
+  });
+
+  it('handleDocs prompt includes required code-change guidance blocks', async () => {
+    await handleDocs(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('Use Grep/Glob for code search');
+  });
+
+  it('handleQA prompt includes required code-change guidance blocks', async () => {
+    await handleQA(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('Use Grep/Glob for code search');
+  });
+
+  it('handleDeps prompt includes required code-change guidance blocks', async () => {
+    await handleDeps(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('Use Grep/Glob for code search');
+  });
+});
+

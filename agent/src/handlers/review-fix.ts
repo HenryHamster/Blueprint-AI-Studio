@@ -15,7 +15,7 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
-  SIZE_GUARDRAIL_GUIDANCE, READ_THE_FAILURE_MESSAGE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
+  assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
 } from '../prompt.js';
@@ -1153,7 +1153,7 @@ export async function handleFix(
   if (fixTypeHints['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${fixTypeHints['fix']}`;
   }
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${READ_THE_FAILURE_MESSAGE}${SIZE_GUARDRAIL_GUIDANCE}${PRIOR_ATTEMPT_DIVERGENCE}${BEYOND_SCOPE_REPORTING}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),

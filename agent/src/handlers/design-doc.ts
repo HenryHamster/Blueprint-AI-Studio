@@ -8,7 +8,7 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 
@@ -231,7 +231,7 @@ Skip full re-analysis of systems with no files in the manifest.
     - There is no reward for playbook volume. Fewer, sharper entries is better than hundreds of vague ones.`;
 
   statusRef.value = 'Running architecture review...';
-  let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Post-check: verify the agent actually called ./design-doc
   try {

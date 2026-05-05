@@ -70,6 +70,7 @@ vi.mock('ws', () => ({
 
 // ── Import under test ─────────────────────────────────────────────────────────
 import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
+import type { AgentTaskType } from '../taskCapabilities.js';
 import { handlers } from './index.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
@@ -110,6 +111,76 @@ describe('handlers registry', () => {
       // Each type in this subset should have a unique function
       expect(seen.has(fn), `duplicate handler found for "${type}"`).toBe(false);
       seen.add(fn);
+    }
+  });
+});
+
+// ── Task class classification (cross-cutting structural invariants) ───────────
+// Maps every registered task type to its prompt-safety class. When a new type
+// is added to handlers/index.ts, these tests fail until the owner declares which
+// class it belongs to — preventing silent drift in cross-cutting guidance blocks.
+//
+// Class contracts (enforced per-handler in sibling test files):
+//   code-change  — MUST include CODE_CHANGE_HELPER_GUIDANCE + assembleFailureGuidanceBlocks()
+//                  + PLAYBOOK_GUIDANCE + DEFAULT_TOOL_GUIDANCE
+//   read-only    — MUST NOT include CODE_CHANGE_HELPER_GUIDANCE (no code push)
+//                  MUST include PLAYBOOK_GUIDANCE + DEFAULT_TOOL_GUIDANCE
+//   research     — MUST include PLAYBOOK_GUIDANCE + DEFAULT_TOOL_GUIDANCE
+//                  MUST NOT include CODE_CHANGE_HELPER_GUIDANCE
+
+type TaskClass = 'code-change' | 'read-only' | 'research';
+
+const TASK_CLASS_MAP = {
+  // Code-change (7): ship code via ./check → ./pr open → ./done
+  create:            'code-change',
+  fix:               'code-change',
+  refactor:          'code-change',
+  migrate:           'code-change',
+  docs:              'code-change',
+  qa:                'code-change',
+  deps:              'code-change',
+  // Read-only / investigative (7): analysis only, must not push code
+  review:            'read-only',
+  security_audit:    'read-only',
+  self_audit:        'read-only',
+  smoketest:         'read-only',
+  debug:             'read-only',
+  perf:              'read-only',
+  investigate:       'read-only',
+  // Research / planning (4): read-heavy, no code shipped
+  plan:              'research',
+  research:          'research',
+  strategic_review:  'research',
+  design_doc_update: 'research',
+} as const satisfies Record<AgentTaskType, TaskClass>;
+
+describe('task type class classification — cross-cutting invariants', () => {
+  it('every registered task type has an explicit class assignment', () => {
+    for (const type of Object.keys(handlers) as AgentTaskType[]) {
+      expect(TASK_CLASS_MAP, `"${type}" is missing from TASK_CLASS_MAP — add it to enforce cross-cutting prompt invariants`).toHaveProperty(type);
+    }
+  });
+
+  it('class map has no phantom entries absent from the handlers registry', () => {
+    const registered = new Set(Object.keys(handlers));
+    for (const type of Object.keys(TASK_CLASS_MAP)) {
+      expect(registered, `"${type}" is in TASK_CLASS_MAP but not in the handlers registry`).toContain(type);
+    }
+  });
+
+  it('class distribution is 7 code-change + 7 read-only + 4 research = 18 total', () => {
+    const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
+    for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
+    expect(counts['code-change']).toBe(7);
+    expect(counts['read-only']).toBe(7);
+    expect(counts['research']).toBe(4);
+  });
+
+  it('no task type belongs to more than one class', () => {
+    const seen = new Set<string>();
+    for (const type of Object.keys(TASK_CLASS_MAP)) {
+      expect(seen, `"${type}" appears more than once in TASK_CLASS_MAP`).not.toContain(type);
+      seen.add(type);
     }
   });
 });

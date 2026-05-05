@@ -1772,3 +1772,53 @@ describe('verifyStepsOk — sycophancy guard for fix_agent_responses', () => {
     })).toBe(false);
   });
 });
+
+// ── Structural prompt invariants (regression-detection) ───────────────────────
+// Pins the cross-cutting guidance blocks that handleFix (code-change) and
+// handleReview (read-only) MUST / MUST NOT assemble. A future PR that drops a
+// block or incorrectly adds CODE_CHANGE_HELPER_GUIDANCE to handleReview will
+// fail here before merging.
+describe('handleFix structural prompt invariants', () => {
+  const FIX_PAYLOAD = {
+    branch: 'fix-branch',
+    base_branch: 'main',
+    pr_number: 42,
+    prompt: 'Fix the issue described in the review.',
+  };
+  const FIX_TASK = { title: 'Fix', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('handleFix prompt includes all required code-change guidance blocks', async () => {
+    await handleFix('task-fix', FIX_PAYLOAD, FIX_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const p = capturedFixPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');       // CODE_CHANGE_HELPER_GUIDANCE
+    expect(p).toContain('./playbook set');                                // PLAYBOOK_GUIDANCE
+    expect(p).toContain('Read The Failure Message Literally');            // READ_THE_FAILURE_MESSAGE
+    expect(p).toContain('Size Guardrails Are Advisory');                  // SIZE_GUARDRAIL_GUIDANCE
+    expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE
+    expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
+    expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
+  });
+});
+
+describe('handleReview structural prompt invariants', () => {
+  const REVIEW_PAYLOAD = { pr_number: 1, branch: 'feat', base_branch: 'main' };
+  const REVIEW_TASK = { title: 'Review', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('handleReview prompt includes DEFAULT_TOOL_GUIDANCE', async () => {
+    await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[calls.length - 1][0]).toContain('Use Grep/Glob for code search');   // DEFAULT_TOOL_GUIDANCE
+  });
+
+  it('handleReview prompt does NOT include CODE_CHANGE_HELPER_GUIDANCE', async () => {
+    await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[calls.length - 1][0]).not.toContain('Task lifecycle — you own it end-to-end');
+  });
+});
