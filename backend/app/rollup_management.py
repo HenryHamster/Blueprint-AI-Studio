@@ -956,6 +956,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
             # commit failed (see orphan-PR rescue below).
             rollup_pr_number: int | None = None
             rollup_pr_url: str = ""
+            # Initialize before the try so the rescue path in the except
+            # handler can name the parent even if `get_github_token_for_task`
+            # below raises before the canonical capture at line ~981. Without
+            # these, the except handler's `parent_id_local` reference would
+            # raise UnboundLocalError, masking the original exception.
+            parent_id_local = parent.id
+            project_id_local = parent.project_id
             try:
                 gh_token, owner, repo = await get_github_token_for_task(parent.id, session)
 
@@ -1953,10 +1960,22 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # no record.  Persist it via a separate session so the retry
                 # cycle's crash-recovery check resumes the existing PR instead
                 # of creating a duplicate.
-                if rollup_pr_number is not None:
+                #
+                # Production 2026-05-04: when the "Parent state changed during
+                # create_pull_request" raise at line ~1211 fired, ``parent``
+                # had been reassigned to None by ``_relock_parent`` at the
+                # call above. Subsequent ``parent.id`` access in this except
+                # block crashed with AttributeError, swallowing the rescue.
+                # Use ``parent_id_local`` / ``project_id_local`` (captured
+                # pre-release in this same scope at lines 981-982) which
+                # always hold the original parent identifiers regardless of
+                # whether ``parent`` got reassigned to None mid-flow.
+                _err_parent_id = parent_id_local if parent_id_local is not None else (parent.id if parent is not None else None)
+                _err_project_id = project_id_local if project_id_local is not None else (parent.project_id if parent is not None else None)
+                if rollup_pr_number is not None and _err_parent_id is not None:
                     try:
                         async with AsyncSessionLocal() as rescue_session:
-                            db_parent = await rescue_session.get(Task, parent.id)
+                            db_parent = await rescue_session.get(Task, _err_parent_id)
                             if db_parent is not None:
                                 db_ctx = db_parent.context or {}
                                 if not db_ctx.get("rollup_pr_number"):
@@ -1969,21 +1988,21 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     await rescue_session.commit()
                                     logger.warning(
                                         f"[ROLLUP] Rescued rollup PR #{rollup_pr_number} marker "
-                                        f"for parent {parent.id} via separate session — "
+                                        f"for parent {_err_parent_id} via separate session — "
                                         f"preventing orphan on retry"
                                     )
                     except Exception as rescue_err:
                         logger.error(
                             f"[ROLLUP] Failed to rescue rollup PR #{rollup_pr_number} marker "
-                            f"for parent {parent.id}: {rescue_err}",
+                            f"for parent {_err_parent_id}: {rescue_err}",
                             exc_info=True,
                         )
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
-                if isinstance(e, HTTPException) and e.status_code == 401:
+                if isinstance(e, HTTPException) and e.status_code == 401 and _err_project_id is not None:
                     from app.routers.agent import invalidate_github_token_cache
-                    invalidate_github_token_cache(str(parent.project_id))
-                    logger.warning(f"[ROLLUP] Auth failure (401) for parent {parent.id} — invalidated token cache")
+                    invalidate_github_token_cache(str(_err_project_id))
+                    logger.warning(f"[ROLLUP] Auth failure (401) for parent {_err_parent_id} — invalidated token cache")
                 is_transient = (
                     isinstance(e, HTTPException) and e.status_code in (401, 500, 502, 503, 504)
                 ) or any(kw in err_str for kw in [

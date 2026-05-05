@@ -1815,6 +1815,20 @@ async def update_agent_status(
                             exc_info=True,
                         )
 
+        # Capture string forms of risky-to-lazy-refresh attributes BEFORE the
+        # metrics + recurring-failures blocks below. Production 2026-05-04:
+        # those blocks' inner ``await session.rollback()`` calls (lines
+        # ~1839, 1919, 1927, 1944, 1955) expire all attached object
+        # attributes; subsequent ``f"...{task.id}..."`` log lines then
+        # trigger sync lazy refresh → asyncpg pool_pre_ping →
+        # MissingGreenlet, which 500s the heartbeat endpoint and starves
+        # task dispatch. Captured at parent scope so both the metrics
+        # block and the recurring-failures block can name the task in
+        # error logs without touching ORM attribute getters.
+        _task_id_str = str(task.id)
+        _task_project_id_str = str(task.project_id)
+        _task_type_str = (task.first_payload or {}).get("type", "unknown")
+
         # Record first-attempt success metrics for playbook effectiveness tracking
         if payload.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             try:
@@ -1843,8 +1857,8 @@ async def update_agent_status(
                 session.add(task)
                 if payload.status == TaskStatus.COMPLETED and not bool(_playbook_count):
                     logger.info(
-                        f"[METRICS] first_task_no_playbook project={task.project_id} task={task.id} "
-                        f"type={task.first_payload.get('type', 'unknown')}"
+                        f"[METRICS] first_task_no_playbook project={_task_project_id_str} task={_task_id_str} "
+                        f"type={_task_type_str}"
                     )
                 # Increment confirmed_count and update effectiveness scoring for successful first attempts
                 if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
@@ -1899,14 +1913,14 @@ async def update_agent_status(
                             flag_modified(_proj, "design_doc")
                             session.add(_proj)
                     except Exception as _pce:
-                        logger.warning(f"[PLAYBOOK] Failed to increment confirmed_count for task {task.id}: {_pce}")
+                        logger.warning(f"[PLAYBOOK] Failed to increment confirmed_count for task {_task_id_str}: {_pce}")
                 # Capture positive pattern for sampling-eligible first-attempt successes
                 if _ctx["_first_attempt_succeeded"] and _proj:
                     try:
                         from app.playbook_learning import capture_success_pattern  # noqa: PLC0415
                         await capture_success_pattern(task, session)
                     except Exception as _sce:
-                        logger.warning(f"[PLAYBOOK] Failed to capture success pattern for task {task.id}: {_sce}")
+                        logger.warning(f"[PLAYBOOK] Failed to capture success pattern for task {_task_id_str}: {_sce}")
                         # WHY: capture_success_pattern issues a COUNT query
                         # (session.execute) and session.get(Project, ...) — both
                         # may raise on serialization / lock-timeout / connection
@@ -1918,7 +1932,7 @@ async def update_agent_status(
                         with contextlib.suppress(Exception):
                             await session.rollback()
             except Exception as _e:
-                logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {task.id}: {_e}")
+                logger.warning(f"[METRICS] Failed to record first-attempt metrics for task {_task_id_str}: {_e}")
                 # WHY: the metrics block also touches session.get and session.add;
                 # any inner op raising past the inner try/excepts (e.g. on a
                 # poisoned session that we already failed to recover) lands here.
@@ -1931,7 +1945,7 @@ async def update_agent_status(
             try:
                 await _check_recurring_failures(task, session)
             except Exception as _pbe:
-                logger.warning(f"[PLAYBOOK] Failed to check recurring failures for task {task.id}: {_pbe}")
+                logger.warning(f"[PLAYBOOK] Failed to check recurring failures for task {_task_id_str}: {_pbe}")
                 # WHY: _check_recurring_failures issues session.execute() (SELECT),
                 # session.get(Project, ...), and session.add(project) without an
                 # internal flush. A serialization/lock-timeout/connection error
