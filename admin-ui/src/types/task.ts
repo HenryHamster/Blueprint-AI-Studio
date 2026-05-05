@@ -63,6 +63,14 @@ export interface Task {
   child_task_ids?: string[];
   estimated_cost_usd?: number | null;
   fix_loop_history?: Record<string, FixLoopAttempt[]> | null;
+  fix_loop_summary?: FixLoopSummary[] | null;
+}
+
+export interface FixLoopSummary {
+  loop: string;
+  iterations: number;
+  last_exit_reason: string | null;
+  non_success: boolean;
 }
 
 export interface FixLoopAttempt {

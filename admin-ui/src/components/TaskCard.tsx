@@ -3,6 +3,8 @@ import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
 import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { authGet, API_BASE_URL } from '../api';
+import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
+import type { FixLoopSummary } from '../types/task';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
 function formatCompact(seconds: number): string {
@@ -14,6 +16,38 @@ function formatCompact(seconds: number): string {
 
 export type { ResearchFinding } from '../types/task';
 import type { ResearchFinding } from '../types/task';
+
+function FixLoopBadge({ summary }: { summary: FixLoopSummary[] }) {
+  // Show up to 2 badges: non_success first, then high-iteration-count
+  const sorted = [...summary].sort((a, b) => {
+    if (a.non_success !== b.non_success) return a.non_success ? -1 : 1;
+    return b.iterations - a.iterations;
+  }).slice(0, 2);
+
+  return (
+    <>
+      {sorted.map((entry) => {
+        const colorClass = entry.last_exit_reason
+          ? (EXIT_REASON_COLORS[entry.last_exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30')
+          : 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+        const label = entry.last_exit_reason?.startsWith('divergence_')
+          ? `${entry.loop} div`
+          : `${entry.loop} ×${entry.iterations}`;
+        const tooltip = `${entry.loop}: ${entry.iterations} iteration${entry.iterations !== 1 ? 's' : ''}, ${entry.last_exit_reason ?? 'unknown'}`;
+        return (
+          <span
+            key={entry.loop}
+            title={tooltip}
+            className={`inline-flex items-center gap-0.5 text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+          >
+            <AlertTriangle className="w-3 h-3 shrink-0" />
+            {label}
+          </span>
+        );
+      })}
+    </>
+  );
+}
 
 export function isSafeUrl(url: string): boolean {
   try {
@@ -546,6 +580,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${(task.attempt_count ?? 0) > 0 ? 'bg-neutral-800 text-neutral-300' : 'bg-neutral-800/50 text-neutral-500'}`}>
           #{(task.attempt_count ?? 0) + 1}
         </span>
+        {task.fix_loop_summary && task.fix_loop_summary.length > 0 && (
+          <FixLoopBadge summary={task.fix_loop_summary} />
+        )}
         {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
           <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
             <AlertTriangle className="w-3 h-3" />

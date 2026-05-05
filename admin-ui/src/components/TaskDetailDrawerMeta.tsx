@@ -975,7 +975,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         </>
       )}
 
-      <TaskFixLoopPanel taskId={task.id} fixLoopAbandoned={task.context?.fix_loop_abandoned} />
+      <TaskFixLoopPanel
+        taskId={task.id}
+        fixLoopAbandoned={task.context?.fix_loop_abandoned}
+      />
 
       <SelfReviewPanel task={task} />
 

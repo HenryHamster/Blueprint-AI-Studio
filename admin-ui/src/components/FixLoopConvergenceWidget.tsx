@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { ResponsiveContainer, AreaChart, Area, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
+import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 
 interface LoopAggregate {
   task_count: number;
@@ -24,16 +26,48 @@ const LOOP_COLORS: Record<string, string> = {
   test: 'text-blue-400',
   check: 'text-purple-400',
 };
-const EXIT_REASON_COLORS: Record<string, string> = {
-  passed: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  early_unchanged: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-  max_attempts: 'bg-red-500/20 text-red-400 border-red-500/30',
-  divergence_detected: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
-  divergence_oscillation: 'bg-orange-400/20 text-orange-300 border-orange-400/30',
-  divergence_similar_error: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  divergence_diff_revert: 'bg-rose-500/20 text-rose-400 border-rose-500/30',
-  runaway_detected: 'bg-red-600/20 text-red-500 border-red-600/30',
-};
+
+interface DayLoopStats {
+  task_count: number;
+  convergence_rate: number | null;
+  divergence_rate: number | null;
+}
+
+interface TrendBucket {
+  date: string;
+  lint: DayLoopStats;
+  test: DayLoopStats;
+  check: DayLoopStats;
+}
+
+interface TrendData {
+  days: number;
+  buckets: TrendBucket[];
+}
+
+interface DivergedTask {
+  task_id: string;
+  title: string;
+  task_type: string;
+  scope: string | null;
+  project_id: string;
+  status: string;
+  loop: string;
+  exit_reason: string;
+  iteration_count: number;
+  error_tail: string | null;
+}
+
+interface DrillDownFilter {
+  loop: string;
+  exit_reason: string;
+}
+
+interface FixLoopConvergenceWidgetProps {
+  trendDays?: 7 | 14 | 30;
+  projectId?: string;
+  onViewTask?: (taskId: string) => void;
+}
 
 const POLL_MS = 60_000;
 const DIST_KEYS = ['1', '2', '3', '4+'] as const;
@@ -60,7 +94,7 @@ function IterDistBar({ dist }: { dist: Record<string, number> }) {
   );
 }
 
-function LoopCard({ name, data }: { name: string; data: LoopAggregate }) {
+function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggregate; onChipClick: (loop: string, reason: string) => void }) {
   if (data.task_count === 0) {
     return (
       <div className="bg-neutral-900/60 rounded-lg p-3 border border-neutral-800 flex flex-col gap-1 min-w-0">
@@ -104,10 +138,15 @@ function LoopCard({ name, data }: { name: string; data: LoopAggregate }) {
         {topReasons.map(([reason, count]) => {
           const cls = EXIT_REASON_COLORS[reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
           return (
-            <span key={reason} className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border ${cls}`}>
+            <button
+              key={reason}
+              onClick={() => onChipClick(name, reason)}
+              className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${cls}`}
+              title={`Show tasks: ${reason}`}
+            >
               {reason.replace(/_/g, ' ')}
               <span className="font-bold">{count}</span>
-            </span>
+            </button>
           );
         })}
       </div>
@@ -115,15 +154,182 @@ function LoopCard({ name, data }: { name: string; data: LoopAggregate }) {
   );
 }
 
-export function FixLoopConvergenceWidget() {
+function DrillDownPanel({
+  filter,
+  hours,
+  projectId,
+  onViewTask,
+  onClose,
+}: {
+  filter: DrillDownFilter;
+  hours: number;
+  projectId?: string;
+  onViewTask?: (taskId: string) => void;
+  onClose: () => void;
+}) {
+  const [tasks, setTasks] = useState<DivergedTask[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const panelMountedRef = useRef(true);
+
+  const fetchDiverged = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    const params = new URLSearchParams({
+      hours: String(hours),
+      loop: filter.loop,
+      exit_reason: filter.exit_reason,
+      limit: '50',
+    });
+    if (projectId) params.set('project_id', projectId);
+    try {
+      const r = await apiFetch(`/api/admin/fix-loop-diverged-tasks?${params}`);
+      if (!panelMountedRef.current) return;
+      if (!r.ok) { setError(`HTTP ${r.status}`); setLoading(false); return; }
+      const body = (await r.json()) as { tasks: DivergedTask[]; total: number };
+      if (!panelMountedRef.current) return;
+      setTasks(body.tasks);
+      setTotal(body.total);
+      setLoading(false);
+    } catch (e) {
+      if (!panelMountedRef.current) return;
+      setError(e instanceof Error ? e.message : String(e));
+      setLoading(false);
+    }
+  }, [filter.loop, filter.exit_reason, hours, projectId]);
+
+  useEffect(() => {
+    panelMountedRef.current = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
+    fetchDiverged();
+    return () => { panelMountedRef.current = false; };
+  }, [fetchDiverged]);
+
+  const reasonCls = EXIT_REASON_COLORS[filter.exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+
+  return (
+    <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="flex items-center gap-2">
+          <span className={`text-[10px] font-semibold uppercase tracking-wide ${LOOP_COLORS[filter.loop]}`}>{LOOP_LABELS[filter.loop]}</span>
+          <span className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border ${reasonCls}`}>
+            {filter.exit_reason.replace(/_/g, ' ')}
+          </span>
+          {!loading && <span className="text-[10px] text-neutral-500">{total} task{total !== 1 ? 's' : ''}</span>}
+        </div>
+        <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
+      </div>
+
+      {loading && <p className="text-[10px] text-neutral-500">Loading…</p>}
+      {error && <p className="text-[10px] text-red-400">{error}</p>}
+      {!loading && !error && tasks.length === 0 && (
+        <p className="text-[10px] text-neutral-600">No tasks found for this filter.</p>
+      )}
+      {!loading && !error && tasks.length > 0 && (
+        <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
+          {tasks.map(t => (
+            <div key={t.task_id} className="bg-neutral-800/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
+              <div className="flex items-start justify-between gap-2">
+                <span className="text-[11px] text-neutral-200 font-medium leading-tight truncate flex-1" title={t.title}>{t.title}</span>
+                {onViewTask && (
+                  <button
+                    onClick={() => onViewTask(t.task_id)}
+                    className="text-[10px] text-neutral-400 hover:text-neutral-100 shrink-0 ml-1 underline underline-offset-2"
+                  >
+                    View
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] text-neutral-500">{t.task_type}</span>
+                {t.scope && <span className="text-[10px] text-neutral-600">{t.scope}</span>}
+                <span className="text-[10px] text-neutral-600">{t.iteration_count} iter</span>
+                <span className={`text-[10px] px-1 py-0.5 rounded border ${EXIT_REASON_COLORS[t.exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
+                  {t.exit_reason.replace(/_/g, ' ')}
+                </span>
+              </div>
+              {t.error_tail && (
+                <pre className="text-[9px] text-neutral-500 font-mono mt-0.5 truncate max-w-full" title={t.error_tail}>{t.error_tail.slice(0, 200)}</pre>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const LOOP_SPARK_COLORS: Record<string, { conv: string; div: string }> = {
+  lint:  { conv: '#f59e0b', div: '#f97316' },
+  test:  { conv: '#60a5fa', div: '#f97316' },
+  check: { conv: '#a78bfa', div: '#f97316' },
+};
+
+function TrendSparkline({ loop, buckets }: { loop: string; buckets: TrendBucket[] }) {
+  const colors = LOOP_SPARK_COLORS[loop];
+  const data = buckets.map(b => {
+    const stats = b[loop as keyof TrendBucket] as DayLoopStats | null | undefined;
+    return {
+      date: b.date,
+      conv: stats != null && stats.convergence_rate != null
+        ? Math.round(stats.convergence_rate * 100)
+        : null,
+      div: stats != null && stats.divergence_rate != null
+        ? Math.round(stats.divergence_rate * 100)
+        : null,
+    };
+  });
+  const hasData = data.some(d => d.conv != null);
+  if (!hasData) return <span className="text-neutral-600 text-xs">no data</span>;
+
+  return (
+    <div className="flex flex-col gap-0.5 min-w-0">
+      <span className={`text-[10px] font-semibold uppercase tracking-wide ${LOOP_COLORS[loop]}`}>{LOOP_LABELS[loop]}</span>
+      <div className="h-10">
+        <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
+          <AreaChart data={data} margin={{ top: 1, right: 0, left: 0, bottom: 1 }}>
+            <defs>
+              <linearGradient id={`tconv-${loop}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={colors.conv} stopOpacity={0.3} />
+                <stop offset="100%" stopColor={colors.conv} stopOpacity={0} />
+              </linearGradient>
+              <linearGradient id={`tdiv-${loop}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={colors.div} stopOpacity={0.3} />
+                <stop offset="100%" stopColor={colors.div} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <Tooltip
+              contentStyle={{ background: '#1a1a1a', border: '1px solid #404040', borderRadius: 4, padding: '4px 8px', fontSize: 10 }}
+              labelStyle={{ color: '#a3a3a3' }}
+              itemStyle={{ color: '#e5e5e5' }}
+              formatter={(value, name) => [value == null ? '—' : `${value}%`, name === 'conv' ? 'converged' : 'diverged']}
+              labelFormatter={(label) => String(label)}
+              isAnimationActive={false}
+            />
+            <Area type="monotone" dataKey="conv" stroke={colors.conv} fill={`url(#tconv-${loop})`} strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls />
+            <Area type="monotone" dataKey="div" stroke={colors.div} fill={`url(#tdiv-${loop})`} strokeWidth={1} dot={false} isAnimationActive={false} connectNulls />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask }: FixLoopConvergenceWidgetProps) {
   const [data, setData] = useState<ConvergenceData | null>(null);
+  const [trendData, setTrendData] = useState<TrendData | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [drillDown, setDrillDown] = useState<DrillDownFilter | null>(null);
   const mountedRef = useRef(true);
 
   const fetchData = useCallback(async () => {
     try {
-      const res = await apiFetch('/api/admin/fix-loop-convergence?hours=24');
+      const [res, trendRes] = await Promise.all([
+        apiFetch('/api/admin/fix-loop-convergence?hours=24'),
+        apiFetch(`/api/admin/fix-loop-convergence-trend?days=${trendDays}`),
+      ]);
       if (!mountedRef.current) return;
       if (!res.ok) {
         setFetchError(`HTTP ${res.status}`);
@@ -135,12 +341,16 @@ export function FixLoopConvergenceWidget() {
       setData(body);
       setFetchError(null);
       setLoading(false);
+      if (trendRes.ok) {
+        const trendBody = (await trendRes.json()) as TrendData;
+        if (mountedRef.current) setTrendData(trendBody);
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       setFetchError(e instanceof Error ? e.message : 'network error');
       setLoading(false);
     }
-  }, []);
+  }, [trendDays]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -155,6 +365,12 @@ export function FixLoopConvergenceWidget() {
     };
   }, [fetchData]);
 
+  const handleChipClick = useCallback((loop: string, exit_reason: string) => {
+    setDrillDown(prev =>
+      prev?.loop === loop && prev?.exit_reason === exit_reason ? null : { loop, exit_reason }
+    );
+  }, []);
+
   if (loading) return null;
   if (fetchError) return null;
   if (!data || data.tasks_with_fix_loops === 0) return null;
@@ -166,9 +382,9 @@ export function FixLoopConvergenceWidget() {
         <span className="text-[10px] text-neutral-600">{data.tasks_with_fix_loops} tasks · 24h</span>
       </div>
       <div className="grid grid-cols-3 gap-2">
-        <LoopCard name="lint" data={data.lint} />
-        <LoopCard name="test" data={data.test} />
-        <LoopCard name="check" data={data.check} />
+        <LoopCard name="lint" data={data.lint} onChipClick={handleChipClick} />
+        <LoopCard name="test" data={data.test} onChipClick={handleChipClick} />
+        <LoopCard name="check" data={data.check} onChipClick={handleChipClick} />
       </div>
       <div className="flex gap-3 mt-1.5 items-center">
         {DIST_KEYS.map((k, i) => {
@@ -180,6 +396,31 @@ export function FixLoopConvergenceWidget() {
           );
         })}
       </div>
+      {drillDown && (
+        <DrillDownPanel
+          filter={drillDown}
+          hours={24}
+          projectId={projectId}
+          onViewTask={onViewTask}
+          onClose={() => setDrillDown(null)}
+        />
+      )}
+      {trendData && trendData.buckets.length >= 2 && (
+        <div className="mt-3">
+          <div className="flex items-center gap-2 mb-1.5">
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day trend</p>
+            <span className="flex items-center gap-1 text-[10px] text-neutral-600">
+              <span className="inline-block w-3 border-t border-amber-400" /> converged
+              <span className="inline-block w-3 border-t border-orange-500 ml-1" /> diverged
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {(['lint', 'test', 'check'] as const).map(loop => (
+              <TrendSparkline key={loop} loop={loop} buckets={trendData.buckets} />
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
 }

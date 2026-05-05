@@ -535,6 +535,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
   const [showAllIssues, setShowAllIssues] = useState(false);
@@ -825,7 +826,29 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           {!loading && <TaskDurationWidget data={taskDurationStats} />}
 
           {/* Section 1d4: Fix-Loop Convergence */}
-          {!loading && <FixLoopConvergenceWidget />}
+          {!loading && (
+            <div>
+              <div className="flex justify-end gap-0.5 mb-1">
+                {([7, 14, 30] as const).map(d => (
+                  <button
+                    key={d}
+                    onClick={() => setFixLoopTrendDays(d)}
+                    className={`text-[10px] px-2 py-0.5 rounded transition-colors ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+                  >
+                    {d}d
+                  </button>
+                ))}
+              </div>
+              <FixLoopConvergenceWidget
+                trendDays={fixLoopTrendDays}
+                projectId={selectedProjectId ?? undefined}
+                onViewTask={(taskId: string) => {
+                  const task = tasks.find(t => t.id === taskId);
+                  if (task) onViewTask(task);
+                }}
+              />
+            </div>
+          )}
 
           {/* Section 1d2: Review Rejection Reason Breakdown */}
           {!loading && (() => {

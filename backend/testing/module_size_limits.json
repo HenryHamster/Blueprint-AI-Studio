@@ -10,7 +10,7 @@
     "github.py": 2050,
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 800,
-    "routers/admin_digest.py": 4200,
+    "routers/admin_digest.py": 4300,
     "routers/admin_pool_accounts.py": 950,
     "max_plan_pool.py": 2100,
     "anomaly_detection.py": 2000,

@@ -31,6 +31,53 @@ function exitReasonBadge(reason: string | null | undefined): ReactElement | null
   return <span className={`text-[10px] font-medium ${cls}`}>{reason.replace(/_/g, ' ')}</span>;
 }
 
+function generateLoopOutcome(
+  loopName: string,
+  attempts: FixLoopAttempt[],
+  summary: LoopSummary,
+): string | null {
+  const label = LOOP_LABELS[loopName] || loopName;
+  const { attempts: attemptCount, last_exit_reason: exitReason } = summary;
+
+  if (!exitReason || exitReason === 'in_progress') {
+    return null;
+  }
+
+  if (exitReason === 'passed') {
+    const plural = attemptCount === 1 ? 'iteration' : 'iterations';
+    return `${label} converged green after ${attemptCount} ${plural}.`;
+  }
+
+  if (exitReason === 'early_unchanged') {
+    return `${label} stopped early with no changes.`;
+  }
+
+  if (exitReason === 'max_attempts') {
+    const plural = attemptCount === 1 ? 'iteration' : 'iterations';
+    return `${label} exhausted ${attemptCount} ${plural} without converging.`;
+  }
+
+  if (exitReason === 'runaway_detected') {
+    return `${label} killed by runaway watchdog after ${attemptCount} invocations.`;
+  }
+
+  if (exitReason.startsWith('divergence_')) {
+    const type = exitReason.replace('divergence_', '');
+    const typeText =
+      type === 'oscillation' ? 'oscillation between two fixes' :
+      type === 'similar_error' ? 'similar errors repeating' :
+      type === 'diff_revert' ? 'changes reverting each iteration' :
+      'pattern detected';
+
+    const divergenceAttempt = attempts.find(a => a.exit_reason?.startsWith('divergence_'));
+    const divergenceIteration = divergenceAttempt?.iteration || attemptCount;
+
+    return `${label} loop diverged at iteration ${divergenceIteration} — ${typeText}.`;
+  }
+
+  return `${label} stopped (${exitReason.replace(/_/g, ' ')}).`;
+}
+
 function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number }) {
   const isSynth = attempt.source === 'trace_synthesized';
   const isTerminal = attempt.exit_reason && attempt.exit_reason !== 'in_progress';
@@ -76,9 +123,15 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
   const { last_exit_reason } = summary;
   const converged = last_exit_reason === 'passed';
   const dot = converged ? 'bg-emerald-500' : last_exit_reason ? 'bg-red-500' : 'bg-neutral-600';
+  const outcome = generateLoopOutcome(name, attempts, summary);
 
   return (
     <div>
+      {outcome && (
+        <div className="text-xs text-neutral-400 mb-1 pl-1">
+          {outcome}
+        </div>
+      )}
       <button
         className="w-full flex items-center gap-2 py-1.5 text-left hover:bg-neutral-800/30 rounded px-1 -mx-1"
         onClick={() => setExpanded(e => !e)}

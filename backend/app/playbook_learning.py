@@ -2286,3 +2286,106 @@ async def compute_sr_catch_rate_trends(
         logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Fix-loop divergence regression alert
+# ---------------------------------------------------------------------------
+
+async def check_fix_loop_divergence_regression(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+) -> Optional[dict[str, Any]]:
+    """Detect fix-loop divergence rate regression across two consecutive 7-day windows.
+
+    Mirrors _MIN_SR_SAMPLE / _TREND_DELTA_THRESHOLD from compute_sr_catch_rate_trends.
+    Idempotent per ISO year-week via project.design_doc["fix_loop_divergence_alerted_window"]
+    so a persistent regression alerts at most once per week.
+    """
+    from app.notification_dispatch import (  # noqa: PLC0415
+        post_fix_loop_divergence_regression_message,
+    )
+
+    now = _utcnow()
+    iso_year, iso_week, _ = now.isocalendar()
+    window_key = f"{iso_year}-W{iso_week:02d}"
+
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+    doc = dict(project.design_doc or {})
+    if doc.get("fix_loop_divergence_alerted_window") == window_key:
+        return None
+
+    tasks = (await session.execute(
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= now - timedelta(days=14),
+        )
+        .options(load_only(Task.id, Task.fix_loop_history, Task.created_at))
+    )).scalars().all()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    c7 = _naive(now - timedelta(days=7))
+    c14 = _naive(now - timedelta(days=14))
+    loops = ("lint", "test", "check")
+
+    def _divergence_stats(start: datetime, end: datetime) -> dict[str, dict]:
+        s: dict[str, dict] = {l: {"n": 0, "d": 0} for l in loops}
+        for t in tasks:
+            ts = _naive(t.created_at) if t.created_at else None
+            if ts is None or not (start <= ts < end):
+                continue
+            for loop in loops:
+                bucket = (t.fix_loop_history or {}).get(loop) or []
+                if not bucket:
+                    continue
+                last_exit: Optional[str] = None
+                for ev in reversed(bucket):
+                    reason = ev.get("exit_reason") if isinstance(ev, dict) else None
+                    if reason and reason != "in_progress":
+                        last_exit = reason
+                        break
+                if last_exit is None:
+                    last_exit = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+                s[loop]["n"] += 1
+                if last_exit and last_exit.startswith("divergence_"):
+                    s[loop]["d"] += 1
+        return s
+
+    curr = _divergence_stats(c7, datetime(9999, 12, 31))
+    prev = _divergence_stats(c14, c7)
+
+    regressions: list[dict] = []
+    for loop in loops:
+        cn, cd = curr[loop]["n"], curr[loop]["d"]
+        pn, pd = prev[loop]["n"], prev[loop]["d"]
+        if cn < _MIN_SR_SAMPLE or pn < _MIN_SR_SAMPLE:
+            continue
+        if cd / cn - pd / pn >= _TREND_DELTA_THRESHOLD:
+            regressions.append({
+                "loop": loop,
+                "prior_rate": round(pd / pn, 3),
+                "current_rate": round(cd / cn, 3),
+                "prior_count": pn,
+                "current_count": cn,
+            })
+
+    if not regressions:
+        return None
+
+    await post_fix_loop_divergence_regression_message(session, project_id, regressions)
+    doc["fix_loop_divergence_alerted_window"] = window_key
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+    await session.commit()
+    logger.info(
+        "[FIX_LOOP_DIVERGENCE] project=%s loops=%s",
+        project_id, [r["loop"] for r in regressions],
+    )
+    return {"regressions": regressions}

@@ -3,6 +3,7 @@ import asyncio
 import uuid
 import logging
 import statistics
+from collections import defaultdict
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
@@ -3933,6 +3934,201 @@ async def get_fix_loop_convergence(
         "lint": _aggregate_loop(per_loop["lint"]),
         "test": _aggregate_loop(per_loop["test"]),
         "check": _aggregate_loop(per_loop["check"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fix-loop convergence daily trend endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/fix-loop-convergence-trend")
+async def get_fix_loop_convergence_trend(
+    days: int = Query(7, ge=1, le=30),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return per-day buckets of fix-loop convergence and divergence rates.
+
+    Each bucket contains, for lint/test/check loops:
+      - task_count: tasks with that loop type
+      - convergence_rate: fraction that exited with 'passed'
+      - divergence_rate: fraction that exited with a divergence_* reason
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(Task.id, Task.project_id, Task.status, Task.fix_loop_history, Task.created_at))
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    result = await session.execute(stmt)
+    tasks = result.scalars().all()
+
+    loop_names = ("lint", "test", "check")
+
+    # day_str -> loop -> list of exit_reasons
+    day_buckets: Dict[str, Dict[str, List[Optional[str]]]] = defaultdict(
+        lambda: {l: [] for l in loop_names}
+    )
+
+    for task in tasks:
+        history = task.fix_loop_history or {}
+        if not history:
+            continue
+        created = task.created_at
+        if created is None:
+            continue
+        day_str = created.strftime("%Y-%m-%d")
+        for loop in loop_names:
+            bucket = history.get(loop) or []
+            if not bucket:
+                continue
+            last_exit: Optional[str] = None
+            for ev in reversed(bucket):
+                reason = ev.get("exit_reason") if isinstance(ev, dict) else None
+                if reason and reason != "in_progress":
+                    last_exit = reason
+                    break
+            if last_exit is None and bucket:
+                last_exit = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+            day_buckets[day_str][loop].append(last_exit)
+
+    def _day_loop_stats(reasons: List[Optional[str]]) -> Dict[str, Any]:
+        n = len(reasons)
+        if n == 0:
+            return {"task_count": 0, "convergence_rate": None, "divergence_rate": None}
+        converged = sum(1 for r in reasons if r == "passed")
+        diverged = sum(1 for r in reasons if r and r.startswith("divergence_"))
+        return {
+            "task_count": n,
+            "convergence_rate": round(converged / n, 3),
+            "divergence_rate": round(diverged / n, 3),
+        }
+
+    # Build sorted list covering every day in the window
+    buckets = []
+    for i in range(days - 1, -1, -1):
+        day = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        entry: Dict[str, Any] = {"date": day}
+        day_data = day_buckets.get(day, {l: [] for l in loop_names})
+        for loop in loop_names:
+            entry[loop] = _day_loop_stats(day_data.get(loop, []))
+        buckets.append(entry)
+
+    if project_id is not None:
+        try:
+            from app.playbook_learning import check_fix_loop_divergence_regression  # noqa: PLC0415
+            await check_fix_loop_divergence_regression(project_id, session)
+        except Exception:
+            logger.exception("[ANALYTICS] fix_loop_divergence_regression check failed (non-critical)")
+
+    return {
+        "days": days,
+        "buckets": buckets,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fix-loop diverged-task drill-down endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/fix-loop-diverged-tasks")
+async def get_fix_loop_diverged_tasks(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    loop: str | None = Query(None, description="Filter by loop name: lint, test, or check"),
+    exit_reason: str | None = Query(None, description="Filter by exit reason, e.g. divergence_oscillation"),
+    limit: int = Query(50, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """List tasks that exited a fix loop with a specific reason in the given window.
+
+    Returns up to `limit` tasks ordered by most-recent first, with enough
+    context (title, type, scope, project, exit reason, iteration count,
+    error_tail) for an operator to decide which task to investigate next.
+    """
+    if loop is not None and loop not in ("lint", "test", "check"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid loop '{loop}'. Must be one of: lint, test, check.",
+        )
+
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(
+            Task.id, Task.project_id, Task.title, Task.status,
+            Task.fix_loop_history, Task.context, Task.payloads, Task.created_at,
+        ))
+        .order_by(Task.created_at.desc())
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    result = await session.execute(stmt)
+    tasks = result.scalars().all()
+
+    loop_names = [loop] if loop is not None else ["lint", "test", "check"]
+
+    rows = []
+    for task in tasks:
+        if len(rows) >= limit:
+            break
+        history = task.fix_loop_history or {}
+        for lname in loop_names:
+            bucket = history.get(lname) or []
+            if not bucket:
+                continue
+            # Resolve terminal exit reason (last non-in_progress event).
+            last_exit: Optional[str] = None
+            last_error_tail: Optional[str] = None
+            for ev in reversed(bucket):
+                if not isinstance(ev, dict):
+                    continue
+                reason = ev.get("exit_reason")
+                if reason and reason != "in_progress":
+                    last_exit = reason
+                    last_error_tail = ev.get("error_tail")
+                    break
+            if exit_reason is not None and last_exit != exit_reason:
+                continue
+            if last_exit is None or last_exit == "passed":
+                continue
+            ctx = task.context or {}
+            rows.append({
+                "task_id": str(task.id),
+                "title": task.title or "Untitled",
+                "task_type": (task.first_payload or {}).get("type", "unknown"),
+                "scope": ctx.get("scope"),
+                "project_id": str(task.project_id),
+                "status": task.status,
+                "loop": lname,
+                "exit_reason": last_exit,
+                "iteration_count": len(bucket),
+                "error_tail": last_error_tail,
+            })
+            if len(rows) >= limit:
+                break
+
+    return {
+        "window_hours": hours,
+        "loop_filter": loop,
+        "exit_reason_filter": exit_reason,
+        "total": len(rows),
+        "tasks": rows,
     }
 
 

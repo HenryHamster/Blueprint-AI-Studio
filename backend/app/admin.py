@@ -31,6 +31,39 @@ def _estimated_cost_usd(task: Task) -> Optional[float]:
     rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
+
+# Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
+# (MAX_LINT_FIX_ATTEMPTS=5, MAX_TEST_FIX_ATTEMPTS=3); "check" has no
+# agent-side constant — 5 is a heuristic default used only for the
+# high_iter > max_iter/2 trouble heuristic in this file.
+_LOOP_MAX_ATTEMPTS: Dict[str, int] = {"lint": 5, "test": 3, "check": 5}
+_FIX_LOOP_SUCCESS_REASONS = frozenset({"passed", "early_unchanged"})
+
+
+def _fix_loop_summary(history: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """Return compact per-loop trouble entries from fix_loop_history, or None when healthy."""
+    if not history:
+        return None
+    flagged = []
+    for loop_name, attempts in history.items():
+        if not isinstance(attempts, list) or not attempts:
+            continue
+        iterations = len(attempts)
+        last = attempts[-1]
+        last_exit_reason = last.get("exit_reason") if isinstance(last, dict) else None
+        non_success = last_exit_reason not in _FIX_LOOP_SUCCESS_REASONS
+        max_iter = _LOOP_MAX_ATTEMPTS.get(loop_name, 5)
+        high_iter = iterations > max_iter / 2
+        if non_success or high_iter:
+            flagged.append({
+                "loop": loop_name,
+                "iterations": iterations,
+                "last_exit_reason": last_exit_reason,
+                "non_success": non_success,
+            })
+    return flagged if flagged else None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -366,6 +399,7 @@ async def get_all_tasks(
             "child_task_ids": children_map.get(str(t.id), []),
             "failure_class": classify_failure(t) if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED) and t.latest_status_message else None,
             "estimated_cost_usd": _estimated_cost_usd(t),
+            "fix_loop_summary": _fix_loop_summary(t.fix_loop_history),
         }
         result_list.append(task_dict)
 

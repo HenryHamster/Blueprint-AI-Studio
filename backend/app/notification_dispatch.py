@@ -1204,3 +1204,36 @@ async def post_feedback_acknowledgment(
         context={"reply_to": str(original_msg_id), "resolution": resolution},
         task_id=task_id,
     )
+
+
+async def post_fix_loop_divergence_regression_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    regressions: list[dict[str, Any]],
+    window_days: int = 7,
+) -> ProjectMessage:
+    """Alert operators when fix-loop divergence rate regresses across consecutive windows.
+
+    Mirrors post_account_model_regression_message — creates a NOTE/system message
+    and fires an external webhook. Each regression entry contains loop, prior_rate,
+    current_rate, prior_count, current_count.
+    """
+    lines = ", ".join(
+        f"{r['loop']} ({r['prior_rate']:.0%}→{r['current_rate']:.0%}, "
+        f"n={r['prior_count']}→{r['current_count']})"
+        for r in regressions
+    )
+    summary = f"Fix-loop divergence rate regressed: {lines} — check /admin#fix-loop"
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="fix_loop_divergence_regressed",
+        summary=summary,
+        context={"regressions": regressions, "window_days": window_days},
+    )
+    asyncio.ensure_future(dispatch_external_notification(
+        project_id,
+        "FIX_LOOP_DIVERGENCE_REGRESSED",
+        {"regressions": regressions, "window_days": window_days, "summary": summary},
+    ))
+    return msg

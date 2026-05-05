@@ -612,3 +612,122 @@ async def test_convergence_endpoint_abandoned_counter(client: AsyncClient, db_se
     assert str(task_abandoned.id) in body["recent_abandoned_task_ids"]
     # tasks_with_fix_loops still counts all tasks with history, not just abandoned
     assert body["tasks_with_fix_loops"] >= 2
+
+
+# --- fix-loop diverged-tasks drill-down endpoint -----------------------------
+
+@pytest.mark.asyncio
+async def test_diverged_tasks_endpoint_happy_path(client: AsyncClient, db_session):
+    """Diverged-tasks endpoint returns rows with task_type from payloads,
+    excludes 'passed' loops, and includes error_tail + iteration_count."""
+    project = Project(name="Diverged drill test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+
+    # Diverged via oscillation on lint
+    diverged_task = Task(
+        project_id=project.id,
+        title="Refactor login",
+        payloads=[{"type": "refactor", "cmd": "x"}],
+        context={"scope": "small"},
+        status=TaskStatus.FAILED,
+        fix_loop_history={
+            "lint": [
+                {"loop": "lint", "iteration": 1, "exit_reason": "in_progress",
+                 "error_tail": "old error"},
+                {"loop": "lint", "iteration": 2, "exit_reason": "in_progress",
+                 "error_tail": "new error"},
+                {"loop": "lint", "iteration": 3, "exit_reason": "divergence_oscillation",
+                 "error_tail": "fingerprints A->B->A"},
+            ],
+        },
+    )
+    # Passed task — must be excluded
+    passed_task = Task(
+        project_id=project.id,
+        title="Add new endpoint",
+        payloads=[{"type": "create", "cmd": "x"}],
+        context={"scope": "medium"},
+        status=TaskStatus.COMPLETED,
+        fix_loop_history={
+            "lint": [
+                {"loop": "lint", "iteration": 1, "exit_reason": "passed"},
+            ],
+        },
+    )
+    db_session.add_all([diverged_task, passed_task])
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/fix-loop-diverged-tasks?hours=24")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["window_hours"] == 24
+    assert body["loop_filter"] is None
+    assert body["exit_reason_filter"] is None
+    assert body["total"] == 1
+
+    row = body["tasks"][0]
+    assert row["title"] == "Refactor login"
+    # CRITICAL: task_type comes from first_payload['type'], not task.context
+    assert row["task_type"] == "refactor"
+    assert row["scope"] == "small"
+    assert row["loop"] == "lint"
+    assert row["exit_reason"] == "divergence_oscillation"
+    assert row["iteration_count"] == 3
+    assert row["error_tail"] == "fingerprints A->B->A"
+    assert row["task_id"] == str(diverged_task.id)
+
+
+@pytest.mark.asyncio
+async def test_diverged_tasks_endpoint_filter_by_exit_reason(client: AsyncClient, db_session):
+    """exit_reason query param filters rows to only that terminal reason."""
+    project = Project(name="Diverged filter test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+
+    osc_task = Task(
+        project_id=project.id,
+        title="Osc task",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={
+            "lint": [{"loop": "lint", "iteration": 1, "exit_reason": "divergence_oscillation"}],
+        },
+    )
+    sim_task = Task(
+        project_id=project.id,
+        title="Sim task",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={
+            "lint": [{"loop": "lint", "iteration": 1, "exit_reason": "divergence_similar_error"}],
+        },
+    )
+    max_task = Task(
+        project_id=project.id,
+        title="Max task",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={
+            "test": [{"loop": "test", "iteration": 3, "exit_reason": "max_attempts"}],
+        },
+    )
+    db_session.add_all([osc_task, sim_task, max_task])
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/fix-loop-diverged-tasks?hours=24&exit_reason=divergence_oscillation"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["exit_reason_filter"] == "divergence_oscillation"
+    assert body["total"] == 1
+    assert body["tasks"][0]["title"] == "Osc task"
+    assert body["tasks"][0]["exit_reason"] == "divergence_oscillation"
