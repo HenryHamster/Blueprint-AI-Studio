@@ -541,10 +541,27 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             f"({requeue_count}/{effective_max} attempts) — failing permanently"
         )
         parent.status = TaskStatus.FAILED
-        parent.latest_status_message = f"Re-evaluation limit reached ({requeue_count} attempts) — children consistently failing"
         failed_children = (await session.execute(
             select(Task).where(Task.parent_task_id == parent.id, Task.status == TaskStatus.FAILED)
         )).scalars().all()
+
+        # Surface divergence cause in the status message when available so
+        # operators on the kanban immediately see why the task was abandoned.
+        _divergence_msg: str | None = None
+        for _fc in failed_children:
+            _abandoned = (_fc.context or {}).get("fix_loop_abandoned")
+            if _abandoned:
+                _divergence_msg = (
+                    f"Abandoned early — fix loop stopped converging "
+                    f"({_abandoned.get('exit_reason')} in {_abandoned.get('loop')} loop)"
+                )
+                break
+
+        parent.latest_status_message = (
+            _divergence_msg
+            if _divergence_msg
+            else f"Re-evaluation limit reached ({requeue_count} attempts) — children consistently failing"
+        )
         from app.failure_classification import worst_child_failure_category, persist_failure_category
         worst_cat = worst_child_failure_category(failed_children)
         persist_failure_category(parent, worst_cat)
@@ -580,6 +597,17 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             logger.info(
                 f"[REQUEUE] Skipping child {str(child.id)[:8]} — review_cap_exhausted, "
                 f"PR already closed. Manual requeue required."
+            )
+            continue
+
+        # Skip children whose fix loop concluded non-convergence — cloning would
+        # re-discover the same divergence without making progress.
+        if (child.context or {}).get("failure_detail") == "fix_loop_diverged":
+            _abandoned = (child.context or {}).get("fix_loop_abandoned") or {}
+            logger.info(
+                f"[REQUEUE] Skipping child {str(child.id)[:8]} — fix_loop_diverged "
+                f"({_abandoned.get('exit_reason')} in {_abandoned.get('loop')} loop). "
+                f"Manual requeue required."
             )
             continue
 

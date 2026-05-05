@@ -100,7 +100,13 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
   );
 }
 
-export function TaskFixLoopPanel({ taskId }: { taskId: string }) {
+export function TaskFixLoopPanel({
+  taskId,
+  fixLoopAbandoned,
+}: {
+  taskId: string;
+  fixLoopAbandoned?: { loop: string; exit_reason: string; at: string } | null;
+}) {
   const [data, setData] = useState<FixLoopHistoryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const mountedRef = useRef(true);
@@ -134,6 +140,11 @@ export function TaskFixLoopPanel({ taskId }: { taskId: string }) {
   return (
     <>
       <h3 className="text-xs font-semibold uppercase tracking-wider text-neutral-400 mb-2 mt-5">Fix Loops</h3>
+      {fixLoopAbandoned && (
+        <div className="mb-2 px-2 py-1.5 rounded bg-orange-950/40 border border-orange-800/50 text-xs text-orange-300">
+          Retries suppressed — fix loop diverged ({fixLoopAbandoned.exit_reason.replace(/_/g, ' ')} in {fixLoopAbandoned.loop} loop)
+        </div>
+      )}
       <div className="space-y-1">
         {activeLoops.map(loop => (
           <LoopSection

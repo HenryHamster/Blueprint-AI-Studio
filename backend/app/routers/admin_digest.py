@@ -3826,7 +3826,8 @@ async def get_fix_loop_convergence(
 
     Returns per-loop average iterations, convergence rate, divergence reason
     histogram, and iteration-count distribution suitable for the dashboard
-    convergence widget.
+    convergence widget.  Also returns ``tasks_abandoned_on_divergence`` (int)
+    and ``recent_abandoned_task_ids`` (list, capped at 25) for drill-in.
     """
     cutoff = datetime.utcnow() - timedelta(hours=hours)
 
@@ -3836,7 +3837,7 @@ async def get_fix_loop_convergence(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.project_id, Task.status, Task.fix_loop_history))
+        .options(load_only(Task.id, Task.project_id, Task.status, Task.fix_loop_history, Task.context))
     )
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
@@ -3846,6 +3847,13 @@ async def get_fix_loop_convergence(
 
     # Only consider tasks that have at least one fix-loop event recorded.
     tasks_with_history = [t for t in tasks if t.fix_loop_history]
+
+    # Abandoned-on-divergence counters (additive — do not affect per-loop aggs).
+    abandoned_ids: List[str] = []
+    for t in tasks:
+        if (t.context or {}).get("fix_loop_abandoned"):
+            abandoned_ids.append(str(t.id))
+    abandoned_ids_recent = abandoned_ids[-25:]  # keep 25 most recent (insertion order ~ created_at)
 
     loop_names = ("lint", "test", "check")
 
@@ -3915,6 +3923,8 @@ async def get_fix_loop_convergence(
         "window_hours": hours,
         "tasks_scanned": len(tasks),
         "tasks_with_fix_loops": len(tasks_with_history),
+        "tasks_abandoned_on_divergence": len(abandoned_ids),
+        "recent_abandoned_task_ids": abandoned_ids_recent,
         "lint": _aggregate_loop(per_loop["lint"]),
         "test": _aggregate_loop(per_loop["test"]),
         "check": _aggregate_loop(per_loop["check"]),

@@ -46,6 +46,18 @@ EXIT_REASONS = (
 # protects the column against a buggy / divergent loop spamming events.
 MAX_ATTEMPTS_PER_LOOP = 50
 
+# Exit reasons that indicate the agent concluded the fix path is not converging.
+# Importable by retry_budget.py and admin_digest.py so suppression logic and
+# dashboard consumers share a single authoritative set.
+DIVERGENCE_EXIT_REASONS: frozenset[str] = frozenset({
+    "divergence_detected",
+    "divergence_oscillation",
+    "divergence_similar_error",
+    "divergence_diff_revert",
+    "runaway_detected",
+    "same_wrong_fix",
+})
+
 
 class FixLoopEventIn(BaseModel):
     """Ingest payload for one fix-loop attempt.
@@ -110,6 +122,50 @@ def apply_fix_loop_events(task: Task, events: List[FixLoopEventIn]) -> None:
 
     task.fix_loop_history = history
     flag_modified(task, "fix_loop_history")
+
+
+def has_terminal_divergence(
+    fix_loop_history: Dict[str, Any] | None,
+) -> "tuple[str, str] | None":
+    """Return ``(loop_name, exit_reason)`` when the most-recently-touched loop
+    ended with a divergence-class reason, else ``None``.
+
+    Conservative: only fires when the last non-``in_progress`` entry of the
+    most-recently-touched loop (by ``ended_at``/``started_at`` timestamp) is in
+    ``DIVERGENCE_EXIT_REASONS``.  Old divergence followed by a recent unrelated
+    failure will NOT trigger abandonment because the newer loop sorts later.
+    """
+    if not fix_loop_history:
+        return None
+
+    # Collect (loop, last_terminal_reason, last_timestamp_str) for each loop.
+    candidates: list[tuple[str, str | None, str]] = []
+    for loop in ("lint", "test", "check"):
+        bucket = fix_loop_history.get(loop) or []
+        if not bucket:
+            continue
+        last_terminal: str | None = None
+        for ev in reversed(bucket):
+            if not isinstance(ev, dict):
+                continue
+            reason = ev.get("exit_reason")
+            if reason and reason != "in_progress":
+                last_terminal = reason
+                break
+        last_entry = bucket[-1] if isinstance(bucket[-1], dict) else {}
+        ts = last_entry.get("ended_at") or last_entry.get("started_at") or ""
+        candidates.append((loop, last_terminal, ts))
+
+    if not candidates:
+        return None
+
+    # Most-recently-touched loop first (lexicographic ISO timestamp compare).
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    most_recent_loop, most_recent_reason, _ = candidates[0]
+
+    if most_recent_reason in DIVERGENCE_EXIT_REASONS:
+        return (most_recent_loop, most_recent_reason)
+    return None
 
 
 def summarize_fix_loop_history(history: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:

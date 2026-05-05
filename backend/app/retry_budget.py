@@ -27,6 +27,7 @@ from app.failure_classification import (
     SCOPE_OVERFLOW,
     classify_failure,
 )
+from app.fix_loop_telemetry import has_terminal_divergence
 from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -197,6 +198,28 @@ async def compute_effective_max_requeues(
                 recurring_tests = True
     if recurring_tests:
         reduction += 1
+
+    # Divergence gate: if any failed child's fix loop concluded it isn't
+    # converging, pin the effective budget to 0 — no further parent retries.
+    # The abandonment marker is written here so the admin digest can count it.
+    for child in children:
+        diverged = has_terminal_divergence(child.fix_loop_history)
+        if diverged:
+            loop_name, exit_reason = diverged
+            child_ctx = dict(child.context or {})
+            if not child_ctx.get("fix_loop_abandoned"):
+                from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+                child_ctx["fix_loop_abandoned"] = {
+                    "loop": loop_name,
+                    "exit_reason": exit_reason,
+                    "at": _utcnow().isoformat(),
+                }
+                child_ctx["failure_detail"] = "fix_loop_diverged"
+                child.context = child_ctx
+                _flag_modified(child, "context")
+                session.add(child)
+            return 0
+
     return max_requeues - reduction
 
 

@@ -55,7 +55,10 @@ export interface Task {
   error_logs?: string;
   failure_class?: string | null;
   research_findings?: ResearchFinding[] | null;
-  context?: Record<string, unknown>;
+  context?: {
+    fix_loop_abandoned?: { loop: string; exit_reason: string; at: string };
+    [key: string]: unknown;
+  };
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
   estimated_cost_usd?: number | null;

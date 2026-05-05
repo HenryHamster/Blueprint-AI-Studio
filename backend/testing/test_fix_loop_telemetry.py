@@ -15,9 +15,11 @@ from httpx import AsyncClient
 
 from app.auth import create_agent_token
 from app.fix_loop_telemetry import (
+    DIVERGENCE_EXIT_REASONS,
     FixLoopEventIn,
     MAX_ATTEMPTS_PER_LOOP,
     apply_fix_loop_events,
+    has_terminal_divergence,
     summarize_fix_loop_history,
 )
 from app.models import Project, ProjectMember, Task, TaskStatus
@@ -358,3 +360,255 @@ async def test_convergence_endpoint_iteration_distribution(client: AsyncClient, 
     assert dist["2"] == 1
     assert dist["3"] == 1
     assert dist["4+"] == 1
+
+
+# --- has_terminal_divergence unit tests --------------------------------------
+
+def test_divergence_exit_reasons_is_frozenset():
+    assert isinstance(DIVERGENCE_EXIT_REASONS, frozenset)
+    # Core names must be present
+    for name in ("divergence_detected", "divergence_oscillation", "runaway_detected"):
+        assert name in DIVERGENCE_EXIT_REASONS
+
+
+def test_has_terminal_divergence_empty_history():
+    assert has_terminal_divergence(None) is None
+    assert has_terminal_divergence({}) is None
+
+
+def test_has_terminal_divergence_fires_on_diverged_loop():
+    history = {
+        "lint": [
+            {"loop": "lint", "iteration": 1, "exit_reason": "in_progress", "ended_at": "2026-05-05T10:00:00"},
+            {"loop": "lint", "iteration": 2, "exit_reason": "divergence_oscillation", "ended_at": "2026-05-05T10:01:00"},
+        ],
+    }
+    result = has_terminal_divergence(history)
+    assert result == ("lint", "divergence_oscillation")
+
+
+def test_has_terminal_divergence_ignores_in_progress_tail():
+    # Last entry is in_progress; last terminal is divergence → still fires
+    history = {
+        "lint": [
+            {"loop": "lint", "iteration": 1, "exit_reason": "divergence_detected", "ended_at": "2026-05-05T10:00:00"},
+            {"loop": "lint", "iteration": 2, "exit_reason": "in_progress", "ended_at": "2026-05-05T10:01:00"},
+        ],
+    }
+    result = has_terminal_divergence(history)
+    assert result == ("lint", "divergence_detected")
+
+
+def test_has_terminal_divergence_non_divergence_does_not_fire():
+    history = {
+        "lint": [
+            {"loop": "lint", "iteration": 1, "exit_reason": "in_progress"},
+            {"loop": "lint", "iteration": 2, "exit_reason": "max_attempts"},
+        ],
+    }
+    assert has_terminal_divergence(history) is None
+
+
+def test_has_terminal_divergence_conservative_old_divergence_new_unrelated():
+    """Old divergence in lint but most recently touched loop (test) ended with non-divergence."""
+    history = {
+        "lint": [
+            {"loop": "lint", "iteration": 1, "exit_reason": "divergence_oscillation", "ended_at": "2026-05-05T09:00:00"},
+        ],
+        "test": [
+            {"loop": "test", "iteration": 1, "exit_reason": "max_attempts", "ended_at": "2026-05-05T10:00:00"},
+        ],
+    }
+    # test loop is most recent and did NOT diverge → must not fire
+    assert has_terminal_divergence(history) is None
+
+
+def test_has_terminal_divergence_most_recent_loop_wins():
+    """Most recently touched loop (check) diverged even though lint passed."""
+    history = {
+        "lint": [
+            {"loop": "lint", "iteration": 1, "exit_reason": "passed", "ended_at": "2026-05-05T09:00:00"},
+        ],
+        "check": [
+            {"loop": "check", "iteration": 1, "exit_reason": "runaway_detected", "ended_at": "2026-05-05T10:00:00"},
+        ],
+    }
+    result = has_terminal_divergence(history)
+    assert result == ("check", "runaway_detected")
+
+
+# --- retry budget + divergence suppression integration -----------------------
+
+@pytest.mark.asyncio
+async def test_compute_effective_max_requeues_diverged_child_caps_budget(
+    db_session,
+):
+    """A failed child with terminal divergence in fix_loop_history should cause
+    compute_effective_max_requeues to return 0 and stamp fix_loop_abandoned on
+    the child's context.
+    """
+    from app.retry_budget import compute_effective_max_requeues
+
+    project = Project(name="Divergence budget test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "plan"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"cmd": "create"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={
+            "lint": [
+                {"loop": "lint", "iteration": 1, "exit_reason": "in_progress", "ended_at": "2026-05-05T10:00:00"},
+                {"loop": "lint", "iteration": 2, "exit_reason": "divergence_oscillation", "ended_at": "2026-05-05T10:01:00"},
+            ],
+        },
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    effective = await compute_effective_max_requeues(parent, db_session, max_requeues=3)
+    assert effective == 0
+
+    await db_session.refresh(child)
+    abandoned = (child.context or {}).get("fix_loop_abandoned")
+    assert abandoned is not None
+    assert abandoned["loop"] == "lint"
+    assert abandoned["exit_reason"] == "divergence_oscillation"
+    assert (child.context or {}).get("failure_detail") == "fix_loop_diverged"
+
+
+@pytest.mark.asyncio
+async def test_compute_effective_max_requeues_non_diverged_child_unchanged(
+    db_session,
+):
+    """A child with no divergence in fix_loop_history must not reduce the budget
+    beyond existing rules (backward compatibility).
+    """
+    from app.retry_budget import compute_effective_max_requeues
+
+    project = Project(name="No divergence budget test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "plan"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"cmd": "create"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={
+            "lint": [
+                {"loop": "lint", "iteration": 1, "exit_reason": "max_attempts", "ended_at": "2026-05-05T10:00:00"},
+            ],
+        },
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    effective = await compute_effective_max_requeues(parent, db_session, max_requeues=3)
+    # No divergence and no recurring class → full budget
+    assert effective == 3
+    await db_session.refresh(child)
+    assert (child.context or {}).get("fix_loop_abandoned") is None
+
+
+@pytest.mark.asyncio
+async def test_compute_effective_max_requeues_no_fix_loop_history_unchanged(
+    db_session,
+):
+    """Child with no fix_loop_history at all must not reduce the budget (backward compat)."""
+    from app.retry_budget import compute_effective_max_requeues
+
+    project = Project(name="No history budget test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "plan"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"cmd": "create"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    effective = await compute_effective_max_requeues(parent, db_session, max_requeues=3)
+    assert effective == 3
+
+
+# --- admin endpoint divergence counter ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_convergence_endpoint_abandoned_counter(client: AsyncClient, db_session):
+    """tasks_abandoned_on_divergence increments when a task has fix_loop_abandoned set."""
+    project = Project(name="Abandoned counter test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+
+    task_normal = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "x"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={"lint": [{"loop": "lint", "iteration": 1, "exit_reason": "max_attempts"}]},
+    )
+    task_abandoned = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "x"}],
+        status=TaskStatus.FAILED,
+        fix_loop_history={"lint": [{"loop": "lint", "iteration": 1, "exit_reason": "divergence_oscillation"}]},
+        context={
+            "fix_loop_abandoned": {
+                "loop": "lint",
+                "exit_reason": "divergence_oscillation",
+                "at": "2026-05-05T10:00:00",
+            },
+            "failure_detail": "fix_loop_diverged",
+        },
+    )
+    db_session.add_all([task_normal, task_abandoned])
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/fix-loop-convergence?hours=24")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tasks_abandoned_on_divergence"] >= 1
+    assert str(task_abandoned.id) in body["recent_abandoned_task_ids"]
+    # tasks_with_fix_loops still counts all tasks with history, not just abandoned
+    assert body["tasks_with_fix_loops"] >= 2
