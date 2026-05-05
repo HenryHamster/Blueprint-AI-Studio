@@ -1365,6 +1365,27 @@ async def prometheus_metrics(request: Request):
     except Exception:
         pass
 
+    # Reaper liveness — counter increments only on a fully-successful cycle.
+    # Production 2026-05-04: reaper crashed every cycle for 80+ minutes
+    # (MissingGreenlet at reaper.py:724) before operator noticed via stuck
+    # task heartbeat ages. Alert on ``last_cycle_age_seconds > 300`` to
+    # catch any reaper crash-loop within ~5 successful-cycle windows.
+    try:
+        from app.reaper import get_reaper_stats  # noqa: PLC0415
+        _reaper_stats = get_reaper_stats()
+        counter(
+            "blueprint_reaper_cycles_completed_total",
+            "Cumulative number of fully-successful reaper cycles",
+            _reaper_stats.get("cycles_completed_total", 0),
+        )
+        gauge(
+            "blueprint_reaper_last_cycle_age_seconds",
+            "Seconds since last fully-successful reaper cycle (-1 if never completed)",
+            _reaper_stats.get("last_cycle_age_seconds", -1),
+        )
+    except Exception:
+        pass
+
     body = "\n".join(lines) + "\n"
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")

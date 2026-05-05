@@ -2931,3 +2931,39 @@ async def test_reap_with_pr_falls_back_to_open_when_gh_unreachable(
     assert t.status == TaskStatus.EVALUATING
     assert "#8888" in (t.latest_status_message or "")
     _spawn.assert_called_once()
+
+
+# ── Reaper liveness telemetry ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_reaper_stats_initial_state_reports_never_completed():
+    """Before any cycle runs, stats report cycles=0 and age=-1 sentinel."""
+    import app.reaper as _reaper_mod
+    _reaper_mod._reaper_cycles_completed_count = 0
+    _reaper_mod._reaper_last_cycle_completed_at = None
+    stats = _reaper_mod.get_reaper_stats()
+    assert stats["cycles_completed_total"] == 0
+    assert stats["last_cycle_age_seconds"] == -1
+
+
+@pytest.mark.asyncio
+async def test_get_reaper_stats_reports_recent_age_after_cycle(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """After one successful cycle, counter increments and age is small.
+
+    Production 2026-05-04: this counter would have caught the reaper
+    crash-loop within ~5 cycle windows (the alert threshold) instead of
+    requiring 80+ minutes of operator vigilance to notice via task
+    heartbeat staleness.
+    """
+    import app.reaper as _reaper_mod
+    _reaper_mod._reaper_cycles_completed_count = 0
+    _reaper_mod._reaper_last_cycle_completed_at = None
+
+    await _run_reaper_once()
+
+    stats = _reaper_mod.get_reaper_stats()
+    assert stats["cycles_completed_total"] == 1
+    # Age should be tiny — well under the 300s alert threshold.
+    assert 0 <= stats["last_cycle_age_seconds"] < 60

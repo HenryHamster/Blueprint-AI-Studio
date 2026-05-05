@@ -286,3 +286,67 @@ resource "google_monitoring_alert_policy" "cloudsql_backup_failure" {
 # cloudsql_cpu block above and target resource.type
 # "alloydb.googleapis.com/Instance" / metric.type
 # "alloydb.googleapis.com/instance/cpu/utilization". See archive/README.md.
+
+# ------------------------------------------------------------------------------
+# Reaper crash-loop alert (log-based metric + alert)
+#
+# Production incident 2026-05-04: a MissingGreenlet regression at
+# reaper.py:724 made the reaper crash on every cycle for 80+ minutes
+# before the operator noticed via stuck task heartbeat ages. The reaper
+# logs "[REAPER] Error: <exc>" at logger.error on every uncaught
+# exception in its main loop, so a log-based metric counting those
+# entries gives a direct crash-loop signal — the alert fires inside
+# 5 successful-cycle windows (~5 min) regardless of bug class.
+#
+# This is broader than reaper.py:724-specific telemetry: any future
+# regression that crashes the reaper loop (DB exhaustion, dialect
+# breakage, deferred-import circular, etc.) trips this same alert.
+# ------------------------------------------------------------------------------
+resource "google_logging_metric" "reaper_loop_error" {
+  count       = local.alerting_enabled ? 1 : 0
+  name        = "reaper_loop_error"
+  description = "Count of '[REAPER] Error:' log entries from the orchestrator reaper main loop. Increments only on uncaught exceptions in the reaper service body."
+  filter      = <<-EOT
+    resource.type="cloud_run_revision"
+    AND resource.labels.service_name="blueprint-orchestrator"
+    AND severity=ERROR
+    AND textPayload=~"\[REAPER\] Error:"
+  EOT
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+resource "google_monitoring_alert_policy" "reaper_loop_error" {
+  count        = local.alerting_enabled ? 1 : 0
+  display_name = "Reaper: crash loop"
+  combiner     = "OR"
+  enabled      = true
+
+  conditions {
+    display_name = "≥3 reaper loop errors in 5 min"
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.reaper_loop_error[0].name}\" AND resource.type=\"cloud_run_revision\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 2
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_DELTA"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email[0].id]
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  documentation {
+    content   = "The reaper main loop has logged ≥3 errors in 5 min — likely crash-looping and not reaping orphan tasks. Stuck-IN_PROGRESS tasks accumulate while this fires. Runbook: check `gcloud logging read 'resource.labels.service_name=\"blueprint-orchestrator\" AND severity>=ERROR'` for the traceback; common shapes are MissingGreenlet on async/sync mismatch (see reaper.py:709 expire_all guard), DB pool exhaustion (see /metrics blueprint_db_pool_invalidations_total), and deferred-import cycles."
+    mime_type = "text/markdown"
+  }
+}

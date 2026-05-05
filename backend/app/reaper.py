@@ -91,6 +91,35 @@ async def _relock_orphan_task(
 # Reaper: track tasks skipped by skip_locked to force-reap after repeated skips
 _reaper_skip_counts: Dict[uuid.UUID, int] = {}
 
+# Reaper liveness telemetry. Incremented at the END of each fully-successful
+# cycle (after the success path resets consecutive_errors). If the cycle body
+# raises, the counter does NOT increment and the age gauge keeps growing —
+# that's the signal a deploy gate / alert can fire on. Production 2026-05-04:
+# the reaper crashed every cycle on a MissingGreenlet at reaper.py:724 for
+# 80+ minutes before operator noticed; this counter is the broad backstop
+# against any "reaper crash-loops silently" failure mode, not just that bug.
+_reaper_cycles_completed_count: int = 0
+_reaper_last_cycle_completed_at: datetime | None = None
+
+
+def get_reaper_stats() -> dict:
+    """Snapshot of reaper liveness for /metrics and admin observability.
+
+    ``last_cycle_age_seconds`` is the wall-clock seconds since the last
+    fully-successful cycle. -1 means the reaper has never completed a cycle
+    (process just started, or every cycle has crashed). Alerts should fire
+    if this exceeds the reaper sleep interval by a meaningful margin
+    (e.g. >300s — five expected cycles missed).
+    """
+    age_seconds: float | int = -1
+    if _reaper_last_cycle_completed_at is not None:
+        age_seconds = max(0, (_utcnow() - _reaper_last_cycle_completed_at).total_seconds())
+    return {
+        "cycles_completed_total": _reaper_cycles_completed_count,
+        "last_cycle_age_seconds": age_seconds,
+    }
+
+
 # Per-(provider, model) regression scan cadence. The reaper itself fires every
 # ~60s; the regression scan is gated to ~15min so we don't pay the per-account
 # Task aggregation cost on every reaper tick. Aligned with the existing
@@ -2211,6 +2240,13 @@ async def reaper_service():
                     except Exception as e:
                         logger.error(f"[REAPER] Regression scan error: {e}", exc_info=True)
             consecutive_errors = 0
+            # Liveness telemetry: only bump on the success path. If the
+            # cycle body raised above, neither this counter nor the
+            # last-completed timestamp advances — the /metrics gauge will
+            # report a growing age and the monitoring alert fires.
+            global _reaper_cycles_completed_count, _reaper_last_cycle_completed_at
+            _reaper_cycles_completed_count += 1
+            _reaper_last_cycle_completed_at = _utcnow()
         except asyncio.CancelledError:
             logger.info("[REAPER] Service shutting down.")
             break
