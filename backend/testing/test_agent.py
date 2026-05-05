@@ -6604,6 +6604,79 @@ async def test_next_role_claims_warm_pinned_queued_task(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
+async def test_next_role_refuses_warm_claim_on_doomed_vm(client: AsyncClient, db_session):
+    """Race guard: when a sibling task's agent_completion fired
+    fire_and_forget_vm_delete, the VM is alive in GCP for ~30-60s but
+    the delete is in flight. Without this guard, next-role races into
+    that window, claims the doomed VM, and the agent gets SIGTERM'd
+    mid-task. Production 2026-05-05 task cfd73cec on VM c44258 hit
+    exactly this — claimed warm VM that was already scheduled for
+    delete by 41456ba8's agent_completion 9s earlier; SIGTERM landed
+    ~50s later as the GCP delete completed."""
+    from datetime import datetime, timedelta
+    from app.main import _orchestrator_deleted_vms
+    import time
+
+    project = Project(name="Next-Role Doomed-VM", user_id="test-user-doomed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id, payloads=[{"type": "fix", "pr_number": 4321}],
+        vm_instance_id="agent-vm-doomed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 4321, "branch": "feat/y"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-doomed",
+            "warm_target_pr": "4321",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    # Mark the VM as orchestrator-scheduled-for-delete. This is the
+    # synchronous marker that fire_and_forget_vm_delete records before
+    # scheduling the background GCP call.
+    _orchestrator_deleted_vms["agent-vm-doomed"] = (time.time(), "agent_completion")
+    try:
+        token = create_agent_token(str(prior_task.id), "agent-vm-doomed")
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={
+                "vm_instance_id": "agent-vm-doomed",
+                "prior_task_id": str(prior_task.id),
+                "prior_pr_number": 4321,
+            },
+            headers={"x-agent-token": token},
+        )
+        # 204 = no warm-claim (treat doomed VM as if no warm task were
+        # available so the agent exits cleanly).
+        assert resp.status_code == 204, (
+            f"expected 204 on doomed-VM warm-claim attempt, got {resp.status_code} — "
+            f"the QUEUED task was claimed onto a VM that's about to die"
+        )
+
+        # The pinned task must remain QUEUED so the orchestrator can
+        # provision a fresh VM for it on the next dispatch tick.
+        await db_session.refresh(pinned_task)
+        assert pinned_task.status == TaskStatus.QUEUED
+        assert pinned_task.vm_instance_id is None
+    finally:
+        _orchestrator_deleted_vms.pop("agent-vm-doomed", None)
+
+
+@pytest.mark.asyncio
 async def test_next_role_rejects_jwt_vm_mismatch(client: AsyncClient, db_session):
     """next-role returns 403 when JWT vm_instance_id mismatches body."""
     project = Project(name="Next-Role JWT Mismatch", user_id="test-user-123")

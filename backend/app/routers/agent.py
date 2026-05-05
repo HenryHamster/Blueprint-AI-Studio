@@ -2426,6 +2426,24 @@ async def next_role(
     # Liveness signal: receiving the request itself proves the VM is alive.
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
 
+    # Race guard: refuse warm-claim on a VM that was just scheduled for
+    # orchestrator-initiated deletion. With fire_and_forget_vm_delete
+    # (main.py — released the agent_completion lock window), there is now
+    # a ~30-60s window where the VM is still alive in GCP but the delete
+    # is in flight. Without this check, the warm-start claim races into
+    # that window, gets the VM, and the pending delete kills the agent
+    # mid-task with [FATAL:SIGTERM] (production 2026-05-05 task cfd73cec
+    # on VM agent-vm-c44258...). The marker is recorded synchronously
+    # before scheduling so it is always observable here.
+    from app.main import is_orchestrator_initiated_delete  # noqa: PLC0415
+    _is_doomed, _delete_reason = is_orchestrator_initiated_delete(req.vm_instance_id)
+    if _is_doomed:
+        logger.info(
+            f"[NEXT-ROLE] Refusing warm-claim on doomed VM {req.vm_instance_id} "
+            f"(delete reason={_delete_reason})"
+        )
+        return JSONResponse(status_code=204, content=None)
+
     # Look up a QUEUED task pinned to this VM.
     # R5-W2-B: lead the predicate with ``Task.context.has_key(...)`` so the
     # JSONB ``?`` operator can satisfy the lookup via ``ix_task_context_gin``.
