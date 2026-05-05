@@ -60,6 +60,7 @@ import {
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,
   formatSelfReviewBlindSpots,
+  formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   type FixAttempt,
 } from './prompt.js';
@@ -1858,6 +1859,57 @@ describe('formatProjectContext', () => {
     };
     const result = formatProjectContext(ctx, 'create');
     expect(result).not.toContain('Persistent review issues');
+  });
+
+  it('renders sr_blind_spot_themes section when themes are provided', () => {
+    const ctx = {
+      sr_blind_spot_themes: [
+        { theme: 'did not verify auth flow', count: 5 },
+        { theme: 'untested error handling path', count: 2 },
+        { theme: 'race condition in async fetch', count: 1 },
+      ],
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Project-wide self-review blind spots (last 14 days');
+    expect(result).toContain('did not verify auth flow (5 tasks)');
+    expect(result).toContain('untested error handling path (2 tasks)');
+    expect(result).toContain('race condition in async fetch (1 task)');
+  });
+
+  it('omits sr_blind_spot_themes section when array is empty or absent', () => {
+    const empty = formatProjectContext({ sr_blind_spot_themes: [] }, 'create');
+    expect(empty).not.toContain('Project-wide self-review blind spots');
+    const absent = formatProjectContext({}, 'create');
+    expect(absent).not.toContain('Project-wide self-review blind spots');
+  });
+});
+
+// ── formatProjectBlindSpotSummary ─────────────────────────────────────────────
+describe('formatProjectBlindSpotSummary', () => {
+  it('returns empty string for empty array', () => {
+    expect(formatProjectBlindSpotSummary([])).toBe('');
+  });
+
+  it('renders themes with counts and correct singular/plural', () => {
+    const result = formatProjectBlindSpotSummary([
+      { theme: 'theme one', count: 1 },
+      { theme: 'theme two', count: 2 },
+    ]);
+    expect(result).toContain('- theme one (1 task)');
+    expect(result).toContain('- theme two (2 tasks)');
+    expect(result).toContain('Project-wide self-review blind spots');
+  });
+
+  it('caps at top 8 entries', () => {
+    const themes = Array.from({ length: 12 }, (_, i) => ({
+      theme: `theme number ${i}`,
+      count: 12 - i,
+    }));
+    const result = formatProjectBlindSpotSummary(themes);
+    expect(result).toContain('theme number 0');
+    expect(result).toContain('theme number 7');
+    expect(result).not.toContain('theme number 8');
+    expect(result).not.toContain('theme number 11');
   });
 });
 

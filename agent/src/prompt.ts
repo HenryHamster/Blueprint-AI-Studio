@@ -28,6 +28,7 @@ export {
 } from './prompts/analysis.js';
 export {
   formatSelfReviewBlindSpots,
+  formatProjectBlindSpotSummary,
 } from './prompts/self-review.js';
 
 // ── Agent Permission Enforcement ────────────────────────────────────────

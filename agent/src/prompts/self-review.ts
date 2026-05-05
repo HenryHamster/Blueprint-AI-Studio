@@ -80,7 +80,7 @@ export function formatProjectBlindSpotSummary(
   const top = themes.slice(0, 8);
   const rows = top.map(t => `- ${t.theme} (${t.count} task${t.count === 1 ? '' : 's'})`).join('\n');
   return (
-    `**Project-wide self-review blind spots (last 7 days — areas where self-review has been most uncertain):**\n` +
+    `**Project-wide self-review blind spots (last 14 days — areas where self-review has been most uncertain):**\n` +
     `${rows}\n` +
     `Focus extra scrutiny on files or patterns that match these themes.\n\n`
   );

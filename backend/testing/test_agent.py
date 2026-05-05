@@ -7605,3 +7605,132 @@ async def test_fire_and_forget_vm_delete_no_op_on_empty_vm_id():
     assert "" not in _orchestrator_deleted_vms, (
         "fire_and_forget_vm_delete must not record a marker for empty vm_id"
     )
+
+
+async def _seed_blind_spot_tasks(db_session, project_id):
+    """Helper: seed COMPLETED tasks with self-review blind_spots for the project."""
+    for i in range(3):
+        db_session.add(Task(
+            project_id=project_id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {"correctness": {"passed": True}},
+                "blind_spots": [f"did not verify file path number {i} thoroughly"],
+            }},
+        ))
+    db_session.add(Task(
+        project_id=project_id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": {
+            "verdict": "pass",
+            "fixes_applied": False,
+            "check_results": {},
+            "blind_spots": ["async error propagation not checked"],
+        }},
+    ))
+    # Skipped envelope: must NOT contribute
+    db_session.add(Task(
+        project_id=project_id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": {
+            "verdict": "unknown",
+            "fixes_applied": False,
+            "check_results": {},
+            "blind_spots": [],
+        }},
+    ))
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_sr_blind_spot_themes_for_create_task(client: AsyncClient, db_session):
+    """Claim endpoint injects sr_blind_spot_themes in project_context for create tasks."""
+    project = Project(name="SR BlindSpots Create", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_blind_spot_tasks(db_session, project.id)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add new model"}],
+        vm_instance_id="agent-vm-srbs-create",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-srbs-create")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_blind_spot_themes" in project_ctx, (
+        f"Expected sr_blind_spot_themes in project_context, got: {list(project_ctx.keys())}"
+    )
+    themes = {t["theme"]: t["count"] for t in project_ctx["sr_blind_spot_themes"]}
+    assert themes.get("did not verify file path number") == 3
+    assert themes.get("async error propagation not checked") == 1
+    # Top-N cap (limit=8) — only 2 distinct themes here
+    assert len(project_ctx["sr_blind_spot_themes"]) == 2
+    # Sorted by count desc
+    assert project_ctx["sr_blind_spot_themes"][0]["count"] >= project_ctx["sr_blind_spot_themes"][1]["count"]
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_sr_blind_spot_themes_when_empty(client: AsyncClient, db_session):
+    """No completed tasks with blind_spots → field absent."""
+    project = Project(name="SR BlindSpots Empty", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Something"}],
+        vm_instance_id="agent-vm-srbs-empty",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-srbs-empty")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_blind_spot_themes" not in project_ctx
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_inject_sr_blind_spot_themes_for_review_task(client: AsyncClient, db_session):
+    """Field is NOT injected for non-(create/fix/refactor/migrate) task types."""
+    project = Project(name="SR BlindSpots Review", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_blind_spot_tasks(db_session, project.id)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 99, "branch": "fix/something"}],
+        vm_instance_id="agent-vm-srbs-review",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-srbs-review")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "sr_blind_spot_themes" not in project_ctx, (
+        f"sr_blind_spot_themes should be absent for review tasks, got: "
+        f"{project_ctx.get('sr_blind_spot_themes')}"
+    )

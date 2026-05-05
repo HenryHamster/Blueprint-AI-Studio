@@ -17,6 +17,109 @@ function formatCompact(seconds: number): string {
 export type { ResearchFinding } from '../types/task';
 import type { ResearchFinding } from '../types/task';
 
+interface SelfReviewCheckResult {
+  passed: boolean;
+  issue?: string;
+}
+
+interface SelfReviewOutcome {
+  verdict?: string;
+  fixes_applied?: boolean;
+  check_results?: Record<string, SelfReviewCheckResult>;
+}
+
+interface SrBadgeState {
+  label: string;
+  tooltip: string;
+  variant: 'pass' | 'pass-fixed' | 'fail' | 'miss';
+}
+
+function getSrBadgeState(task: Task): SrBadgeState | null {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
+  if (!outcome) return null;
+
+  const verdict = outcome.verdict ?? 'unknown';
+  const checkResults = outcome.check_results ?? {};
+  const isSoftFallback = verdict === 'unknown' && Object.keys(checkResults).length === 0;
+  if (isSoftFallback) return null;
+
+  const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
+  const failedCategories = Object.entries(checkResults).filter(([, r]) => !(r as SelfReviewCheckResult).passed);
+
+  if (humanCategories && Object.keys(humanCategories).length > 0) {
+    const allCats = Array.from(new Set([...Object.keys(checkResults), ...Object.keys(humanCategories)]));
+    const missedCount = allCats.filter(cat => cat in humanCategories && !(checkResults[cat] && !(checkResults[cat] as SelfReviewCheckResult).passed)).length;
+    if (missedCount > 0) {
+      return {
+        variant: 'miss',
+        label: `SR miss ${missedCount}`,
+        tooltip: `${missedCount} human-review categor${missedCount !== 1 ? 'ies' : 'y'} not caught by self-review`,
+      };
+    }
+  }
+
+  if (verdict === 'fail') {
+    const n = failedCategories.length;
+    return {
+      variant: 'fail',
+      label: 'SR ✗',
+      tooltip: `Self-review verdict: fail${n > 0 ? ` (${n} failed check${n !== 1 ? 's' : ''})` : ''}`,
+    };
+  }
+
+  if (verdict === 'pass') {
+    if (outcome.fixes_applied) {
+      const n = failedCategories.length;
+      return {
+        variant: 'pass-fixed',
+        label: n > 0 ? `SR ✓ +${n}` : 'SR ✓ +',
+        tooltip: `Self-review passed; agent caught and applied fixes${n > 0 ? ` (${n} flagged check${n !== 1 ? 's' : ''})` : ''}`,
+      };
+    }
+    return {
+      variant: 'pass',
+      label: 'SR ✓',
+      tooltip: 'Self-review passed with no issues caught',
+    };
+  }
+
+  return null;
+}
+
+function SrBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
+  const state = getSrBadgeState(task);
+  if (!state) return null;
+
+  const colorClass =
+    state.variant === 'pass' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400' :
+    state.variant === 'pass-fixed' ? 'bg-teal-500/10 border-teal-500/20 text-teal-400' :
+    state.variant === 'fail' ? 'bg-red-500/10 border-red-500/20 text-red-400' :
+    'bg-amber-500/10 border-amber-500/20 text-amber-400';
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        title={state.tooltip}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass} hover:opacity-80 transition-opacity`}
+      >
+        {state.label}
+      </button>
+    );
+  }
+
+  return (
+    <span
+      title={state.tooltip}
+      className={`inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded ${colorClass}`}
+    >
+      {state.label}
+    </span>
+  );
+}
+
 function FixLoopBadge({ summary }: { summary: FixLoopSummary[] }) {
   // Show up to 2 badges: non_success first, then high-iteration-count
   const sorted = [...summary].sort((a, b) => {
@@ -177,6 +280,7 @@ interface TaskCardProps {
   onDismiss: (id: string) => void;
   onArchive: (id: string) => void;
   onViewLogs: (task: Task) => void;
+  onOpenSelfReview?: () => void;
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
   blockingCount?: number;
@@ -338,7 +442,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, searchQuery, onDirectionClick }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, searchQuery, onDirectionClick }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -609,6 +713,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
             </span>
           )
+        )}
+        {(isTerminal || task.status === 'EVALUATING') && (
+          <SrBadge task={task} onClick={onOpenSelfReview} />
         )}
       </div>
 

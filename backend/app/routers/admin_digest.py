@@ -35,6 +35,10 @@ from app.retry_budget import failure_class_history_classes
 from app import strategic_cycle as _strategic_cycle
 from app.strategic_analysis import _compute_prediction_calibration
 from app.playbook_learning import _categorize_review_issues
+from app.sr_blind_spots import (
+    aggregate_sr_blind_spot_envelope,
+    is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,24 +75,12 @@ def _stash_projected_task_fields(
     object.__setattr__(task, "_projected_completed_at_ts", completed_at_ts)
 
 
-_SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
 _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 
-
-def _is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
-    """A self-review outcome is a 'skip' when the agent emitted the
-    bash ./done fallback envelope: verdict=='unknown' with empty
-    check_results, or a blind_spots marker matching the fallback paths.
-    """
-    if not sro:
-        return False
-    blind_spots = sro.get("blind_spots") or []
-    for entry in blind_spots:
-        if isinstance(entry, str) and any(m in entry for m in _SR_SKIP_BLIND_SPOT_MARKERS):
-            return True
-    if sro.get("verdict") == "unknown" and not (sro.get("check_results") or {}):
-        return True
-    return False
+# Re-exported from app.sr_blind_spots so existing call sites keep working
+# after the aggregation logic was extracted to be shared with the agent
+# router. Tests and other modules import this from admin_digest today.
+_is_skipped_sr_outcome = _is_skipped_sr_outcome_shared
 
 
 def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
@@ -4520,37 +4512,6 @@ async def list_sr_blind_spots(
     envelopes are excluded so noise from the ./done bash fallback doesn't inflate
     theme counts.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
-
-    stmt = (
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.COMPLETED,
-            Task.created_at >= cutoff,
-        )
-        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
-        .order_by(Task.created_at.desc())
-        .limit(2000)
+    return await aggregate_sr_blind_spot_envelope(
+        session, project_id, days=days, limit=limit,
     )
-    result = await session.execute(stmt)
-    all_tasks = result.scalars().all()
-
-    theme_counts: Dict[str, int] = defaultdict(int)
-    for t in all_tasks:
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or _is_skipped_sr_outcome(sro):
-            continue
-        for entry in (sro.get("blind_spots") or []):
-            if not isinstance(entry, str) or not entry.strip():
-                continue
-            theme = " ".join(entry.lower().split()[:6])
-            theme_counts[theme] += 1
-
-    top = sorted(theme_counts.items(), key=lambda x: -x[1])[:limit]
-    return {
-        "window_days": days,
-        "total_distinct_themes": len(theme_counts),
-        "themes": [{"theme": t, "count": c} for t, c in top],
-    }

@@ -1,5 +1,6 @@
 import { strVal } from '../prompt.js';
 import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
+import { formatProjectBlindSpotSummary } from './self-review.js';
 
 function parseResearchSummary(raw: string): string {
   try {
@@ -432,6 +433,23 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build project-wide SR blind-spot themes (last 14 days) — only if budget allows.
+  // Surfaced from backend agent.py injection: ctx.sr_blind_spot_themes is
+  // [{theme, count}, ...] sorted by count desc, capped at 8.
+  const srBlindSpotThemesRaw = ctx.sr_blind_spot_themes as Array<{ theme: string; count: number }> | null | undefined;
+  let srBlindSpotThemesLines: string[] = [];
+  if (Array.isArray(srBlindSpotThemesRaw) && srBlindSpotThemesRaw.length > 0) {
+    const rendered = formatProjectBlindSpotSummary(srBlindSpotThemesRaw);
+    if (rendered) {
+      const candidateLines = rendered.split('\n');
+      const candidate = candidateLines.join('\n');
+      if (candidate.length <= budget) {
+        srBlindSpotThemesLines = candidateLines;
+        budget -= candidate.length;
+      }
+    }
+  }
+
   // Build per-module review feedback warnings — only if budget allows
   type ModuleFeedbackWarning = { file: string; top_categories: Record<string, number>; sample_size: number };
   const moduleFeedbackWarnings = ctx.module_feedback_warnings as ModuleFeedbackWarning[] | null | undefined;
@@ -493,6 +511,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srBlindSpotThemesLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

@@ -48,6 +48,7 @@ from app.github import (
     create_check_run,
 )
 from app.broadcast import broadcast_to_project
+from app.sr_blind_spots import aggregate_sr_blind_spot_themes
 
 logger = logging.getLogger(__name__)
 
@@ -2051,6 +2052,25 @@ async def claim_task(
                     response["project_context"]["self_review_catch_rate"] = catch_rate_payload
         except Exception:
             logger.exception("[AGENT] Failed to inject self_review_catch_rate (non-critical)")
+
+    # Inject project-wide SR blind-spot themes (last 14 days, top 8). Surfaces
+    # recurring areas where self-review has been most uncertain so the agent
+    # can apply extra scrutiny in those areas. Shape:
+    #   project_context.sr_blind_spot_themes = [{"theme": str, "count": int}, ...]
+    # No design_doc cache exists for this aggregate today — we scan tasks
+    # directly. Mirroring the sr_catch_rate_trends precompute path is a
+    # future optimization (see app/sr_blind_spots.py).
+    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
+        try:
+            themes = await aggregate_sr_blind_spot_themes(
+                session, project_for_playbook.id, days=14, limit=8,
+            )
+            if themes:
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["sr_blind_spot_themes"] = themes
+        except Exception:
+            logger.exception("[AGENT] Failed to inject sr_blind_spot_themes (non-critical)")
 
     # Inject scoped architecture context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
