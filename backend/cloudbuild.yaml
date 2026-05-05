@@ -47,17 +47,21 @@ steps:
       - '--service-account'
       - 'orchestrator-sa@$PROJECT_ID.iam.gserviceaccount.com'
       - '--set-env-vars'
-      # VM_PROVISIONING_MODEL=SPOT — agent VMs use spot/preemptible pricing
-      # (60-91% cheaper, ~5%% mid-task termination handled by reaper + retry).
-      # Flip to STANDARD via `gcloud run services update --update-env-vars
-      # VM_PROVISIONING_MODEL=STANDARD` to revert with no redeploy.
+      # VM_PROVISIONING_MODEL=STANDARD — flipped from SPOT 2026-05-05 because
+      # LLM token cost dominates VM compute cost. SPOT saves ~70%% on the VM
+      # slice but each ~5%% preemption wastes the LLM tokens already spent on
+      # the killed task; net savings dropped to ~0-2%% while the operational
+      # tax (mis-classified preemption diagnostics, retry latency) stayed
+      # constant. Re-enable via `gcloud run services update --update-env-vars
+      # VM_PROVISIONING_MODEL=SPOT` if scale grows enough that the absolute
+      # VM dollars matter again.
       #
       # DISABLED_REGIONS — list of regions where multi-region NAT was dropped
       # from terraform (vpc.tf). Orchestrator skips these zones at spawn time
       # with an explicit "administratively disabled (no subnet)" log.
       # Restore by re-enabling the multi-region NAT block in vpc.tf and
       # setting DISABLED_REGIONS="" here.
-      - 'GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=us-central1-a,VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@$PROJECT_ID.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=$PROJECT_ID-agent-artifacts,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},ORCHESTRATOR_URL=${_ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${_INITIAL_ADMIN_EMAIL},VM_PROVISIONING_MODEL=SPOT,DISABLED_REGIONS=us-east1;us-east4;us-west1'
+      - 'GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=us-central1-a,VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@$PROJECT_ID.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=$PROJECT_ID-agent-artifacts,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS},ORCHESTRATOR_URL=${_ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${_INITIAL_ADMIN_EMAIL},VM_PROVISIONING_MODEL=STANDARD,DISABLED_REGIONS=us-east1;us-east4;us-west1'
       - '--set-secrets'
       # ANTHROPIC_API_KEY is optional — only needed as fallback if not using Max plan auth on VM images
       # REDIS_URL removed 2026-05-02 — see redis_client.py:1-7, all consumers
