@@ -704,7 +704,19 @@ async def reaper_service():
                 # own release-around-IO + skip_locked re-acquire dance for the
                 # mutation phase. expire_all() ensures subsequent reads come
                 # from fresh DB state.
+                #
+                # CRITICAL: snapshot IDs BEFORE expire_all. After expire_all,
+                # every attribute on every instance is expired — including
+                # ``task.id``. Accessing ``task.id`` then triggers a sync
+                # attribute __get__ that drives a lazy refresh; on AsyncSession
+                # the underlying pool ping uses ``await_()`` which raises
+                # MissingGreenlet because the sync attribute access is not
+                # inside the AsyncSession's greenlet bridge. Result: the
+                # orphan loop crashes mid-iteration on the very first task.
+                # Iterate by id instead so no expired-attribute access happens.
+                _orphaned_task_ids: list[str] = []
                 if orphaned_tasks:
+                    _orphaned_task_ids = [t.id for t in orphaned_tasks]
                     await session.commit()
                     session.expire_all()
 
@@ -718,12 +730,12 @@ async def reaper_service():
                 # orphan detection on the next reaper cycle.
                 _deferred_parent_requeues: list[Task] = []
 
-                for task in orphaned_tasks:
+                for task_id in _orphaned_task_ids:
                     # Re-validate status before acting — task may have completed/been cancelled
                     # between the initial query and now
-                    fresh_task = await session.get(Task, task.id)
+                    fresh_task = await session.get(Task, task_id)
                     if fresh_task is None or fresh_task.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS):
-                        logger.info(f"[REAPER] Skipping task {task.id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
+                        logger.info(f"[REAPER] Skipping task {task_id} — status transitioned to {fresh_task.status if fresh_task else 'gone'} before reap")
                         continue
                     task = fresh_task  # Use fresh data for all subsequent reads and writes
 
