@@ -154,16 +154,24 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
   );
 }
 
+const DIVERGENCE_PATTERNS = [
+  'divergence_oscillation',
+  'divergence_similar_error',
+  'divergence_diff_revert',
+] as const;
+
 function DrillDownPanel({
   filter,
   hours,
   projectId,
+  exitReasonCounts,
   onViewTask,
   onClose,
 }: {
   filter: DrillDownFilter;
   hours: number;
   projectId?: string;
+  exitReasonCounts: Record<string, number>;
   onViewTask?: (taskId: string) => void;
   onClose: () => void;
 }) {
@@ -171,7 +179,14 @@ function DrillDownPanel({
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [activePattern, setActivePattern] = useState<string | null>(null);
   const panelMountedRef = useRef(true);
+
+  const isDivergenceFilter = filter.exit_reason.includes('divergence');
+  const effectiveReason = activePattern ?? filter.exit_reason;
+  const patternCounts: Record<string, number> = isDivergenceFilter
+    ? Object.fromEntries(DIVERGENCE_PATTERNS.map(p => [p, exitReasonCounts[p] ?? 0]))
+    : {};
 
   const fetchDiverged = useCallback(async () => {
     setLoading(true);
@@ -179,7 +194,7 @@ function DrillDownPanel({
     const params = new URLSearchParams({
       hours: String(hours),
       loop: filter.loop,
-      exit_reason: filter.exit_reason,
+      exit_reason: effectiveReason,
       limit: '50',
     });
     if (projectId) params.set('project_id', projectId);
@@ -197,7 +212,7 @@ function DrillDownPanel({
       setError(e instanceof Error ? e.message : String(e));
       setLoading(false);
     }
-  }, [filter.loop, filter.exit_reason, hours, projectId]);
+  }, [filter.loop, effectiveReason, hours, projectId]);
 
   useEffect(() => {
     panelMountedRef.current = true;
@@ -206,20 +221,46 @@ function DrillDownPanel({
     return () => { panelMountedRef.current = false; };
   }, [fetchDiverged]);
 
-  const reasonCls = EXIT_REASON_COLORS[filter.exit_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const reasonCls = EXIT_REASON_COLORS[effectiveReason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
 
   return (
     <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
       <div className="flex items-center justify-between gap-2 mb-2">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className={`text-[10px] font-semibold uppercase tracking-wide ${LOOP_COLORS[filter.loop]}`}>{LOOP_LABELS[filter.loop]}</span>
           <span className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border ${reasonCls}`}>
-            {filter.exit_reason.replace(/_/g, ' ')}
+            {effectiveReason.replace(/_/g, ' ')}
           </span>
           {!loading && <span className="text-[10px] text-neutral-500">{total} task{total !== 1 ? 's' : ''}</span>}
         </div>
         <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
       </div>
+      {isDivergenceFilter && DIVERGENCE_PATTERNS.some(p => (patternCounts[p] ?? 0) > 0) && (
+        <div className="flex flex-wrap gap-1 mb-2">
+          {DIVERGENCE_PATTERNS.map(p => {
+            const count = patternCounts[p] ?? 0;
+            if (count === 0) return null;
+            const cls = EXIT_REASON_COLORS[p] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+            const isActive = activePattern === p;
+            return (
+              <button
+                key={p}
+                onClick={() => setActivePattern(prev => prev === p ? null : p)}
+                className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border transition-all ${cls} ${isActive ? 'ring-1 ring-white/30' : 'opacity-60 hover:opacity-100'}`}
+                title={isActive ? 'Click to show all patterns' : `Filter by ${p.replace(/_/g, ' ')}`}
+              >
+                {p.replace(/divergence_/g, '').replace(/_/g, ' ')}
+                <span className="font-bold">{count}</span>
+              </button>
+            );
+          })}
+          {activePattern && (
+            <button onClick={() => setActivePattern(null)} className="text-[10px] text-neutral-400 hover:text-neutral-200 px-1">
+              show all
+            </button>
+          )}
+        </div>
+      )}
 
       {loading && <p className="text-[10px] text-neutral-500">Loading…</p>}
       {error && <p className="text-[10px] text-red-400">{error}</p>}
@@ -401,6 +442,7 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
           filter={drillDown}
           hours={24}
           projectId={projectId}
+          exitReasonCounts={data[drillDown.loop as 'lint' | 'test' | 'check']?.exit_reason_counts ?? {}}
           onViewTask={onViewTask}
           onClose={() => setDrillDown(null)}
         />

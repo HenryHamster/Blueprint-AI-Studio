@@ -25,6 +25,25 @@ const EXIT_REASON_STYLE: Record<string, string> = {
   in_progress: 'text-blue-400',
 };
 
+function formatDuration(startedAt: string | null | undefined, endedAt: string | null | undefined): string | null {
+  if (!startedAt || !endedAt) return null;
+  const start = new Date(startedAt).getTime();
+  const end = new Date(endedAt).getTime();
+  if (!start || !end || start >= end) return null;
+  const seconds = Math.round((end - start) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return secs === 0 ? `${minutes}m` : `${minutes}m ${secs}s`;
+}
+
+function formatAbsoluteTime(isoString: string | null | undefined): string | null {
+  if (!isoString) return null;
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+}
+
 function exitReasonBadge(reason: string | null | undefined): ReactElement | null {
   if (!reason) return null;
   const cls = EXIT_REASON_STYLE[reason] ?? 'text-neutral-400';
@@ -81,6 +100,10 @@ function generateLoopOutcome(
 function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number }) {
   const isSynth = attempt.source === 'trace_synthesized';
   const isTerminal = attempt.exit_reason && attempt.exit_reason !== 'in_progress';
+  const duration = formatDuration(attempt.started_at, attempt.ended_at);
+  const startTime = formatAbsoluteTime(attempt.started_at);
+  const endTime = formatAbsoluteTime(attempt.ended_at);
+  const tooltipText = startTime && endTime ? `${startTime} → ${endTime}` : null;
 
   return (
     <div className={`flex items-start gap-2 text-xs py-1.5 border-b border-neutral-800/50 last:border-0 ${isSynth ? 'opacity-70' : ''}`}>
@@ -113,6 +136,12 @@ function AttemptRow({ attempt, index }: { attempt: FixLoopAttempt; index: number
           </pre>
         )}
       </div>
+
+      {duration && (
+        <div className="shrink-0 text-right" title={tooltipText ?? undefined}>
+          <span className="font-mono text-[10px] text-neutral-500">{duration}</span>
+        </div>
+      )}
     </div>
   );
 }
