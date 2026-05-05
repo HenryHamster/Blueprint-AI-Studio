@@ -1749,8 +1749,8 @@ class TestBuildPastRetirementCritiques:
 
 
 @pytest.mark.asyncio
-async def test_retirement_critiques_persisted_via_api_path(db_session, mocker):
-    """API path: _strategic_retirement_critiques from task.context ends up in cycle metadata."""
+async def test_retirement_critiques_persisted_via_context_injection(db_session, mocker):
+    """Context-injection path: _strategic_retirement_critiques pre-injected into task.context ends up in cycle metadata."""
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
@@ -2258,3 +2258,147 @@ async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, moc
     await db_session.refresh(project)
     new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-existing2"]
     assert len(new_dirs) == 1, "Distinct direction should have been created"
+
+
+# ── set_retirement_critiques HTTP API path ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_list_payload_via_http(client, db_session, mocker):
+    """HTTP API: POST /api/agent/strategic with a list payload returns 200 and stores critiques."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-HTTP", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[{"id": "d-ret2", "status": "expired", "text": "Old dir", "research_history": []}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-http",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id, "_strategic_vision_set": True},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-rc-http", task_type="strategic_review")
+    critiques = [
+        {
+            "direction_id": "d-ret2",
+            "what_it_addressed": "Speed up CI",
+            "pattern_that_produced_it": "premature optimization",
+            "lesson": "Wait for evidence.",
+        }
+    ]
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={"task_id": str(task.id), "op": "set_retirement_critiques", "data": critiques},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_retirement_critiques"
+    assert body["count"] == 1
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get("_strategic_retirement_critiques")
+    assert stored == critiques, f"Expected stored critiques, got: {stored}"
+
+
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_sentinel_via_http(client, db_session, mocker):
+    """HTTP API: sentinel dict {'no_eligible_retirements': true} returns 200 and is stored."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-HTTP-SENT", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-sent",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-rc-sent", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={"task_id": str(task.id), "op": "set_retirement_critiques", "data": {"no_eligible_retirements": True}},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 0
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get("_strategic_retirement_critiques")
+    assert stored == {"no_eligible_retirements": True}
+
+
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_invalid_dict_returns_400(client, db_session, mocker):
+    """HTTP API: a non-sentinel dict payload returns 400."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-HTTP-BAD", user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-bad",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-rc-bad", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={"task_id": str(task.id), "op": "set_retirement_critiques", "data": {"some": "dict"}},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text

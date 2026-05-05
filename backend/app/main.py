@@ -1990,7 +1990,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
     task_id: uuid.UUID
     op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "create_message", "resolve_message", "spawn_task"
-    data: dict = {}
+    data: Any = {}
 
 @app.post("/api/agent/strategic")
 @limiter.limit("60/minute")
