@@ -38,7 +38,12 @@ export const CLAUDE_RESULT_GRACE_MS = 30_000;
 // Chosen to be well above any legitimate single tool call but well under the
 // 20-60 min wall-clock budget so a hung tool call is caught quickly.
 // flags.timedOut stays false so the post-Claude commit/push phase still runs.
-export const CLAUDE_STREAM_STALL_MS = 5 * 60_000;
+// 2026-05-05: bumped 5 → 12 min. The backend Docker test runner is silent for
+// 5-8 min during sidecar build + alembic + pytest (see TEST_RUNNER_DOCKER_TIMEOUT
+// below); 5 min was firing inside legitimate test waits and killing agents
+// mid-Bash with a complete diff but no shipped PR. Heartbeats fire on an
+// independent 30s setInterval, so the reaper still sees the VM as alive.
+export const CLAUDE_STREAM_STALL_MS = 12 * 60_000;
 
 // Log/error message tail length used in status reports.
 export const LOG_TAIL_BYTES = 5_000;

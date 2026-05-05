@@ -2879,7 +2879,7 @@ describe('mid-stream stall watchdog', () => {
     return { child, handlers, emitStdout };
   }
 
-  // Drive fake time forward in steps shorter than CLAUDE_STREAM_STALL_MS (5 min),
+  // Drive fake time forward in steps shorter than CLAUDE_STREAM_STALL_MS,
   // emitting a no-op 'system' event between steps. Each emission flows through
   // stdout.on('data') -> resetStallWatchdog(), keeping the stream-stall watchdog
   // alive so we can isolate the tool-use stall watchdog under test. 'system'
