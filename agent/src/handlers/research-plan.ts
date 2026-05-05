@@ -994,6 +994,88 @@ When describing changes in prose, be precise: "opening gap g-strategic-mem (from
 Before finishing, write /tmp/research_progress_${p.taskId}.md — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.`;
 }
 
+// ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────
+// Exported for unit testing. Returns { ok: true, analysisText } when both
+// /tmp/problem_model_<taskId>.json and /tmp/running_update_<taskId>.md exist
+// after the thinker (or its focused retry) completes. On any failure path it
+// calls persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
+// and returns { ok: false } so the caller can simply return.
+export async function runThinkerWithGate(
+  thinkerPrompt: string,
+  taskId: string,
+  ws: WebSocket | null,
+  statusRef: { value: string },
+  model: string | undefined,
+  effort: string | undefined,
+  disallowedTools: string[],
+): Promise<{ ok: true; analysisText: string } | { ok: false }> {
+  const problemModelPath = `/tmp/problem_model_${taskId}.json`;
+  const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
+
+  statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
+  const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
+  const analysisText = thinkerResult.lastResultText || thinkerResult.allOutput.slice(-80_000);
+
+  const filesPresent = () =>
+    fs.existsSync(problemModelPath) && fs.existsSync(runningUpdatePath);
+
+  if (thinkerResult.exitCode !== 0) {
+    sendLog(ws, `\n[ERROR] Strategic thinker (pass 1) exited ${thinkerResult.exitCode} — skipping executor.\n`);
+    try {
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        logs: thinkerResult.allOutput.slice(-10_000),
+        failure_category: 'strategic_thinker_artifacts_missing',
+      });
+    } catch (e) {
+      sendLog(ws, `[ERROR] Failed to post thinker gate failure: ${String(e)}\n`);
+    }
+    return { ok: false };
+  }
+
+  if (!filesPresent()) {
+    const missing: string[] = [];
+    if (!fs.existsSync(problemModelPath)) missing.push(problemModelPath);
+    if (!fs.existsSync(runningUpdatePath)) missing.push(runningUpdatePath);
+    sendLog(ws, `\n[WARNING] Thinker exited 0 but handoff files missing (${missing.join(', ')}). Running focused retry...\n`);
+
+    const retryPrompt = [
+      'Your previous analysis completed but the required handoff files were not written.',
+      'Write them NOW using cat heredoc — nothing else.',
+      '',
+      `Missing: ${missing.join(', ')}`,
+      '',
+      ...(missing.includes(problemModelPath)
+        ? [`cat > ${problemModelPath} << 'HEREDOC'\n<problem_model JSON verbatim from your prior analysis Section 1>\nHEREDOC`]
+        : []),
+      ...(missing.includes(runningUpdatePath)
+        ? [`cat > ${runningUpdatePath} << 'HEREDOC'\n<running_update markdown verbatim from your prior analysis Section 4>\nHEREDOC`]
+        : []),
+    ].join('\n');
+    const retryResult = await runClaudeCode(retryPrompt, ws, statusRef, model, effort, disallowedTools);
+
+    if (!filesPresent()) {
+      sendLog(ws, `\n[ERROR] Strategic thinker artifacts still missing after focused retry — aborting executor.\n`);
+      try {
+        await persistAndPostStatus(taskId, {
+          task_id: taskId,
+          status: 'FAILED',
+          artifact_type: 'ERROR_LOG',
+          logs: (thinkerResult.allOutput + '\n' + retryResult.allOutput).slice(-10_000),
+          failure_category: 'strategic_thinker_artifacts_missing',
+        });
+      } catch (e) {
+        sendLog(ws, `[ERROR] Failed to post thinker gate failure: ${String(e)}\n`);
+      }
+      return { ok: false };
+    }
+  }
+
+  return { ok: true, analysisText };
+}
+
 // ── Handler: Research (analyze codebase, output improvement findings) ──────
 export async function handleResearch(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1963,10 +2045,11 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       taskId,
     });
 
-    statusRef.value = 'Running strategic analysis (pass 1: thinking)...';
-    const thinkerResult = await runClaudeCode(thinkerPrompt, ws, statusRef, model, effort, disallowedTools);
-    const rawAnalysis = thinkerResult.lastResultText || thinkerResult.allOutput.slice(-80_000);
-    const analysisText = rawAnalysis;
+    const thinkerGateResult = await runThinkerWithGate(
+      thinkerPrompt, taskId, ws, statusRef, model, effort, disallowedTools,
+    );
+    if (!thinkerGateResult.ok) return;
+    const analysisText = thinkerGateResult.analysisText;
 
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.
@@ -2158,7 +2241,7 @@ ${analysisText.slice(0, 50_000)}
       const directionRejectedInOutput = /\[CONSTRAINT\].*create_direction/.test(allOutput) || /"status"\s*:\s*"skipped"/.test(allOutput);
 
       // Check if thinker's structured output contained direction recommendations
-      const structuredSection = rawAnalysis.match(/## Structured Output[\s\S]*$/i)?.[0] || '';
+      const structuredSection = analysisText.match(/## Structured Output[\s\S]*$/i)?.[0] ?? '';
       const thinkerRecommendedCreates = /create[_-]direction|"op"\s*:\s*"create"/i.test(structuredSection);
 
       if (directionRejectedInOutput && !anyDirectionOp) {

@@ -54,6 +54,7 @@ OUTCOME_FAILED_PHASE2 = "failed_phase2"
 OUTCOME_STALLED_PHASE1 = "stalled_phase1"
 OUTCOME_STALLED_PHASE2 = "stalled_phase2"
 OUTCOME_FAILED_PHASE2_SPAWN = "failed_phase2_spawn"
+OUTCOME_THINKER_ARTIFACTS_MISSING = "thinker_artifacts_missing"
 
 
 def new_cycle_id() -> str:
@@ -161,19 +162,26 @@ async def mark_phase1_completed(
 
 async def mark_failure(
     session: AsyncSession, cycle_id: str, *, phase: str, reason: str,
+    outcome_override: Optional[str] = None,
 ) -> Optional[StrategicCycle]:
-    """Mark cycle as failed at ``phase`` (``"phase1"`` | ``"phase2"`` | ``"phase2_spawn"``)."""
+    """Mark cycle as failed at ``phase`` (``"phase1"`` | ``"phase2"`` | ``"phase2_spawn"``).
+
+    ``outcome_override`` replaces the default outcome for the phase when a
+    more specific terminal outcome is appropriate (e.g.
+    ``OUTCOME_THINKER_ARTIFACTS_MISSING``).  The timestamp logic for the phase
+    still applies regardless of the override.
+    """
     cycle = await get(session, cycle_id)
     if cycle is None:
         return None
     if phase == "phase1":
-        cycle.outcome = OUTCOME_FAILED_PHASE1
+        cycle.outcome = outcome_override or OUTCOME_FAILED_PHASE1
         cycle.phase1_completed_at = cycle.phase1_completed_at or _utcnow()
     elif phase == "phase2":
-        cycle.outcome = OUTCOME_FAILED_PHASE2
+        cycle.outcome = outcome_override or OUTCOME_FAILED_PHASE2
         cycle.phase2_completed_at = cycle.phase2_completed_at or _utcnow()
     elif phase == "phase2_spawn":
-        cycle.outcome = OUTCOME_FAILED_PHASE2_SPAWN
+        cycle.outcome = outcome_override or OUTCOME_FAILED_PHASE2_SPAWN
         cycle.phase1_completed_at = cycle.phase1_completed_at or _utcnow()
     else:
         logger.warning(f"[STRATEGIC_CYCLE] mark_failure: unknown phase '{phase}'")

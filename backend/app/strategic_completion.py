@@ -139,10 +139,17 @@ async def _record_strategic_task_failure(
     if cycle_id:
         task_type = task.first_payload.get("type", "")
         failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
+        failure_category = task.first_payload.get("failure_category", "")
+        outcome_override = (
+            strategic_cycle.OUTCOME_THINKER_ARTIFACTS_MISSING
+            if failure_category == "strategic_thinker_artifacts_missing"
+            else None
+        )
         await strategic_cycle.mark_failure(
             session, cycle_id,
             phase=failed_phase,
             reason=(task.latest_status_message or "task failed")[:200],
+            outcome_override=outcome_override,
         )
     session.add(project)
     logger.warning(

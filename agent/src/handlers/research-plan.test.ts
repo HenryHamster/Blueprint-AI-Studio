@@ -9,7 +9,23 @@ vi.mock('fs', () => ({
   },
 }));
 
+vi.mock('../index.js', () => ({
+  WORKSPACE: '/tmp/workspace',
+  sendLog: vi.fn(),
+  runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+  persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+  strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
+  sanitize: (s: string) => s,
+  readHandlerOutput: vi.fn().mockReturnValue(null),
+  log: vi.fn(),
+  getAgentToken: vi.fn().mockReturnValue(''),
+  apiPost: vi.fn().mockResolvedValue({}),
+  apiGet: vi.fn().mockResolvedValue({}),
+  getProviderRunner: vi.fn().mockReturnValue('claude'),
+}));
+
 import fs from 'fs';
+import { runClaudeCode, persistAndPostStatus } from '../index.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -26,6 +42,7 @@ import {
   readProgressArtifact,
   buildPortfolioComposition,
   buildThinkerPrompt,
+  runThinkerWithGate,
   type ThinkerPromptParams,
 } from './research-plan.js';
 
@@ -1183,5 +1200,93 @@ describe('buildThinkerPrompt', () => {
     expect(broken).not.toContain('## 1. State assessment');
     // This verifies our structural test WOULD catch such a regression
     expect(prompt).toContain('## 1. State assessment'); // original still passes
+  });
+});
+
+// ── runThinkerWithGate ────────────────────────────────────────────────────────
+
+describe('runThinkerWithGate', () => {
+  const mockRunClaudeCode = vi.mocked(runClaudeCode);
+  const mockPersistAndPostStatus = vi.mocked(persistAndPostStatus);
+  const mockExistsSync = vi.mocked(fs.existsSync as (p: string) => boolean);
+
+  const taskId = 'test-task-123';
+  const ws = null;
+  const statusRef = { value: '' };
+
+  const okThinkerResult = { exitCode: 0, allOutput: 'analysis output', lastResultText: 'analysis text' };
+  const failThinkerResult = { exitCode: 1, allOutput: 'crash output', lastResultText: '' };
+
+  beforeEach(() => {
+    // resetAllMocks clears queued mockReturnValueOnce values too, preventing
+    // bleed-over between tests. Re-setup defaults after the reset.
+    vi.resetAllMocks();
+    mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    mockPersistAndPostStatus.mockResolvedValue(undefined);
+    mockExistsSync.mockReturnValue(false); // default: files absent
+  });
+
+  it('(a) thinker exits 0 + both files present → returns ok with analysisText, executor eligible', async () => {
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+    mockExistsSync.mockReturnValue(true); // both files present
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result).toEqual({ ok: true, analysisText: 'analysis text' });
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
+    expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
+  });
+
+  it('(b) thinker exits 0 + files missing → focused retry runs and creates them, returns ok', async () => {
+    mockRunClaudeCode
+      .mockResolvedValueOnce(okThinkerResult)           // pass-1 thinker
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' }); // focused retry
+
+    // filesPresent() uses short-circuit: only problemModelPath is checked when it returns false.
+    // Sequence: outer filesPresent(problem→false), missing[](problem→false, running→false),
+    //           inner filesPresent(problem→true, running→true).
+    mockExistsSync
+      .mockReturnValueOnce(false) // outer filesPresent: problem_model (short-circuits)
+      .mockReturnValueOnce(false) // missing[] check: problem_model
+      .mockReturnValueOnce(false) // missing[] check: running_update
+      .mockReturnValueOnce(true)  // inner filesPresent: problem_model
+      .mockReturnValueOnce(true); // inner filesPresent: running_update
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mockRunClaudeCode.mock.calls[1][0]).toContain('handoff files were not written');
+    expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
+  });
+
+  it('(c) retry still misses files → executor never runs, persistAndPostStatus called with FAILED + failure_category', async () => {
+    mockRunClaudeCode
+      .mockResolvedValueOnce(okThinkerResult)           // pass-1 thinker
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' }); // focused retry
+    // mockExistsSync default (from beforeEach): always false
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result).toEqual({ ok: false });
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mockPersistAndPostStatus).toHaveBeenCalledOnce();
+    const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
+    expect(statusArg.status).toBe('FAILED');
+    expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
+  });
+
+  it('(d) thinker exits non-zero → FAILED posted, no retry, returns ok: false', async () => {
+    mockRunClaudeCode.mockResolvedValueOnce(failThinkerResult);
+    // mockExistsSync default (from beforeEach): always false
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result).toEqual({ ok: false });
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(1);
+    expect(mockPersistAndPostStatus).toHaveBeenCalledOnce();
+    const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
+    expect(statusArg.status).toBe('FAILED');
+    expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
   });
 });

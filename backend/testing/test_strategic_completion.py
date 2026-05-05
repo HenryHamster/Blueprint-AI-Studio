@@ -756,6 +756,90 @@ class TestRecordStrategicTaskFailure:
         session.add.assert_not_called()
 
 
+# ── thinker_artifacts_missing outcome routing ────────────────────────────────
+
+class TestThinkerArtifactsMissingOutcome:
+    """failure_category=strategic_thinker_artifacts_missing routes the cycle
+    to OUTCOME_THINKER_ARTIFACTS_MISSING instead of OUTCOME_FAILED_PHASE2."""
+
+    @pytest.mark.asyncio
+    async def test_thinker_artifacts_missing_sets_new_outcome(self, strat_fail_db):
+        from app import strategic_cycle as sc
+        from app.models import StrategicCycle
+        cycle_id = "cycle-thinker-001"
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        cycle = StrategicCycle(
+            id=cycle_id, project_id=project.id,
+            outcome=sc.OUTCOME_PHASE2_RUNNING,
+            phase1_started_at=_utcnow(),
+            phase1_completed_at=_utcnow(),
+            phase2_started_at=_utcnow(),
+        )
+        strat_fail_db.add(cycle)
+        await strat_fail_db.commit()
+
+        # Task carries failure_category in its payload
+        task = Task(
+            project_id=project.id,
+            payloads=[{
+                "type": "strategic_review",
+                "prompt": "p",
+                "failure_category": "strategic_thinker_artifacts_missing",
+            }],
+            context={"strategic_cycle_id": cycle_id},
+            latest_status_message="thinker artifacts missing",
+        )
+        strat_fail_db.add(task)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(task)
+
+        await _record_strategic_task_failure(task, strat_fail_db)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(cycle)
+
+        assert cycle.outcome == sc.OUTCOME_THINKER_ARTIFACTS_MISSING
+        assert cycle.outcome not in sc.ACTIVE_OUTCOMES
+
+    @pytest.mark.asyncio
+    async def test_generic_phase2_failure_still_uses_failed_phase2(self, strat_fail_db):
+        from app import strategic_cycle as sc
+        from app.models import StrategicCycle
+        cycle_id = "cycle-generic-fail-001"
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        cycle = StrategicCycle(
+            id=cycle_id, project_id=project.id,
+            outcome=sc.OUTCOME_PHASE2_RUNNING,
+            phase1_started_at=_utcnow(),
+            phase1_completed_at=_utcnow(),
+            phase2_started_at=_utcnow(),
+        )
+        strat_fail_db.add(cycle)
+        await strat_fail_db.commit()
+
+        # Task with no special failure_category
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review", "prompt": "p"}],
+            context={"strategic_cycle_id": cycle_id},
+            latest_status_message="VM crash",
+        )
+        strat_fail_db.add(task)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(task)
+
+        await _record_strategic_task_failure(task, strat_fail_db)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(cycle)
+
+        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
+
+
 # ── _check_direction_starvation ──────────────────────────────────────────────
 
 
