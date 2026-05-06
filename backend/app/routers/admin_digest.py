@@ -1120,6 +1120,23 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 "by_task_type": sr_trends.get("by_task_type") or {},
             }
 
+    # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend stored in project.design_doc.
+    fresh_reviewer_trend: Optional[Dict[str, Any]] = None
+    if project and project.design_doc:
+        fr_trends = project.design_doc.get("fresh_reviewer_trend") or {}
+        if fr_trends:
+            fresh_reviewer_trend = {
+                "computed_at": fr_trends.get("computed_at"),
+                "bucket_mode": fr_trends.get("bucket_mode"),
+                "current_cycle_id": fr_trends.get("current_cycle_id"),
+                "previous_cycle_id": fr_trends.get("previous_cycle_id"),
+                "current_sample_size": fr_trends.get("current_sample_size"),
+                "previous_sample_size": fr_trends.get("previous_sample_size"),
+                "per_category_hit_rate": fr_trends.get("per_category_hit_rate") or {},
+                "added_value": fr_trends.get("added_value") or {},
+                "approval_rate_lift": fr_trends.get("approval_rate_lift") or {},
+            }
+
     direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
     if project and project.design_doc:
         dfa = project.design_doc.get("direction_first_attempt_feedback")
@@ -1181,6 +1198,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
+        "fresh_reviewer_trend": fresh_reviewer_trend,
         "edges_considered_metrics": edges_considered_metrics,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
@@ -3412,6 +3430,7 @@ async def _compute_digest(
     # --- Latest strategic cycle + prediction calibration ---
     latest_cycle = None
     prediction_calibration: Dict[str, Any] | None = None
+    fresh_reviewer_trend: Optional[Dict[str, Any]] = None
     if project_id:
         _proj = await session.get(Project, project_id)
         if _proj:
@@ -3433,6 +3452,20 @@ async def _compute_digest(
                 session, project_id, limit=20,
             )
             prediction_calibration = _compute_prediction_calibration(_proj, _sc_history)
+            # Fresh-reviewer cycle-over-cycle trend persisted by compute_fresh_reviewer_trend.
+            _fr_trends = (_proj.design_doc or {}).get("fresh_reviewer_trend") or {}
+            if _fr_trends:
+                fresh_reviewer_trend = {
+                    "computed_at": _fr_trends.get("computed_at"),
+                    "bucket_mode": _fr_trends.get("bucket_mode"),
+                    "current_cycle_id": _fr_trends.get("current_cycle_id"),
+                    "previous_cycle_id": _fr_trends.get("previous_cycle_id"),
+                    "current_sample_size": _fr_trends.get("current_sample_size"),
+                    "previous_sample_size": _fr_trends.get("previous_sample_size"),
+                    "per_category_hit_rate": _fr_trends.get("per_category_hit_rate") or {},
+                    "added_value": _fr_trends.get("added_value") or {},
+                    "approval_rate_lift": _fr_trends.get("approval_rate_lift") or {},
+                }
 
     _rejected_in_window = [
         t for t in all_tasks
@@ -4143,6 +4176,7 @@ async def _compute_digest(
         "self_review_skip_rate": _self_review_skip_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
+        "fresh_reviewer_trend": fresh_reviewer_trend,
         "edges_considered_metrics": _review_quality["edges_considered_metrics"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),

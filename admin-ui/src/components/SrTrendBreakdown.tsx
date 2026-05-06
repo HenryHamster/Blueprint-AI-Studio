@@ -10,7 +10,10 @@ export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;
   miss_rate?: number | null;
+  all_iterations_miss_rate?: number | null;
   weighted_miss_rate?: number | null;
+  false_positive_rate?: number | null;
+  precision?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   rate_history?: number[];
   /** True when the SR prompt version changed within the rate_history window — attribution breaks here. */
@@ -20,6 +23,7 @@ export interface SrCategoryTrend {
 
 export interface SrTaskTypeCategoryStats {
   miss_rate: number;
+  all_iterations_miss_rate?: number | null;
   sample_count: number;
   examples?: SrMissExample[];
 }
@@ -48,6 +52,16 @@ function ExampleList({ examples, indent }: { examples: SrMissExample[]; indent?:
   );
 }
 
+export interface SrSeverityBucket {
+  current_miss_rate?: number | null;
+  previous_miss_rate?: number | null;
+  current_hit_rate?: number | null;
+  previous_hit_rate?: number | null;
+  current_sample?: number | null;
+  previous_sample?: number | null;
+  trend?: 'improving' | 'stable' | 'regressing';
+}
+
 export interface SrTrendData {
   computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
@@ -57,7 +71,12 @@ export interface SrTrendData {
   prompt_version?: string | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
+  sr_skip_rate?: number | null;
+  sr_skip_reason_distribution?: Record<string, number> | null;
+  by_severity?: Record<string, SrSeverityBucket> | null;
 }
+
+const SKIP_RATE_AMBER_THRESHOLD = 0.25;
 
 function trendPriority(t: SrCategoryTrend['trend']): number {
   if (t === 'decreasing') return 0;
@@ -88,6 +107,12 @@ function deltaColorClass(delta: number): string {
   if (delta > 0.005) return 'text-red-400'; // regression
   if (delta < -0.005) return 'text-emerald-400'; // improvement
   return 'text-neutral-500'; // stable
+}
+
+function fpRateColorClass(fp: number): string {
+  if (fp > 0.5) return 'text-red-400';
+  if (fp > 0.3) return 'text-amber-400';
+  return 'text-neutral-500';
 }
 
 function formatDelta(delta: number): string {
@@ -200,6 +225,9 @@ function ByTaskTypeRow({ ttype, cats }: { ttype: string; cats: Record<string, Sr
               <>
                 <span className="text-neutral-400">{cat}</span>{' '}
                 <span className="font-mono text-orange-400">{Math.round(stats.miss_rate * 100)}%</span>
+                {stats.all_iterations_miss_rate != null && (
+                  <span className="font-mono text-sky-600" title="all-iterations miss rate">{` all:${Math.round(stats.all_iterations_miss_rate * 100)}%`}</span>
+                )}
               </>
             );
             return hasExamples ? (
@@ -235,6 +263,163 @@ function ByTaskTypeSection({ byTaskType }: { byTaskType: Record<string, Record<s
   );
 }
 
+const SEV_ORDER = ['CRITICAL', 'MAJOR', 'MINOR'] as const;
+
+function sevLabelColor(sev: string): string {
+  if (sev === 'CRITICAL') return 'text-red-400';
+  if (sev === 'MAJOR') return 'text-amber-400';
+  return 'text-neutral-400';
+}
+
+function sevTrendColorClass(trend: SrSeverityBucket['trend']): string {
+  if (trend === 'regressing') return 'text-red-400';
+  if (trend === 'improving') return 'text-emerald-400';
+  return 'text-neutral-500';
+}
+
+function SevTrendIcon({ trend }: { trend: SrSeverityBucket['trend'] }) {
+  const color = sevTrendColorClass(trend);
+  if (trend === 'regressing') {
+    return <TrendingUp className={`w-3 h-3 ${color}`} aria-label="miss-rate regressing" />;
+  }
+  if (trend === 'improving') {
+    return <TrendingDown className={`w-3 h-3 ${color}`} aria-label="miss-rate improving" />;
+  }
+  return <Minus className={`w-3 h-3 ${color}`} aria-label="miss-rate stable" />;
+}
+
+function SeverityBucketItem({ sev, bucket }: { sev: string; bucket: SrSeverityBucket }) {
+  const miss = bucket.current_miss_rate;
+  const prevMiss = bucket.previous_miss_rate;
+  const delta = miss != null && prevMiss != null ? miss - prevMiss : null;
+  const trendColor = sevTrendColorClass(bucket.trend);
+  return (
+    <div className="flex items-center gap-1 text-[10px]">
+      <span className={`font-mono shrink-0 font-medium ${sevLabelColor(sev)}`} title={sev}>
+        {sev[0]}
+      </span>
+      <span className={`font-mono font-bold tabular-nums ${trendColor}`}>
+        {miss != null ? `${Math.round(miss * 100)}%` : '–'}
+      </span>
+      {delta != null && (
+        <span className={`font-mono tabular-nums text-[9px] ${deltaColorClass(delta)}`}>
+          {formatDelta(delta)}
+        </span>
+      )}
+      <SevTrendIcon trend={bucket.trend} />
+    </div>
+  );
+}
+
+function SeveritySection({ bySeverity, inline }: { bySeverity: Record<string, SrSeverityBucket>; inline?: boolean }) {
+  const visible = SEV_ORDER.filter(s => {
+    const b = bySeverity[s];
+    return b && ((b.current_sample ?? 0) > 0 || (b.previous_sample ?? 0) > 0);
+  });
+  if (visible.length === 0) return null;
+
+  if (inline) {
+    return (
+      <div className="flex items-center gap-2 text-[10px] ml-1">
+        <span className="text-neutral-600 text-[9px] uppercase tracking-wide shrink-0">sev</span>
+        {visible.map(sev => (
+          <SeverityBucketItem key={sev} sev={sev} bucket={bySeverity[sev]} />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-1.5 pb-1.5 border-b border-neutral-800/60">
+      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">By Severity</p>
+      <div className="flex gap-3 flex-wrap">
+        {visible.map(sev => (
+          <SeverityBucketItem key={sev} sev={sev} bucket={bySeverity[sev]} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export interface FreshReviewerMetricEntry {
+  current: number | null;
+  previous: number | null;
+  delta?: number | null;
+  trend?: 'improving' | 'regressing' | 'stable' | null;
+}
+
+export interface FreshReviewerTrend {
+  computed_at?: string | null;
+  bucket_mode?: 'cycle' | 'calendar' | null;
+  current_cycle_id?: string | null;
+  previous_cycle_id?: string | null;
+  current_sample_size?: number | null;
+  previous_sample_size?: number | null;
+  per_category_hit_rate?: Record<string, FreshReviewerMetricEntry> | null;
+  added_value?: Record<string, { current: number; previous: number; trend?: string | null }> | null;
+  approval_rate_lift?: FreshReviewerMetricEntry | null;
+}
+
+function frTrendColor(trend: string | null | undefined): string {
+  if (trend === 'improving') return 'text-emerald-400';
+  if (trend === 'regressing') return 'text-red-400';
+  return 'text-neutral-500';
+}
+
+export function FreshReviewerTrendBreakdown({ trend }: { trend: FreshReviewerTrend | null | undefined }) {
+  if (!trend) return null;
+  const cats = trend.per_category_hit_rate;
+  const lift = trend.approval_rate_lift;
+  const hasCats = cats && Object.keys(cats).length > 0;
+  if (!hasCats && lift == null) return null;
+  const cycleLabel =
+    trend.bucket_mode === 'cycle' && trend.current_cycle_id
+      ? `cycle ${trend.current_cycle_id.slice(-6)} vs ${trend.previous_cycle_id ? trend.previous_cycle_id.slice(-6) : '–'}`
+      : null;
+  return (
+    <div data-testid="fr-trend-breakdown" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
+      <div className="flex items-baseline gap-2 mb-1">
+        <p className="text-[9px] text-neutral-500 uppercase tracking-wide">Fresh-Reviewer Trend</p>
+        {cycleLabel && <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>}
+        {trend.current_sample_size != null && (
+          <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={trend.current_sample_size}</span>
+        )}
+      </div>
+      {hasCats && (
+        <div className="flex flex-col gap-0.5 mb-1">
+          <p className="text-[9px] text-neutral-600">Hit rate by category</p>
+          {Object.entries(cats!).map(([cat, m]) => (
+            <div key={cat} className="flex items-center gap-2 text-[10px]">
+              <span className="text-neutral-300 flex-1 truncate">{cat}</span>
+              <span className={`font-mono tabular-nums ${frTrendColor(m.trend)}`}>
+                {m.current != null ? `${Math.round(m.current * 100)}%` : '–'}
+              </span>
+              {m.delta != null && (
+                <span className={`font-mono tabular-nums text-xs ${deltaColorClass(m.delta)}`}>
+                  {formatDelta(m.delta)}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {lift != null && (
+        <div className="flex items-center gap-2 text-[10px] pt-1 border-t border-neutral-800/60">
+          <span className="text-neutral-400 flex-1">Approval rate lift</span>
+          <span className={`font-mono tabular-nums ${frTrendColor(lift.trend)}`}>
+            {lift.current != null ? `${lift.current >= 0 ? '+' : ''}${Math.round(lift.current * 100)}pp` : '–'}
+          </span>
+          {lift.delta != null && (
+            <span className={`font-mono tabular-nums text-xs ${deltaColorClass(lift.delta)}`}>
+              {formatDelta(lift.delta)}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface SrMissedTask {
   task_id: string;
   title: string;
@@ -265,7 +450,10 @@ function CategoryRow({
 }) {
   const [open, setOpen] = useState(false);
   const miss = deriveMissRate(c);
+  const allIterMiss = c.all_iterations_miss_rate;
   const wmiss = c.weighted_miss_rate;
+  const fp = c.false_positive_rate;
+  const prec = c.precision;
   const color = trendColorClass(c.trend);
   const delta = calculateMissRateDelta(c);
   const deltaColor = delta != null ? deltaColorClass(delta) : '';
@@ -303,6 +491,11 @@ function CategoryRow({
         <span className={`font-mono font-bold tabular-nums ${color}`}>
           {miss != null ? `${Math.round(miss * 100)}%` : '–'}
         </span>
+        {allIterMiss != null && (
+          <span className="font-mono tabular-nums text-sky-600" title="miss rate including iteration 2+ feedback (all-iterations)">
+            {`all:${Math.round(allIterMiss * 100)}%`}
+          </span>
+        )}
         {delta != null && (
           <span className={`font-mono tabular-nums text-xs ${deltaColor}`} title="cycle-over-cycle change">
             {formatDelta(delta)}
@@ -311,6 +504,19 @@ function CategoryRow({
         {wmiss != null && (
           <span className="font-mono tabular-nums text-neutral-500" title="severity-weighted miss rate">
             {`w:${Math.round(wmiss * 100)}%`}
+          </span>
+        )}
+        {fp != null && (
+          <span
+            className={`font-mono tabular-nums ${fpRateColorClass(fp)}`}
+            title="false-positive rate: SR failed but no reviewer/CI issue confirmed"
+          >
+            {`fp:${Math.round(fp * 100)}%`}
+          </span>
+        )}
+        {prec != null && (
+          <span className="font-mono tabular-nums text-neutral-500" title="precision: hits / (hits + false-positives)">
+            {`prec:${Math.round(prec * 100)}%`}
           </span>
         )}
         <TrendIcon trend={c.trend} />
@@ -360,6 +566,11 @@ function CategoryRow({
       <span className={`font-mono ${color}`}>
         {miss != null ? `${Math.round(miss * 100)}%` : '–'} miss
       </span>
+      {allIterMiss != null && (
+        <span className="font-mono text-sky-600" title="miss rate including iteration 2+ feedback (all-iterations)">
+          {`all:${Math.round(allIterMiss * 100)}%`}
+        </span>
+      )}
       {delta != null && (
         <span className={`font-mono text-xs ${deltaColor}`} title="cycle-over-cycle change">
           {formatDelta(delta)}
@@ -368,6 +579,19 @@ function CategoryRow({
       {wmiss != null && (
         <span className="font-mono text-neutral-500" title="severity-weighted miss rate">
           {`w:${Math.round(wmiss * 100)}%`}
+        </span>
+      )}
+      {fp != null && (
+        <span
+          className={`font-mono ${fpRateColorClass(fp)}`}
+          title="false-positive rate: SR failed but no reviewer/CI issue confirmed"
+        >
+          {`fp:${Math.round(fp * 100)}%`}
+        </span>
+      )}
+      {prec != null && (
+        <span className="font-mono text-neutral-500" title="precision: hits / (hits + false-positives)">
+          {`prec:${Math.round(prec * 100)}%`}
         </span>
       )}
       <TrendIcon trend={c.trend} />
@@ -430,6 +654,12 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
     ? `prompt v=${trends.prompt_version.slice(0, 7)}`
     : null;
 
+  const skipRate = trends?.sr_skip_rate;
+  const skipDist = trends?.sr_skip_reason_distribution;
+  const topSkipReason = skipDist && Object.keys(skipDist).length > 0
+    ? Object.entries(skipDist).sort(([, a], [, b]) => b - a)[0]
+    : null;
+
   if (variant === 'card') {
     return (
       <div
@@ -447,6 +677,18 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
             <span className="text-[9px] text-amber-600 font-mono" title="SR prompt version for this window">{promptVersionLabel}</span>
           )}
         </div>
+        {skipRate != null && (
+          <p
+            data-testid="sr-skip-rate-line"
+            className={`text-[9px] mb-1 font-mono ${skipRate >= SKIP_RATE_AMBER_THRESHOLD ? 'text-amber-400' : 'text-neutral-500'}`}
+          >
+            {`Skipped ${Math.round(skipRate * 100)}%`}
+            {topSkipReason && skipDist && ` (top: ${topSkipReason[0]} ${Math.round(topSkipReason[1] / Object.values(skipDist).reduce((a, b) => a + b, 0) * 100)}%)`}
+          </p>
+        )}
+        {trends?.by_severity && Object.keys(trends.by_severity).length > 0 && (
+          <SeveritySection bySeverity={trends.by_severity} />
+        )}
         <div className="flex flex-col gap-0.5">
           {entries.map(([cat, c]) => (
             <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
@@ -461,6 +703,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
 
   return (
     <div data-testid="sr-trend-breakdown" className="flex flex-col gap-0.5 ml-1">
+      {trends?.by_severity && Object.keys(trends.by_severity).length > 0 && (
+        <SeveritySection bySeverity={trends.by_severity} inline />
+      )}
       {entries.map(([cat, c]) => (
         <CategoryRow key={cat} cat={cat} c={c} variant="inline" onCategoryClick={onCategoryClick} />
       ))}

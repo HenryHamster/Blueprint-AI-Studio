@@ -4135,6 +4135,522 @@ async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_incre
     mock_dispatch.assert_not_called()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for all_iterations_catch_rate in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_attempt(db_session: AsyncSession):
+    """A category flagged only in iteration 2+ appears in all_iterations_catch_rate as a miss
+    but current_hit_rate (first-attempt) is None for that category — the two metrics diverge."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window (5 tasks): SR passes everything.
+    # First-attempt human truth: test-coverage only (iteration 0).
+    # All-iterations truth: test-coverage + correctness (flagged in iteration 2).
+    for _ in range(5):
+        task = Task(
+            project_id=project.id,
+            title="SR task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"check_results": {}},
+                "_first_attempt_rejection_categories": {"test-coverage": 1},
+                "_all_iterations_rejection_categories": {"test-coverage": 1, "correctness": 1},
+            },
+        )
+        task.created_at = _utcnow() - timedelta(days=2)
+        db_session.add(task)
+        tasks.append(task)
+    # Previous window (5 tasks): same shape
+    for _ in range(5):
+        task = Task(
+            project_id=project.id,
+            title="SR task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"check_results": {}},
+                "_first_attempt_rejection_categories": {"test-coverage": 1},
+                "_all_iterations_rejection_categories": {"test-coverage": 1, "correctness": 1},
+            },
+        )
+        task.created_at = _utcnow() - timedelta(days=20)
+        db_session.add(task)
+        tasks.append(task)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cats = result["categories"]
+    # test-coverage: flagged in first iteration → visible in both metrics
+    assert "test-coverage" in cats
+    assert cats["test-coverage"]["current_hit_rate"] == 0.0
+    assert cats["test-coverage"]["all_iterations_catch_rate"] == 0.0
+
+    # correctness: flagged only in iteration 2 — invisible to the first-attempt metric
+    # but the all-iterations metric counts it as a miss (catch_rate == 0)
+    assert "correctness" in cats, "iteration-2 category must surface in all_iterations_catch_rate"
+    assert cats["correctness"]["current_hit_rate"] is None, (
+        "correctness must be absent from first-attempt metric"
+    )
+    assert cats["correctness"]["all_iterations_catch_rate"] == 0.0
+    assert cats["correctness"]["all_iterations_miss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(db_session: AsyncSession):
+    """When _all_iterations_rejection_categories is absent and review_history is empty,
+    all_iterations_catch_rate falls back to the first-attempt categories so existing
+    tasks continue to produce a non-None all_iterations value."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 5 current tasks: only _first_attempt_rejection_categories, no all-iterations field
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 5 previous tasks: same
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    # Both metrics resolve to the same value when there's no extra iteration data
+    assert cat["current_hit_rate"] is not None
+    assert cat["all_iterations_catch_rate"] is not None
+    assert cat["current_hit_rate"] == cat["all_iterations_catch_rate"]
+    assert cat["all_iterations_miss_rate"] is not None
+
+
+# ---------------------------------------------------------------------------
+# SR false-positive rate and precision per category
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_false_positive_rate_no_human_confirmation(db_session: AsyncSession):
+    """SR fails a category that no human ever flags → false_positive_rate == 1.0."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 5 current: SR fails 'correctness', human flags only 'test-coverage' (unrelated)
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=2,
+                          human_cats={"test-coverage": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    # 5 previous: same
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=20,
+                          human_cats={"test-coverage": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["false_positive_rate"] == 1.0, "all SR failures unconfirmed → FP rate must be 1.0"
+    assert cat["precision"] == 0.0, "zero confirmed failures → precision must be 0.0"
+
+
+@pytest.mark.asyncio
+async def test_sr_false_positive_rate_human_confirms_is_zero(db_session: AsyncSession):
+    """SR fails a category that human also flags → false_positive_rate == 0.0, precision == 1.0."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=2,
+                          human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=20,
+                          human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["false_positive_rate"] == 0.0, "all SR failures confirmed by human → FP rate 0"
+    assert cat["precision"] == 1.0, "all SR failures confirmed → precision must be 1.0"
+
+
+@pytest.mark.asyncio
+async def test_sr_false_positive_rate_review_history_confirms_not_fp(db_session: AsyncSession):
+    """SR fails test-coverage; review_history (iter 2) contains a 'missing test' issue
+    that keyword-matches test-coverage → not counted as a false positive."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    def _make_task_with_review_history(age_days):
+        check_results = {"test-coverage": {"passed": False, "issue": "x"}}
+        task = Task(
+            project_id=project.id,
+            title="SR task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"check_results": check_results},
+                # Unrelated first-attempt feedback so count >= _MIN_SR_SAMPLE
+                "_first_attempt_rejection_categories": {"style-conventions": 1},
+                "review_loop": {
+                    "review_history": [
+                        {"iteration": 2, "issues": [
+                            {"description": "missing test for edge case", "severity": "MAJOR"}
+                        ]}
+                    ]
+                },
+            },
+        )
+        task.created_at = _utcnow() - timedelta(days=age_days)
+        return task
+
+    for _ in range(5):
+        t = _make_task_with_review_history(age_days=2)
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_task_with_review_history(age_days=20)
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    # review_history confirmed the SR failure → fp_count == 0
+    assert cat["false_positive_rate"] == 0.0, (
+        "review_history keyword-matched test-coverage → SR failure is confirmed, not a FP"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sr_passes_do_not_affect_false_positive_metric(db_session: AsyncSession):
+    """When SR passes a category, it contributes nothing to sr_failed_count or fp_count."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # SR passes everything; human flags 'correctness'
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=2,
+                          human_cats={"correctness": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=20,
+                          human_cats={"correctness": 1}, sr_failed_cats=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["false_positive_rate"] is None, (
+        "SR never failed correctness → no sr_failed_count → FP rate must be None"
+    )
+    assert cat["precision"] is None, (
+        "SR never failed correctness → precision must be None"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests for per-severity catch-rate breakdown in compute_sr_catch_rate_trends
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_severity_counts(db_session: AsyncSession):
+    """by_severity accumulates correct hit_count and human_count per severity."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 5 tasks with CRITICAL issue in "error-handling"; SR catches 2 of them
+    # "exception" keyword → categorised as error-handling
+    review_issue_critical = {"description": "Unhandled exception in request path", "severity": "CRITICAL"}
+    for i in range(2):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_issue_critical],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(3):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],  # SR did NOT catch error-handling
+            review_issues=[review_issue_critical],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks with MAJOR issue in "error-handling"; SR catches all
+    review_issue_major = {"description": "Missing error handling for null input", "severity": "MAJOR"}
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_issue_major],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert "by_severity" in result
+    by_sev = result["by_severity"]
+
+    # CRITICAL: 5 issues total (current window), 2 caught by SR
+    assert by_sev["CRITICAL"]["current_sample"] == 5
+    assert by_sev["CRITICAL"]["current_hit_rate"] == round(2 / 5, 3)
+    assert by_sev["CRITICAL"]["current_miss_rate"] == round(3 / 5, 3)
+
+    # MAJOR: 5 issues in previous window, 5 caught
+    assert by_sev["MAJOR"]["previous_sample"] == 5
+    assert by_sev["MAJOR"]["previous_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_session: AsyncSession):
+    """CRITICAL regression (>=3pp delta) fires the alert even when category trend is stable."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Review issue that categorises to error-handling (keyword "exception")
+    review_crit = {"description": "Unhandled exception bypasses auth guard", "severity": "CRITICAL"}
+
+    # Current window: 5 tasks; SR misses error-handling (sr_failed only has "correctness")
+    # → CRITICAL miss_rate = 5/5 = 1.0
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks; SR catches error-handling for 4 of them
+    # → CRITICAL miss_rate = 1/5 = 0.2
+    for i in range(4):
+        t = _make_sr_task_with_review(
+            project.id, age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task_with_review(
+        project.id, age_days=20,
+        human_cats={"correctness": 1},
+        sr_failed_cats=["correctness"],
+        review_issues=[review_crit],
+    )
+    db_session.add(t)
+    tasks.append(t)
+
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # Per-category trend for "correctness" should be stable (all caught in both windows)
+    assert result["categories"]["correctness"]["trend"] in ("stable", "increasing")
+    # Per-severity CRITICAL must be regressing (delta = 0.8 >= 0.03)
+    assert result["by_severity"]["CRITICAL"]["trend"] == "regressing"
+    # Alert must fire due to severity regression
+    mock_post.assert_called_once()
+    call_desc = mock_post.call_args.args[2] if len(mock_post.call_args.args) >= 3 else mock_post.call_args.kwargs.get("description", "")
+    assert "CRITICAL" in call_desc
+    mock_dispatch.assert_called_once()
+    payload = mock_dispatch.call_args.kwargs.get("payload") or mock_dispatch.call_args.args[2]
+    assert "regressing_severities" in payload
+    sevs = payload["regressing_severities"]
+    assert any(s["severity"] == "CRITICAL" for s in sevs)
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_session: AsyncSession):
+    """A new regressing severity not in the prior alert state breaks dedup and re-fires."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    review_crit = {"description": "Unhandled exception on auth path", "severity": "CRITICAL"}
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(4):
+        t = _make_sr_task_with_review(
+            project.id, age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task_with_review(
+        project.id, age_days=20,
+        human_cats={"correctness": 1},
+        sr_failed_cats=["correctness"],
+        review_issues=[review_crit],
+    )
+    db_session.add(t)
+    tasks.append(t)
+    await db_session.flush()
+
+    # Pre-seed alert state with categories=[] and severities=[] to simulate prior alert
+    # that covered no categories and no severities.
+    doc = dict(project.design_doc or {})
+    doc["sr_catch_rate_trends_alert"] = {
+        "computed_at": (_utcnow() - timedelta(days=1)).isoformat(),
+        "cycle_id": None,
+        "categories": [],
+        "severities": [],
+    }
+    project.design_doc = doc
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
+         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    # CRITICAL is regressing, so alert fires despite prior alert existing (different severity set)
+    assert result is not None
+    assert result["by_severity"]["CRITICAL"]["trend"] == "regressing"
+    mock_post.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_severity_absent_when_no_rev_hist(db_session: AsyncSession):
+    """by_severity has zero samples when tasks have no review_history."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert "by_severity" in result
+    by_sev = result["by_severity"]
+    # No review_history → all samples are zero, all rates are None
+    for sev in ("CRITICAL", "MAJOR", "MINOR"):
+        assert by_sev[sev]["current_sample"] == 0
+        assert by_sev[sev]["previous_sample"] == 0
+        assert by_sev[sev]["current_miss_rate"] is None
+        assert by_sev[sev]["trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(db_session: AsyncSession):
+    """by_severity is persisted to project.design_doc['sr_catch_rate_trends']."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    review_issue = {"description": "Logic bug in edge case", "severity": "MAJOR"}
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_issue],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task_with_review(
+            project.id, age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_issue],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    assert result is not None
+    stored = project.design_doc.get("sr_catch_rate_trends", {})
+    assert "by_severity" in stored
+    assert "CRITICAL" in stored["by_severity"]
+    assert "MAJOR" in stored["by_severity"]
+    assert "MINOR" in stored["by_severity"]
+
+
 # ---------------------------------------------------------------------------
 # LLM categorization helpers
 # ---------------------------------------------------------------------------
@@ -4493,6 +5009,429 @@ async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession)
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     mock_post2.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for sr_skip_rate / sr_skip_reason_distribution
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_skip_task(project_id, *, age_days: float, skip_reason: str | None = None) -> Task:
+    """Build a Task whose _self_review_outcome is a fallback/skip envelope."""
+    if skip_reason:
+        outcome: dict = {"verdict": "unknown", "check_results": {}, "skip_reason": skip_reason}
+    else:
+        # Legacy: verdict unknown + empty check_results, no skip_reason field
+        outcome = {"verdict": "unknown", "check_results": {}}
+    task = Task(
+        project_id=project_id,
+        title="Skip task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": outcome},
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_fresh_reviewer_trend
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_fr_task(
+    project_id,
+    *,
+    age_days: float,
+    reviewer_findings=None,
+    human_cats=None,
+    sr_failed_cats=None,
+    first_attempt_succeeded: bool = True,
+    task_type: str = "create",
+    cycle_id=None,
+) -> Task:
+    """Build a Task for fresh-reviewer trend tests."""
+    check_results = {cat: {"passed": False} for cat in (sr_failed_cats or [])}
+    ctx: dict = {"_first_attempt_succeeded": first_attempt_succeeded}
+    if reviewer_findings is not None:
+        ctx["_self_review_outcome"] = {
+            "check_results": check_results,
+            "reviewer_findings": reviewer_findings,
+        }
+    else:
+        ctx["_self_review_outcome"] = {"check_results": check_results}
+    if human_cats is not None:
+        ctx["_first_attempt_rejection_categories"] = human_cats
+    task = Task(
+        project_id=project_id,
+        title="FR task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    if cycle_id:
+        task.strategic_cycle_id = cycle_id
+    return task
+
+
+@pytest.mark.asyncio
+async def test_sr_skip_rate_and_distribution(db_session: AsyncSession):
+    """sr_skip_rate and sr_skip_reason_distribution are computed for a mixed current window."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window (0-14 days): 5 normal SR tasks + 3 skip tasks (2 structured, 1 legacy)
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    t1 = _make_skip_task(project.id, age_days=2, skip_reason="diff_too_small")
+    t2 = _make_skip_task(project.id, age_days=3, skip_reason="json_missing")
+    t3 = _make_skip_task(project.id, age_days=4, skip_reason=None)  # legacy unknown
+    for t in [t1, t2, t3]:
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window (14-28 days): 5 normal SR tasks
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # 3 skipped out of 8 tasks-with-outcome in current window
+    assert "sr_skip_rate" in result
+    assert abs(result["sr_skip_rate"] - round(3 / 8, 3)) < 0.001
+    dist = result["sr_skip_reason_distribution"]
+    assert dist is not None
+    assert dist.get("diff_too_small") == 1
+    assert dist.get("json_missing") == 1
+    assert dist.get("legacy_unknown") == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_skip_rate_omitted_below_min_sample(db_session: AsyncSession):
+    """sr_skip_rate is omitted when the current window has fewer than _MIN_SR_SAMPLE tasks-with-outcome."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # 4 tasks in current window (below _MIN_SR_SAMPLE=5 for skip stats)
+    for _ in range(4):
+        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    # Overall result may be None (below _MIN_SR_SAMPLE) or skip fields may be absent
+    if result is not None:
+        assert "sr_skip_rate" not in result
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_returns_none_below_sample_size(db_session: AsyncSession):
+    """Returns None when either window has fewer than _MIN_SR_SAMPLE tasks with reviewer_findings."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(3):
+        t = _make_fr_task(project.id, age_days=2, reviewer_findings=[{"category": "correctness"}])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_fr_task(project.id, age_days=20, reviewer_findings=[{"category": "correctness"}])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_per_category_hit_rate(db_session: AsyncSession):
+    """per_category_hit_rate reflects confirmed / flagged per category."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current: 5 flag correctness, 3 confirmed + 2 not
+    for i in range(5):
+        confirmed = i < 3
+        t = _make_fr_task(
+            project.id, age_days=2,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"] if confirmed else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous: 5 flag correctness, all confirmed
+    for _ in range(5):
+        t = _make_fr_task(
+            project.id, age_days=20,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["per_category_hit_rate"]["correctness"]
+    assert cat["current"] == round(3 / 5, 3)
+    assert cat["previous"] == 1.0
+    assert cat["trend"] == "regressing"
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession):
+    """added_value counts tasks where fresh-reviewer flagged what agent SR missed."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current: 5 with reviewer flagging correctness, human confirmed all;
+    # agent SR caught it in first 2, missed in last 3 → added_value=3
+    for i in range(5):
+        agent_caught = i < 2
+        t = _make_fr_task(
+            project.id, age_days=2,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"],
+            sr_failed_cats=["correctness"] if agent_caught else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous: reviewer flags correctness, agent also caught all → added_value=0
+    for _ in range(5):
+        t = _make_fr_task(
+            project.id, age_days=20,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"],
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    av = result["added_value"]["correctness"]
+    assert av["current"] == 3
+    assert av["previous"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_approval_rate_lift(db_session: AsyncSession):
+    """approval_rate_lift is fa_rate_with_reviewer minus fa_rate_without."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current: 5 with reviewer (all succeed), 5 without (3/5 succeed)
+    for _ in range(5):
+        t = _make_fr_task(project.id, age_days=2,
+                          reviewer_findings=[{"category": "style-conventions"}],
+                          first_attempt_succeeded=True)
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_fr_task(project.id, age_days=2, first_attempt_succeeded=(i < 3))
+        db_session.add(t)
+        tasks.append(t)
+    # Previous: 5 with reviewer (4/5 succeed), 5 without (4/5 succeed)
+    for i in range(5):
+        t = _make_fr_task(project.id, age_days=20,
+                          reviewer_findings=[{"category": "style-conventions"}],
+                          first_attempt_succeeded=(i < 4))
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_fr_task(project.id, age_days=20, first_attempt_succeeded=(i < 4))
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    lift = result["approval_rate_lift"]
+    # current lift = 1.0 - 0.6 = 0.4; previous lift = 0.8 - 0.8 = 0.0
+    assert lift["current"] == pytest.approx(0.4, abs=0.01)
+    assert lift["previous"] == pytest.approx(0.0, abs=0.01)
+    assert lift["trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_stable_classification(db_session: AsyncSession):
+    """Hit rate delta < 5pp → trend='stable'."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for window_age in (2, 20):
+        for i in range(5):
+            t = _make_fr_task(
+                project.id, age_days=window_age,
+                reviewer_findings=[{"category": "security"}],
+                human_cats=["security"] if i < 4 else [],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["per_category_hit_rate"]["security"]["trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_persists_to_design_doc(db_session: AsyncSession):
+    """Writes fresh_reviewer_trend to project.design_doc."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for window_age in (2, 20):
+        for _ in range(5):
+            t = _make_fr_task(project.id, age_days=window_age,
+                              reviewer_findings=[{"category": "correctness"}])
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+    await db_session.flush()
+    await db_session.refresh(project)
+
+    assert result is not None
+    assert project.design_doc.get("fresh_reviewer_trend") is not None
+    assert project.design_doc["fresh_reviewer_trend"]["computed_at"] == result["computed_at"]
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(db_session: AsyncSession):
+    """Cycle bucketing: tasks without reviewer_findings don't count toward sample size."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+    project = await _make_project(db_session)
+    c1 = _make_cycle(project.id, age_days=10)
+    c2 = _make_cycle(project.id, age_days=30)
+    db_session.add_all([c1, c2])
+    await db_session.flush()
+
+    tasks = []
+    # c1: 5 with reviewer, 10 without
+    for _ in range(5):
+        t = _make_fr_task(project.id, age_days=5,
+                          reviewer_findings=[{"category": "correctness"}],
+                          cycle_id=str(c1.id))
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_fr_task(project.id, age_days=5, cycle_id=str(c1.id))
+        db_session.add(t)
+        tasks.append(t)
+    # c2: 5 with reviewer
+    for _ in range(5):
+        t = _make_fr_task(project.id, age_days=25,
+                          reviewer_findings=[{"category": "correctness"}],
+                          cycle_id=str(c2.id))
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_sample_size"] == 5
+    assert result["previous_sample_size"] == 5
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_improving_classification(db_session: AsyncSession):
+    """Hit rate delta >= 5pp → trend='improving' for per_category_hit_rate."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current: 5 flag correctness, all 5 confirmed → rate=1.0
+    for _ in range(5):
+        t = _make_fr_task(
+            project.id, age_days=2,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous: 5 flag correctness, only 3 confirmed → rate=0.6
+    for i in range(5):
+        t = _make_fr_task(
+            project.id, age_days=20,
+            reviewer_findings=[{"category": "correctness"}],
+            human_cats=["correctness"] if i < 3 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["per_category_hit_rate"]["correctness"]
+    assert cat["current"] == 1.0
+    assert cat["previous"] == round(3 / 5, 3)
+    assert cat["trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_compute_fresh_reviewer_trend_calendar_fallback(db_session: AsyncSession):
+    """Falls back to calendar bucketing (0-14d vs 14-28d) when no completed cycles exist."""
+    from app.playbook_learning import compute_fresh_reviewer_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # No cycles → calendar mode; 5 tasks in 0-14d window
+    for _ in range(5):
+        t = _make_fr_task(project.id, age_days=7,
+                          reviewer_findings=[{"category": "correctness"}])
+        db_session.add(t)
+        tasks.append(t)
+    # 5 tasks in 14-28d window
+    for _ in range(5):
+        t = _make_fr_task(project.id, age_days=21,
+                          reviewer_findings=[{"category": "correctness"}])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "calendar"
+    assert result["current_sample_size"] == 5
+    assert result["previous_sample_size"] == 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────

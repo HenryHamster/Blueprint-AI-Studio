@@ -3359,6 +3359,13 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     // Verify that it uses fallback when file is invalid JSON
     expect(doneScript).toContain('self-review JSON parsing failed');
 
+    // Verify structured skip_reason in parse-failure fallback
+    expect(doneScript).toContain('"skip_reason":"json_parse_failed"');
+
+    // Verify marker-file logic for missing SR file (json_missing default + override)
+    expect(doneScript).toContain('SKIP_REASON="json_missing"');
+    expect(doneScript).toContain('self_review_skip_reason_test-task-123.txt');
+
     // Verify that it always includes self_review_outcome in payload
     expect(doneScript).toContain('{self_review_outcome: $self_review}');
   });

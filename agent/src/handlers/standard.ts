@@ -124,6 +124,20 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
 
 const FRESH_REVIEWER_MIN_LINES = 20;
 
+export const SR_SKIP_REASONS = {
+  DIFF_TOO_SMALL: 'diff_too_small',
+  REVIEWER_SESSION_FAILED: 'reviewer_session_failed',
+  REVIEWER_NO_FINDINGS_PARSE: 'reviewer_no_findings_parse',
+  JSON_PARSE_FAILED: 'json_parse_failed',
+  JSON_MISSING: 'json_missing',
+  NO_BASELINE: 'no_baseline',
+  AUTO_REMEDIATION: 'auto_remediation',
+} as const;
+
+function writeSrSkipReason(taskId: string, reason: string): void {
+  try { fs.writeFileSync(`/tmp/self_review_skip_reason_${taskId}.txt`, reason, { mode: 0o644 }); } catch { /* best-effort */ }
+}
+
 type SRCatchRateExample = { severity: string; desc: string };
 type SRCatchRateCategory = {
   miss_rate?: number;
@@ -194,6 +208,7 @@ export async function runFreshReviewerPass(
   const changed = diff.split('\n').filter(l => /^[+-]/.test(l) && !/^[+-]{3}/.test(l)).length;
   if (changed < FRESH_REVIEWER_MIN_LINES) {
     sendLog(ws, `[FreshReview] Diff too small (${changed} lines) — skipping reviewer pass.\n`);
+    writeSrSkipReason(taskId, SR_SKIP_REASONS.DIFF_TOO_SMALL);
     return;
   }
 
@@ -236,12 +251,14 @@ If no issues found: {"reviewer_findings": []}`;
 
   if (exitCode !== 0) {
     sendLog(ws, '[FreshReview] Reviewer session failed — skipping merge.\n');
+    writeSrSkipReason(taskId, SR_SKIP_REASONS.REVIEWER_SESSION_FAILED);
     return;
   }
 
   const parsed = extractSelfReviewJson(lastResultText);
   if (!parsed || !Array.isArray(parsed.reviewer_findings)) {
     sendLog(ws, '[FreshReview] No parseable findings — skipping merge.\n');
+    writeSrSkipReason(taskId, SR_SKIP_REASONS.REVIEWER_NO_FINDINGS_PARSE);
     return;
   }
 

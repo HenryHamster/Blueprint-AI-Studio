@@ -1682,6 +1682,11 @@ _MIN_REVIEW_SAMPLE = 10
 # Rate-of-change threshold below which a category is considered "stable" vs
 # "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
 _TREND_DELTA_THRESHOLD = 0.05
+_SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
+    "CRITICAL": 0.03,
+    "MAJOR": 0.05,
+    "MINOR": 0.10,
+}
 
 # Baseline-floor alert: fire when a category's hit-rate stays below this
 # threshold for at least _FLOOR_MIN_CONSECUTIVE_WINDOWS measurement windows.
@@ -2023,20 +2028,26 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
 
 def _stats_for_tasks(
     tasks: list,
-) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]]]:
-    """Compute SR stats for a pre-filtered task list (no date filtering)."""
+) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]], dict[str, dict], dict[str, dict]]:
+    """Compute SR stats for a pre-filtered task list (no date filtering).
+
+    Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats).
+    ``all_iter_cat_stats`` uses ALL review iterations as the human-truth set
+    (not just iteration 0).  Falls back to first-attempt categories when
+    ``review_loop.review_history`` is absent (backward compat).
+    ``sev_stats`` accumulates per-severity hit/miss counts from review_history
+    issues across all categories.
+    """
     _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
     count = 0
     cat_stats: dict[str, dict] = {}
     type_cat_stats: dict[str, dict[str, dict]] = {}
+    all_iter_cat_stats: dict[str, dict] = {}
+    sev_stats: dict[str, dict] = {}
     for t in tasks:
         ctx = t.context or {}
         if "_self_review_outcome" not in ctx:
             continue
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-        if not human_cats:
-            continue
-        count += 1
         check_results = ctx["_self_review_outcome"].get("check_results") or {}
         sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
@@ -2046,6 +2057,40 @@ def _stats_for_tasks(
             rev_cats = _categorize_review_issues(rev_hist)
             for cat_name, issues in rev_cats.items():
                 cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+
+        # FP tracking: among SR-failed categories, count those never confirmed by
+        # any human reviewer across all review iterations (first rejection OR later).
+        # Runs for every task (even those with no first-attempt rejection) because
+        # those are exactly the cases where SR may have flagged a false positive.
+        all_human_flagged = set(rev_cats.keys()) | human_cats
+        for cat in sr_failed:
+            if cat not in cat_stats:
+                cat_stats[cat] = {
+                    "hit_count": 0, "human_count": 0,
+                    "w_hit": 0.0, "w_total": 0.0,
+                    "miss_examples": [],
+                    "sr_failed_count": 0, "fp_count": 0,
+                }
+            cat_stats[cat].setdefault("sr_failed_count", 0)
+            cat_stats[cat].setdefault("fp_count", 0)
+            cat_stats[cat]["sr_failed_count"] += 1
+            if cat not in all_human_flagged:
+                cat_stats[cat]["fp_count"] += 1
+
+        if not human_cats:
+            continue
+        count += 1
+        for cat_name, issues in rev_cats.items():
+            for issue in issues:
+                sev = issue.get("severity", "")
+                if sev not in _sw:
+                    continue
+                if sev not in sev_stats:
+                    sev_stats[sev] = {"hit_count": 0, "human_count": 0}
+                sev_stats[sev]["human_count"] += 1
+                if cat_name in sr_failed:
+                    sev_stats[sev]["hit_count"] += 1
         task_type = t.first_payload.get("type", "")
         for cat in human_cats:
             if cat not in cat_stats:
@@ -2053,6 +2098,7 @@ def _stats_for_tasks(
                     "hit_count": 0, "human_count": 0,
                     "w_hit": 0.0, "w_total": 0.0,
                     "miss_examples": [],
+                    "sr_failed_count": 0, "fp_count": 0,
                 }
             cat_stats[cat]["human_count"] += 1
             w = cat_weights.get(cat, 1)
@@ -2080,7 +2126,52 @@ def _stats_for_tasks(
                         type_cat_stats[task_type][cat]["miss_examples"].append(
                             {"desc": issue["desc"], "severity": issue["severity"]}
                         )
-    return count, cat_stats, type_cat_stats
+        # All-iterations human truth: prefer persisted _all_iterations_rejection_categories
+        # (written by task_lifecycle on every rejection iteration); fall back to
+        # categorising review_history in-line, then to first-attempt categories.
+        _stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
+        if _stored_all_iter:
+            all_iter_cats = set(_stored_all_iter.keys())
+        elif rev_hist:
+            all_iter_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
+        else:
+            all_iter_cats = human_cats
+        for cat in all_iter_cats:
+            if cat not in all_iter_cat_stats:
+                all_iter_cat_stats[cat] = {"hit_count": 0, "human_count": 0}
+            all_iter_cat_stats[cat]["human_count"] += 1
+            if cat in sr_failed:
+                all_iter_cat_stats[cat]["hit_count"] += 1
+    return count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats
+
+
+def _sr_skip_stats(
+    tasks: list,
+) -> tuple[Optional[float], Optional[dict[str, int]]]:
+    """Compute skip-rate and reason distribution over tasks-with-SR-outcome.
+
+    Denominator: tasks that have ``_self_review_outcome`` in their context.
+    Numerator: tasks whose outcome is a fallback envelope (structured
+    ``skip_reason`` present OR verdict=='unknown' with empty check_results).
+    Returns (None, None) when the sample is below _MIN_SR_SAMPLE.
+    """
+    total = 0
+    dist: dict[str, int] = {}
+    for t in tasks:
+        ctx = t.context or {}
+        outcome = ctx.get("_self_review_outcome")
+        if outcome is None:
+            continue
+        total += 1
+        reason = outcome.get("skip_reason")
+        if reason:
+            dist[str(reason)] = dist.get(str(reason), 0) + 1
+        elif outcome.get("verdict") == "unknown" and not (outcome.get("check_results") or {}):
+            dist["legacy_unknown"] = dist.get("legacy_unknown", 0) + 1
+    if total < _MIN_SR_SAMPLE:
+        return None, None
+    skipped = sum(dist.values())
+    return round(skipped / total, 3), dist
 
 
 def compute_sr_catch_rate_by_direction(
@@ -2122,7 +2213,7 @@ def compute_sr_catch_rate_by_direction(
 
     result: dict[str, dict[str, Any]] = {}
     for direction_id, tasks in by_direction.items():
-        count, cat_stats, _ = _stats_for_tasks(tasks)
+        count, cat_stats, _, _, _ = _stats_for_tasks(tasks)
         if count < _MIN_DIRECTION_SR_SAMPLE:
             continue
         categories: dict[str, Any] = {}
@@ -2182,6 +2273,11 @@ async def compute_sr_catch_rate_trends(
     current_stats: dict[str, dict] = {}
     previous_stats: dict[str, dict] = {}
     current_type_stats: dict[str, dict[str, dict]] = {}
+    current_window_tasks: list = []
+    current_all_iter_stats: dict[str, dict] = {}
+    previous_all_iter_stats: dict[str, dict] = {}
+    current_sev_stats: dict[str, dict] = {}
+    previous_sev_stats: dict[str, dict] = {}
 
     cycle_stmt = (
         select(StrategicCycle)
@@ -2201,8 +2297,8 @@ async def compute_sr_catch_rate_trends(
         for i in range(len(cycle_rows) - 1):
             c_cycle = cycle_rows[i]
             p_cycle = cycle_rows[i + 1]
-            c_count, c_stats, c_type_stats = _stats_for_tasks(task_by_cycle.get(c_cycle.id, []))
-            p_count, p_stats, _ = _stats_for_tasks(task_by_cycle.get(p_cycle.id, []))
+            c_count, c_stats, c_type_stats, c_all_iter, c_sev = _stats_for_tasks(task_by_cycle.get(c_cycle.id, []))
+            p_count, p_stats, _, p_all_iter, p_sev = _stats_for_tasks(task_by_cycle.get(p_cycle.id, []))
             if c_count >= _MIN_SR_SAMPLE and p_count >= _MIN_SR_SAMPLE:
                 use_cycle_mode = True
                 current_cycle_id = c_cycle.id
@@ -2212,6 +2308,11 @@ async def compute_sr_catch_rate_trends(
                 current_stats = c_stats
                 previous_stats = p_stats
                 current_type_stats = c_type_stats
+                current_window_tasks = task_by_cycle.get(c_cycle.id, [])
+                current_all_iter_stats = c_all_iter
+                previous_all_iter_stats = p_all_iter
+                current_sev_stats = c_sev
+                previous_sev_stats = p_sev
                 break
 
     if not use_cycle_mode:
@@ -2221,17 +2322,21 @@ async def compute_sr_catch_rate_trends(
         sentinel_n = datetime(9999, 12, 31)
         cal_current = [t for t in all_tasks if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n]
         cal_previous = [t for t in all_tasks if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n]
-        current_count, current_stats, current_type_stats = _stats_for_tasks(cal_current)
-        previous_count, previous_stats, _ = _stats_for_tasks(cal_previous)
+        current_count, current_stats, current_type_stats, current_all_iter_stats, current_sev_stats = _stats_for_tasks(cal_current)
+        previous_count, previous_stats, _, previous_all_iter_stats, previous_sev_stats = _stats_for_tasks(cal_previous)
+        current_window_tasks = cal_current
 
     if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
         return None
 
-    all_cats = set(current_stats.keys()) | set(previous_stats.keys())
+    all_cats = set(current_stats.keys()) | set(previous_stats.keys()) | set(current_all_iter_stats.keys())
     if not all_cats:
         return None
 
-    _empty_cat: dict[str, Any] = {"hit_count": 0, "human_count": 0, "w_hit": 0.0, "w_total": 0.0}
+    _empty_cat: dict[str, Any] = {
+        "hit_count": 0, "human_count": 0, "w_hit": 0.0, "w_total": 0.0,
+        "sr_failed_count": 0, "fp_count": 0,
+    }
     categories: dict[str, Any] = {}
     for cat in all_cats:
         curr = current_stats.get(cat, _empty_cat)
@@ -2263,6 +2368,40 @@ async def compute_sr_catch_rate_trends(
         weighted_miss_rate = (
             round(1.0 - curr["w_hit"] / w_total, 3) if w_total > 0 else miss_rate
         )
+
+        curr_sr_failed = curr.get("sr_failed_count", 0)
+        curr_fp = curr.get("fp_count", 0)
+        prev_sr_failed = prev.get("sr_failed_count", 0)
+        prev_fp = prev.get("fp_count", 0)
+        current_fp_rate = (
+            round(curr_fp / curr_sr_failed, 3) if curr_sr_failed > 0 else None
+        )
+        previous_fp_rate = (
+            round(prev_fp / prev_sr_failed, 3) if prev_sr_failed > 0 else None
+        )
+        if current_fp_rate is not None and previous_fp_rate is not None:
+            fp_delta = current_fp_rate - previous_fp_rate
+            if fp_delta >= _TREND_DELTA_THRESHOLD:
+                fp_trend = "increasing"
+            elif fp_delta <= -_TREND_DELTA_THRESHOLD:
+                fp_trend = "decreasing"
+            else:
+                fp_trend = "stable"
+        else:
+            fp_trend = "stable"
+        precision = (
+            round((curr_sr_failed - curr_fp) / curr_sr_failed, 3)
+            if curr_sr_failed > 0 else None
+        )
+
+        curr_all = current_all_iter_stats.get(cat, {"hit_count": 0, "human_count": 0})
+        all_iter_hit_rate = (
+            round(curr_all["hit_count"] / curr_all["human_count"], 3)
+            if curr_all["human_count"] > 0 else None
+        )
+        all_iter_miss_rate = (
+            round(1 - all_iter_hit_rate, 3) if all_iter_hit_rate is not None else None
+        )
         categories[cat] = {
             "current_hit_rate": current_hit_rate,
             "previous_hit_rate": previous_hit_rate,
@@ -2271,6 +2410,12 @@ async def compute_sr_catch_rate_trends(
             "miss_rate": miss_rate,
             "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
+            "false_positive_rate": current_fp_rate,
+            "previous_fp_rate": previous_fp_rate,
+            "fp_trend": fp_trend,
+            "precision": precision,
+            "all_iterations_catch_rate": all_iter_hit_rate,
+            "all_iterations_miss_rate": all_iter_miss_rate,
         }
 
     # Attach miss examples to top-_EXAMPLE_MAX_CATS categories by weighted_miss_rate.
@@ -2347,6 +2492,43 @@ async def compute_sr_catch_rate_trends(
         if type_cats:
             by_task_type[ttype] = type_cats
 
+    sr_skip_rate, sr_skip_dist = _sr_skip_stats(current_window_tasks)
+
+    # Compute per-severity catch-rate breakdown across all categories.
+    by_severity: dict[str, Any] = {}
+    for sev in ("CRITICAL", "MAJOR", "MINOR"):
+        curr_s = current_sev_stats.get(sev, {"hit_count": 0, "human_count": 0})
+        prev_s = previous_sev_stats.get(sev, {"hit_count": 0, "human_count": 0})
+        curr_hit = (
+            round(curr_s["hit_count"] / curr_s["human_count"], 3)
+            if curr_s["human_count"] > 0 else None
+        )
+        prev_hit = (
+            round(prev_s["hit_count"] / prev_s["human_count"], 3)
+            if prev_s["human_count"] > 0 else None
+        )
+        curr_miss = round(1.0 - curr_hit, 3) if curr_hit is not None else None
+        prev_miss = round(1.0 - prev_hit, 3) if prev_hit is not None else None
+        if curr_miss is not None and prev_miss is not None:
+            sev_delta = curr_miss - prev_miss
+            thr = _SR_SEVERITY_DELTA_THRESHOLDS[sev]
+            sev_trend = (
+                "regressing" if sev_delta >= thr
+                else "improving" if sev_delta <= -thr
+                else "stable"
+            )
+        else:
+            sev_trend = "stable"
+        by_severity[sev] = {
+            "current_miss_rate": curr_miss,
+            "previous_miss_rate": prev_miss,
+            "current_hit_rate": curr_hit,
+            "previous_hit_rate": prev_hit,
+            "current_sample": curr_s["human_count"],
+            "previous_sample": prev_s["human_count"],
+            "trend": sev_trend,
+        }
+
     edges_stats = _compute_edges_stats(all_tasks)
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
@@ -2355,8 +2537,12 @@ async def compute_sr_catch_rate_trends(
         "previous_cycle_id": previous_cycle_id,
         "categories": categories,
         "by_task_type": by_task_type,
+        "by_severity": by_severity,
         "edges_considered_stats": edges_stats,
     }
+    if sr_skip_rate is not None:
+        result["sr_skip_rate"] = sr_skip_rate
+        result["sr_skip_reason_distribution"] = sr_skip_dist
 
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
@@ -2368,7 +2554,7 @@ async def compute_sr_catch_rate_trends(
         project_id, len(categories),
     )
 
-    # Fire notification when one or more categories are regressing.
+    # Fire notification when categories or severity buckets are regressing.
     try:
         import asyncio
         from app.notification_dispatch import (
@@ -2380,23 +2566,40 @@ async def compute_sr_catch_rate_trends(
             cat: data for cat, data in categories.items()
             if data.get("trend") == "decreasing"
         }
-        if regressing:
+        regressing_severities = {
+            sev: data for sev, data in by_severity.items()
+            if data.get("trend") == "regressing"
+        }
+        fp_spiking = {
+            cat: data for cat, data in categories.items()
+            if data.get("fp_trend") == "increasing"
+        }
+        alertable = {**regressing, **fp_spiking}
+        if alertable or regressing_severities:
             # Dedup: in cycle mode key off cycle_id; in calendar mode use 14-day window.
+            # Dedup key includes both regressing categories and regressing severities.
             alert_state: dict = dict(doc.get("sr_catch_rate_trends_alert") or {})
             alert_computed_at: Optional[str] = alert_state.get("computed_at")
             alerted_cats: list = list(alert_state.get("categories") or [])
-            current_regressing_cats = sorted(regressing.keys())
+            alerted_sevs: list = list(alert_state.get("severities") or [])
+            current_regressing_cats = sorted(alertable.keys())
+            current_regressing_sevs = sorted(regressing_severities.keys())
 
             already_alerted = False
             if use_cycle_mode:
                 already_alerted = (
                     alert_state.get("cycle_id") == current_cycle_id
                     and alerted_cats == current_regressing_cats
+                    and alerted_sevs == current_regressing_sevs
                 )
             elif alert_computed_at:
                 try:
                     last_alert_dt = datetime.fromisoformat(alert_computed_at)
-                    if (now - last_alert_dt).days < 14 and alerted_cats == current_regressing_cats:
+                    if (
+                        (now - last_alert_dt).days < 14
+                        and alerted_cats == current_regressing_cats
+                        and alerted_sevs == current_regressing_sevs
+                    ):
                         already_alerted = True
                 except (ValueError, TypeError):
                     pass
@@ -2404,13 +2607,31 @@ async def compute_sr_catch_rate_trends(
             if not already_alerted:
                 lines = ["SR catch-rate regression detected:"]
                 for cat in current_regressing_cats:
-                    data = regressing[cat]
-                    prev = data.get("previous_hit_rate")
-                    curr_rate = data.get("current_hit_rate")
-                    sample = current_stats.get(cat, {}).get("human_count", 0)
-                    prev_str = f"{prev:.0%}" if prev is not None else "N/A"
-                    curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
-                    lines.append(f"  • {cat}: {prev_str} → {curr_str} (n={sample})")
+                    data = alertable[cat]
+                    if cat in regressing:
+                        prev = data.get("previous_hit_rate")
+                        curr_rate = data.get("current_hit_rate")
+                        sample = current_stats.get(cat, {}).get("human_count", 0)
+                        prev_str = f"{prev:.0%}" if prev is not None else "N/A"
+                        curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
+                        lines.append(f"  • {cat}: hit-rate {prev_str} → {curr_str} (n={sample})")
+                    else:
+                        prev_fp = data.get("previous_fp_rate")
+                        curr_fp = data.get("false_positive_rate")
+                        sample = current_stats.get(cat, {}).get("sr_failed_count", 0)
+                        prev_str = f"{prev_fp:.0%}" if prev_fp is not None else "N/A"
+                        curr_str = f"{curr_fp:.0%}" if curr_fp is not None else "N/A"
+                        lines.append(f"  • {cat}: FP-rate {prev_str} → {curr_str} (n={sample})")
+                if current_regressing_sevs:
+                    lines.append("Severity regressions:")
+                    for sev in current_regressing_sevs:
+                        data_sev = regressing_severities[sev]
+                        prev_miss = data_sev.get("previous_miss_rate")
+                        curr_miss = data_sev.get("current_miss_rate")
+                        sample_n = data_sev.get("current_sample", 0)
+                        prev_str = f"{prev_miss:.0%}" if prev_miss is not None else "N/A"
+                        curr_str = f"{curr_miss:.0%}" if curr_miss is not None else "N/A"
+                        lines.append(f"  • {sev}: {prev_str} → {curr_str} (n={sample_n})")
                 description = "\n".join(lines)
 
                 await post_failure_alert_message(session, project_id, description)
@@ -2421,11 +2642,22 @@ async def compute_sr_catch_rate_trends(
                     "regressing_categories": [
                         {
                             "category": cat,
-                            "previous_hit_rate": regressing[cat].get("previous_hit_rate"),
-                            "current_hit_rate": regressing[cat].get("current_hit_rate"),
+                            "previous_hit_rate": alertable[cat].get("previous_hit_rate"),
+                            "current_hit_rate": alertable[cat].get("current_hit_rate"),
+                            "false_positive_rate": alertable[cat].get("false_positive_rate"),
+                            "fp_trend": alertable[cat].get("fp_trend"),
                             "sample_size": current_stats.get(cat, {}).get("human_count", 0),
                         }
                         for cat in current_regressing_cats
+                    ],
+                    "regressing_severities": [
+                        {
+                            "severity": sev,
+                            "previous_miss_rate": regressing_severities[sev].get("previous_miss_rate"),
+                            "current_miss_rate": regressing_severities[sev].get("current_miss_rate"),
+                            "sample_size": regressing_severities[sev].get("current_sample", 0),
+                        }
+                        for sev in current_regressing_sevs
                     ],
                 }
                 asyncio.ensure_future(
@@ -2440,14 +2672,15 @@ async def compute_sr_catch_rate_trends(
                     "computed_at": result["computed_at"],
                     "cycle_id": current_cycle_id,
                     "categories": current_regressing_cats,
+                    "severities": current_regressing_sevs,
                 }
                 project.design_doc = doc
                 flag_modified(project, "design_doc")
                 session.add(project)
 
                 logger.info(
-                    "[SR_CATCH_RATE_TRENDS] project=%s regression_alert categories=%s",
-                    project_id, current_regressing_cats,
+                    "[SR_CATCH_RATE_TRENDS] project=%s regression_alert categories=%s severities=%s",
+                    project_id, current_regressing_cats, current_regressing_sevs,
                 )
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
@@ -2660,6 +2893,218 @@ async def check_fix_loop_divergence_regression(
         project_id, [r["loop"] for r in regressions],
     )
     return {"regressions": regressions}
+
+
+# ---------------------------------------------------------------------------
+# Fresh-reviewer cycle-over-cycle trend
+# ---------------------------------------------------------------------------
+
+_FR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
+
+
+async def compute_fresh_reviewer_trend(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> Optional[dict[str, Any]]:
+    """Cycle-bucketed trend for fresh-reviewer effectiveness.
+
+    Mirrors the cycle-vs-calendar bucketing from ``compute_sr_catch_rate_trends``.
+    Requires at least ``_MIN_SR_SAMPLE`` tasks *with* reviewer_findings in both
+    the current and previous bucket before computing rates.
+
+    Output keys per category: ``per_category_hit_rate``, ``added_value``,
+    ``approval_rate_lift`` — each with ``current``, ``previous``, ``delta``,
+    and ``trend`` (stable / improving / regressing).
+
+    **Side effect**: writes result to ``project.design_doc["fresh_reviewer_trend"]``.
+    """
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    _code_tasks = [
+        t for t in all_tasks
+        if (t.first_payload or {}).get("type") in _FR_CODE_CHANGE_TYPES
+    ]
+
+    def _bucket_stats(tasks: list) -> dict[str, Any]:
+        """Compute fresh-reviewer stats for a pre-filtered task list."""
+        with_reviewer = [
+            t for t in tasks
+            if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+        ]
+        without_reviewer = [
+            t for t in tasks
+            if not (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+        ]
+
+        def _fa_rate(ts: list) -> Optional[float]:
+            measured = [t for t in ts if "_first_attempt_succeeded" in (t.context or {})]
+            if not measured:
+                return None
+            return round(sum(1 for t in measured if t.context["_first_attempt_succeeded"]) / len(measured), 3)
+
+        cat_flagged: dict[str, int] = {}
+        cat_confirmed: dict[str, int] = {}
+        cat_added_value: dict[str, int] = {}
+        for t in with_reviewer:
+            ctx = t.context or {}
+            findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
+            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+            check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+            agent_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            for finding in findings:
+                cat = finding.get("category") if isinstance(finding, dict) else None
+                if not cat:
+                    continue
+                cat_flagged[cat] = cat_flagged.get(cat, 0) + 1
+                if cat in human_cats:
+                    cat_confirmed[cat] = cat_confirmed.get(cat, 0) + 1
+                    if cat not in agent_failed:
+                        cat_added_value[cat] = cat_added_value.get(cat, 0) + 1
+
+        return {
+            "sample_size": len(with_reviewer),
+            "cat_flagged": cat_flagged,
+            "cat_confirmed": cat_confirmed,
+            "cat_added_value": cat_added_value,
+            "fa_rate_with": _fa_rate(with_reviewer),
+            "fa_rate_without": _fa_rate(without_reviewer),
+        }
+
+    # --- Cycle-based bucketing (primary mode) ---
+    use_cycle_mode = False
+    current_cycle_id: Optional[str] = None
+    previous_cycle_id: Optional[str] = None
+    current_stats: dict[str, Any] = {}
+    previous_stats: dict[str, Any] = {}
+
+    cycle_stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+
+    if len(cycle_rows) >= 2:
+        task_by_cycle: dict[str, list] = {}
+        for t in _code_tasks:
+            cid = getattr(t, "strategic_cycle_id", None)
+            if cid:
+                task_by_cycle.setdefault(cid, []).append(t)
+        for i in range(len(cycle_rows) - 1):
+            c_cycle = cycle_rows[i]
+            p_cycle = cycle_rows[i + 1]
+            c_stats = _bucket_stats(task_by_cycle.get(c_cycle.id, []))
+            p_stats = _bucket_stats(task_by_cycle.get(p_cycle.id, []))
+            if c_stats["sample_size"] >= _MIN_SR_SAMPLE and p_stats["sample_size"] >= _MIN_SR_SAMPLE:
+                use_cycle_mode = True
+                current_cycle_id = c_cycle.id
+                previous_cycle_id = p_cycle.id
+                current_stats = c_stats
+                previous_stats = p_stats
+                break
+
+    if not use_cycle_mode:
+        cutoff_14d_n = _naive(now - timedelta(days=14))
+        cutoff_28d_n = _naive(now - timedelta(days=28))
+        sentinel_n = datetime(9999, 12, 31)
+        cal_current = [t for t in _code_tasks if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n]
+        cal_previous = [t for t in _code_tasks if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n]
+        current_stats = _bucket_stats(cal_current)
+        previous_stats = _bucket_stats(cal_previous)
+
+    if current_stats.get("sample_size", 0) < _MIN_SR_SAMPLE or previous_stats.get("sample_size", 0) < _MIN_SR_SAMPLE:
+        return None
+
+    def _classify(curr: Optional[float], prev: Optional[float]) -> str:
+        if curr is None or prev is None:
+            return "stable"
+        delta = curr - prev
+        if delta >= _TREND_DELTA_THRESHOLD:
+            return "improving"
+        if delta <= -_TREND_DELTA_THRESHOLD:
+            return "regressing"
+        return "stable"
+
+    # Per-category hit rate
+    c_flagged = current_stats["cat_flagged"]
+    p_flagged = previous_stats["cat_flagged"]
+    all_cats = set(c_flagged.keys()) | set(p_flagged.keys())
+
+    per_category_hit_rate: dict[str, Any] = {}
+    for cat in all_cats:
+        c_total = c_flagged.get(cat, 0)
+        p_total = p_flagged.get(cat, 0)
+        c_rate = round(current_stats["cat_confirmed"].get(cat, 0) / c_total, 3) if c_total >= 2 else None
+        p_rate = round(previous_stats["cat_confirmed"].get(cat, 0) / p_total, 3) if p_total >= 2 else None
+        per_category_hit_rate[cat] = {
+            "current": c_rate,
+            "previous": p_rate,
+            "delta": round(c_rate - p_rate, 3) if c_rate is not None and p_rate is not None else None,
+            "trend": _classify(c_rate, p_rate),
+        }
+
+    # Added value (fresh-reviewer catches what agent self-review missed)
+    c_av = current_stats["cat_added_value"]
+    p_av = previous_stats["cat_added_value"]
+    av_cats = set(c_av.keys()) | set(p_av.keys())
+    added_value: dict[str, Any] = {}
+    for cat in av_cats:
+        c_cnt = c_av.get(cat, 0)
+        p_cnt = p_av.get(cat, 0)
+        added_value[cat] = {
+            "current": c_cnt,
+            "previous": p_cnt,
+            "trend": _classify(float(c_cnt), float(p_cnt)),
+        }
+
+    # Approval rate lift
+    c_with = current_stats["fa_rate_with"]
+    c_without = current_stats["fa_rate_without"]
+    p_with = previous_stats["fa_rate_with"]
+    p_without = previous_stats["fa_rate_without"]
+    c_lift = round(c_with - c_without, 3) if c_with is not None and c_without is not None else None
+    p_lift = round(p_with - p_without, 3) if p_with is not None and p_without is not None else None
+    approval_rate_lift: dict[str, Any] = {
+        "current": c_lift,
+        "previous": p_lift,
+        "delta": round(c_lift - p_lift, 3) if c_lift is not None and p_lift is not None else None,
+        "trend": _classify(c_lift, p_lift),
+    }
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "bucket_mode": "cycle" if use_cycle_mode else "calendar",
+        "current_cycle_id": current_cycle_id,
+        "previous_cycle_id": previous_cycle_id,
+        "current_sample_size": current_stats["sample_size"],
+        "previous_sample_size": previous_stats["sample_size"],
+        "per_category_hit_rate": per_category_hit_rate,
+        "added_value": added_value,
+        "approval_rate_lift": approval_rate_lift,
+    }
+
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    doc["fresh_reviewer_trend"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[FRESH_REVIEWER_TREND] project=%s categories=%d bucket_mode=%s",
+        project_id, len(per_category_hit_rate), result["bucket_mode"],
+    )
+
+    return result
 
 
 async def compute_sr_reviewer_disagreements(

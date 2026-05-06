@@ -939,11 +939,12 @@ if [ -s "$SELF_REVIEW_FILE" ]; then
     SELF_REVIEW_JSON=$(cat "$SELF_REVIEW_FILE")
   else
     echo "[done] /tmp/self_review_${cfg.taskId}.json exists but is not valid JSON — using fallback envelope" >&2
-    SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review JSON parsing failed"]}'
+    SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review JSON parsing failed"],"skip_reason":"json_parse_failed"}'
   fi
 else
   echo "[done] /tmp/self_review_${cfg.taskId}.json not found — using minimal fallback envelope" >&2
-  SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review skipped — investigate"]}'
+  SKIP_REASON="json_missing"; MARKER="/tmp/self_review_skip_reason_${cfg.taskId}.txt"; [ -s "$MARKER" ] && SKIP_REASON=$(head -c 64 "$MARKER" | tr -dc 'a-z_')
+  SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review skipped — investigate"],"skip_reason":"'"$SKIP_REASON"'"}'
 fi
 
 # Optional enrichment: changed_files from git diff — review-pipeline scope

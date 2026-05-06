@@ -2736,37 +2736,50 @@ async def _process_post_commit(
                         else:
                             await session.commit()
                         logger.warning(f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}")
-                    # On the first review rejection, store which issue categories caused it
-                    # on the original task so analytics can track first-attempt failure patterns.
+                    # On every review rejection, store which issue categories caused it
+                    # on the original task.  Iteration 1 → _first_attempt_rejection_categories
+                    # (existing field); all iterations → _all_iterations_rejection_categories
+                    # (accumulated superset used by all-iterations catch-rate metric).
                     review_iteration = review_loop.get("iteration", 1)
-                    if review_iteration == 1 and issues and original_task_id:
+                    if issues and original_task_id:
                         try:
-                            from app.playbook_learning import cache_first_attempt_classification
+                            from app.playbook_learning import (
+                                cache_first_attempt_classification,
+                                _keyword_from_flat,
+                            )
                             rh_items = [
                                 {"description": i.get("description", ""),
                                  "severity": i.get("severity", "minor"),
-                                 "iteration": 1}
+                                 "iteration": review_iteration}
                                 for i in issues if i.get("description")
                             ]
                             if rh_items:
                                 orig_task = await session.get(Task, uuid.UUID(original_task_id))
                                 if orig_task:
                                     task_ctx = dict(orig_task.context or {})
-                                    buckets = await cache_first_attempt_classification(task_ctx, rh_items)
+                                    if review_iteration == 1:
+                                        buckets = await cache_first_attempt_classification(task_ctx, rh_items)
+                                    else:
+                                        buckets = _keyword_from_flat(rh_items)
                                     rejection_cats = {cat: len(items) for cat, items in buckets.items() if items}
                                     if rejection_cats:
-                                        minor_only = all(
-                                            (i.get("severity", "minor") or "minor").lower() == "minor"
-                                            for i in issues if i.get("description")
-                                        )
-                                        task_ctx["_first_attempt_rejection_categories"] = rejection_cats
-                                        task_ctx["_first_attempt_minor_only"] = minor_only
+                                        if review_iteration == 1:
+                                            minor_only = all(
+                                                (i.get("severity", "minor") or "minor").lower() == "minor"
+                                                for i in issues if i.get("description")
+                                            )
+                                            task_ctx["_first_attempt_rejection_categories"] = rejection_cats
+                                            task_ctx["_first_attempt_minor_only"] = minor_only
+                                        existing_all = dict(task_ctx.get("_all_iterations_rejection_categories") or {})
+                                        for cat, cnt in rejection_cats.items():
+                                            existing_all[cat] = existing_all.get(cat, 0) + cnt
+                                        task_ctx["_all_iterations_rejection_categories"] = existing_all
                                     orig_task.context = task_ctx
                                     flag_modified(orig_task, "context")
                                     session.add(orig_task)
                                     await session.commit()
                         except Exception as _cat_e:
-                            logger.warning(f"[REVIEW PIPELINE] Failed to record first-attempt rejection categories: {_cat_e}")
+                            logger.warning(f"[REVIEW PIPELINE] Failed to record rejection categories: {_cat_e}")
                     action_taken = True
 
                 if not action_taken:

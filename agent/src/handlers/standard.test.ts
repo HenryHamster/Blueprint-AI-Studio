@@ -112,7 +112,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS } from './standard.js';
 import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -1343,8 +1343,12 @@ describe('runFreshReviewerPass', () => {
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: '', lastResultText: '' });
     const { default: fs } = await import('fs');
     await runFreshReviewerPass('t3', 'Title', 'Desc', [], null, { value: '' });
+    // SR JSON must NOT be written; marker file (skip_reason) IS written
     expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalledWith(
-      expect.stringContaining('self_review_t3'), expect.anything(), expect.anything(),
+      expect.stringContaining('self_review_t3.json'), expect.anything(), expect.anything(),
+    );
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/self_review_skip_reason_t3.txt', SR_SKIP_REASONS.REVIEWER_SESSION_FAILED, expect.anything(),
     );
   });
 
@@ -1354,8 +1358,22 @@ describe('runFreshReviewerPass', () => {
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: 'not json' });
     const { default: fs } = await import('fs');
     await runFreshReviewerPass('t4', 'Title', 'Desc', [], null, { value: '' });
+    // SR JSON must NOT be written; marker file (skip_reason) IS written
     expect(vi.mocked(fs.writeFileSync)).not.toHaveBeenCalledWith(
-      expect.stringContaining('self_review_t4'), expect.anything(), expect.anything(),
+      expect.stringContaining('self_review_t4.json'), expect.anything(), expect.anything(),
+    );
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/self_review_skip_reason_t4.txt', SR_SKIP_REASONS.REVIEWER_NO_FINDINGS_PARSE, expect.anything(),
+    );
+  });
+
+  it('writes diff_too_small marker when diff is below threshold', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue('+one\n-one'); // only 2 changed lines
+    const { default: fs } = await import('fs');
+    await runFreshReviewerPass('t5', 'Title', 'Desc', [], null, { value: '' });
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/self_review_skip_reason_t5.txt', SR_SKIP_REASONS.DIFF_TOO_SMALL, expect.anything(),
     );
   });
 
