@@ -1215,6 +1215,19 @@ class SystemMaturity(SQLModel, table=True):
     )
 
 
+# --- Regression-case watchdog thresholds ---
+# Tunable via runtime_config using the same-named lowercase keys.
+# REGRESSION_WATCHDOG_ACTIVE_STALE_HOURS: Hours since updated_at before an ACTIVE
+#   case is considered stuck and escalated to NEEDS_MANUAL_INTERVENTION.  An ACTIVE
+#   case goes stale when an investigation completes with low/no confidence and no
+#   remediation task is spawned.
+# REGRESSION_WATCHDOG_MERGED_STALE_HOURS: Hours since updated_at before a MERGED
+#   case is considered stuck.  A MERGED case goes stale when the recovery scan
+#   cannot evaluate it (e.g. signal_snapshot_at_merge is empty).
+REGRESSION_WATCHDOG_ACTIVE_STALE_HOURS = 24
+REGRESSION_WATCHDOG_MERGED_STALE_HOURS = 6
+
+
 class RegressionCaseStatus(str, Enum):
     ACTIVE = "ACTIVE"
     REMEDIATING = "REMEDIATING"
@@ -1311,7 +1324,12 @@ class RegressionRemediationCase(SQLModel, table=True):
 
         Captures the post-merge signal snapshot and appends a fix-log entry so
         the recovery scan can verify the regression resolved.
+        Falls back to signal_snapshot_at_spawn when the caller passes an empty
+        snapshot so run_recovery_once can evaluate the MERGED→CLOSED transition
+        regardless of which call site triggered the merge.
         """
+        if not signal_snapshot:
+            signal_snapshot = dict(self.signal_snapshot_at_spawn or {})
         self.signal_snapshot_at_merge = signal_snapshot
         self.last_remediation_pr_number = pr_number
         self.last_remediation_result = "merged"

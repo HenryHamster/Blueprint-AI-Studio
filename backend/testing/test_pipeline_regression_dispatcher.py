@@ -21,8 +21,11 @@ from app.models import Project, Task, TaskStatus
 from app.pipeline_regression_dispatcher import (
     _REGRESSION_COOLDOWN,
     _REGRESSION_RECOVERY_COOLDOWN,
+    _WATCHDOG_ACTIVE_STALE_THRESHOLD,
+    _WATCHDOG_MERGED_STALE_THRESHOLD,
     run_once,
     run_recovery_once,
+    run_watchdog_once,
 )
 from app.time_utils import _utcnow
 
@@ -880,3 +883,332 @@ async def test_recovery_scan_respects_cooldown(db_session):
 
     changed = await run_recovery_once(db_session, project.id)
     assert changed == 0
+
+
+@pytest.mark.asyncio
+async def test_investigate_fix_merge_recovery_closed(db_session, mocker):
+    """Full investigate→fix→merge→recovery flow: MERGED → CLOSED when signal recovered.
+
+    Regression guard: signal_snapshot propagated through remediation_context so
+    mark_merged receives a non-empty snapshot and run_recovery_once can evaluate.
+    """
+    from types import SimpleNamespace
+    import json as _json
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_completion import _handle_investigation_completion
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    # Initial state: regression is present so run_once spawns an investigation.
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spawn the initial investigation (creates the RegressionRemediationCase).
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    investigation = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["regression_class"].as_string() == "sr_catch_rate:correctness",
+        )
+    )).scalars().first()
+    assert investigation is not None
+
+    # Complete the investigation → spawns a remediation 'create' task.
+    diagnosis = {
+        "summary": "sr correctness drop",
+        "root_cause": "prompt drift",
+        "recommended_fix": "restore checklist",
+        "confidence": "high",
+        "severity": "high",
+        "affected_files": [{"path": "agent/src/prompts/self-review.ts", "issue": "drift"}],
+    }
+    await _handle_investigation_completion(
+        investigation, SimpleNamespace(logs=_json.dumps(diagnosis)), db_session,
+    )
+    await db_session.commit()
+
+    remediation = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.parent_task_id == investigation.id,
+        )
+    )).scalars().first()
+    assert remediation is not None
+    # regression_class must be propagated so mark_merged can stamp the snapshot.
+    assert remediation.context.get("regression_class") == "sr_catch_rate:correctness"
+    assert remediation.context.get("signal_snapshot"), (
+        "signal_snapshot must be propagated into remediation context"
+    )
+
+    # Simulate the PR merging: stamp MERGED with the signal snapshot.
+    await _close_loop_regression_case_on_merge(remediation, 9999, db_session)
+    await db_session.commit()
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+            RegressionRemediationCase.regression_class == "sr_catch_rate:correctness",
+        )
+    )).scalars().first()
+    assert case is not None
+    assert case.status == RegressionCaseStatus.MERGED
+    assert case.signal_snapshot_at_merge, "mark_merged must receive a non-empty snapshot"
+
+    # Backdate the merge so recovery cooldown has elapsed.
+    snap = dict(case.signal_snapshot_at_merge)
+    snap["captured_at"] = (_utcnow() - timedelta(minutes=20)).isoformat()
+    case.signal_snapshot_at_merge = snap
+    db_session.add(case)
+
+    # Simulate the signal recovering: update design_doc so run_recovery_once sees no regression.
+    project.design_doc = _design_doc_with_sr_regression(
+        category="correctness", prior=0.80, current=0.80,
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    # Recovery scan sees a recovered signal → CLOSED.
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_mark_merged_fallback_when_signal_snapshot_missing(db_session, mocker):
+    """Regression guard: when remediation task context lacks signal_snapshot,
+    mark_merged falls back to signal_snapshot_at_spawn and run_recovery_once
+    can still close the case.
+
+    Exercises the bug path: old code left signal_snapshot_at_merge empty for
+    tasks that went through investigate→fix without context propagation.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    # Initial state: regression is present so run_once spawns and creates the case.
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spawn creates the RegressionRemediationCase with signal_snapshot_at_spawn.
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    # Build a minimal remediation task carrying regression_class but missing
+    # signal_snapshot — simulating the pre-fix bug state.
+    remediation = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"regression_class": "sr_catch_rate:correctness"},
+    )
+    db_session.add(remediation)
+    await db_session.commit()
+    await db_session.refresh(remediation)
+
+    await _close_loop_regression_case_on_merge(remediation, 1234, db_session)
+    await db_session.commit()
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+            RegressionRemediationCase.regression_class == "sr_catch_rate:correctness",
+        )
+    )).scalars().first()
+    assert case is not None
+    assert case.status == RegressionCaseStatus.MERGED
+    # Fallback must populate signal_snapshot_at_merge from signal_snapshot_at_spawn.
+    assert case.signal_snapshot_at_merge, (
+        "mark_merged fallback must produce a non-empty snapshot from signal_snapshot_at_spawn"
+    )
+
+    # Backdate merge so recovery cooldown has elapsed.
+    snap = dict(case.signal_snapshot_at_merge)
+    snap["captured_at"] = (_utcnow() - timedelta(minutes=20)).isoformat()
+    case.signal_snapshot_at_merge = snap
+    db_session.add(case)
+
+    # Simulate the signal recovering before the recovery scan.
+    project.design_doc = _design_doc_with_sr_regression(
+        category="correctness", prior=0.80, current=0.80,
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# Watchdog — run_watchdog_once tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_stale_case(
+    db_session,
+    project_id,
+    *,
+    status: "RegressionCaseStatus",
+    hours_stale: int,
+    regression_class: str = "sr_catch_rate:correctness",
+) -> "RegressionRemediationCase":
+    """Create a case and backdate its updated_at to simulate staleness."""
+    from sqlalchemy import update
+    from app.models import RegressionRemediationCase as RRC
+
+    case = RRC(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=status,
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    stale_ts = _utcnow() - timedelta(hours=hours_stale)
+    await db_session.execute(
+        update(RRC).where(RRC.id == case.id).values(updated_at=stale_ts)
+    )
+    await db_session.commit()
+    await db_session.refresh(case)
+    return case
+
+
+@pytest.mark.asyncio
+async def test_watchdog_active_stale_triggers_alert(db_session):
+    """ACTIVE case older than 24h threshold escalates to NEEDS_MANUAL_INTERVENTION and opens Alert (case a)."""
+    from app.models import Alert, RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_hours = int(_WATCHDOG_ACTIVE_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.ACTIVE,
+        hours_stale=stale_hours,
+    )
+
+    escalated = await run_watchdog_once(db_session, project.id)
+    assert escalated == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.needs_manual_intervention_at is not None
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert any("sr_catch_rate:correctness" in (a.title or "") for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_merged_stale_triggers_alert(db_session):
+    """MERGED case older than 6h threshold escalates to NEEDS_MANUAL_INTERVENTION and opens Alert (case b)."""
+    from app.models import Alert, RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_hours = int(_WATCHDOG_MERGED_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.MERGED,
+        hours_stale=stale_hours,
+    )
+
+    escalated = await run_watchdog_once(db_session, project.id)
+    assert escalated == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.needs_manual_intervention_at is not None
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert any("sr_catch_rate:correctness" in (a.title or "") for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_recent_case_not_triggered(db_session):
+    """Case with recent updated_at does not trigger the watchdog (case c)."""
+    from app.models import Alert, RegressionCaseStatus
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Only 1 hour old — well within both thresholds.
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.ACTIVE,
+        hours_stale=1,
+    )
+
+    escalated = await run_watchdog_once(db_session, project.id)
+    assert escalated == 0
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_watchdog_excludes_needs_manual_intervention(db_session):
+    """NEEDS_MANUAL_INTERVENTION cases are excluded from watchdog processing (case d)."""
+    from app.models import Alert, RegressionCaseStatus
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Already escalated — very stale but should not be touched again.
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hours_stale=48,
+    )
+
+    escalated = await run_watchdog_once(db_session, project.id)
+    assert escalated == 0
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == []

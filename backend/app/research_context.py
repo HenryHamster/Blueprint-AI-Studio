@@ -154,6 +154,8 @@ def _build_research_context(
     history_entry: dict,
     finding_scopes: Optional[list] = None,
     prior_history: Optional[list] = None,
+    finding_claims: Optional[list] = None,
+    finding_sources: Optional[list] = None,
 ) -> str:
     """Build a compounding research_context document deterministically (no LLM)."""
     parsed = _parse_research_context(prior_context or "")
@@ -173,6 +175,14 @@ def _build_research_context(
             entry_text = f"{title}{scope_tag} (proposed). {first_sentence}" if first_sentence else f"{title}{scope_tag} (proposed)"
         else:
             entry_text = f"{title}{scope_tag} (proposed)"
+        _claims = (finding_claims[i] if finding_claims and i < len(finding_claims) else None) or []
+        _sources = (finding_sources[i] if finding_sources and i < len(finding_sources) else None) or []
+        if _claims:
+            entry_text += ". Claims: " + "; ".join(str(c)[:80] for c in _claims[:3])
+        if _sources:
+            _refs = [s.get("ref", "") for s in _sources if isinstance(s, dict) and s.get("ref")][:3]
+            if _refs:
+                entry_text += ". Sources: " + ", ".join(_refs)
         parsed["established"].append(entry_text)
 
     # Add cycle_insights to Open Questions (deduplicate)

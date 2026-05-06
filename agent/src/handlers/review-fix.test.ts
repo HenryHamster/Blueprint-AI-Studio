@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // 2026-05-04: handleFix no longer drives lint/test/push/PR via wrapper helpers.
@@ -1905,8 +1905,60 @@ describe('handleFix task-type-specific self-review focus blocks', () => {
     expect(p).toContain('Task lifecycle — you own it end-to-end');
   });
 
-  it('does not include a type-specific block for create or unknown task types', async () => {
-    for (const taskType of ['create', 'unknown', '']) {
+  it('includes create focus block for create original_task_type', async () => {
+    await handleFix(
+      'task-create-fix',
+      { ...basePayload, original_task_type: 'create' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: create tasks');
+    expect(p).toContain('Test coverage');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('includes fix focus block for fix original_task_type', async () => {
+    await handleFix(
+      'task-fix-fix',
+      { ...basePayload, original_task_type: 'fix' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: fix tasks');
+    expect(p).toContain('Regression surface');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('includes docs focus block for docs original_task_type', async () => {
+    await handleFix(
+      'task-docs-fix',
+      { ...basePayload, original_task_type: 'docs' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: docs tasks');
+    expect(p).toContain('Link rot');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('includes deps focus block for deps original_task_type', async () => {
+    await handleFix(
+      'task-deps-fix',
+      { ...basePayload, original_task_type: 'deps' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: deps tasks');
+    expect(p).toContain('Lockfile');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('does not include a type-specific block for unknown task types', async () => {
+    for (const taskType of ['unknown', '']) {
       vi.clearAllMocks();
       await handleFix(
         `task-${taskType}-fix`,
@@ -1918,6 +1970,10 @@ describe('handleFix task-type-specific self-review focus blocks', () => {
       expect(p).not.toContain('Self-review focus: migrate tasks');
       expect(p).not.toContain('Self-review focus: refactor tasks');
       expect(p).not.toContain('Self-review focus: qa tasks');
+      expect(p).not.toContain('Self-review focus: create tasks');
+      expect(p).not.toContain('Self-review focus: fix tasks');
+      expect(p).not.toContain('Self-review focus: docs tasks');
+      expect(p).not.toContain('Self-review focus: deps tasks');
       expect(p).toContain('Task lifecycle — you own it end-to-end'); // generic always present
     }
   });
@@ -1929,24 +1985,78 @@ describe('handleReview structural prompt invariants', () => {
 
   beforeEach(() => { vi.clearAllMocks(); });
 
-  it('handleReview prompt includes DEFAULT_TOOL_GUIDANCE', async () => {
+  async function captureReviewPrompt(): Promise<string> {
     await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
     const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
-    expect(calls.length).toBeGreaterThan(0);
-    expect(calls[calls.length - 1][0]).toContain('Use Grep/Glob for code search');   // DEFAULT_TOOL_GUIDANCE
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('handleReview prompt includes DEFAULT_TOOL_GUIDANCE', async () => {
+    expect(await captureReviewPrompt()).toContain('Use Grep/Glob for code search');
   });
 
   it('handleReview prompt does NOT include CODE_CHANGE_HELPER_GUIDANCE', async () => {
-    await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
-    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
-    expect(calls.length).toBeGreaterThan(0);
-    expect(calls[calls.length - 1][0]).not.toContain('Task lifecycle — you own it end-to-end');
+    expect(await captureReviewPrompt()).not.toContain('Task lifecycle — you own it end-to-end');
   });
 
   it('handleReview prompt contains task-type fingerprint: no informational-only verdict path', async () => {
-    await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
-    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
-    expect(calls.length).toBeGreaterThan(0);
-    expect(calls[calls.length - 1][0]).toContain('There is no informational-only path');
+    expect(await captureReviewPrompt()).toContain('There is no informational-only path');
+  });
+
+  it('handleReview prompt contains APPROVE verdict marker', async () => {
+    expect(await captureReviewPrompt()).toContain('"verdict": "APPROVE"');
+  });
+
+  it('handleReview prompt contains REQUEST_CHANGES verdict marker', async () => {
+    expect(await captureReviewPrompt()).toContain('"verdict": "REQUEST_CHANGES"');
+  });
+
+  it('handleReview prompt contains no-third-verdict guidance', async () => {
+    expect(await captureReviewPrompt()).toContain('Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY"');
+  });
+
+  it('handleReview prompt contains Severity Classification Guide', async () => {
+    expect(await captureReviewPrompt()).toContain('**Severity Classification Guide:**');
+  });
+
+  it('handleReview prompt contains verdict JSON file path pattern', async () => {
+    expect(await captureReviewPrompt()).toContain('/tmp/review_verdict_');
+  });
+
+  it('handleReview prompt contains Correctness & Logic checklist section', async () => {
+    expect(await captureReviewPrompt()).toContain('**Correctness & Logic:**');
+  });
+
+  it('handleReview prompt contains Security checklist section', async () => {
+    expect(await captureReviewPrompt()).toContain('**Security:**');
+  });
+});
+
+describe('handleReview prompt determinism', () => {
+  const REVIEW_PAYLOAD = { pr_number: 1, branch: 'feat', base_branch: 'main' };
+  const REVIEW_TASK = { title: 'Review', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('produces identical prompts for identical inputs (no Date.now/Math.random leaks)', async () => {
+    const invoke = async () => {
+      vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+      await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
+      const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+      return calls[calls.length - 1][0];
+    };
+    const prompt1 = await invoke();
+    vi.clearAllMocks();
+    const prompt2 = await invoke();
+    expect(prompt1).toBe(prompt2);
   });
 });

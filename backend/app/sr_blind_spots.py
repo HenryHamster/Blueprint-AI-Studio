@@ -120,3 +120,81 @@ async def aggregate_sr_blind_spot_envelope(
         "total_distinct_themes": len(theme_counts),
         "themes": [{"theme": t, "count": c} for t, c in top],
     }
+
+
+_SR_CODE_CHANGE_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
+
+
+def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
+    """Single source of truth for the (category, task_type) -> count tally.
+
+    The caller is responsible for filtering tasks by status and by created_at
+    cutoff (each call site has slightly different fetch semantics — DB vs.
+    pre-fetched playbook list — but the disagreement-counting rule itself
+    must not drift between them).
+
+    A *disagreement* is counted for every reviewer_finding category that
+    self-review either omitted or marked ``passed: true``. Skipped/fallback
+    self-review envelopes are excluded so the bash ./done fallback does not
+    inflate counts.
+    """
+    counts: Dict[tuple, int] = defaultdict(int)
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type", "")
+        if task_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        reviewer_findings = sro.get("reviewer_findings") or []
+        if not reviewer_findings:
+            continue
+        check_results = sro.get("check_results") or {}
+        for finding in reviewer_findings:
+            if not isinstance(finding, dict):
+                continue
+            cat = finding.get("category")
+            if not cat:
+                continue
+            cr = check_results.get(cat)
+            if cr is None or cr.get("passed", True):
+                counts[(cat, task_type)] += 1
+    return counts
+
+
+async def aggregate_sr_reviewer_disagreements(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    days: int,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Aggregate categories where self-review passed but the fresh-reviewer flagged an issue.
+
+    For each completed code-change task that has both ``check_results`` and
+    ``reviewer_findings``, a *disagreement* is recorded for every category
+    where the fresh-reviewer raised a finding but self-review either omitted
+    the category or marked it ``passed: true``.
+
+    Returns up to ``limit`` entries sorted by count descending:
+      [{"category": str, "task_type": str, "count": int}, ...]
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .order_by(Task.created_at.desc())
+        .limit(_TASK_SCAN_CAP)
+    )
+    result = await session.execute(stmt)
+    all_tasks = result.scalars().all()
+
+    disagreement_counts = count_reviewer_disagreements_in_tasks(all_tasks)
+    top = sorted(disagreement_counts.items(), key=lambda x: -x[1])[:limit]
+    return [{"category": cat, "task_type": ttype, "count": cnt} for (cat, ttype), cnt in top]

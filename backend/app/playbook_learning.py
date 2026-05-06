@@ -2660,3 +2660,73 @@ async def check_fix_loop_divergence_regression(
         project_id, [r["loop"] for r in regressions],
     )
     return {"regressions": regressions}
+
+
+async def compute_sr_reviewer_disagreements(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+    *,
+    window_days: int = 30,
+    limit: int = 20,
+) -> Optional[dict[str, Any]]:
+    """Aggregate categories where SR passed but the fresh reviewer flagged an issue.
+
+    Scans ``all_tasks`` (already fetched by the caller) for completed
+    code-change tasks that have both ``check_results`` and
+    ``reviewer_findings`` in their ``_self_review_outcome``. A disagreement
+    is counted for every (category, task_type) pair where the fresh reviewer
+    raised a finding but self-review either omitted the category or marked it
+    ``passed: true``.
+
+    **Side effect**: writes the result to
+    ``project.design_doc["sr_reviewer_disagreements"]`` so downstream readers
+    (admin digest, agent project-context) can access pre-computed data without
+    re-scanning tasks.
+
+    Returns the result dict, or ``None`` when no disagreements are found.
+    """
+    from app.sr_blind_spots import count_reviewer_disagreements_in_tasks  # noqa: PLC0415
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=window_days)
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    cutoff_naive = _naive(cutoff)
+
+    eligible = [
+        t for t in all_tasks
+        if t.status == TaskStatus.COMPLETED
+        and (not t.created_at or _naive(t.created_at) >= cutoff_naive)
+    ]
+    disagreement_counts = count_reviewer_disagreements_in_tasks(eligible)
+
+    if not disagreement_counts:
+        return None
+
+    top = sorted(disagreement_counts.items(), key=lambda x: -x[1])[:limit]
+    entries = [
+        {"category": cat, "task_type": ttype, "count": cnt}
+        for (cat, ttype), cnt in top
+    ]
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "window_days": window_days,
+        "disagreements": entries,
+    }
+
+    project = await session.get(Project, project_id)
+    if project:
+        doc = dict(project.design_doc or {})
+        doc["sr_reviewer_disagreements"] = result
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+
+    logger.info(
+        "[SR_REVIEWER_DISAGREEMENTS] project=%s entries=%d",
+        project_id, len(entries),
+    )
+    return result

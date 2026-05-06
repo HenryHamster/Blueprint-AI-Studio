@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
@@ -160,5 +160,49 @@ describe('handleDesignDocUpdate', () => {
   it('contains task-type fingerprint: Do NOT create files in the repo', async () => {
     const prompt = await capturePrompt();
     expect(prompt).toContain('Do NOT create files in the repo');
+  });
+
+  it('contains YOUR ONLY OUTPUT MECHANISM section header (load-bearing contract)', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).toContain('YOUR ONLY OUTPUT MECHANISM');
+  });
+
+  it('contains ./design-doc set invocation pattern in the prompt body', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).toContain('./design-doc set');
+  });
+
+  it('contains Current pages section for existing-state context', async () => {
+    const prompt = await capturePrompt();
+    expect(prompt).toContain('Current pages');
+  });
+});
+
+describe('handleDesignDocUpdate prompt determinism', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: { summary: 'x' } }]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('produces identical prompts for identical inputs (no Date.now/Math.random leaks)', async () => {
+    const invoke = async () => {
+      await handleDesignDocUpdate(
+        TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      );
+      return vi.mocked(runClaudeCode).mock.calls[0][0];
+    };
+    const prompt1 = await invoke();
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(apiGet).mockResolvedValue([{ name: PROJECT_NAME, design_doc: { summary: 'x' } }]);
+    const prompt2 = await invoke();
+    expect(prompt1).toBe(prompt2);
   });
 });

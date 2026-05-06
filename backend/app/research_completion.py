@@ -548,6 +548,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             _f["actionability_grade"] = "MEDIUM"
 
+    # Validate optional structured fields: claims and sources.
+    for _f in findings:
+        if "claims" in _f and not isinstance(_f.get("claims"), list):
+            _f["claims"] = []
+        if "sources" in _f:
+            if not isinstance(_f["sources"], list):
+                _f["sources"] = []
+            else:
+                _f["sources"] = [s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")]
+
     # Store all findings for admin visibility before filtering
     task.plan_output = findings
     session.add(task)

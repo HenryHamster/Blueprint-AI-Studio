@@ -468,6 +468,37 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
   );
 }
 
+export interface SrReviewerDisagreement {
+  category: string;
+  task_type: string;
+  count: number;
+}
+
+export interface SrReviewerDisagreementsData {
+  window_days: number;
+  total_entries: number;
+  disagreements: SrReviewerDisagreement[];
+}
+
+export function SrReviewerDisagreementsPanel({ data }: { data: SrReviewerDisagreementsData }) {
+  if (!data.disagreements.length) return null;
+  return (
+    <div data-testid="sr-reviewer-disagreements" className="flex flex-wrap gap-1.5">
+      {data.disagreements.slice(0, 8).map((d, i) => (
+        <span
+          key={i}
+          title={`${d.count} task${d.count !== 1 ? 's' : ''} where self-review passed ${d.category} but reviewer flagged it`}
+          className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-orange-500/10 text-orange-400 border-orange-500/20"
+        >
+          <span className="truncate max-w-[120px]">{d.category}</span>
+          {d.task_type && <span className="text-orange-600 font-normal">{d.task_type}</span>}
+          <span className="font-bold shrink-0">×{d.count}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 const WINDOW_OPTIONS: { label: string; days: number }[] = [
   { label: '7d', days: 7 },
   { label: '14d', days: 14 },

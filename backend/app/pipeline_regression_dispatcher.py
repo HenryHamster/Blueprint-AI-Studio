@@ -49,6 +49,15 @@ _PIPELINE_SUCCESS_MIN_SAMPLE = 10
 # Give merged signals time to settle before the recovery scan re-evaluates them.
 _REGRESSION_RECOVERY_COOLDOWN = timedelta(minutes=15)
 
+# Watchdog staleness thresholds.  An ACTIVE case that hasn't been updated in
+# 24h has silently stalled (investigation finished with low confidence and no
+# remediation was spawned, or the close-loop step dropped it).  A MERGED case
+# that hasn't been updated in 6h means the recovery scan cannot evaluate it
+# (e.g. signal_snapshot_at_merge is missing).  Both escalate to
+# NEEDS_MANUAL_INTERVENTION and open an Alert so operators are notified.
+_WATCHDOG_ACTIVE_STALE_THRESHOLD = timedelta(hours=24)
+_WATCHDOG_MERGED_STALE_THRESHOLD = timedelta(hours=6)
+
 # Persistent-anomaly dispatch thresholds. An anomaly must recur at least this
 # many times within the recency window before an investigation is spawned — the
 # same philosophy as the 5pp SR delta floor: one bad cycle is noise, repeated
@@ -581,8 +590,6 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
     changed = 0
     for case in rows:
         snapshot = case.signal_snapshot_at_merge or {}
-        if not snapshot:
-            continue
         merged_at_raw = snapshot.get("captured_at") or case.updated_at.isoformat()
         try:
             merged_at = datetime.fromisoformat(str(merged_at_raw).replace("Z", "+00:00"))
@@ -670,6 +677,69 @@ async def _evaluate_anomaly_signal(
         if spawn is not None:
             spawned += 1
     return spawned
+
+
+async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int:
+    """Escalate stale ACTIVE/MERGED regression cases to NEEDS_MANUAL_INTERVENTION.
+
+    Catches two silent failure modes:
+    - ACTIVE cases not updated in 24h: investigation finished with low/no
+      confidence and no remediation task was spawned.
+    - MERGED cases not updated in 6h: recovery scan could not evaluate them
+      (e.g. signal_snapshot_at_merge missing or signal unresolvable).
+
+    Returns the number of cases escalated.
+    """
+    now = _utcnow()
+    rows = (await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.status.in_([
+                RegressionCaseStatus.ACTIVE,
+                RegressionCaseStatus.MERGED,
+            ]),
+        )
+    )).scalars().all()
+
+    escalated = 0
+    for case in rows:
+        updated = case.updated_at
+        if updated.tzinfo is not None:
+            updated = updated.replace(tzinfo=None)
+
+        if case.status == RegressionCaseStatus.ACTIVE:
+            threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
+            reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
+        else:  # MERGED
+            threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
+            reason = "MERGED case stale — recovery scan could not evaluate it (signal_snapshot_at_merge may be empty)"
+
+        if now < updated + threshold:
+            continue
+
+        logger.warning(
+            "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
+            "threshold_hours=%s — escalating to NEEDS_MANUAL_INTERVENTION",
+            case.status, project_id, case.regression_class,
+            updated.isoformat(), threshold.total_seconds() / 3600,
+        )
+        case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+        case.needs_manual_intervention_at = now
+        session.add(case)
+        session.add(Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Regression case stalled: {case.regression_class}"[:200],
+            message=(
+                f"{reason}. Case last updated {updated.isoformat()}; "
+                f"staleness threshold {threshold}. Manual review required."
+            )[:1000],
+        ))
+        escalated += 1
+
+    if escalated:
+        await session.commit()
+    return escalated
 
 
 async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:

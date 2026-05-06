@@ -155,6 +155,8 @@ async def apply_post_spawn_state(
             finding_titles_by_dir: dict = {}
             finding_descriptions_by_dir: dict = {}
             finding_scopes_by_dir: dict = {}
+            finding_claims_by_dir: dict = {}
+            finding_sources_by_dir: dict = {}
             for orig_i, finding, fhash in deduplicated:
                 did = finding.get("direction_id")
                 if did:
@@ -167,6 +169,8 @@ async def apply_post_spawn_state(
                     finding_scopes_by_dir.setdefault(did, []).append(
                         finding.get("scope", DEFAULT_TASK_SCOPE)
                     )
+                    finding_claims_by_dir.setdefault(did, []).append(finding.get("claims") or [])
+                    finding_sources_by_dir.setdefault(did, []).append(finding.get("sources") or [])
             # Group filter-skip records by direction so each direction's
             # research_history entry can record the exact titles + reasons
             # that were rejected on this cycle. Bucket entries without a
@@ -329,6 +333,8 @@ async def apply_post_spawn_state(
                         finding_titles=finding_titles_by_dir.get(did, [])[:5],
                         key_finding_descriptions=finding_descriptions_by_dir.get(did, [])[:5],
                         finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
+                        finding_claims=finding_claims_by_dir.get(did, [])[:5],
+                        finding_sources=finding_sources_by_dir.get(did, [])[:5],
                         cycle_insights=[i["summary"][:200] for i in insights[:3]],
                         history_entry=entry,
                         prior_history=d.get("research_history", [])[:-1],

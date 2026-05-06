@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.routers.admin_analytics import _derive_completed_at
 from app.routers.admin_digest import _stash_projected_task_fields
+from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
 
 
@@ -7503,6 +7504,152 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     # Skipped envelope contributes no entries
     assert body["total_distinct_themes"] == 2
 
+
+
+# ---------------------------------------------------------------------------
+# SR reviewer-disagreement aggregation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_basic(db_session):
+    """Counts disagreements where reviewer flagged a category self-review passed."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 3 create tasks: reviewer flags "correctness", self-review passed it
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": {
+                "verdict": "pass",
+                "check_results": {"correctness": {"passed": True}},
+                "blind_spots": [],
+                "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "missed edge"}],
+            }},
+        ))
+    # 1 fix task: reviewer flags "security", self-review omitted the category
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        context={"_self_review_outcome": {
+            "verdict": "pass",
+            "check_results": {},
+            "blind_spots": [],
+            "reviewer_findings": [{"category": "security", "severity": "CRITICAL", "description": "unvalidated input"}],
+        }},
+    ))
+    # 1 task where self-review already FAILED the category — should NOT count as disagreement
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        context={"_self_review_outcome": {
+            "verdict": "fail",
+            "check_results": {"correctness": {"passed": False}},
+            "blind_spots": [],
+            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "logic bug"}],
+        }},
+    ))
+    await db_session.commit()
+
+    results = await aggregate_sr_reviewer_disagreements(
+        db_session, project.id, days=30, limit=10,
+    )
+    by_key = {(r["category"], r["task_type"]): r["count"] for r in results}
+    assert by_key[("correctness", "create")] == 3
+    assert by_key[("security", "fix")] == 1
+    # Already-failed category must not appear
+    assert ("correctness", "fix") not in by_key
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_skipped_excluded(db_session):
+    """Skipped/fallback SR envelopes are excluded from disagreement counts."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": {
+            "verdict": "unknown",
+            "check_results": {},
+            "blind_spots": [],
+            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
+        }},
+    ))
+    await db_session.commit()
+
+    results = await aggregate_sr_reviewer_disagreements(
+        db_session, project.id, days=30, limit=10,
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_no_reviewer_findings_excluded(db_session):
+    """Tasks without reviewer_findings are not counted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [],
+        }},
+    ))
+    await db_session.commit()
+
+    results = await aggregate_sr_reviewer_disagreements(
+        db_session, project.id, days=30, limit=10,
+    )
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_endpoint(client: AsyncClient, db_session):
+    """GET sr-reviewer-disagreements returns envelope with window_days and disagreements list."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [],
+            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
+        }},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["window_days"] == 30
+    assert body["total_entries"] == 1
+    assert body["disagreements"][0]["category"] == "correctness"
+    assert body["disagreements"][0]["task_type"] == "create"
+    assert body["disagreements"][0]["count"] == 1
 
 
 # ---------------------------------------------------------------------------

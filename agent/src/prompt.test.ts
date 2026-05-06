@@ -3492,7 +3492,7 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 
 // ── Per-task-type self-review focus blocks ────────────────────────────────────
 // getTaskTypeFocusBlock() returns the right static focus block for migrate,
-// refactor, and qa tasks and '' for all other types (create, fix, etc.).
+// refactor, qa, create, fix, docs, and deps tasks; '' for unknown types.
 // CODE_CHANGE_HELPER_GUIDANCE is always composed independently and unaffected.
 describe('getTaskTypeFocusBlock — task-type-specific self-review focus blocks', () => {
   it('returns the migrate focus block for "migrate" task type', async () => {
@@ -3510,14 +3510,28 @@ describe('getTaskTypeFocusBlock — task-type-specific self-review focus blocks'
     expect(getTaskTypeFocusBlock('qa')).toBe(QA_TASK_FOCUS);
   });
 
-  it('returns empty string for "create" task type', async () => {
-    const { getTaskTypeFocusBlock } = await import('./prompt.js');
-    expect(getTaskTypeFocusBlock('create')).toBe('');
+  it('returns a non-empty focus block for "create" task type', async () => {
+    const { getTaskTypeFocusBlock, CREATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('create')).toBe(CREATE_TASK_FOCUS);
+    expect(getTaskTypeFocusBlock('create')).not.toBe('');
   });
 
-  it('returns empty string for "fix" task type', async () => {
-    const { getTaskTypeFocusBlock } = await import('./prompt.js');
-    expect(getTaskTypeFocusBlock('fix')).toBe('');
+  it('returns a non-empty focus block for "fix" task type', async () => {
+    const { getTaskTypeFocusBlock, FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('fix')).toBe(FIX_TASK_FOCUS);
+    expect(getTaskTypeFocusBlock('fix')).not.toBe('');
+  });
+
+  it('returns a non-empty focus block for "docs" task type', async () => {
+    const { getTaskTypeFocusBlock, DOCS_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('docs')).toBe(DOCS_TASK_FOCUS);
+    expect(getTaskTypeFocusBlock('docs')).not.toBe('');
+  });
+
+  it('returns a non-empty focus block for "deps" task type', async () => {
+    const { getTaskTypeFocusBlock, DEPS_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('deps')).toBe(DEPS_TASK_FOCUS);
+    expect(getTaskTypeFocusBlock('deps')).not.toBe('');
   });
 
   it('returns empty string for unknown task types', async () => {
@@ -3580,6 +3594,76 @@ describe('QA_TASK_FOCUS — content invariants', () => {
   });
 });
 
+describe('CREATE_TASK_FOCUS — content invariants', () => {
+  it('mentions test-coverage check', async () => {
+    const { CREATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(CREATE_TASK_FOCUS).toContain('test-coverage');
+  });
+
+  it('requires scope-drift check via git diff --stat', async () => {
+    const { CREATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(CREATE_TASK_FOCUS).toContain('scope-drift');
+    expect(CREATE_TASK_FOCUS).toContain('git diff --stat');
+  });
+
+  it('requires caller compatibility check', async () => {
+    const { CREATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(CREATE_TASK_FOCUS).toContain('grep');
+  });
+});
+
+describe('FIX_TASK_FOCUS — content invariants', () => {
+  it('mentions regression_risk check for the failing path', async () => {
+    const { FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(FIX_TASK_FOCUS).toContain('regression_risk');
+  });
+
+  it('requires scope-drift check via git diff --stat', async () => {
+    const { FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(FIX_TASK_FOCUS).toContain('scope-drift');
+    expect(FIX_TASK_FOCUS).toContain('git diff --stat');
+  });
+
+  it('distinguishes root cause from symptom', async () => {
+    const { FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(FIX_TASK_FOCUS).toContain('root cause');
+  });
+});
+
+describe('DOCS_TASK_FOCUS — content invariants', () => {
+  it('warns about link rot', async () => {
+    const { DOCS_TASK_FOCUS } = await import('./prompt.js');
+    expect(DOCS_TASK_FOCUS).toContain('link');
+  });
+
+  it('warns about code-comment vs behavior mismatch', async () => {
+    const { DOCS_TASK_FOCUS } = await import('./prompt.js');
+    expect(DOCS_TASK_FOCUS).toContain('behavior');
+  });
+
+  it('requires production code untouched check via scope-drift', async () => {
+    const { DOCS_TASK_FOCUS } = await import('./prompt.js');
+    expect(DOCS_TASK_FOCUS).toContain('scope-drift');
+  });
+});
+
+describe('DEPS_TASK_FOCUS — content invariants', () => {
+  it('requires lockfile/manifest parity check', async () => {
+    const { DEPS_TASK_FOCUS } = await import('./prompt.js');
+    expect(DEPS_TASK_FOCUS).toContain('lockfile');
+  });
+
+  it('warns about transitive dependency impact', async () => {
+    const { DEPS_TASK_FOCUS } = await import('./prompt.js');
+    expect(DEPS_TASK_FOCUS).toContain('transitive');
+  });
+
+  it('guards against major version bumps', async () => {
+    const { DEPS_TASK_FOCUS } = await import('./prompt.js');
+    expect(DEPS_TASK_FOCUS).toContain('major');
+  });
+});
+
 describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () => {
   it('CODE_CHANGE_HELPER_GUIDANCE is unchanged regardless of task type', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
@@ -3606,6 +3690,91 @@ describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () 
     const focus = getTaskTypeFocusBlock('qa');
     expect(focus).not.toBe('');
     expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: qa tasks');
+  });
+
+  it('focus block for create is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('create');
+    expect(focus).not.toBe('');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: create tasks');
+  });
+
+  it('focus block for fix is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('fix');
+    expect(focus).not.toBe('');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: fix tasks');
+  });
+
+  it('focus block for docs is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('docs');
+    expect(focus).not.toBe('');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: docs tasks');
+  });
+
+  it('focus block for deps is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('deps');
+    expect(focus).not.toBe('');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: deps tasks');
+  });
+});
+
+// ── SELF_REVIEW_PROMPT_VERSION — version lock ─────────────────────────────────
+// Pin the version so trend data correctly attributes the regime change when
+// create/fix/docs/deps focus blocks were added. If this test fails, bump the
+// version in prompt.ts and reset this assertion to the new value.
+describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
+  it('is "2" after adding create/fix/docs/deps focus blocks', async () => {
+    const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('2');
+  });
+
+  it('is a non-empty string (used as prompt_version field in self-review JSON)', async () => {
+    const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
+    expect(typeof SELF_REVIEW_PROMPT_VERSION).toBe('string');
+    expect(SELF_REVIEW_PROMPT_VERSION).not.toBe('');
+  });
+});
+
+// ── Assembled prompt inclusion — focus block appears after generic guidance ───
+// Handlers concatenate CODE_CHANGE_HELPER_GUIDANCE + getTaskTypeFocusBlock(type).
+// These tests verify the focus block content actually appears in that composite
+// for the four newly-added task types (create, fix, docs, deps).
+describe('assembled prompt — focus block included after CODE_CHANGE_HELPER_GUIDANCE', () => {
+  it('create focus block appears in assembled guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE, CREATE_TASK_FOCUS } = await import('./prompt.js');
+    const assembled = CODE_CHANGE_HELPER_GUIDANCE + getTaskTypeFocusBlock('create');
+    expect(assembled).toContain(CREATE_TASK_FOCUS);
+    expect(assembled.indexOf(CODE_CHANGE_HELPER_GUIDANCE)).toBeLessThan(assembled.indexOf(CREATE_TASK_FOCUS));
+  });
+
+  it('fix focus block appears in assembled guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE, FIX_TASK_FOCUS } = await import('./prompt.js');
+    const assembled = CODE_CHANGE_HELPER_GUIDANCE + getTaskTypeFocusBlock('fix');
+    expect(assembled).toContain(FIX_TASK_FOCUS);
+    expect(assembled.indexOf(CODE_CHANGE_HELPER_GUIDANCE)).toBeLessThan(assembled.indexOf(FIX_TASK_FOCUS));
+  });
+
+  it('docs focus block appears in assembled guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE, DOCS_TASK_FOCUS } = await import('./prompt.js');
+    const assembled = CODE_CHANGE_HELPER_GUIDANCE + getTaskTypeFocusBlock('docs');
+    expect(assembled).toContain(DOCS_TASK_FOCUS);
+    expect(assembled.indexOf(CODE_CHANGE_HELPER_GUIDANCE)).toBeLessThan(assembled.indexOf(DOCS_TASK_FOCUS));
+  });
+
+  it('deps focus block appears in assembled guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE, DEPS_TASK_FOCUS } = await import('./prompt.js');
+    const assembled = CODE_CHANGE_HELPER_GUIDANCE + getTaskTypeFocusBlock('deps');
+    expect(assembled).toContain(DEPS_TASK_FOCUS);
+    expect(assembled.indexOf(CODE_CHANGE_HELPER_GUIDANCE)).toBeLessThan(assembled.indexOf(DEPS_TASK_FOCUS));
+  });
+
+  it('unknown type yields no extra content beyond generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const assembled = CODE_CHANGE_HELPER_GUIDANCE + getTaskTypeFocusBlock('unknown');
+    expect(assembled).toBe(CODE_CHANGE_HELPER_GUIDANCE);
   });
 });
 

@@ -1236,6 +1236,15 @@ async def claim_task(
                 )
             except Exception:
                 logger.exception("[AGENT] Failed to compute sr_catch_rate_trends (non-critical)")
+            try:
+                from app.playbook_learning import compute_sr_reviewer_disagreements
+                await compute_sr_reviewer_disagreements(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception("[AGENT] Failed to compute sr_reviewer_disagreements (non-critical)")
 
         direction_concurrent_files: list[str] = []
         if current_direction_id:
@@ -1895,6 +1904,15 @@ async def claim_task(
                     )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)")
+                try:
+                    from app.playbook_learning import compute_sr_reviewer_disagreements
+                    await compute_sr_reviewer_disagreements(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute research sr_reviewer_disagreements (non-critical)")
                 success_summary: list[str] = []
                 for scope_name, counts in research_scope_rates.items():
                     created = counts["created"]

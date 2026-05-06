@@ -4493,3 +4493,160 @@ async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession)
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     mock_post2.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_sr_reviewer_disagreements
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_reviewer_task(
+    project_id,
+    *,
+    age_days: float,
+    task_type: str = "create",
+    check_results: dict | None = None,
+    reviewer_findings: list | None = None,
+) -> Task:
+    """Build a completed Task with self-review outcome and fresh-reviewer findings."""
+    sro: dict = {"check_results": check_results or {}}
+    if reviewer_findings is not None:
+        sro["reviewer_findings"] = reviewer_findings
+    task = Task(
+        project_id=project_id,
+        title="SR reviewer task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": sro},
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_reviewer_disagreements_returns_none_when_no_findings(db_session: AsyncSession):
+    """Returns None when no tasks have reviewer_findings."""
+    from app.playbook_learning import compute_sr_reviewer_disagreements
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(3):
+        t = _make_sr_reviewer_task(project.id, age_days=1)
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_reviewer_disagreements_counts_disagreements(db_session: AsyncSession):
+    """Counts disagreements where reviewer flagged but SR passed/omitted the category."""
+    from app.playbook_learning import compute_sr_reviewer_disagreements
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 3 tasks: reviewer flags correctness, SR omits it -> disagreement
+    for _ in range(3):
+        t = _make_sr_reviewer_task(
+            project.id,
+            age_days=1,
+            task_type="fix",
+            check_results={},
+            reviewer_findings=[{"category": "correctness", "severity": "HIGH", "description": "bug"}],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 1 task: reviewer flags correctness but SR already failed it -> NOT a disagreement
+    t2 = _make_sr_reviewer_task(
+        project.id,
+        age_days=2,
+        task_type="fix",
+        check_results={"correctness": {"passed": False, "issue": "x"}},
+        reviewer_findings=[{"category": "correctness", "severity": "HIGH", "description": "bug"}],
+    )
+    db_session.add(t2)
+    tasks.append(t2)
+    await db_session.flush()
+
+    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["window_days"] == 30
+    entries = result["disagreements"]
+    assert len(entries) == 1
+    assert entries[0]["category"] == "correctness"
+    assert entries[0]["task_type"] == "fix"
+    assert entries[0]["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(db_session: AsyncSession):
+    """Result is written to project.design_doc['sr_reviewer_disagreements']."""
+    from app.playbook_learning import compute_sr_reviewer_disagreements
+
+    project = await _make_project(db_session)
+    tasks = []
+    t = _make_sr_reviewer_task(
+        project.id,
+        age_days=1,
+        check_results={},
+        reviewer_findings=[{"category": "test-coverage", "severity": "MEDIUM", "description": "missing test"}],
+    )
+    db_session.add(t)
+    tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
+
+    stored = project.design_doc.get("sr_reviewer_disagreements") or {}
+    assert stored.get("disagreements")
+    assert stored["disagreements"][0]["category"] == "test-coverage"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_reviewer_disagreements_excludes_old_tasks(db_session: AsyncSession):
+    """Tasks older than window_days are excluded."""
+    from app.playbook_learning import compute_sr_reviewer_disagreements
+
+    project = await _make_project(db_session)
+    tasks = []
+    t = _make_sr_reviewer_task(
+        project.id,
+        age_days=35,  # outside 30-day default window
+        check_results={},
+        reviewer_findings=[{"category": "security", "severity": "HIGH", "description": "x"}],
+    )
+    db_session.add(t)
+    tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_reviewer_disagreements_excludes_non_code_types(db_session: AsyncSession):
+    """Only code-change task types (create/fix/refactor/migrate) are counted."""
+    from app.playbook_learning import compute_sr_reviewer_disagreements
+
+    project = await _make_project(db_session)
+    tasks = []
+    for ttype in ("research", "plan", "review"):
+        t = _make_sr_reviewer_task(
+            project.id,
+            age_days=1,
+            task_type=ttype,
+            check_results={},
+            reviewer_findings=[{"category": "correctness", "severity": "HIGH", "description": "bug"}],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
+
+    assert result is None

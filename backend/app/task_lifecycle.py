@@ -1202,7 +1202,12 @@ async def _close_loop_regression_case_on_merge(
     case = result.scalar_one_or_none()
     if case is None:
         return
-    case.mark_merged(pr_number, (task.context or {}).get("signal_snapshot", {}))
+    snapshot = (task.context or {}).get("signal_snapshot") or {}
+    if not snapshot:
+        # Fall back to spawn-time snapshot; run_recovery_once requires a
+        # non-empty snapshot to evaluate the MERGED→CLOSED transition.
+        snapshot = dict(case.signal_snapshot_at_spawn or {})
+    case.mark_merged(pr_number, snapshot)
     session.add(case)
 
 

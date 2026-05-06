@@ -1399,15 +1399,114 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     vi.mocked(fs.readFileSync).mockReturnValue('');
   });
 
+  // ── handlePlan fingerprints ──────────────────────────────────────────────────
+
   it('handlePlan prompt contains depends_on_indices (plan output schema cue)', async () => {
     await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('depends_on_indices');
   });
 
+  it('handlePlan prompt contains "subtasks" (plan JSON output schema root key)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('"subtasks"');
+  });
+
+  it('handlePlan prompt contains related_files (subtask schema field)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('related_files');
+  });
+
+  it('handlePlan prompt contains effort field (subtask schema field)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('"effort"');
+  });
+
+  it('handlePlan prompt contains "type" field (controls subtask execution mode)', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('"type"');
+  });
+
+  // ── handleResearch fingerprints ──────────────────────────────────────────────
+
   it('handleResearch prompt contains "Explore aggressively" (read-only exploration directive)', async () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('Explore aggressively');
+  });
+
+  it('handleResearch prompt contains /tmp/research_findings_ output file path', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('/tmp/research_findings_');
+  });
+
+  it('handleResearch prompt contains actionability_grade (output schema required field)', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('actionability_grade');
+  });
+
+  it('handleResearch prompt contains /tmp/research_progress_ second output file', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('/tmp/research_progress_');
+  });
+
+  it('handleResearch prompt contains related_files (finding output schema field)', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('related_files');
+  });
+});
+
+// ── Prompt determinism meta-tests ─────────────────────────────────────────────
+describe('handlePlan / handleResearch prompt determinism', () => {
+  const FP_TASK_ID = 'det-task-001';
+  const FP_GH_TOKEN = 'gh-token';
+  const FP_OWNER = 'owner';
+  const FP_REPO = 'repo';
+  const FP_WS = null;
+  const FP_STATUS_REF = () => ({ value: '' });
+  const FP_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const FP_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('handlePlan produces identical prompts for identical inputs', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const prompt1 = vi.mocked(runClaudeCode).mock.calls[0][0];
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const prompt2 = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt1).toBe(prompt2);
+  });
+
+  it('handleResearch produces identical prompts for identical inputs', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const prompt1 = vi.mocked(runClaudeCode).mock.calls[0][0];
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const prompt2 = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt1).toBe(prompt2);
   });
 });

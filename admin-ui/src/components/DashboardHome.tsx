@@ -29,7 +29,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, type SrTrendData, type SrMissedTask } from './SrTrendBreakdown';
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData } from './SrTrendBreakdown';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -572,6 +572,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
+  const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
@@ -683,6 +684,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
             if (res.ok) setBlindSpots(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-reviewer-disagreements`);
+            if (res.ok) setSrReviewerDisagreements(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -1087,6 +1094,17 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   </span>
                 ))}
               </div>
+            </section>
+          )}
+
+          {/* SR Reviewer Disagreements */}
+          {!loading && srReviewerDisagreements && srReviewerDisagreements.disagreements.length > 0 && (
+            <section>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+                SR ↔ Reviewer Disagreements
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {srReviewerDisagreements.total_entries} categor{srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}</span>
+              </p>
+              <SrReviewerDisagreementsPanel data={srReviewerDisagreements} />
             </section>
           )}
 

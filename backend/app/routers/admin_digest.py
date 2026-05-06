@@ -39,6 +39,7 @@ from app.strategic_analysis import _compute_prediction_calibration
 from app.playbook_learning import _categorize_review_issues
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_envelope,
+    aggregate_sr_reviewer_disagreements,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
 )
 
@@ -4978,6 +4979,30 @@ async def list_sr_blind_spots(
     return await aggregate_sr_blind_spot_envelope(
         session, project_id, days=days, limit=limit,
     )
+
+
+@router.get("/projects/{project_id}/sr-reviewer-disagreements")
+async def list_sr_reviewer_disagreements(
+    project_id: uuid.UUID,
+    days: int = Query(30, ge=1, le=90),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate categories where self-review passed but the fresh-reviewer flagged an issue.
+
+    Returns up to ``limit`` entries sorted by disagreement count descending.
+    Only code-change tasks (create/fix/refactor/migrate) with both
+    ``check_results`` and ``reviewer_findings`` are included.
+    """
+    entries = await aggregate_sr_reviewer_disagreements(
+        session, project_id, days=days, limit=limit,
+    )
+    return {
+        "window_days": days,
+        "total_entries": len(entries),
+        "disagreements": entries,
+    }
 
 
 _MIN_DIRECTION_SR_SAMPLE = 3

@@ -1131,7 +1131,7 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "1";
+export const SELF_REVIEW_PROMPT_VERSION = "2";
 
 // Task-type-specific self-review focus blocks. Each block overlays the generic
 // CODE_CHANGE_HELPER_GUIDANCE with concrete, type-specific scrutiny targeting
@@ -1185,6 +1185,72 @@ that don't exercise edge cases or new behaviors.
    insufficient. Verify assertions check actual return values or side effects.
 `;
 
+export const CREATE_TASK_FOCUS = `
+## Self-review focus: create tasks
+
+Create tasks most commonly miss test coverage for new behavior and drift outside
+the declared scope. Apply these additional checks before \`./done\`:
+
+1. **Test coverage** — for every new function, class, or behavior you shipped,
+   confirm there is at least one test. In \`test-coverage\`, attest explicitly:
+   \`"issue": "new behavior X has a test in test_foo.py"\` (or note the gap).
+2. **Scope-drift** — run \`git diff --stat HEAD\` and list every changed file.
+   Any file outside the declared scope must be justified; record unexplained
+   additions under \`scope-drift\` with \`passed: false\`.
+3. **Caller compatibility** — grep for callers of any function or export you
+   added or modified; confirm their call sites still compile and behave correctly.
+`;
+
+export const FIX_TASK_FOCUS = `
+## Self-review focus: fix tasks
+
+Fix tasks most commonly introduce regression risk on the surface that was already
+failing, and scope creep into unrelated files. Apply these additional checks:
+
+1. **Regression surface** — identify the specific code path that was failing before
+   your fix. Confirm the fix targets ONLY that path and does not silently change
+   adjacent behavior. Record in \`regression_risk\` even when passing:
+   \`"issue": "fixed path: foo() — adjacent callers bar(), baz() verified unchanged"\`.
+2. **Scope-drift** — run \`git diff --stat HEAD\`. Fixes should be surgical; any
+   file that is not directly on the failure path must be justified. Record
+   unjustified additions under \`scope-drift\` with \`passed: false\`.
+3. **Root-cause vs. symptom** — confirm the fix addresses the root cause, not just
+   the observable symptom. If you only masked the symptom, record it under
+   \`correctness\` with \`passed: false\`.
+`;
+
+export const DOCS_TASK_FOCUS = `
+## Self-review focus: docs tasks
+
+Docs tasks most commonly ship stale links or descriptions that diverge from
+current code behavior. Apply these additional checks before \`./done\`:
+
+1. **Link rot** — for every URL or cross-reference you added or kept, verify it
+   resolves. Dead links in published docs are high-visibility failures.
+2. **Code-comment vs. behavior** — for every code snippet or function description
+   you wrote, re-read the actual implementation and confirm it matches. Divergence
+   between docs and code is worse than no docs.
+3. **Production-code untouched** — confirm \`git diff --stat HEAD\` shows only
+   documentation files (README, docs/, docstrings). Any production-code change
+   belongs in a separate task; record under \`scope-drift\` if found.
+`;
+
+export const DEPS_TASK_FOCUS = `
+## Self-review focus: deps tasks
+
+Deps tasks most commonly leave lockfile/manifest drift or miss transitive breakage.
+Apply these additional checks before \`./done\`:
+
+1. **Lockfile/manifest parity** — confirm every file that declares a dependency
+   (package.json, requirements.txt, pyproject.toml, Cargo.toml, go.mod) has a
+   corresponding updated lockfile (package-lock.json, poetry.lock, Cargo.lock,
+   go.sum). A manifest update without a lockfile update is a broken state.
+2. **Transitive impact** — check whether bumped packages pulled in new transitive
+   deps or dropped old ones. Run the build to confirm no implicit peer-dep errors.
+3. **Major-version guard** — confirm no package crossed a major version boundary.
+   Record any that did under \`correctness\` with \`passed: false\`.
+`;
+
 // Returns the task-type-specific self-review focus block to append after
 // CODE_CHANGE_HELPER_GUIDANCE. Returns '' for task types without a custom block.
 export function getTaskTypeFocusBlock(taskType: string): string {
@@ -1192,6 +1258,10 @@ export function getTaskTypeFocusBlock(taskType: string): string {
     case 'migrate': return MIGRATE_TASK_FOCUS;
     case 'refactor': return REFACTOR_TASK_FOCUS;
     case 'qa': return QA_TASK_FOCUS;
+    case 'create': return CREATE_TASK_FOCUS;
+    case 'fix': return FIX_TASK_FOCUS;
+    case 'docs': return DOCS_TASK_FOCUS;
+    case 'deps': return DEPS_TASK_FOCUS;
     default: return '';
   }
 }

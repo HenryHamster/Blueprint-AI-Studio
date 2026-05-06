@@ -2505,9 +2505,15 @@ implementation findings. Add metadata alongside them when relevant.
   "related_files": ["path/to/file.py"],
   "depends_on_indices": [],
   "direction_id": "d-xxx or null",
-  "effort": "high|medium|low|null"
+  "effort": "high|medium|low|null",
+  "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
+  "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.py or pr#123 or msg_id", "excerpt": "optional short quote"}]
 }]
 \`\`\`
+
+**claims** (optional): Short factual assertions that back this finding — one sentence each, verifiable (e.g. 'backend/app/task_completion.py:_handle_research_completion stores findings in task.plan_output'). Omit the field when synthesizing across many observations with no single traceable origin.
+
+**sources** (optional, provenance only): Cite a specific origin when you have one. type 'file': a file you read, 'pr': a merged PR number, 'log': a pipeline log line, 'message': a user message. Omit the field when synthesizing. excerpt is optional — include only a directly relevant short quote.
 
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.

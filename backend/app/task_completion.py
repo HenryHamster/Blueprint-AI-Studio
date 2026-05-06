@@ -2888,6 +2888,21 @@ async def _spawn_investigation_remediation(
         remediation_context["trigger_failure_taxonomy"] = trigger_failure_taxonomy
     if parent_ctx.get("proactive_pattern_fix"):
         remediation_context["proactive_pattern_fix"] = True
+    regression_class = parent_ctx.get("regression_class")
+    if regression_class:
+        remediation_context["regression_class"] = regression_class
+        from app.models import RegressionRemediationCase  # noqa: PLC0415
+        case_result = await session.execute(
+            select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == task.project_id,
+                RegressionRemediationCase.regression_class == regression_class,
+            )
+        )
+        case_row = case_result.scalar_one_or_none()
+        if case_row is not None:
+            snap = dict(case_row.signal_snapshot_at_spawn or {})
+            snap["captured_at"] = _utcnow().isoformat()
+            remediation_context["signal_snapshot"] = snap
 
     new_task = Task(
         project_id=task.project_id,

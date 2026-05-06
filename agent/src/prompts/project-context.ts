@@ -433,6 +433,40 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
+  // Build SR vs fresh-reviewer disagreement calibration block — only if budget allows.
+  // Shape: ctx.sr_reviewer_disagreements = { disagreements: [{category, task_type, count}], window_days: number }
+  type SRReviewerDisagreementEntry = { category: string; task_type: string; count: number };
+  const srReviewerDisagreementsData = ctx.sr_reviewer_disagreements as {
+    disagreements?: SRReviewerDisagreementEntry[];
+    window_days?: number;
+  } | null | undefined;
+  let srReviewerDisagreementLines: string[] = [];
+  if (srReviewerDisagreementsData?.disagreements && srReviewerDisagreementsData.disagreements.length > 0) {
+    const rawEntries = srReviewerDisagreementsData.disagreements;
+    const windowDays = srReviewerDisagreementsData.window_days ?? 30;
+    // Prioritize entries matching the current task type, then show cross-type entries
+    const forCurrentType = taskType ? rawEntries.filter((e) => e.task_type === taskType) : [];
+    const forOtherTypes = taskType ? rawEntries.filter((e) => e.task_type !== taskType) : rawEntries;
+    const ordered = [...forCurrentType, ...forOtherTypes].slice(0, 8);
+    if (ordered.length > 0) {
+      const typeScope = taskType ? ` — especially in ${taskType} tasks` : '';
+      const candidateLines: string[] = [
+        '### SR vs Fresh-Reviewer Disagreements',
+        `Categories where self-review passed but the fresh reviewer caught issues (last ${windowDays} days)${typeScope}. Apply extra scrutiny here:`,
+      ];
+      for (const entry of ordered) {
+        const typeSuffix = taskType && entry.task_type !== taskType ? ` (${entry.task_type} tasks)` : '';
+        candidateLines.push(`- **${entry.category}**: ${entry.count} disagreement${entry.count === 1 ? '' : 's'}${typeSuffix}`);
+      }
+      candidateLines.push('');
+      const candidate = candidateLines.join('\n');
+      if (candidate.length <= budget) {
+        srReviewerDisagreementLines = candidateLines;
+        budget -= candidate.length;
+      }
+    }
+  }
+
   // Build project-wide SR blind-spot themes (last 14 days) — only if budget allows.
   // Surfaced from backend agent.py injection: ctx.sr_blind_spot_themes is
   // [{theme, count}, ...] sorted by count desc, capped at 8.
@@ -511,6 +545,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srBlindSpotThemesLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

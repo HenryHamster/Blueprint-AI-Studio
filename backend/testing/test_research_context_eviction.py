@@ -367,3 +367,70 @@ class TestPriorOutcomeTagging:
             prior_history=None,
         )
         assert "Thing A [small] (proposed)" in result
+
+
+class TestClaimsAndSources:
+    """_build_research_context: claims/sources rendering and backward compat."""
+
+    def _build(self, titles, descs, claims=None, sources=None):
+        return _build_research_context(
+            prior_context=None,
+            finding_titles=titles,
+            key_finding_descriptions=descs,
+            cycle_insights=[],
+            history_entry={},
+            finding_claims=claims,
+            finding_sources=sources,
+        )
+
+    def test_claims_rendered_in_entry(self):
+        result = self._build(
+            titles=["feat: add caching"],
+            descs=["Add a cache layer."],
+            claims=[["cache miss rate is 40%", "redis already deployed"]],
+        )
+        assert "Claims: cache miss rate is 40%" in result
+        assert "redis already deployed" in result
+
+    def test_sources_rendered_in_entry(self):
+        result = self._build(
+            titles=["feat: add caching"],
+            descs=["Add a cache layer."],
+            sources=[[{"type": "file", "ref": "backend/app/cache.py", "excerpt": "line 42"}]],
+        )
+        assert "Sources: backend/app/cache.py" in result
+
+    def test_finding_without_claims_sources_unchanged(self):
+        result = self._build(
+            titles=["feat: basic finding"],
+            descs=["A simple description."],
+        )
+        assert "feat: basic finding [small] (proposed)" in result
+        assert "Claims" not in result
+        assert "Sources" not in result
+
+    def test_empty_claims_list_not_rendered(self):
+        result = self._build(
+            titles=["feat: no claims"],
+            descs=["Description."],
+            claims=[[]],
+        )
+        assert "Claims" not in result
+
+    def test_sources_missing_ref_skipped(self):
+        result = self._build(
+            titles=["feat: bad source"],
+            descs=["Description."],
+            sources=[[{"type": "file", "excerpt": "no ref here"}]],
+        )
+        assert "Sources" not in result
+
+    def test_claims_capped_at_three(self):
+        result = self._build(
+            titles=["feat: many claims"],
+            descs=["Description."],
+            claims=[["claim1", "claim2", "claim3", "claim4", "claim5"]],
+        )
+        assert "claim1" in result
+        assert "claim3" in result
+        assert "claim4" not in result
