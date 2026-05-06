@@ -417,12 +417,20 @@ interface ReviewerFinding {
   description: string;
 }
 
+interface EdgeConsidered {
+  case: string;
+  handled: boolean;
+  evidence?: string;
+  blind_spot?: string;
+}
+
 interface SelfReviewOutcome {
   verdict?: string;
   fixes_applied?: boolean;
   check_results?: Record<string, SelfReviewCheckResult>;
   blind_spots?: string[];
   reviewer_findings?: ReviewerFinding[];
+  edges_considered?: EdgeConsidered[];
 }
 
 function getSeverityColor(severity: string): string {
@@ -538,6 +546,30 @@ function SelfReviewPanel({ task }: { task: Task }) {
                       </li>
                     ))}
                   </ul>
+                </div>
+              )}
+
+              {outcome.edges_considered && outcome.edges_considered.length > 0 && (
+                <div>
+                  <p className="text-xs text-neutral-400 font-medium mb-1.5">Edges considered ({outcome.edges_considered.length})</p>
+                  <div className="rounded border border-neutral-700 overflow-hidden text-[10px]">
+                    <div className="grid grid-cols-[1fr_auto] bg-neutral-800/60 px-2 py-1 font-semibold text-neutral-400 uppercase tracking-wide gap-2">
+                      <span>Case</span>
+                      <span>Handled</span>
+                    </div>
+                    {outcome.edges_considered.map((edge, i) => (
+                      <div key={i} className={`px-2 py-1.5 border-t border-neutral-700/50 ${!edge.handled ? 'bg-amber-950/20' : ''}`}>
+                        <div className="grid grid-cols-[1fr_auto] gap-2 items-start">
+                          <span className="text-neutral-300 break-words">{edge.case}</span>
+                          <span className={`font-semibold shrink-0 ${edge.handled ? 'text-emerald-400' : 'text-amber-400'}`}>
+                            {edge.handled ? '✓ yes' : '✗ no'}
+                          </span>
+                        </div>
+                        {edge.evidence && <p className="text-neutral-500 mt-0.5 break-words">evidence: {edge.evidence}</p>}
+                        {edge.blind_spot && <p className="text-amber-400/70 mt-0.5 break-words">blind spot: {edge.blind_spot}</p>}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 

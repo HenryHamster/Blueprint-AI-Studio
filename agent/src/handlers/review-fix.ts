@@ -15,6 +15,7 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
@@ -847,6 +848,7 @@ export async function handleFix(
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const originalPrompt = strVal(payload.original_prompt);
+  const fixOrigTaskType = strVal(payload.original_task_type || '');
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -1153,7 +1155,8 @@ export async function handleFix(
   if (fixTypeHints['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${fixTypeHints['fix']}`;
   }
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  const fixFocusBlock = getTaskTypeFocusBlock(fixOrigTaskType);
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
@@ -1262,10 +1265,23 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   });
 
   // Fresh reviewer pass: read-only second session to catch issues the fix
-  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
+  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer,
+  // and auto-on for self-repo projects so cycle-over-cycle catch-rate has a
+  // meaningful sample without an operator toggling the flag.
   const fixProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
-  if (fixProjectMeta?.enable_fresh_reviewer === true) {
+  const freshReviewerEnabled =
+    fixProjectMeta?.enable_fresh_reviewer === true || fixProjectMeta?.is_self_repo === true;
+  if (freshReviewerEnabled) {
     const fixTaskTitle = strVal(task.title) || originalPrompt.slice(0, 80) || 'Fix task';
-    await runFreshReviewerPass(taskId, fixTaskTitle, originalPrompt || prompt, fixRelatedFiles, ws, statusRef, model);
+    await runFreshReviewerPass(
+      taskId,
+      fixTaskTitle,
+      originalPrompt || prompt,
+      fixRelatedFiles,
+      ws,
+      statusRef,
+      model,
+      task.project_context as Record<string, unknown> | undefined,
+    );
   }
 }

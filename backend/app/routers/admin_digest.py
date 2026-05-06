@@ -240,6 +240,62 @@ def _compute_fresh_reviewer_effectiveness(terminal_tasks: List[Task]) -> "Dict[s
     }
 
 
+def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
+    """Rolling metrics for the edges_considered field in self-review outcomes.
+
+    Computes avg edges enumerated per task and unhandled-edge-flagged rate.
+    Correlates tasks with vs. without enumerated edges against correctness/
+    error-handling reviewer rejections to validate field utility.
+    Returns None when fewer than 3 qualifying code-change tasks exist.
+    """
+    code_change_tasks = [
+        t for t in terminal_tasks
+        if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
+        and "_self_review_outcome" in (t.context or {})
+    ]
+    if len(code_change_tasks) < 3:
+        return None
+
+    tasks_with_edges: List[Task] = []
+    tasks_without_edges: List[Task] = []
+    total_edges = 0
+    unhandled_flagged = 0
+    for t in code_change_tasks:
+        edges = (t.context or {}).get("_self_review_outcome", {}).get("edges_considered") or []
+        if not isinstance(edges, list):
+            edges = []
+        if edges:
+            tasks_with_edges.append(t)
+            total_edges += len(edges)
+            if any(not e.get("handled", True) for e in edges if isinstance(e, dict)):
+                unhandled_flagged += 1
+        else:
+            tasks_without_edges.append(t)
+
+    _edge_cats = {"correctness", "error-handling"}
+
+    def _rejection_rate(tasks: List[Task]) -> "float | None":
+        measured = [t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})]
+        if not measured:
+            return None
+        flagged = sum(
+            1 for t in measured
+            if _edge_cats & set(t.context.get("_first_attempt_rejection_categories") or [])
+        )
+        return round(flagged / len(measured), 3)
+
+    n_with = len(tasks_with_edges)
+    return {
+        "sample_size": len(code_change_tasks),
+        "tasks_with_edges_count": n_with,
+        "tasks_with_edges_rate": round(n_with / len(code_change_tasks), 3),
+        "avg_edges_per_task": round(total_edges / n_with, 2) if n_with else None,
+        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3) if n_with else None,
+        "correctness_rejection_rate_with_edges": _rejection_rate(tasks_with_edges),
+        "correctness_rejection_rate_without_edges": _rejection_rate(tasks_without_edges),
+    }
+
+
 def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
     """Compute self-review effectiveness, prediction accuracy, and review accuracy
     from a list of terminal tasks. Returns dict with three keys, each None when
@@ -296,12 +352,14 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
     ]
     self_review_prediction_accuracy = _compute_sr_prediction_accuracy(tasks_with_both)
     fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
+    edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks)
 
     return {
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "review_accuracy": review_accuracy,
         "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
+        "edges_considered_metrics": edges_considered_metrics,
     }
 
 
@@ -1041,6 +1099,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         and "_first_attempt_rejection_categories" in (t.context or {})
     ]
     self_review_prediction_accuracy = _compute_sr_prediction_accuracy(tasks_with_both_24h)
+    edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks_24h)
 
     # Medium-scope pre/post investment measurement — computed over a longer lookback
     # so research agents see the actual before/after merge rates straight from the prompt
@@ -1088,6 +1147,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
+        "edges_considered_metrics": edges_considered_metrics,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
         "review_effectiveness_trends": review_effectiveness_trends,
@@ -3938,6 +3998,7 @@ async def _compute_digest(
         "self_review_skip_rate": _self_review_skip_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
+        "edges_considered_metrics": _review_quality["edges_considered_metrics"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),
         "completed_count": len(completed_tasks),
@@ -4773,3 +4834,162 @@ async def list_sr_blind_spots(
     return await aggregate_sr_blind_spot_envelope(
         session, project_id, days=days, limit=limit,
     )
+
+
+_MIN_DIRECTION_SR_SAMPLE = 3
+
+
+@router.get("/projects/{project_id}/direction-sr-breakdown")
+async def get_direction_sr_breakdown(
+    project_id: uuid.UUID,
+    days: int = Query(30, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Per-direction SR catch-rate breakdown.
+
+    Only directions with >= 3 qualifying tasks (both SR check_results and
+    human rejection categories present) are included.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    stmt = (
+        select(Task)
+        .where(Task.project_id == project_id, Task.status == TaskStatus.COMPLETED, Task.created_at >= cutoff)
+        .options(load_only(Task.id, Task.title, Task.context, Task.payloads, Task.project_id))
+        .order_by(Task.created_at.desc())
+        .limit(2000)
+    )
+    all_tasks = (await session.execute(stmt)).scalars().all()
+
+    dir_tasks: Dict[str, list] = {}
+    for t in all_tasks:
+        ctx = t.context or {}
+        if "_self_review_outcome" not in ctx or not ctx.get("_first_attempt_rejection_categories"):
+            continue
+        did = str(ctx.get("direction_id") or "")
+        if did:
+            dir_tasks.setdefault(did, []).append(t)
+
+    dir_text: Dict[str, str] = {}
+    project = await session.get(Project, project_id)
+    if project:
+        for d in ((project.design_doc or {}).get("directions") or []):
+            did = str(d.get("id") or d.get("direction_id") or "")
+            if did:
+                dir_text[did] = d.get("text") or d.get("description") or ""
+
+    directions_out = []
+    for did, tasks in dir_tasks.items():
+        if len(tasks) < _MIN_DIRECTION_SR_SAMPLE:
+            continue
+        cat_stats: Dict[str, Dict] = {}
+        for t in tasks:
+            ctx = t.context or {}
+            human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
+            check_results = ctx["_self_review_outcome"].get("check_results") or {}
+            sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+            rev_cats = _categorize_review_issues(rev_hist) if rev_hist else {}
+            for cat in human_cats:
+                s = cat_stats.setdefault(cat, {"hit_count": 0, "human_count": 0, "miss_examples": []})
+                s["human_count"] += 1
+                if cat in sr_failed:
+                    s["hit_count"] += 1
+                else:
+                    for issue in rev_cats.get(cat, []):
+                        if len(s["miss_examples"]) < 3:
+                            s["miss_examples"].append({"desc": issue["desc"], "severity": issue["severity"]})
+        total_human = sum(s["human_count"] for s in cat_stats.values())
+        total_hit = sum(s["hit_count"] for s in cat_stats.values())
+        cats_out: Dict[str, Any] = {}
+        worst_cat: Optional[str] = None
+        worst_miss = -1.0
+        for cat, s in cat_stats.items():
+            miss_rate = round(1 - s["hit_count"] / s["human_count"], 3) if s["human_count"] else None
+            cats_out[cat] = {"human_count": s["human_count"], "hit_count": s["hit_count"], "miss_rate": miss_rate, "miss_examples": s["miss_examples"]}
+            if miss_rate is not None and miss_rate > worst_miss:
+                worst_miss = miss_rate
+                worst_cat = cat
+        directions_out.append({
+            "direction_id": did,
+            "direction_text": dir_text.get(did, ""),
+            "sample_size": len(tasks),
+            "overall_catch_rate": round(total_hit / total_human, 3) if total_human else None,
+            "categories": cats_out,
+            "worst_category": worst_cat,
+        })
+
+    directions_out.sort(key=lambda x: (x.get("overall_catch_rate") or 1.0))
+    return {"directions": directions_out, "min_sample": _MIN_DIRECTION_SR_SAMPLE}
+
+
+@router.get("/projects/{project_id}/sr-recent-misses")
+async def get_sr_recent_misses(
+    project_id: uuid.UUID,
+    limit: int = Query(20, ge=1, le=100),
+    category: Optional[str] = Query(None),
+    days: int = Query(30, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return the most recent tasks where SR missed a human-caught category.
+
+    A 'miss' is a category present in _first_attempt_rejection_categories
+    that the agent's check_results either marked passed or did not record.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    stmt = (
+        select(Task)
+        .where(Task.project_id == project_id, Task.status == TaskStatus.COMPLETED, Task.created_at >= cutoff)
+        .options(load_only(Task.id, Task.title, Task.created_at, Task.context, Task.payloads, Task.project_id))
+        .order_by(Task.created_at.desc())
+        .limit(2000)
+    )
+    all_tasks = (await session.execute(stmt)).scalars().all()
+
+    rows = []
+    matched_task_ids: list[uuid.UUID] = []
+    for t in all_tasks:
+        ctx = t.context or {}
+        sr_outcome = ctx.get("_self_review_outcome")
+        human_cats_raw = ctx.get("_first_attempt_rejection_categories")
+        if not sr_outcome or not human_cats_raw:
+            continue
+        human_cats = set(human_cats_raw)
+        check_results = sr_outcome.get("check_results") or {}
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        missed = human_cats - sr_failed
+        if not missed:
+            continue
+        if category and category not in missed:
+            continue
+        fp = t.first_payload or {}
+        rows.append({
+            "task_id": str(t.id),
+            "title": t.title,
+            "scope": ctx.get("scope"),
+            "task_type": fp.get("type") or ctx.get("type"),
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "missed_categories": sorted(missed),
+            "caught_categories": sorted(human_cats & sr_failed),
+            "pr_url": None,
+        })
+        matched_task_ids.append(t.id)
+        if len(rows) >= limit:
+            break
+
+    if matched_task_ids:
+        art_stmt = (
+            select(Artifact.task_id, Artifact.pr_url)
+            .where(
+                Artifact.task_id.in_(matched_task_ids),
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                Artifact.pr_url.isnot(None),
+            )
+        )
+        art_rows = (await session.execute(art_stmt)).all()
+        pr_map = {str(r.task_id): r.pr_url for r in art_rows}
+        for row in rows:
+            row["pr_url"] = pr_map.get(row["task_id"])
+
+    return {"misses": rows, "total": len(rows)}

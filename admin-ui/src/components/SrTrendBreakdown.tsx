@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
 
 export interface SrMissExample {
   severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
@@ -13,6 +13,8 @@ export interface SrCategoryTrend {
   weighted_miss_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   rate_history?: number[];
+  /** True when the SR prompt version changed within the rate_history window — attribution breaks here. */
+  prompt_version_changed?: boolean | null;
   examples?: SrMissExample[];
 }
 
@@ -51,6 +53,8 @@ export interface SrTrendData {
   bucket_mode?: 'cycle' | 'calendar' | null;
   current_cycle_id?: string | null;
   previous_cycle_id?: string | null;
+  /** Short version stamp of the SR prompt active in the current window (e.g. "a1b2c3"). */
+  prompt_version?: string | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
 }
@@ -93,10 +97,20 @@ function formatDelta(delta: number): string {
   return '±0pp';
 }
 
-function trendStroke(t: SrCategoryTrend['trend']): string {
+function trendStroke(t: SrCategoryTrend['trend'], versionChanged?: boolean | null): string {
+  if (versionChanged) return '#f59e0b'; // amber — attribution break mid-window
   if (t === 'decreasing') return '#f87171';
   if (t === 'increasing') return '#34d399';
   return '#737373';
+}
+
+const FLOOR_HIT_RATE = 0.5; // 50% hit-rate floor — categories below this are flagged
+const FLOOR_MIN_WINDOWS = 2; // consecutive windows below floor required to flag
+
+function isBelowFloor(c: SrCategoryTrend, floorHitRate = FLOOR_HIT_RATE, minWindows = FLOOR_MIN_WINDOWS): boolean {
+  const history = c.rate_history;
+  if (!history || history.length < minWindows) return false;
+  return history.slice(-minWindows).every(r => r < floorHitRate);
 }
 
 // SR `trend` `decreasing` = hit-rate falling = miss-rate rising = regression (red).
@@ -119,11 +133,13 @@ function MissRateSparkline({
   width,
   height,
   stroke,
+  title,
 }: {
   history: number[];
   width: number;
   height: number;
   stroke: string;
+  title?: string;
 }) {
   if (!history || history.length < 2) {
     return <span className="inline-block" style={{ width, height }} aria-hidden="true" />;
@@ -145,7 +161,10 @@ function MissRateSparkline({
       viewBox={`0 0 ${width} ${height}`}
       className="inline-block align-middle"
       aria-hidden="true"
+      role={title ? 'img' : undefined}
+      aria-label={title}
     >
+      {title && <title>{title}</title>}
       <polyline fill="none" stroke={stroke} strokeWidth="1" points={points} />
     </svg>
   );
@@ -250,6 +269,7 @@ function CategoryRow({
   const color = trendColorClass(c.trend);
   const delta = calculateMissRateDelta(c);
   const deltaColor = delta != null ? deltaColorClass(delta) : '';
+  const belowFloor = isBelowFloor(c);
   const examples = c.examples ?? [];
   const hasExamples = examples.length > 0;
   const clickable = !!onCategoryClick;
@@ -275,6 +295,7 @@ function CategoryRow({
     },
   } : {};
 
+  const sparklineTitle = c.prompt_version_changed ? 'prompt version changed mid-window — attribution may differ' : undefined;
   if (variant === 'card') {
     const rowBody = (
       <>
@@ -293,11 +314,21 @@ function CategoryRow({
           </span>
         )}
         <TrendIcon trend={c.trend} />
+        {belowFloor && (
+          <span
+            className="shrink-0"
+            title={`Hit rate stuck below ${Math.round(FLOOR_HIT_RATE * 100)}% for ${FLOOR_MIN_WINDOWS}+ windows`}
+            aria-label="below floor"
+          >
+            <AlertTriangle className="w-3 h-3 text-orange-400" />
+          </span>
+        )}
         <MissRateSparkline
           history={c.rate_history ?? []}
           width={40}
           height={12}
-          stroke={trendStroke(c.trend)}
+          stroke={trendStroke(c.trend, c.prompt_version_changed)}
+          title={sparklineTitle}
         />
       </>
     );
@@ -340,11 +371,21 @@ function CategoryRow({
         </span>
       )}
       <TrendIcon trend={c.trend} />
+      {belowFloor && (
+        <span
+          className="shrink-0"
+          title={`Hit rate stuck below ${Math.round(FLOOR_HIT_RATE * 100)}% for ${FLOOR_MIN_WINDOWS}+ windows`}
+          aria-label="below floor"
+        >
+          <AlertTriangle className="w-3 h-3 text-orange-400" />
+        </span>
+      )}
       <MissRateSparkline
         history={c.rate_history ?? []}
         width={32}
         height={10}
-        stroke={trendStroke(c.trend)}
+        stroke={trendStroke(c.trend, c.prompt_version_changed)}
+        title={sparklineTitle}
       />
     </>
   );
@@ -385,6 +426,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
     }
     return null;
   })();
+  const promptVersionLabel = trends?.prompt_version
+    ? `prompt v=${trends.prompt_version.slice(0, 7)}`
+    : null;
 
   if (variant === 'card') {
     return (
@@ -398,6 +442,9 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
           </p>
           {cycleLabel && (
             <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>
+          )}
+          {promptVersionLabel && (
+            <span className="text-[9px] text-amber-600 font-mono" title="SR prompt version for this window">{promptVersionLabel}</span>
           )}
         </div>
         <div className="flex flex-col gap-0.5">

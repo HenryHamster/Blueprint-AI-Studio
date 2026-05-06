@@ -29,7 +29,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
+import { SrTrendBreakdown, SrMissedRetrospective, type SrTrendData, type SrMissedTask } from './SrTrendBreakdown';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel } from './PipelineRegressionsPanel';
 import type { Task } from '../types/task';
@@ -570,6 +570,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
+  const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
@@ -681,6 +682,15 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
             if (res.ok) setBlindSpots(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses`);
+            if (res.ok) {
+              const data = await res.json();
+              setSrRecentMisses(data.misses ?? []);
+            }
           } catch { /* silent */ }
         })(),
       );
@@ -1034,6 +1044,23 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   );
                 })()}
               </div>
+            </section>
+          )}
+
+          {/* SR Recent Misses */}
+          {!loading && srRecentMisses && srRecentMisses.length > 0 && (
+            <section>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+                Recent SR Misses
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srRecentMisses.length} task{srRecentMisses.length !== 1 ? 's' : ''}</span>
+              </p>
+              <SrMissedRetrospective
+                tasks={srRecentMisses}
+                onTaskClick={(taskId) => {
+                  const task = tasks.find(t => t.id === taskId);
+                  if (task) onViewTask(task);
+                }}
+              />
             </section>
           )}
 

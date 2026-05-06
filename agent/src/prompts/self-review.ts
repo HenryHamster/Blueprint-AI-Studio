@@ -30,8 +30,15 @@ export function formatSelfReviewBlindSpots(
   const blindSpots = Array.isArray(selfReviewOutcome.blind_spots)
     ? (selfReviewOutcome.blind_spots as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
     : [];
+  type EdgeRaw = Record<string, unknown>;
+  const edgesConsidered = Array.isArray(selfReviewOutcome.edges_considered)
+    ? (selfReviewOutcome.edges_considered as unknown[]).filter(
+        (e): e is EdgeRaw =>
+          typeof e === 'object' && e !== null && typeof (e as EdgeRaw).case === 'string',
+      )
+    : [];
   const incomplete = categories.includes('incomplete_review');
-  if (!incomplete && truncatedFilesRead.length === 0 && reviewerFindings.length === 0 && blindSpots.length === 0) return '';
+  if (!incomplete && truncatedFilesRead.length === 0 && reviewerFindings.length === 0 && blindSpots.length === 0 && edgesConsidered.length === 0) return '';
 
   const verifiedSet = new Set(truncatedFilesRead);
   const unverified = changedFilePaths.filter(p => p && !verifiedSet.has(p));
@@ -59,6 +66,20 @@ export function formatSelfReviewBlindSpots(
       `- Fresh-reviewer findings (a second read-only session flagged these before ./done — verify each was addressed or is a false positive):\n` +
       sorted.map(f => `  - [${String(f.severity)}] ${String(f.category)}: ${String(f.description)}`).join('\n'),
     );
+  }
+  if (edgesConsidered.length > 0) {
+    const unhandled = edgesConsidered.filter(e => e.handled === false);
+    const handled = edgesConsidered.filter(e => e.handled !== false);
+    const edgeLines: string[] = ['- Edge cases the agent enumerated:'];
+    for (const e of unhandled) {
+      const note = typeof e.blind_spot === 'string' ? ` — ${e.blind_spot}` : ' — unhandled, no explanation given';
+      edgeLines.push(`  - [UNHANDLED] ${String(e.case)}${note}`);
+    }
+    for (const e of handled) {
+      const evidence = typeof e.evidence === 'string' ? ` (${e.evidence})` : '';
+      edgeLines.push(`  - [handled] ${String(e.case)}${evidence}`);
+    }
+    lines.push(edgeLines.join('\n'));
   }
   let blindSpotsBlock = '';
   if (blindSpots.length > 0) {

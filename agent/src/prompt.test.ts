@@ -3490,6 +3490,125 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
   });
 });
 
+// ── Per-task-type self-review focus blocks ────────────────────────────────────
+// getTaskTypeFocusBlock() returns the right static focus block for migrate,
+// refactor, and qa tasks and '' for all other types (create, fix, etc.).
+// CODE_CHANGE_HELPER_GUIDANCE is always composed independently and unaffected.
+describe('getTaskTypeFocusBlock — task-type-specific self-review focus blocks', () => {
+  it('returns the migrate focus block for "migrate" task type', async () => {
+    const { getTaskTypeFocusBlock, MIGRATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('migrate')).toBe(MIGRATE_TASK_FOCUS);
+  });
+
+  it('returns the refactor focus block for "refactor" task type', async () => {
+    const { getTaskTypeFocusBlock, REFACTOR_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('refactor')).toBe(REFACTOR_TASK_FOCUS);
+  });
+
+  it('returns the qa focus block for "qa" task type', async () => {
+    const { getTaskTypeFocusBlock, QA_TASK_FOCUS } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('qa')).toBe(QA_TASK_FOCUS);
+  });
+
+  it('returns empty string for "create" task type', async () => {
+    const { getTaskTypeFocusBlock } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('create')).toBe('');
+  });
+
+  it('returns empty string for "fix" task type', async () => {
+    const { getTaskTypeFocusBlock } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('fix')).toBe('');
+  });
+
+  it('returns empty string for unknown task types', async () => {
+    const { getTaskTypeFocusBlock } = await import('./prompt.js');
+    expect(getTaskTypeFocusBlock('unknown')).toBe('');
+  });
+});
+
+describe('MIGRATE_TASK_FOCUS — content invariants', () => {
+  it('mentions down_revision chain check', async () => {
+    const { MIGRATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(MIGRATE_TASK_FOCUS).toContain('down_revision');
+  });
+
+  it('instructs agent to name affected tests in regression_risk field', async () => {
+    const { MIGRATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(MIGRATE_TASK_FOCUS).toContain('regression_risk');
+    expect(MIGRATE_TASK_FOCUS).toContain('affected_tests');
+  });
+
+  it('mentions EXPECTED_SCHEMA_REVISION bump', async () => {
+    const { MIGRATE_TASK_FOCUS } = await import('./prompt.js');
+    expect(MIGRATE_TASK_FOCUS).toContain('EXPECTED_SCHEMA_REVISION');
+  });
+});
+
+describe('REFACTOR_TASK_FOCUS — content invariants', () => {
+  it('flags scope-drift as mandatory check', async () => {
+    const { REFACTOR_TASK_FOCUS } = await import('./prompt.js');
+    expect(REFACTOR_TASK_FOCUS).toContain('scope-drift');
+    expect(REFACTOR_TASK_FOCUS).toContain('mandatory');
+  });
+
+  it('requires before/after record for behavioral changes under correctness', async () => {
+    const { REFACTOR_TASK_FOCUS } = await import('./prompt.js');
+    expect(REFACTOR_TASK_FOCUS).toContain('correctness');
+    expect(REFACTOR_TASK_FOCUS).toContain('before/after');
+  });
+
+  it('instructs caller inventory via grep', async () => {
+    const { REFACTOR_TASK_FOCUS } = await import('./prompt.js');
+    expect(REFACTOR_TASK_FOCUS).toContain('grep');
+  });
+});
+
+describe('QA_TASK_FOCUS — content invariants', () => {
+  it('requires explicit behavior enumeration in test-coverage field', async () => {
+    const { QA_TASK_FOCUS } = await import('./prompt.js');
+    expect(QA_TASK_FOCUS).toContain('test-coverage');
+  });
+
+  it('requires edge-case coverage', async () => {
+    const { QA_TASK_FOCUS } = await import('./prompt.js');
+    expect(QA_TASK_FOCUS).toContain('edge');
+  });
+
+  it('warns against assertion-free "runs without error" tests', async () => {
+    const { QA_TASK_FOCUS } = await import('./prompt.js');
+    expect(QA_TASK_FOCUS).toContain('without error');
+  });
+});
+
+describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () => {
+  it('CODE_CHANGE_HELPER_GUIDANCE is unchanged regardless of task type', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('focus block for migrate is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('migrate');
+    expect(focus).not.toBe('');
+    // Generic guidance must not embed the task-type block
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: migrate tasks');
+  });
+
+  it('focus block for refactor is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('refactor');
+    expect(focus).not.toBe('');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: refactor tasks');
+  });
+
+  it('focus block for qa is separate from generic guidance', async () => {
+    const { getTaskTypeFocusBlock, CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    const focus = getTaskTypeFocusBlock('qa');
+    expect(focus).not.toBe('');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('Self-review focus: qa tasks');
+  });
+});
+
 // ── assembleFailureGuidanceBlocks — structural invariants ─────────────────────
 // code-change handlers (standard.ts, review-fix.ts, specialized.ts) delegate to
 // assembleFailureGuidanceBlocks() for the four cross-cutting failure-guidance

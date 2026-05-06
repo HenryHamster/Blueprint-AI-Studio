@@ -456,6 +456,7 @@ export default function App() {
         selectedProjectId={s.selectedProjectId}
         selectedProjectOwner={selectedProject?.github_owner ?? null}
         selectedProjectRepo={selectedProject?.github_repo ?? null}
+        selectedProjectIsSelfRepo={selectedProject?.is_self_repo ?? false}
         selectedProjectRole={selectedProject?.my_role ?? null}
         buildConfig={s.buildConfig}
         onUpdateBuildConfig={s.handleUpdateBuildConfig}

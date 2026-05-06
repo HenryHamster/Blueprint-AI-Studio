@@ -154,6 +154,7 @@ export interface HeaderBarProps {
   selectedProjectId: string | null;
   selectedProjectOwner: string | null;
   selectedProjectRepo: string | null;
+  selectedProjectIsSelfRepo?: boolean;
   selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
@@ -513,6 +514,7 @@ export function HeaderBar(props: HeaderBarProps) {
           selectedProjectId={props.selectedProjectId}
           selectedProjectOwner={props.selectedProjectOwner}
           selectedProjectRepo={props.selectedProjectRepo}
+          selectedProjectIsSelfRepo={props.selectedProjectIsSelfRepo}
           selectedProjectRole={props.selectedProjectRole}
           buildConfig={props.buildConfig}
           onUpdateBuildConfig={props.onUpdateBuildConfig}

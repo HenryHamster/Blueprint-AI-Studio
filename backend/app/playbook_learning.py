@@ -1683,6 +1683,11 @@ _MIN_REVIEW_SAMPLE = 10
 # "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
 _TREND_DELTA_THRESHOLD = 0.05
 
+# Baseline-floor alert: fire when a category's hit-rate stays below this
+# threshold for at least _FLOOR_MIN_CONSECUTIVE_WINDOWS measurement windows.
+_SR_FLOOR_THRESHOLD = 0.50
+_FLOOR_MIN_CONSECUTIVE_WINDOWS = 2
+
 
 async def compute_review_effectiveness(
     project_id: uuid.UUID,
@@ -1892,6 +1897,7 @@ async def compute_review_effectiveness(
 # rejection categories required per window.  Half the human-review threshold
 # since SR data is sparser.
 _MIN_SR_SAMPLE = 5
+_MIN_DIRECTION_SR_SAMPLE = 3
 
 # Example-collection caps for miss-example surfacing in the agent prompt.
 _EXAMPLE_MAX_PER_CAT = 3
@@ -1946,6 +1952,201 @@ def _finalize_examples(raw_examples: list[dict]) -> list[dict]:
     return result
 
 
+_SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
+_EDGE_CATS = {"correctness", "error-handling"}
+
+
+def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
+    """Compute edges_considered rolling metrics for a task list.
+
+    Returns None when fewer than 3 qualifying code-change tasks with
+    ``_self_review_outcome`` exist. When sufficient data is present, returns::
+
+        {
+          "sample_size": int,
+          "tasks_with_edges_rate": float,
+          "avg_edges_per_task": float | None,
+          "unhandled_edge_flagged_rate": float | None,
+          "correctness_rejection_rate_with_edges": float | None,
+          "correctness_rejection_rate_without_edges": float | None,
+        }
+
+    The last two fields correlate tasks that enumerated edges vs. those that
+    didn't against subsequent correctness/error-handling reviewer flags,
+    enabling validation that edges_considered actually improves catch rate.
+    """
+    code_tasks = [
+        t for t in tasks
+        if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
+        and "_self_review_outcome" in (t.context or {})
+    ]
+    if len(code_tasks) < 3:
+        return None
+
+    with_edges: list = []
+    without_edges: list = []
+    total_edges = 0
+    unhandled_flagged = 0
+    for t in code_tasks:
+        edges = (t.context or {}).get("_self_review_outcome", {}).get("edges_considered") or []
+        if not isinstance(edges, list):
+            edges = []
+        if edges:
+            with_edges.append(t)
+            total_edges += len(edges)
+            if any(not e.get("handled", True) for e in edges if isinstance(e, dict)):
+                unhandled_flagged += 1
+        else:
+            without_edges.append(t)
+
+    def _rejection_rate(task_list: list) -> Optional[float]:
+        measured = [t for t in task_list if "_first_attempt_rejection_categories" in (t.context or {})]
+        if not measured:
+            return None
+        flagged = sum(
+            1 for t in measured
+            if _EDGE_CATS & set(t.context.get("_first_attempt_rejection_categories") or [])
+        )
+        return round(flagged / len(measured), 3)
+
+    n_with = len(with_edges)
+    n_total = len(code_tasks)
+    return {
+        "sample_size": n_total,
+        "tasks_with_edges_rate": round(n_with / n_total, 3),
+        "avg_edges_per_task": round(total_edges / n_with, 2) if n_with else None,
+        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3) if n_with else None,
+        "correctness_rejection_rate_with_edges": _rejection_rate(with_edges),
+        "correctness_rejection_rate_without_edges": _rejection_rate(without_edges),
+    }
+
+
+def _stats_for_tasks(
+    tasks: list,
+) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]]]:
+    """Compute SR stats for a pre-filtered task list (no date filtering)."""
+    _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+    count = 0
+    cat_stats: dict[str, dict] = {}
+    type_cat_stats: dict[str, dict[str, dict]] = {}
+    for t in tasks:
+        ctx = t.context or {}
+        if "_self_review_outcome" not in ctx:
+            continue
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        if not human_cats:
+            continue
+        count += 1
+        check_results = ctx["_self_review_outcome"].get("check_results") or {}
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        cat_weights: dict[str, int] = {}
+        rev_cats: dict[str, list[dict]] = {}
+        if rev_hist:
+            rev_cats = _categorize_review_issues(rev_hist)
+            for cat_name, issues in rev_cats.items():
+                cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
+        task_type = t.first_payload.get("type", "")
+        for cat in human_cats:
+            if cat not in cat_stats:
+                cat_stats[cat] = {
+                    "hit_count": 0, "human_count": 0,
+                    "w_hit": 0.0, "w_total": 0.0,
+                    "miss_examples": [],
+                }
+            cat_stats[cat]["human_count"] += 1
+            w = cat_weights.get(cat, 1)
+            cat_stats[cat]["w_total"] += w
+            if cat in sr_failed:
+                cat_stats[cat]["hit_count"] += 1
+                cat_stats[cat]["w_hit"] += w
+            else:
+                for issue in rev_cats.get(cat, []):
+                    cat_stats[cat]["miss_examples"].append(
+                        {"desc": issue["desc"], "severity": issue["severity"]}
+                    )
+            if task_type:
+                if task_type not in type_cat_stats:
+                    type_cat_stats[task_type] = {}
+                if cat not in type_cat_stats[task_type]:
+                    type_cat_stats[task_type][cat] = {
+                        "hit_count": 0, "human_count": 0, "miss_examples": [],
+                    }
+                type_cat_stats[task_type][cat]["human_count"] += 1
+                if cat in sr_failed:
+                    type_cat_stats[task_type][cat]["hit_count"] += 1
+                else:
+                    for issue in rev_cats.get(cat, []):
+                        type_cat_stats[task_type][cat]["miss_examples"].append(
+                            {"desc": issue["desc"], "severity": issue["severity"]}
+                        )
+    return count, cat_stats, type_cat_stats
+
+
+def compute_sr_catch_rate_by_direction(
+    all_tasks: list,
+) -> dict[str, dict[str, Any]]:
+    """Compute per-direction SR catch-rate breakdown.
+
+    Groups *all_tasks* by ``context.direction_id`` and, for each direction with
+    at least :data:`_MIN_DIRECTION_SR_SAMPLE` qualifying tasks (both
+    ``_self_review_outcome`` and ``_first_attempt_rejection_categories`` present),
+    computes category-level miss rates and sample counts.
+
+    Returns a dict keyed by direction_id::
+
+        {
+          "d-abc123": {
+            "sample_count": 5,
+            "categories": {
+              "regression_risk": {
+                "hit_rate": 0.4,
+                "miss_rate": 0.6,
+                "sample_count": 5,
+                "examples": [...]   # only when misses exist
+              },
+              ...
+            }
+          },
+          ...
+        }
+
+    Directions with fewer than _MIN_DIRECTION_SR_SAMPLE qualifying tasks are
+    omitted (insufficient signal).
+    """
+    by_direction: dict[str, list] = {}
+    for t in all_tasks:
+        did = (t.context or {}).get("direction_id")
+        if did:
+            by_direction.setdefault(did, []).append(t)
+
+    result: dict[str, dict[str, Any]] = {}
+    for direction_id, tasks in by_direction.items():
+        count, cat_stats, _ = _stats_for_tasks(tasks)
+        if count < _MIN_DIRECTION_SR_SAMPLE:
+            continue
+        categories: dict[str, Any] = {}
+        for cat, stats in cat_stats.items():
+            if stats["human_count"] == 0:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            entry: dict[str, Any] = {
+                "hit_rate": hit_rate,
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+            }
+            ex = _finalize_examples(stats.get("miss_examples", []))
+            if ex:
+                entry["examples"] = ex
+            categories[cat] = entry
+        if categories:
+            result[direction_id] = {
+                "sample_count": count,
+                "categories": categories,
+            }
+    return result
+
+
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -1971,67 +2172,6 @@ async def compute_sr_catch_rate_trends(
 
     def _naive(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None) if dt.tzinfo else dt
-
-    def _stats_for_tasks(
-        tasks: list,
-    ) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]]]:
-        """Compute SR stats for a pre-filtered task list (no date filtering)."""
-        _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
-        count = 0
-        cat_stats: dict[str, dict] = {}
-        type_cat_stats: dict[str, dict[str, dict]] = {}
-        for t in tasks:
-            ctx = t.context or {}
-            if "_self_review_outcome" not in ctx:
-                continue
-            human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-            if not human_cats:
-                continue
-            count += 1
-            check_results = ctx["_self_review_outcome"].get("check_results") or {}
-            sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
-            rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
-            cat_weights: dict[str, int] = {}
-            rev_cats: dict[str, list[dict]] = {}
-            if rev_hist:
-                rev_cats = _categorize_review_issues(rev_hist)
-                for cat_name, issues in rev_cats.items():
-                    cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
-            task_type = t.first_payload.get("type", "")
-            for cat in human_cats:
-                if cat not in cat_stats:
-                    cat_stats[cat] = {
-                        "hit_count": 0, "human_count": 0,
-                        "w_hit": 0.0, "w_total": 0.0,
-                        "miss_examples": [],
-                    }
-                cat_stats[cat]["human_count"] += 1
-                w = cat_weights.get(cat, 1)
-                cat_stats[cat]["w_total"] += w
-                if cat in sr_failed:
-                    cat_stats[cat]["hit_count"] += 1
-                    cat_stats[cat]["w_hit"] += w
-                else:
-                    for issue in rev_cats.get(cat, []):
-                        cat_stats[cat]["miss_examples"].append(
-                            {"desc": issue["desc"], "severity": issue["severity"]}
-                        )
-                if task_type:
-                    if task_type not in type_cat_stats:
-                        type_cat_stats[task_type] = {}
-                    if cat not in type_cat_stats[task_type]:
-                        type_cat_stats[task_type][cat] = {
-                            "hit_count": 0, "human_count": 0, "miss_examples": [],
-                        }
-                    type_cat_stats[task_type][cat]["human_count"] += 1
-                    if cat in sr_failed:
-                        type_cat_stats[task_type][cat]["hit_count"] += 1
-                    else:
-                        for issue in rev_cats.get(cat, []):
-                            type_cat_stats[task_type][cat]["miss_examples"].append(
-                                {"desc": issue["desc"], "severity": issue["severity"]}
-                            )
-        return count, cat_stats, type_cat_stats
 
     # --- Cycle-based bucketing (primary mode) ---
     use_cycle_mode = False
@@ -2175,6 +2315,16 @@ async def compute_sr_catch_rate_trends(
             rate_history = rate_history[-5:]
         data["rate_history"] = rate_history
 
+    # Mark categories currently below the baseline floor so the UI can surface them.
+    _floor_thresh: float = float(doc.get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD)
+    _floor_min_win: int = int(doc.get("sr_floor_min_windows") or _FLOOR_MIN_CONSECUTIVE_WINDOWS)
+    for cat, data in categories.items():
+        history = data.get("rate_history") or []
+        data["below_floor"] = (
+            len(history) >= _floor_min_win
+            and all(r < _floor_thresh for r in history[-_floor_min_win:])
+        )
+
     # Compute per-task-type category breakdown from current window only.
     # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
     by_task_type: dict[str, dict[str, Any]] = {}
@@ -2197,6 +2347,7 @@ async def compute_sr_catch_rate_trends(
         if type_cats:
             by_task_type[ttype] = type_cats
 
+    edges_stats = _compute_edges_stats(all_tasks)
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
         "bucket_mode": "cycle" if use_cycle_mode else "calendar",
@@ -2204,6 +2355,7 @@ async def compute_sr_catch_rate_trends(
         "previous_cycle_id": previous_cycle_id,
         "categories": categories,
         "by_task_type": by_task_type,
+        "edges_considered_stats": edges_stats,
     }
 
     doc["sr_catch_rate_trends"] = result
@@ -2299,6 +2451,108 @@ async def compute_sr_catch_rate_trends(
                 )
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
+
+    # Baseline-floor alert: fire when a category stays below _SR_FLOOR_THRESHOLD
+    # for at least _FLOOR_MIN_CONSECUTIVE_WINDOWS consecutive measurement windows.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        floor_threshold: float = float(
+            (doc.get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD)
+        )
+        floor_min_windows: int = int(
+            (doc.get("sr_floor_min_windows") or _FLOOR_MIN_CONSECUTIVE_WINDOWS)
+        )
+
+        below_floor = {
+            cat: data
+            for cat, data in categories.items()
+            if (
+                data.get("current_hit_rate") is not None
+                and len(data.get("rate_history") or []) >= floor_min_windows
+                and all(
+                    r < floor_threshold
+                    for r in (data.get("rate_history") or [])[-floor_min_windows:]
+                )
+            )
+        }
+
+        if below_floor:
+            floor_alert_state: dict = dict(doc.get("sr_catch_rate_floor_alert") or {})
+            floor_alerted_cats: list = list(floor_alert_state.get("categories") or [])
+            current_floor_cats = sorted(below_floor.keys())
+
+            floor_already_alerted = False
+            if use_cycle_mode:
+                floor_already_alerted = (
+                    floor_alert_state.get("cycle_id") == current_cycle_id
+                    and floor_alerted_cats == current_floor_cats
+                )
+            else:
+                floor_alert_at: Optional[str] = floor_alert_state.get("computed_at")
+                if floor_alert_at:
+                    try:
+                        last_floor_dt = datetime.fromisoformat(floor_alert_at)
+                        if (now - last_floor_dt).days < 14 and floor_alerted_cats == current_floor_cats:
+                            floor_already_alerted = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not floor_already_alerted:
+                lines = [f"SR catch-rate below floor ({floor_threshold:.0%}) for {floor_min_windows}+ windows:"]
+                for cat in current_floor_cats:
+                    data = below_floor[cat]
+                    curr_rate = data.get("current_hit_rate")
+                    sample = current_stats.get(cat, {}).get("human_count", 0)
+                    curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
+                    history = data.get("rate_history") or []
+                    history_str = ", ".join(f"{r:.0%}" for r in history[-floor_min_windows:])
+                    lines.append(f"  • {cat}: {curr_str} (last {floor_min_windows} windows: {history_str}, n={sample})")
+                description = "\n".join(lines)
+
+                await post_failure_alert_message(session, project_id, description)
+
+                floor_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "floor_threshold": floor_threshold,
+                    "below_floor_categories": [
+                        {
+                            "category": cat,
+                            "current_hit_rate": below_floor[cat].get("current_hit_rate"),
+                            "rate_history": below_floor[cat].get("rate_history"),
+                            "sample_size": current_stats.get(cat, {}).get("human_count", 0),
+                        }
+                        for cat in current_floor_cats
+                    ],
+                }
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_catch_rate_below_floor",
+                        payload=floor_payload,
+                    )
+                )
+
+                doc["sr_catch_rate_floor_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_floor_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s floor_alert categories=%s",
+                    project_id, current_floor_cats,
+                )
+    except Exception:
+        logger.exception("[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing")
 
     return result
 

@@ -146,6 +146,7 @@ interface SettingsDropdownProps {
   selectedProjectId: string | null;
   selectedProjectOwner: string | null;
   selectedProjectRepo: string | null;
+  selectedProjectIsSelfRepo?: boolean;
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
   onDetectBuildConfig: () => Promise<void>;
@@ -384,6 +385,7 @@ export function SettingsDropdown({
   selectedProjectId,
   selectedProjectOwner,
   selectedProjectRepo,
+  selectedProjectIsSelfRepo,
   buildConfig,
   onUpdateBuildConfig,
   onDetectBuildConfig,
@@ -1409,6 +1411,7 @@ export function SettingsDropdown({
       <ProjectBuildConfigSection
         githubOwner={selectedProjectOwner}
         githubRepo={selectedProjectRepo}
+        isSelfRepo={selectedProjectIsSelfRepo}
         buildConfig={buildConfig}
         onSave={onUpdateBuildConfig}
         onDetect={onDetectBuildConfig}

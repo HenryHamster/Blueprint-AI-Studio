@@ -32,6 +32,8 @@ class AgentStatusPayload(BaseModel):
     scope_gate_triggered: str | None = Field(None, max_length=50)
     changed_files: List[str] | None = Field(None, max_length=100)
     test_failure_summary: str | None = Field(None, max_length=5000)
+    # Kept as Dict[str, Any] so agent_status.py can store it directly in the
+    # task.context JSON column without an extra .model_dump() call.
     self_review_outcome: Dict[str, Any] | None = None
     diff_summary: List[Dict[str, Any]] | None = Field(None, max_length=50)
     file_change_details: List[Dict[str, Any]] | None = Field(None, max_length=50)

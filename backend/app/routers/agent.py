@@ -1667,6 +1667,9 @@ async def claim_task(
                         notes = self_review_outcome.get("notes")
                         if notes:
                             sro_compact["notes"] = str(notes)[:200]
+                        prompt_version = self_review_outcome.get("prompt_version")
+                        if prompt_version is not None:
+                            sro_compact["prompt_version"] = prompt_version
                         check_results = self_review_outcome.get("check_results")
                         if isinstance(check_results, dict):
                             failed_checks = [

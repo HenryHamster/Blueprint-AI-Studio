@@ -4,7 +4,7 @@ import {
   sanitize, sendLog, runClaudeCode, persistAndPostStatus, git,
   rotateOAuthCredentialsIfChanged,
 } from '../index.js';
-import { writeCodeChangeHelpers } from '../prompt.js';
+import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
 
 // ── Code-change task runner ─────────────────────────────────────────────────
 //
@@ -58,6 +58,22 @@ export interface CodeChangeTaskOpts {
   /** Message to post when Claude exits cleanly with no diff (e.g. read-only
    *  task that decided no changes were needed). */
   noChangesMessage?: string;
+}
+
+/** Read Claude's self-review JSON and ensure prompt_version is stamped. */
+function readSelfReviewOutcome(taskId: string): Record<string, unknown> | null {
+  const path = `/tmp/self_review_${taskId}.json`;
+  try {
+    if (!fs.existsSync(path)) return null;
+    const raw = fs.readFileSync(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!('prompt_version' in parsed)) {
+      parsed.prompt_version = SELF_REVIEW_PROMPT_VERSION;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void> {
@@ -157,6 +173,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
       const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
       changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
     } catch { /* git may be in odd state — best effort */ }
+    const selfReview = readSelfReviewOutcome(taskId);
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'COMPLETED',
@@ -164,6 +181,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
       pr_url: prUrl,
       logs: 'Task completed. Claude opened PR but did not call ./done — wrapper finalised.',
       ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
+      ...(selfReview ? { self_review_outcome: selfReview } : {}),
     });
     return;
   }

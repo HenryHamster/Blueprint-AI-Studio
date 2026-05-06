@@ -8,6 +8,7 @@ import {
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
@@ -123,6 +124,48 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
 
 const FRESH_REVIEWER_MIN_LINES = 20;
 
+type SRCatchRateExample = { severity: string; desc: string };
+type SRCatchRateCategory = {
+  miss_rate?: number;
+  weighted_miss_rate?: number;
+  examples?: SRCatchRateExample[];
+};
+
+function formatFreshReviewerCalibrationSection(
+  projectContext: Record<string, unknown> | undefined,
+): string {
+  const srCatchRate = projectContext?.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
+  const categories = srCatchRate?.categories;
+  if (!categories || Object.keys(categories).length === 0) return '';
+
+  const ranked = Object.entries(categories)
+    .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
+    .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate ?? 0) - (a[1].weighted_miss_rate ?? a[1].miss_rate ?? 0))
+    .slice(0, 3);
+
+  if (ranked.length === 0) return '';
+
+  const lines: string[] = [
+    'Calibration from prior self-review misses:',
+  ];
+  for (const [category, data] of ranked) {
+    const missRate = Math.round((data.miss_rate ?? 0) * 100);
+    const weightedMissRate = data.weighted_miss_rate;
+    const rateText = weightedMissRate !== undefined
+      ? `${missRate}% missed (${Math.round(weightedMissRate * 100)}% severity-weighted)`
+      : `${missRate}% missed`;
+    lines.push(`- ${category}: ${rateText}`);
+    const examples = (data.examples || []).slice(0, 2);
+    for (const ex of examples) {
+      lines.push(`  - [${ex.severity}] ${ex.desc}`);
+    }
+  }
+  lines.push('Scrutinize these categories extra carefully.');
+  return `${lines.join('\n')}\n\n`;
+}
+
 /**
  * Runs a second read-only Claude session to review the current diff as an
  * adversarial reviewer. Findings are merged into /tmp/self_review_<taskId>.json:
@@ -138,6 +181,7 @@ export async function runFreshReviewerPass(
   ws: WebSocket | null,
   statusRef: { value: string },
   model?: string,
+  projectContext?: Record<string, unknown>,
 ): Promise<void> {
   let baseCommit = '';
   try { baseCommit = fs.readFileSync(`/tmp/base_commit_${taskId}`, 'utf-8').trim(); } catch { /* ok */ }
@@ -159,13 +203,14 @@ export async function runFreshReviewerPass(
 
   const MAX_DIFF = 20_000;
   const diffSnippet = diff.length > MAX_DIFF ? diff.slice(0, MAX_DIFF) + '\n...[truncated]' : diff;
+  const calibrationSection = formatFreshReviewerCalibrationSection(projectContext);
   const prompt = `You are reviewing a PR for a colleague. The author thinks it is done. Find what they missed.
 
 Task: ${taskTitle}
 Description: ${taskDescription.slice(0, 800)}
 Declared scope: ${relatedFiles.join(', ') || 'unspecified'}
 
-Diff:
+${calibrationSection}Diff:
 ${diffSnippet}
 
 Check specifically for:
@@ -173,6 +218,10 @@ Check specifically for:
 - scope-drift: changes outside declared scope files
 - correctness: logic bugs, off-by-one errors, race conditions, edge cases
 - error-handling: unhandled exceptions, missing null checks, async error paths
+- security: injection attacks, auth flaws, exposed secrets, unvalidated user inputs
+- type-safety: unsafe casts, any-typed externals, missing null guards in TypeScript
+- architecture: boundary violations, coupling regressions, abstraction leaks
+- test-coverage: new behavior without tests, untested edge cases or error paths
 
 Output ONLY a JSON object:
 {"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}]}
@@ -286,7 +335,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
@@ -502,16 +552,29 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing
-  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
+  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer,
+  // and auto-on for self-repo projects (the Blueprint repo measuring itself) so
+  // the cycle-over-cycle catch-rate measurement always has a meaningful sample.
   // Skipped for auto-remediation tasks (their job IS to fix what a reviewer would flag).
   const projectMeta = task.project_metadata as Record<string, unknown> | undefined;
-  if (projectMeta?.enable_fresh_reviewer === true && !isAutoRemediation) {
+  const freshReviewerEnabled =
+    projectMeta?.enable_fresh_reviewer === true || projectMeta?.is_self_repo === true;
+  if (freshReviewerEnabled && !isAutoRemediation) {
     const reviewerRelatedFiles = (
       (payload.related_files as string[] | undefined) ||
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
       []
     );
-    await runFreshReviewerPass(taskId, taskTitle, rawPrompt, reviewerRelatedFiles, ws, statusRef, model);
+    await runFreshReviewerPass(
+      taskId,
+      taskTitle,
+      rawPrompt,
+      reviewerRelatedFiles,
+      ws,
+      statusRef,
+      model,
+      task.project_context as Record<string, unknown> | undefined,
+    );
   }
 }
 

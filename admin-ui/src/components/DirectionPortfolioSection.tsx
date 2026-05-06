@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { STAGE_DROPOUT_LABELS, TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { StrategicAuditPanel } from './StrategicAuditPanel';
+import { apiFetch } from '../api';
 
 export interface DirectionProgress {
   direction_id: string;
@@ -161,6 +162,45 @@ function CalibrationChip({ factor, note, sampleCount }: { factor: number | null 
   );
 }
 
+interface DirectionSrCatStat {
+  miss_rate: number | null;
+  human_count: number;
+  miss_examples: Array<{ desc: string; severity: string }>;
+}
+
+interface DirectionSrEntry {
+  direction_id: string;
+  sample_size: number;
+  overall_catch_rate: number | null;
+  worst_category: string | null;
+  categories: Record<string, DirectionSrCatStat>;
+}
+
+function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
+  const [open, setOpen] = useState(false);
+  const catchPct = entry.overall_catch_rate != null ? Math.round(entry.overall_catch_rate * 100) : null;
+  if (catchPct == null) return null;
+  const catchColor = catchPct >= 70 ? 'text-emerald-400' : catchPct >= 50 ? 'text-amber-400' : 'text-red-400';
+  const worstCat = entry.worst_category;
+  const worstMiss = worstCat ? entry.categories[worstCat]?.miss_rate : null;
+  const label = `SR: ${catchPct}% catch${worstCat && worstMiss != null ? ` · ${worstCat} ${Math.round(worstMiss * 100)}% miss` : ''}`;
+  return (
+    <div className="mt-1 text-[9px]">
+      <button type="button" className={`${catchColor} hover:underline cursor-pointer`} title={`SR catch rate (n=${entry.sample_size})`} onClick={e => { e.stopPropagation(); setOpen(v => !v); }}>{label}</button>
+      {open && (
+        <div className="mt-0.5 flex flex-col gap-0.5 pl-2 border-l border-neutral-800" onClick={e => e.stopPropagation()}>
+          {Object.entries(entry.categories).sort(([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0)).map(([cat, s]) => (
+            <div key={cat} className="text-neutral-400">
+              <span className="text-neutral-300">{cat}</span>{' '}{s.miss_rate != null ? `${Math.round(s.miss_rate * 100)}%` : '–'} miss
+              {s.miss_examples.map((ex, i) => <div key={i} className="pl-1.5 text-neutral-500 line-clamp-1">{ex.desc}</div>)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SectionSkeleton() {
   return <div className="h-28 w-full animate-pulse rounded bg-neutral-900/50 border border-neutral-800/50" />;
 }
@@ -181,6 +221,20 @@ export function DirectionPortfolioSection({
   onDirectionClick,
   projectId,
 }: DirectionPortfolioSectionProps) {
+  const [srBreakdown, setSrBreakdown] = useState<Record<string, DirectionSrEntry>>({});
+  useEffect(() => {
+    if (!projectId) return;
+    apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/direction-sr-breakdown`)
+      .then(r => r.ok ? r.json() : null)
+      .then((data: { directions?: DirectionSrEntry[] } | null) => {
+        if (!data?.directions) return;
+        const map: Record<string, DirectionSrEntry> = {};
+        for (const entry of data.directions) map[entry.direction_id] = entry;
+        setSrBreakdown(map);
+      })
+      .catch(() => {});
+  }, [projectId]);
+
   return (
     <section>
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
@@ -309,6 +363,7 @@ export function DirectionPortfolioSection({
                       ))}
                     </ul>
                   )}
+                  {srBreakdown[d.direction_id] && <DirectionSrPill entry={srBreakdown[d.direction_id]} />}
                 </div>
               );
             })}

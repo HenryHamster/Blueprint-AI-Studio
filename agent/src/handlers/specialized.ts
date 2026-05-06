@@ -12,6 +12,7 @@ import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObje
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
+  getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
@@ -230,9 +231,10 @@ CRITICAL RULES:
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
   const migrateBaseCommit = git(['rev-parse', 'HEAD']);
+  const migrateFocusBlock = getTaskTypeFocusBlock('migrate');
   const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
     + migratePrompt + migrateFirstTaskSection
-    + CODE_CHANGE_HELPER_GUIDANCE + PLAYBOOK_GUIDANCE
+    + CODE_CHANGE_HELPER_GUIDANCE + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `
 

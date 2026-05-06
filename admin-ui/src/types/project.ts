@@ -49,6 +49,7 @@ export interface Project {
   created_at: string;
   my_role?: 'owner' | 'member' | 'viewer';
   build_config?: BuildConfig | null;
+  is_self_repo?: boolean;
 }
 
 export interface AutoRemediationConfig {

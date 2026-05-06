@@ -7503,6 +7503,256 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     # Skipped envelope contributes no entries
     assert body["total_distinct_themes"] == 2
 
+
+
+# ---------------------------------------------------------------------------
+# SR recent misses endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_empty(client: AsyncClient, db_session):
+    """No tasks → endpoint returns empty list."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["misses"] == []
+    assert body["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_basic(client: AsyncClient, db_session):
+    """Tasks where SR missed a human-caught category appear in the response."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task where SR passed "correctness" but human rejected for it → miss
+    task = make_task(
+        project_id=project.id,
+        title="Add feature X",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={
+            "scope": "small",
+            "_first_attempt_rejection_categories": ["correctness", "error-handling"],
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {
+                    "correctness": {"passed": True},
+                    "error-handling": {"passed": False},
+                },
+                "blind_spots": [],
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    row = body["misses"][0]
+    assert row["title"] == "Add feature X"
+    assert row["scope"] == "small"
+    assert row["task_type"] == "create"
+    # correctness was missed (SR passed it, human flagged it)
+    assert "correctness" in row["missed_categories"]
+    # error-handling was caught (SR failed it, human flagged it)
+    assert "error-handling" in row["caught_categories"]
+    assert "correctness" not in row["caught_categories"]
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_excludes_fully_caught(client: AsyncClient, db_session):
+    """Tasks where SR caught all human-flagged categories are excluded."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # SR failed "correctness" AND human flagged "correctness" → no miss
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        context={
+            "_first_attempt_rejection_categories": ["correctness"],
+            "_self_review_outcome": {
+                "verdict": "fail",
+                "fixes_applied": True,
+                "check_results": {"correctness": {"passed": False}},
+                "blind_spots": [],
+            },
+        },
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 0
+    assert body["misses"] == []
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_excludes_tasks_without_sr_outcome(client: AsyncClient, db_session):
+    """Tasks missing _self_review_outcome or _first_attempt_rejection_categories are skipped."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No SR outcome
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_rejection_categories": ["correctness"]},
+    ))
+    # No rejection categories
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": _sr_valid_outcome()},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_category_filter(client: AsyncClient, db_session):
+    """The ?category= filter returns only rows that missed that specific category."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task 1: missed "correctness"
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Task A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={
+            "_first_attempt_rejection_categories": ["correctness"],
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {"correctness": {"passed": True}},
+                "blind_spots": [],
+            },
+        },
+    ))
+    # Task 2: missed "security"
+    db_session.add(make_task(
+        project_id=project.id,
+        title="Task B",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        context={
+            "_first_attempt_rejection_categories": ["security"],
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {"security": {"passed": True}},
+                "blind_spots": [],
+            },
+        },
+    ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-recent-misses?category=correctness"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["misses"][0]["title"] == "Task A"
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_limit_param(client: AsyncClient, db_session):
+    """The ?limit= parameter caps the number of returned rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for i in range(5):
+        db_session.add(make_task(
+            project_id=project.id,
+            title=f"Task {i}",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": ["correctness"],
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                },
+            },
+        ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-recent-misses?limit=3"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 3
+    assert len(body["misses"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_sr_recent_misses_project_isolation(client: AsyncClient, db_session):
+    """Tasks from other projects are not included in the response."""
+    project_a = make_project()
+    project_b = make_project()
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    miss_ctx = {
+        "_first_attempt_rejection_categories": ["correctness"],
+        "_self_review_outcome": {
+            "verdict": "pass",
+            "fixes_applied": False,
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [],
+        },
+    }
+    db_session.add(make_task(
+        project_id=project_a.id, status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}], context=miss_ctx,
+    ))
+    db_session.add(make_task(
+        project_id=project_b.id, status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}], context=miss_ctx,
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project_a.id}/sr-recent-misses")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+
 # ── POST /regression-cases/{regression_class}/clear-manual-intervention ─────
 
 

@@ -4,12 +4,12 @@ Covers: failure alerts, circuit breaker alerts, auto-pause/resume alerts,
 and deduplication logic.
 """
 import pytest
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 from sqlmodel import select as sql_select
 
-from app.models import Alert, AlertSeverity, TaskStatus
+from app.models import Alert, AlertSeverity, Task, TaskStatus
 from app.main import (
     _maybe_create_failure_alert,
     _maybe_create_circuit_breaker_alert,
@@ -762,3 +762,195 @@ class TestFlappingResumeExternalNotifications:
 
         webhook_mock.assert_not_awaited()
         dispatch_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SR catch-rate baseline-floor alert
+# ---------------------------------------------------------------------------
+
+def _make_sr_floor_task(project_id, *, age_days: float, hit: bool) -> Task:
+    """Task where SR catches (hit=True) or misses (hit=False) a 'security' issue."""
+    check_results = {"security": {"passed": False, "issue": "x"}} if hit else {}
+    task = Task(
+        project_id=project_id,
+        title="SR floor test task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": {"security": 1},
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+def _floor_dispatch_calls(mock_dispatch):
+    return [
+        c for c in mock_dispatch.call_args_list
+        if (c.kwargs.get("event_type") or (c.args[1] if len(c.args) > 1 else ""))
+        == "sr_catch_rate_below_floor"
+    ]
+
+
+class TestSRCatchRateFloorAlert:
+    """baseline-floor alert (sr_catch_rate_below_floor) in compute_sr_catch_rate_trends."""
+
+    def _tasks(self, project_id, *, current_hits: int, current_misses: int, prev: int = 5):
+        """Build task lists spanning current (age_days=2) and previous (age_days=20) windows."""
+        tasks = []
+        for _ in range(current_hits):
+            tasks.append(_make_sr_floor_task(project_id, age_days=2, hit=True))
+        for _ in range(current_misses):
+            tasks.append(_make_sr_floor_task(project_id, age_days=2, hit=False))
+        for _ in range(prev):
+            tasks.append(_make_sr_floor_task(project_id, age_days=20, hit=True))
+        return tasks
+
+    @pytest.mark.asyncio
+    async def test_floor_alert_fires_when_consistently_below_floor(self, db_session):
+        from app.playbook_learning import compute_sr_catch_rate_trends
+
+        # Pre-seed rate_history with 2 below-floor entries (threshold=0.50).
+        # computed_at yesterday → is_new_window=False → history preserved.
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.35, 0.40]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        tasks = self._tasks(project.id, current_hits=2, current_misses=3)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+        assert result is not None
+        assert result["categories"]["security"].get("below_floor") is True
+
+        floor_calls = _floor_dispatch_calls(mock_dispatch)
+        assert len(floor_calls) == 1
+        payload = floor_calls[0].kwargs.get("payload") or floor_calls[0].args[2]
+        assert "below_floor_categories" in payload
+        assert payload["floor_threshold"] == 0.5
+        sec = next(c for c in payload["below_floor_categories"] if c["category"] == "security")
+        assert sec["current_hit_rate"] is not None
+        assert sec["sample_size"] > 0
+
+    @pytest.mark.asyncio
+    async def test_floor_alert_dedup_does_not_fire_twice_in_same_window(self, db_session):
+        from app.playbook_learning import compute_sr_catch_rate_trends
+
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.35, 0.40]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        tasks = self._tasks(project.id, current_hits=2, current_misses=3)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as d1, \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+        await db_session.refresh(project)
+        assert "sr_catch_rate_floor_alert" in (project.design_doc or {})
+        assert len(_floor_dispatch_calls(d1)) == 1
+
+        # Second call in same window — should be deduped
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as d2, \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+        assert len(_floor_dispatch_calls(d2)) == 0
+
+    @pytest.mark.asyncio
+    async def test_floor_alert_does_not_fire_when_above_floor(self, db_session):
+        from app.playbook_learning import compute_sr_catch_rate_trends
+
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.60, 0.70]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # 4/5 hits → current hit_rate=0.80, well above floor
+        tasks = self._tasks(project.id, current_hits=4, current_misses=1)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+        assert result is not None
+        assert result["categories"]["security"].get("below_floor") is False
+        assert len(_floor_dispatch_calls(mock_dispatch)) == 0
+
+    @pytest.mark.asyncio
+    async def test_regression_alert_unaffected_when_floor_also_triggers(self, db_session):
+        """A simultaneous regression and floor violation fires both distinct events."""
+        from app.playbook_learning import compute_sr_catch_rate_trends
+
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        # rate_history below floor; current window will also be decreasing vs previous
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.30, 0.35]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # current: 2/5 hits = 0.40; previous: 4/5 hits = 0.80 → decreasing AND below floor
+        tasks = self._tasks(project.id, current_hits=2, current_misses=3)
+        for _ in range(4):
+            tasks.append(_make_sr_floor_task(project.id, age_days=20, hit=True))
+        tasks.append(_make_sr_floor_task(project.id, age_days=20, hit=False))
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+        assert result is not None
+        assert result["categories"]["security"]["trend"] == "decreasing"
+        assert result["categories"]["security"].get("below_floor") is True
+
+        event_types = [
+            c.kwargs.get("event_type") or (c.args[1] if len(c.args) > 1 else "")
+            for c in mock_dispatch.call_args_list
+        ]
+        assert "sr_catch_rate_regression" in event_types
+        assert "sr_catch_rate_below_floor" in event_types

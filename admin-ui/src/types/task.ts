@@ -64,6 +64,14 @@ export interface Task {
   estimated_cost_usd?: number | null;
   fix_loop_history?: Record<string, FixLoopAttempt[]> | null;
   fix_loop_summary?: FixLoopSummary[] | null;
+  edges_considered?: EdgeConsidered[] | null;
+}
+
+export interface EdgeConsidered {
+  case: string;
+  handled: boolean;
+  evidence?: string;
+  blind_spot?: string;
 }
 
 export interface FixLoopSummary {

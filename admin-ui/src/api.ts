@@ -192,6 +192,68 @@ export async function fetchSrMissedRetrospectives(
   return res.json();
 }
 
+export interface SrRecentMiss {
+  task_id: string;
+  title: string;
+  scope: string | null;
+  task_type: string | null;
+  missed_categories: string[];
+  caught_categories: string[];
+  pr_url: string | null;
+}
+
+export interface SrRecentMissesResponse {
+  misses: SrRecentMiss[];
+  total: number;
+}
+
+export async function fetchSrRecentMisses(
+  projectId: string,
+  params?: { limit?: number; category?: string; days?: number },
+): Promise<SrRecentMissesResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
+  if (params?.category) searchParams.set('category', params.category);
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-recent-misses${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch SR recent misses: ${res.status}`);
+  return res.json();
+}
+
+export interface DirectionSrCatStat {
+  human_count: number;
+  hit_count: number;
+  miss_rate: number | null;
+  miss_examples: Array<{ desc: string; severity: string }>;
+}
+
+export interface DirectionSrEntry {
+  direction_id: string;
+  direction_text?: string;
+  sample_size: number;
+  overall_catch_rate: number | null;
+  worst_category: string | null;
+  categories: Record<string, DirectionSrCatStat>;
+}
+
+export interface DirectionSrBreakdownResponse {
+  directions: DirectionSrEntry[];
+  min_sample: number;
+}
+
+export async function fetchDirectionSrBreakdown(
+  projectId: string,
+  days = 30,
+): Promise<DirectionSrBreakdownResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/direction-sr-breakdown?days=${days}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch direction SR breakdown: ${res.status}`);
+  return res.json();
+}
+
 export async function onboardProject(
   owner: string,
   repo: string,

@@ -1358,6 +1358,83 @@ describe('runFreshReviewerPass', () => {
       expect.stringContaining('self_review_t4'), expect.anything(), expect.anything(),
     );
   });
+
+  it('keeps the reviewer prompt unchanged when calibration data is absent or empty', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+
+    await runFreshReviewerPass('t5', 'Title', 'Desc', [], null, { value: '' });
+    const promptWithoutCalibration = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof promptWithoutCalibration !== 'string') throw new Error('expected reviewer prompt');
+
+    vi.mocked(idx.runClaudeCode).mockClear();
+    await runFreshReviewerPass('t6', 'Title', 'Desc', [], null, { value: '' }, undefined, { self_review_catch_rate: { categories: {} } });
+    const promptWithEmptyCalibration = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof promptWithEmptyCalibration !== 'string') throw new Error('expected reviewer prompt');
+
+    expect(promptWithEmptyCalibration).toBe(promptWithoutCalibration);
+    expect(promptWithEmptyCalibration).not.toContain('Calibration from prior self-review misses:');
+  });
+
+  it('adds a ranked calibration block with top miss categories and examples', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+
+    await runFreshReviewerPass(
+      't7',
+      'Title',
+      'Desc',
+      ['src/foo.ts'],
+      null,
+      { value: '' },
+      undefined,
+      {
+        self_review_catch_rate: {
+          categories: {
+            security: {
+              miss_rate: 0.6,
+              weighted_miss_rate: 0.9,
+              examples: [
+                { severity: 'HIGH', desc: 'missing auth check' },
+                { severity: 'LOW', desc: 'unsanitized input' },
+                { severity: 'LOW', desc: 'extra example that should be omitted' },
+              ],
+            },
+            correctness: {
+              miss_rate: 0.4,
+              weighted_miss_rate: 0.6,
+              examples: [{ severity: 'MEDIUM', desc: 'off-by-one loop' }],
+            },
+            error_handling: {
+              miss_rate: 0.2,
+              weighted_miss_rate: 0.3,
+              examples: [{ severity: 'MEDIUM', desc: 'missing null guard' }],
+            },
+            type_safety: {
+              miss_rate: 0.1,
+              weighted_miss_rate: 0.2,
+              examples: [{ severity: 'LOW', desc: 'unsafe cast' }],
+            },
+          },
+        },
+      },
+    );
+
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    const calibrationIndex = prompt.indexOf('Calibration from prior self-review misses:');
+    expect(calibrationIndex).toBeGreaterThanOrEqual(0);
+    expect(prompt).toContain('- security: 60% missed (90% severity-weighted)');
+    expect(prompt).toContain('  - [HIGH] missing auth check');
+    expect(prompt).toContain('  - [LOW] unsanitized input');
+    expect(prompt).not.toContain('extra example that should be omitted');
+    expect(prompt.indexOf('- security:')).toBeLessThan(prompt.indexOf('- correctness:'));
+    expect(prompt.indexOf('- correctness:')).toBeLessThan(prompt.indexOf('- error_handling:'));
+    expect(prompt).not.toContain('- type_safety:');
+    expect(prompt).toContain('Scrutinize these categories extra carefully.');
+  });
 });
 
 // ── enable_fresh_reviewer flag integration ────────────────────────────────────
@@ -1394,6 +1471,42 @@ describe('handleCreate — enable_fresh_reviewer flag', () => {
       title: 'Test task', description: '',
       context: {}, project_context: {},
       project_metadata: { enable_fresh_reviewer: false },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeUndefined();
+  });
+
+  it('runs fresh-reviewer pass when project_metadata.is_self_repo is true and enable_fresh_reviewer is unset', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' });
+
+    const task = {
+      title: 'Test task', description: '',
+      context: {}, project_context: {},
+      project_metadata: { is_self_repo: true },
+    };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeDefined();
+  });
+
+  it('still skips fresh-reviewer pass for auto-remediation tasks even when is_self_repo is true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' });
+
+    const task = {
+      title: 'Test task', description: '',
+      context: { auto_remediation: true }, project_context: {},
+      project_metadata: { is_self_repo: true, enable_fresh_reviewer: false },
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
@@ -1639,3 +1752,40 @@ describe('code-change handler structural prompt invariants', () => {
   });
 });
 
+// ── Task-type-specific self-review focus blocks ───────────────────────────────
+describe('task-type self-review focus blocks', () => {
+  const TASK = { title: 'T', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('includes migrate focus block and generic guidance for migrate task type', async () => {
+    await handleCreate(TASK_ID, { prompt: 'do something', type: 'migrate' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Self-review focus: migrate tasks');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('includes refactor focus block and generic guidance for refactor task type', async () => {
+    await handleRefactor(TASK_ID, { prompt: 'do something', type: 'refactor' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Self-review focus: refactor tasks');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('includes qa focus block and generic guidance for qa task type', async () => {
+    await handleQA(TASK_ID, { prompt: 'do something', type: 'qa' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain('Self-review focus: qa tasks');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('does not include any focus block for create task type', async () => {
+    await handleCreate(TASK_ID, { prompt: 'do something', type: 'create' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Self-review focus:');
+  });
+
+  it('does not include any focus block when task type is absent', async () => {
+    await handleCreate(TASK_ID, { prompt: 'do something' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    expect(capturedPrompt()).not.toContain('Self-review focus:');
+  });
+});

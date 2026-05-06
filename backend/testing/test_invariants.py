@@ -1138,3 +1138,113 @@ class TestPromptVocabularyParity:
             f"Add them to _REVIEW_CATEGORIES in backend/app/playbook_learning.py "
             f"and to the agent bullet list in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE)."
         )
+
+
+# ── edges_considered Schema Invariants ────────────────────────────────────────
+# MUST stay in sync with EDGES_CONSIDERED_GUIDANCE in agent/src/prompt.ts and
+# the entry-reading code in admin_digest._compute_edges_considered_metrics /
+# playbook_learning._compute_edges_stats.
+
+# Required keys for each edges_considered entry in the self-review JSON.
+EDGES_CONSIDERED_REQUIRED_KEYS = frozenset({'case', 'handled'})
+# Optional keys that may appear in an edges_considered entry.
+EDGES_CONSIDERED_OPTIONAL_KEYS = frozenset({'evidence', 'blind_spot'})
+
+
+class TestEdgesConsideredInvariants:
+    """Structural invariants for the edges_considered field in self-review JSON.
+
+    guards against schema drift between the agent prompt guidance
+    (EDGES_CONSIDERED_GUIDANCE in agent/src/prompt.ts) and the backend metric
+    consumers (_compute_edges_considered_metrics, _compute_edges_stats).
+    """
+
+    def test_required_keys_are_subset_of_all_valid_keys(self):
+        """Required entry keys must be a strict subset of the allowed key set."""
+        all_valid = EDGES_CONSIDERED_REQUIRED_KEYS | EDGES_CONSIDERED_OPTIONAL_KEYS
+        assert EDGES_CONSIDERED_REQUIRED_KEYS < all_valid, (
+            "EDGES_CONSIDERED_REQUIRED_KEYS must be a strict subset of all valid keys."
+        )
+
+    def test_compute_edges_considered_metrics_returns_none_below_threshold(self):
+        """_compute_edges_considered_metrics must return None when fewer than
+        3 qualifying code-change tasks exist (insufficient sample)."""
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        result = _compute_edges_considered_metrics([])
+        assert result is None, (
+            "_compute_edges_considered_metrics([]) must return None."
+        )
+
+    def test_compute_edges_considered_metrics_return_shape(self):
+        """_compute_edges_considered_metrics must return a dict with the
+        expected keys when given sufficient qualifying tasks.
+
+        If this fails: the return shape changed — update the frontend
+        reader (admin-ui) and this test together to avoid contract drift.
+        """
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        EXPECTED_KEYS = {
+            "sample_size",
+            "tasks_with_edges_count",
+            "tasks_with_edges_rate",
+            "avg_edges_per_task",
+            "unhandled_edge_flagged_rate",
+            "correctness_rejection_rate_with_edges",
+            "correctness_rejection_rate_without_edges",
+        }
+
+        def _make_task(edges, rejected_cats=None):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            ctx = {"_self_review_outcome": {}}
+            if edges is not None:
+                ctx["_self_review_outcome"]["edges_considered"] = edges
+            if rejected_cats is not None:
+                ctx["_first_attempt_rejection_categories"] = rejected_cats
+            ctx["_first_attempt_succeeded"] = True
+            t.context = ctx
+            return t
+
+        tasks = [
+            _make_task([{"case": "empty list", "handled": True}]),
+            _make_task([{"case": "null payload", "handled": False, "blind_spot": "unchecked"}]),
+            _make_task([]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None, (
+            "_compute_edges_considered_metrics must return a dict for 3+ qualifying tasks."
+        )
+        missing_keys = EXPECTED_KEYS - result.keys()
+        assert not missing_keys, (
+            f"_compute_edges_considered_metrics return dict is missing keys: {sorted(missing_keys)}. "
+            "Update this test and the frontend reader together when changing the return shape."
+        )
+
+    def test_entry_handled_field_is_read_correctly(self):
+        """Backend metric consumers must read the 'handled' bool from entries correctly.
+        An entry with handled=False must count toward unhandled_edge_flagged_rate.
+        """
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        tasks = [
+            _make_task([{"case": "c1", "handled": False}]),
+            _make_task([{"case": "c2", "handled": True}]),
+            _make_task([{"case": "c3", "handled": True}]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+        assert result["tasks_with_edges_count"] == 3
+        assert result["unhandled_edge_flagged_rate"] == round(1 / 3, 3), (
+            "unhandled_edge_flagged_rate must equal fraction of tasks that have at least "
+            "one entry with handled=False."
+        )

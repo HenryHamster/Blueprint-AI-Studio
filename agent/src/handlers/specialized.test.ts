@@ -902,6 +902,43 @@ describe('handleSelfAudit — findings ingestion', () => {
   });
 });
 
+// ── handleMigrate — task-type-specific self-review focus block ────────────────
+describe('handleMigrate — migrate self-review focus block', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'ls-remote') throw new Error('branch not found');
+      if (args[0] === 'rev-parse') return 'abc1234567';
+      return '';
+    });
+    vi.mocked(listOpenPullRequestsForBranch).mockResolvedValue([]);
+  });
+
+  it('includes MIGRATE_TASK_FOCUS block after CODE_CHANGE_HELPER_GUIDANCE', async () => {
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('Self-review focus: migrate tasks');
+    expect(prompt).toContain('Down-revision chain');
+    expect(prompt).toContain('Affected tests');
+  });
+
+  it('migrate focus block is positioned after CODE_CHANGE_HELPER_GUIDANCE', async () => {
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedMigratePrompt();
+    const guidanceIdx = prompt.indexOf('Task lifecycle — you own it end-to-end');
+    const focusIdx = prompt.indexOf('Self-review focus: migrate tasks');
+    expect(guidanceIdx).toBeGreaterThanOrEqual(0);
+    expect(focusIdx).toBeGreaterThan(guidanceIdx);
+  });
+
+  it('still includes CODE_CHANGE_HELPER_GUIDANCE alongside the focus block', async () => {
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedMigratePrompt();
+    expect(prompt).toContain('Task lifecycle — you own it end-to-end');
+    expect(prompt).toContain('Self-review focus: migrate tasks');
+  });
+});
+
 // ── Structural prompt invariants (regression-detection) ───────────────────────
 // Pins the cross-cutting guidance blocks for every specialized handler.
 // A future PR that drops a block from prompt assembly will fail here before merging.

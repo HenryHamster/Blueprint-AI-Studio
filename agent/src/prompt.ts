@@ -287,6 +287,43 @@ both the feature and the cleanup unshipped. Report-and-skip lets the
 feature land AND makes the debt visible for proper prioritization.
 `;
 
+// ── Edges-considered structured self-review field ────────────────────────────
+// Exported type used by sibling-cluster code (handlers, backend schemas) to
+// stay consistent with the prompt-defined shape.
+export interface EdgeConsidered {
+  case: string;
+  handled: boolean;
+  evidence?: string;
+  blind_spot?: string;
+}
+
+// Self-review prompt block requesting enumerated edge-case analysis.
+// Included in code-change task prompts so the self-review JSON captures
+// which paths the agent thought through (and which it did not).
+export const EDGES_CONSIDERED_GUIDANCE = `
+## Edges-Considered Field in Self-Review
+
+When writing your self-review JSON (\`/tmp/self_review_<task_id>.json\`),
+include an optional \`edges_considered\` array. Each entry names one specific
+edge case the diff touches and declares whether it is handled:
+
+\`\`\`json
+"edges_considered": [
+  {"case": "empty input list", "handled": true, "evidence": "early return at L42"},
+  {"case": "concurrent calls to same key", "handled": false, "blind_spot": "no lock — relying on caller serialization"},
+  {"case": "null/undefined payload field", "handled": true, "evidence": "optional chaining at L87"}
+]
+\`\`\`
+
+Guidelines:
+- **medium/large scope tasks**: enumerate at least 3 edges. Small tasks may have fewer.
+- \`evidence\`: cite file + line where the edge is handled (e.g. \`"early return at L42"\`).
+- \`blind_spot\`: when \`handled: false\`, explain why it is deferred or acceptable.
+- Unhandled edges (\`handled: false\`) are advisory — they do NOT fail the self-review,
+  but they feed the catch-rate dashboard and downstream reviewer focus.
+- Omitting the field entirely is acceptable; it is never required.
+`;
+
 // Canonical concatenation of the cross-cutting failure-guidance blocks
 // shared by code-change handlers (standard.ts, review-fix.ts fix path).
 // Centralized so block order, inclusion, and future additions only need
@@ -1086,6 +1123,79 @@ export function formatPlaybook(
 // helpers and the *required* exit ritual. Without this, Claude has no way
 // to know the helpers exist and falls through to the wrapper's "FAILED:
 // incomplete" path on every task.
+
+// Bump this stamp whenever the self-review prompt guidance changes
+// (category list, scope thresholds, schema shape, etc.) so that
+// compute_sr_catch_rate_trends can distinguish prompt changes from
+// genuine catch-rate movement. Kept as a string so the typed shape
+// across the agent → backend (schemas.SelfReviewOutcome) → frontend
+// (SrTrendData.prompt_version) chain is consistent and string-safe
+// for frontend operations like `.slice(...)`.
+export const SELF_REVIEW_PROMPT_VERSION = "1";
+
+// Task-type-specific self-review focus blocks. Each block overlays the generic
+// CODE_CHANGE_HELPER_GUIDANCE with concrete, type-specific scrutiny targeting
+// the dominant miss patterns observed per task type in sr_catch_rate_trends.
+// Handlers compose these into the prompt via getTaskTypeFocusBlock(taskType).
+
+export const MIGRATE_TASK_FOCUS = `
+## Self-review focus: migrate tasks
+
+Migrate tasks carry the highest regression_risk because schema or data changes
+ripple into existing tests. Apply these additional checks before \`./done\`:
+
+1. **Down-revision chain** — verify the new migration's \`down_revision\` matches
+   the current alembic head (\`alembic heads\`). A broken chain silently skips
+   the migration in CI.
+2. **Affected tests** — scan for tests that exercise the changed models or tables.
+   Name them explicitly; record them in the \`regression_risk\` issue field even
+   when they still pass (e.g. \`"issue": "affected_tests: [test_foo, test_bar] — all still pass"\`).
+3. **EXPECTED_SCHEMA_REVISION** — if \`backend/app/main.py\` declares this constant,
+   bump it to match the new alembic head or the invariant test will fail.
+`;
+
+export const REFACTOR_TASK_FOCUS = `
+## Self-review focus: refactor tasks
+
+Refactor tasks must guarantee NO new behavior is introduced. The dominant miss
+is accidental scope-drift or subtle behavioral changes that bypass tests.
+
+1. **Scope-drift (mandatory)** — run \`git diff --stat HEAD\` and confirm every
+   changed file is in scope. If ANY externally-observable behavior changed (return
+   values, side effects, error messages, API shape), record it under \`correctness\`
+   with explicit before/after: \`"issue": "behavior changed: foo() returned X, now returns Y"\`.
+2. **Caller inventory** — grep for every caller of renamed or restructured exports.
+   Verify each call site is updated and behavior-preserving.
+3. **Test delta** — a pure refactor should need no new tests; if you added tests,
+   explain why in \`blind_spots\`.
+`;
+
+export const QA_TASK_FOCUS = `
+## Self-review focus: qa tasks
+
+QA tasks must produce meaningful coverage — the dominant miss is trivial tests
+that don't exercise edge cases or new behaviors.
+
+1. **Behavior enumeration** — list every new behavior or code path under test. In
+   \`test-coverage\`, explicitly attest that each has a test: \`"issue": "behaviors
+   covered: [X, Y, Z] — each has a dedicated test"\`.
+2. **Edge cases** — for each behavior, name at least one non-happy-path scenario
+   (empty input, error branch, boundary value) and confirm a test exercises it.
+3. **Assertion strength** — tests that only check a function runs without error are
+   insufficient. Verify assertions check actual return values or side effects.
+`;
+
+// Returns the task-type-specific self-review focus block to append after
+// CODE_CHANGE_HELPER_GUIDANCE. Returns '' for task types without a custom block.
+export function getTaskTypeFocusBlock(taskType: string): string {
+  switch (taskType) {
+    case 'migrate': return MIGRATE_TASK_FOCUS;
+    case 'refactor': return REFACTOR_TASK_FOCUS;
+    case 'qa': return QA_TASK_FOCUS;
+    default: return '';
+  }
+}
+
 export const CODE_CHANGE_HELPER_GUIDANCE = `
 ## Task lifecycle — you own it end-to-end
 
@@ -1206,6 +1316,7 @@ Schema:
 {
   "verdict": "pass" | "fail",
   "fixes_applied": true | false,
+  "prompt_version": "<string from SELF_REVIEW_PROMPT_VERSION — include verbatim>",
   "check_results": {
     "<category>": { "passed": true | false, "issue": "..." }
   },

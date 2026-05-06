@@ -945,6 +945,59 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 
+  it('runs fresh-reviewer pass when project_metadata.is_self_repo is true and enable_fresh_reviewer is unset', async () => {
+    vi.mocked(indexMod.git).mockReturnValue(Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n'));
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+
+    await handleFix(
+      'task-fix-self-repo',
+      basePayload,
+      {
+        context: { scope: 'small' },
+        project_metadata: { is_self_repo: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const reviewerCall = vi.mocked(indexMod.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
+    );
+    expect(reviewerCall).toBeDefined();
+  });
+
+  it('forwards project_context into the fresh-reviewer calibration block when enabled', async () => {
+    vi.mocked(indexMod.git).mockReturnValue(Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n'));
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+
+    await handleFix(
+      'task-fix-reviewer-calibration',
+      basePayload,
+      {
+        context: { scope: 'small' },
+        project_context: {
+          self_review_catch_rate: {
+            categories: {
+              security: {
+                miss_rate: 0.5,
+                weighted_miss_rate: 0.8,
+                examples: [{ severity: 'HIGH', desc: 'missing auth guard' }],
+              },
+            },
+          },
+        },
+        project_metadata: { enable_fresh_reviewer: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const reviewerPrompt = vi.mocked(indexMod.runClaudeCode).mock.calls.find(
+      call => typeof call[0] === 'string' && call[0].includes('Calibration from prior self-review misses:'),
+    )?.[0];
+    if (typeof reviewerPrompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(reviewerPrompt).toContain('- security: 50% missed (80% severity-weighted)');
+    expect(reviewerPrompt).toContain('missing auth guard');
+  });
+
   it('rebases onto base branch before delegating to runCodeChangeTask', async () => {
     const seenGitArgs: string[][] = [];
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
@@ -1799,6 +1852,74 @@ describe('handleFix structural prompt invariants', () => {
     expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE
     expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
     expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
+  });
+});
+
+describe('handleFix task-type-specific self-review focus blocks', () => {
+  const basePayload = {
+    branch: 'fix-branch',
+    base_branch: 'main',
+    pr_number: 42,
+    prompt: 'Fix the issue.',
+  };
+  const baseTask = { title: 'Fix', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('includes migrate focus block for migrate original_task_type', async () => {
+    await handleFix(
+      'task-migrate-fix',
+      { ...basePayload, original_task_type: 'migrate' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: migrate tasks');
+    expect(p).toContain('down_revision');
+    expect(p).toContain('Task lifecycle — you own it end-to-end'); // generic guidance still present
+  });
+
+  it('includes refactor focus block for refactor original_task_type', async () => {
+    await handleFix(
+      'task-refactor-fix',
+      { ...basePayload, original_task_type: 'refactor' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: refactor tasks');
+    expect(p).toContain('NO new behavior');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('includes qa focus block for qa original_task_type', async () => {
+    await handleFix(
+      'task-qa-fix',
+      { ...basePayload, original_task_type: 'qa' },
+      baseTask,
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const p = capturedFixPrompt();
+    expect(p).toContain('Self-review focus: qa tasks');
+    expect(p).toContain('Behavior enumeration');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+  });
+
+  it('does not include a type-specific block for create or unknown task types', async () => {
+    for (const taskType of ['create', 'unknown', '']) {
+      vi.clearAllMocks();
+      await handleFix(
+        `task-${taskType}-fix`,
+        { ...basePayload, original_task_type: taskType },
+        baseTask,
+        'token', 'owner', 'repo', null, statusRef(),
+      );
+      const p = capturedFixPrompt();
+      expect(p).not.toContain('Self-review focus: migrate tasks');
+      expect(p).not.toContain('Self-review focus: refactor tasks');
+      expect(p).not.toContain('Self-review focus: qa tasks');
+      expect(p).toContain('Task lifecycle — you own it end-to-end'); // generic always present
+    }
   });
 });
 

@@ -5,6 +5,7 @@ import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 interface ProjectBuildConfigSectionProps {
   githubOwner: string | null;
   githubRepo: string | null;
+  isSelfRepo?: boolean;
   buildConfig: BuildConfig | null;
   onSave: (config: BuildConfig) => Promise<void>;
   onDetect: () => Promise<void>;
@@ -26,6 +27,7 @@ function newDir(): BuildConfigDirectory {
 export function ProjectBuildConfigSection({
   githubOwner,
   githubRepo,
+  isSelfRepo = false,
   buildConfig,
   onSave,
   onDetect,
@@ -303,6 +305,11 @@ export function ProjectBuildConfigSection({
                 Second-pass critique by an independent Claude session before <code className="font-mono text-neutral-400">./done</code>.
                 Catches issues the primary agent may miss. Adds a small additional cost per code-change task.
               </p>
+              {isSelfRepo && (
+                <p className="text-[11px] text-blue-400 mt-1">
+                  Auto-on for this project (self-repo) — runs regardless of this toggle.
+                </p>
+              )}
             </div>
           </label>
         </div>
