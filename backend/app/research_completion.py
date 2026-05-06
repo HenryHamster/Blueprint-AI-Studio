@@ -58,7 +58,7 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     _detect_dedup_deadlock,
     apply_post_spawn_state,
 )
-from app.source_ref_validation import validate_source_refs
+from app.source_ref_validation import validate_source_refs, _parse_ref
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE, scope_to_effort
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
@@ -496,6 +496,103 @@ def _build_preventive_context(
     }
 
 
+def _apply_structural_actionability_downgrade(findings: list) -> int:
+    """Downgrade each finding's actionability_grade when its structural support
+    (claims count, valid sources, description length) does not justify the
+    claimed grade. Mutates findings in place. Returns the count of downgrades.
+
+    Extracted from _handle_research_completion so unit tests that exercise
+    orthogonal behaviors (deduplication, dispatch, etc.) can patch this gate
+    to a no-op via mocker.patch without having to attach structural metadata
+    to every test fixture.
+    """
+    grade_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    downgrades = 0
+    for f in findings:
+        claims = f.get("claims") if isinstance(f.get("claims"), list) else []
+        desc = str(f.get("description") or "").strip()
+        sources = f.get("sources") if isinstance(f.get("sources"), list) else []
+        valid_sources = sum(
+            1
+            for s in sources
+            if isinstance(s, dict)
+            and (
+                str(s.get("type") or "").lower() in ("pr", "message")
+                or s.get("valid", True) is not False
+            )
+        )
+        structural_grade = "LOW"
+        if len(claims) >= 2 and valid_sources >= 1 and len(desc) >= 80:
+            structural_grade = "HIGH"
+        elif (len(claims) >= 1 or valid_sources >= 1) and len(desc) >= 40:
+            structural_grade = "MEDIUM"
+        current = f.get("actionability_grade", "MEDIUM")
+        if grade_order[structural_grade] < grade_order.get(current, 1):
+            f["actionability_grade"] = structural_grade
+            downgrades += 1
+    return downgrades
+
+
+async def lookup_findings_by_source_ref(
+    session: AsyncSession,
+    project_id: Any,
+    ref: str,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return findings whose source_refs cite the given file path or PR ref.
+
+    Searches plan_output of research tasks for findings with a source whose
+    normalized path matches ref (exact) or is a child path of ref (prefix).
+    Supports file refs (e.g. "backend/app/foo.py") and PR/message refs
+    (matched by exact ref string).
+
+    Returns a list of dicts with task_id, direction_id, finding_title,
+    finding_description, matched_sources, and finding_index.
+    """
+    ref_path, _, _ = _parse_ref(ref)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.plan_output.isnot(None),
+        )
+        .order_by(Task.created_at.desc())
+        .limit(1000)
+    )
+    tasks = (await session.execute(stmt)).scalars().all()
+
+    matches: List[Dict[str, Any]] = []
+    for task in tasks:
+        plan = task.plan_output
+        if not isinstance(plan, list):
+            continue
+        for idx, finding in enumerate(plan):
+            if not isinstance(finding, dict):
+                continue
+            sources = finding.get("sources") or []
+            matched_sources = []
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                src_ref = src.get("ref", "")
+                src_path, _, _ = _parse_ref(src_ref)
+                if src_path == ref_path or src_path.startswith(ref_path + "/"):
+                    matched_sources.append(src)
+            if matched_sources:
+                matches.append({
+                    "task_id": str(task.id),
+                    "direction_id": (task.context or {}).get("direction_id"),
+                    "finding_index": idx,
+                    "finding_title": finding.get("title", ""),
+                    "finding_description": (finding.get("description") or "")[:200],
+                    "matched_sources": matched_sources,
+                })
+                if len(matches) >= limit:
+                    return matches
+    return matches
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Increment _research_spawn_count on completion (variable name is legacy;
@@ -534,9 +631,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         return
 
     # Normalize actionability_grade: any missing or invalid value defaults to MEDIUM.
-    # The agent is prompted to emit a grade on every finding; this guard ensures
-    # downstream gates (low-actionability deferral) and admin surfaces always see
-    # a valid value rather than silently acting on None.
+    # Then downgrade when the finding structure does not support the claimed grade.
     _valid_grades = {"HIGH", "MEDIUM", "LOW"}
     for _f in findings:
         _g = _f.get("actionability_grade")
@@ -561,8 +656,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # Validate file-type source refs at write time
                 _f["sources"] = validate_source_refs(_f["sources"])
 
+    _structural_downgrades = _apply_structural_actionability_downgrade(findings)
+
     # Store all findings for admin visibility before filtering
     task.plan_output = findings
+    task.context = {
+        **(task.context or {}),
+        "_actionability_structural_downgrades": _structural_downgrades,
+    }
     session.add(task)
     await session.commit()
 

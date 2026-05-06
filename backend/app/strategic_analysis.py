@@ -135,6 +135,12 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
             outcome["proposed"] = proposed[:10]
         if failed_approaches:
             outcome["failed_approaches"] = failed_approaches[:10]
+        raw_evidence = d.get("recent_findings_evidence") or []
+        if raw_evidence:
+            from app.research_context import filter_direction_evidence  # noqa: PLC0415
+            filtered = filter_direction_evidence(ctx, raw_evidence)
+            if filtered:
+                outcome["evidence"] = filtered
         # Include lifetime totals for context
         lifetime_cycles = len(history) + (agg.get("total_cycles") or 0)
         lifetime_merged = sum(h.get("prs_merged", 0) for h in history) + (agg.get("total_prs_merged") or 0)

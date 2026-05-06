@@ -35,6 +35,7 @@ from app.strategic_completion import (
     _RETIRED_NOTE_PREFIX,
 )
 from app.strategic_spawning import _build_previous_decision_outcomes, _build_past_retirement_critiques
+from app.strategic_analysis import _build_outcome_evaluation
 from app.models import Project, Task
 
 
@@ -2651,3 +2652,92 @@ async def test_strategic_http_create_direction_dedup_persists_rejection_record(c
     assert existing_text in record.get("rejected_text", "")
     assert record.get("dedup_reasoning") == "slightly different framing"
     assert "rejected_at" in record
+
+
+# ── _build_outcome_evaluation: evidence block ─────────────────────────────────
+
+
+class TestBuildOutcomeEvaluationEvidence:
+    """_build_outcome_evaluation surfaces evidence from recent_findings_evidence.
+
+    Asserts that the evidence block is included when present and meaningful,
+    omitted gracefully when absent, and that failed findings are excluded.
+    """
+
+    def _make_project(self, **dir_kwargs):
+        d = {
+            "id": "d-ev1", "status": "active", "text": "Improve caching layer",
+            "research_history": [],
+        }
+        d.update(dir_kwargs)
+        return Project(name="P", user_id="u1", directions=[d], vision={})
+
+    def test_evidence_included_when_present_with_claims(self):
+        evidence = [{"title": "Finding A", "claims": ["c1", "c2"], "source_refs": [{"ref": "backend/foo.py"}]}]
+        project = self._make_project(recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "evidence" in direction
+        assert len(direction["evidence"]) == 1
+        assert direction["evidence"][0]["title"] == "Finding A"
+        assert "c1" in direction["evidence"][0]["claims"]
+
+    def test_evidence_omitted_when_no_recent_findings_evidence_key(self):
+        project = self._make_project()  # no recent_findings_evidence
+        result = _build_outcome_evaluation(project)
+        assert "evidence" not in result["directions"][0]
+
+    def test_evidence_omitted_for_empty_recent_findings_evidence(self):
+        project = self._make_project(recent_findings_evidence=[])
+        result = _build_outcome_evaluation(project)
+        assert "evidence" not in result["directions"][0]
+
+    def test_finding_with_no_claims_and_no_source_refs_excluded(self):
+        evidence = [{"title": "Empty Finding", "claims": [], "source_refs": []}]
+        project = self._make_project(recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        assert "evidence" not in result["directions"][0]
+
+    def test_failed_findings_excluded_from_evidence(self):
+        ctx = "## Established Findings\n- Finding A (failed: build error)\n"
+        evidence = [{"title": "Finding A", "claims": ["c1"], "source_refs": [{"ref": "backend/foo.py"}]}]
+        project = self._make_project(research_context=ctx, recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        assert "evidence" not in result["directions"][0]
+
+    def test_proposed_findings_included(self):
+        ctx = "## Established Findings\n- Finding B (proposed)\n"
+        evidence = [{"title": "Finding B", "claims": ["c1"], "source_refs": []}]
+        project = self._make_project(research_context=ctx, recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        ev = result["directions"][0].get("evidence")
+        assert ev is not None
+        assert ev[0]["title"] == "Finding B"
+
+    def test_claims_capped_at_3_per_finding(self):
+        evidence = [{"title": "Big Finding", "claims": [f"claim{i}" for i in range(6)], "source_refs": [{"ref": "f.py"}]}]
+        project = self._make_project(recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        ev = result["directions"][0].get("evidence")
+        assert ev is not None
+        assert len(ev[0]["claims"]) <= 3
+
+    def test_source_refs_capped_at_3_per_finding(self):
+        refs = [{"ref": f"backend/file{i}.py"} for i in range(6)]
+        evidence = [{"title": "Big Finding", "claims": ["c1"], "source_refs": refs}]
+        project = self._make_project(recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        ev = result["directions"][0].get("evidence")
+        assert ev is not None
+        assert len(ev[0]["source_refs"]) <= 3
+
+    def test_total_evidence_entries_capped_at_5(self):
+        evidence = [
+            {"title": f"Finding {i}", "claims": [f"c{i}"], "source_refs": [{"ref": f"f{i}.py"}]}
+            for i in range(8)
+        ]
+        project = self._make_project(recent_findings_evidence=evidence)
+        result = _build_outcome_evaluation(project)
+        ev = result["directions"][0].get("evidence")
+        assert ev is not None
+        assert len(ev) <= 5

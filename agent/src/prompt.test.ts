@@ -62,6 +62,7 @@ import {
   formatSelfReviewBlindSpots,
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
+  formatSelfReviewCalibrationSection,
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
@@ -4030,5 +4031,94 @@ describe('task-type focus blocks — contradiction linter', () => {
     const { DEPS_TASK_FOCUS } = await import('./prompt.js');
     const { violations } = lintFocusBlock('DEPS_TASK_FOCUS', DEPS_TASK_FOCUS);
     expect(violations).toEqual([]);
+  });
+});
+
+// ── formatSelfReviewCalibrationSection ───────────────────────────────────────
+describe('formatSelfReviewCalibrationSection', () => {
+  it('returns empty string when source is undefined', () => {
+    expect(formatSelfReviewCalibrationSection(undefined)).toBe('');
+  });
+
+  it('returns empty string when prompt_version_changed is true', () => {
+    const source = {
+      categories: { regression_risk: { miss_rate: 0.6, below_floor: true } },
+      prompt_version_changed: true,
+    };
+    expect(formatSelfReviewCalibrationSection(source)).toBe('');
+  });
+
+  it('returns empty string when no categories have miss_rate >= 0.5', () => {
+    const source = {
+      categories: { correctness: { miss_rate: 0.3, below_floor: false } },
+    };
+    expect(formatSelfReviewCalibrationSection(source)).toBe('');
+  });
+
+  it('returns calibration block for below_floor categories using top-level categories', () => {
+    const source = {
+      categories: { regression_risk: { miss_rate: 0.6, below_floor: true } },
+    };
+    const result = formatSelfReviewCalibrationSection(source);
+    expect(result).toContain('## Self-review calibration');
+    expect(result).toContain('regression_risk');
+    expect(result).toContain('60%');
+  });
+
+  it('caps output at the top 2 categories by miss rate', () => {
+    const source = {
+      categories: {
+        regression_risk: { miss_rate: 0.7, below_floor: true },
+        scope_drift: { miss_rate: 0.8, below_floor: true },
+        correctness: { miss_rate: 0.6, below_floor: true },
+      },
+    };
+    const result = formatSelfReviewCalibrationSection(source);
+    const matches = [...result.matchAll(/Historical pattern:/g)];
+    expect(matches.length).toBe(2);
+    expect(result).toContain('scope_drift');
+    expect(result).toContain('regression_risk');
+    expect(result).not.toContain('correctness');
+  });
+
+  it('uses by_task_type map when taskType is provided', () => {
+    const source = {
+      by_task_type: {
+        create: { regression_risk: { miss_rate: 0.65, below_floor: true } },
+        fix: { correctness: { miss_rate: 0.55, below_floor: true } },
+      },
+    };
+    const result = formatSelfReviewCalibrationSection(source, 'create');
+    expect(result).toContain('regression_risk');
+    expect(result).not.toContain('correctness');
+  });
+
+  it('falls back to for_task_type when by_task_type lacks the requested task type', () => {
+    const source = {
+      by_task_type: {},
+      for_task_type: { scope_drift: { miss_rate: 0.75, below_floor: true } },
+    };
+    const result = formatSelfReviewCalibrationSection(source, 'create');
+    expect(result).toContain('scope_drift');
+    expect(result).toContain('75%');
+  });
+
+  it('omits entries where below_floor is false when taskType is provided', () => {
+    const source = {
+      by_task_type: {
+        create: {
+          regression_risk: { miss_rate: 0.6, below_floor: false },
+          scope_drift: { miss_rate: 0.7, below_floor: true },
+        },
+      },
+    };
+    const result = formatSelfReviewCalibrationSection(source, 'create');
+    expect(result).toContain('scope_drift');
+    expect(result).not.toContain('regression_risk');
+  });
+
+  it('returns empty string when categories are empty', () => {
+    const source = { categories: {} };
+    expect(formatSelfReviewCalibrationSection(source)).toBe('');
   });
 });

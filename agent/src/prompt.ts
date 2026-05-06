@@ -1221,7 +1221,27 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "3";
+export const SELF_REVIEW_PROMPT_VERSION = "4";
+
+type SRCatchRateSource = {
+  categories?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
+  by_task_type?: Record<string, Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>>;
+  for_task_type?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
+  prompt_version_changed?: boolean;
+};
+
+export function formatSelfReviewCalibrationSection(source: SRCatchRateSource | undefined, taskType = ''): string {
+  if (!source || source.prompt_version_changed) return '';
+  const categories = taskType ? (source.by_task_type?.[taskType] ?? source.for_task_type) : source.categories;
+  if (!categories) return '';
+  const rows = Object.entries(categories)
+    .map(([category, data]) => ({ category, data, miss: typeof data.miss_rate === 'number' ? data.miss_rate : typeof data.hit_rate === 'number' ? 1 - data.hit_rate : typeof data.current_hit_rate === 'number' ? 1 - data.current_hit_rate : -1 }))
+    .filter(({ data, miss }) => miss >= 0.5 && (taskType ? data.below_floor !== false : true))
+    .sort((a, b) => (b.data.weighted_miss_rate ?? b.miss) - (a.data.weighted_miss_rate ?? a.miss))
+    .slice(0, 2);
+  if (rows.length === 0) return '';
+  return `## Self-review calibration\nHistorical pattern for this task type:\n${rows.map(({ category, miss }) => `- Historical pattern: ${category} is missing ${Math.round(miss * 100)}% of issues a reviewer catches on this project. Scrutinize this category extra carefully.`).join('\n')}\n\n`;
+}
 
 // Task-type-specific self-review focus blocks. Each block overlays the generic
 // CODE_CHANGE_HELPER_GUIDANCE with concrete, type-specific scrutiny targeting
@@ -1768,6 +1788,13 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         (taskContext?.related_files as string[] | undefined) ||
         [];
       prefix = formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
+      if (['create', 'fix', 'refactor', 'migrate'].includes(taskType)) {
+        prefix += formatSelfReviewCalibrationSection(
+          (projectCtx.self_review_catch_rate as SRCatchRateSource | undefined) ||
+          (projectCtx.sr_catch_rate_trends as SRCatchRateSource | undefined),
+          taskType,
+        );
+      }
     }
   }
 

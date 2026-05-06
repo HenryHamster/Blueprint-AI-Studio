@@ -86,6 +86,14 @@ def _patch_research_externals(mocker):
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     # Simulate no pool configured so capacity-aware batch cap doesn't constrain unit tests
     mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
+    # Disable the structural actionability downgrade gate so unit tests that
+    # construct simplified findings (without claims / sources / long descriptions)
+    # are not deferred as low_actionability. Tests that specifically exercise the
+    # gate's behavior should bypass _patch_research_externals or override this.
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
 
 
 def _make_finding(

@@ -1168,6 +1168,58 @@ class TestComputePredictionCalibration:
 # Autonomous attribution: CPM uses autonomous_prs_merged
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# evidence block from recent_findings_evidence
+# ---------------------------------------------------------------------------
+
+def test_evidence_included_for_merged_findings():
+    research_ctx = (
+        "## Established Findings\n"
+        "- feat: auth fix [small] (merged). Description\n"
+        "- feat: perf fix [small] (proposed). Description\n"
+    )
+    evidence = [
+        {"title": "feat: auth fix", "claims": ["claim A", "claim B", "claim C", "claim D"],
+         "source_refs": [{"ref": "backend/app/auth.py"}, {"ref": "PR #123"}, {"ref": "backend/app/models.py"}, {"ref": "extra"}]},
+        {"title": "feat: perf fix", "claims": ["claim X"],
+         "source_refs": [{"ref": "agent/src/index.ts"}]},
+    ]
+    directions = [{"id": "d1", "status": "active", "research_context": research_ctx,
+                   "recent_findings_evidence": evidence, "research_history": []}]
+    result = _build_outcome_evaluation(_make_project(directions=directions), [])
+    d = result["directions"][0]
+    assert "evidence" in d
+    ev = {e["title"]: e for e in d["evidence"]}
+    # claims capped at 3
+    assert len(ev["feat: auth fix"]["claims"]) == 3
+    # source_refs capped at 3
+    assert len(ev["feat: auth fix"]["source_refs"]) == 3
+    assert "feat: perf fix" in ev
+
+
+def test_evidence_omits_failed_findings():
+    research_ctx = (
+        "## Established Findings\n"
+        "- feat: broken [small] (failed: ci). Description\n"
+    )
+    evidence = [
+        {"title": "feat: broken", "claims": ["claim A"], "source_refs": [{"ref": "file.py"}]},
+    ]
+    directions = [{"id": "d1", "status": "active", "research_context": research_ctx,
+                   "recent_findings_evidence": evidence, "research_history": []}]
+    result = _build_outcome_evaluation(_make_project(directions=directions), [])
+    d = result["directions"][0]
+    assert "evidence" not in d
+
+
+def test_evidence_absent_when_no_recent_findings_evidence():
+    directions = [{"id": "d1", "status": "active", "research_history": [
+        {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1}
+    ]}]
+    result = _build_outcome_evaluation(_make_project(directions=directions), [])
+    assert "evidence" not in result["directions"][0]
+
+
 class TestAutonomousCPM:
     """cost_per_merged_pr uses autonomous_prs_merged as denominator."""
 

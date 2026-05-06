@@ -493,3 +493,54 @@ class TestBuildRecentFindingsEvidence:
         )
         # Budget is too small for all findings
         assert len(result) < 10
+
+
+class TestEvictedOutRecords:
+    """_build_research_context evicted_out: structured audit records for callers."""
+
+    def _build_with_eviction(self):
+        prior = _make_large_context(established_count=80, entry_len=90)
+        evicted: list = []
+        _build_research_context(
+            prior_context=prior,
+            finding_titles=["New finding"],
+            key_finding_descriptions=["New description."],
+            cycle_insights=[],
+            history_entry={},
+            evicted_out=evicted,
+        )
+        return evicted
+
+    def test_populated_when_eviction_occurs(self):
+        assert len(self._build_with_eviction()) > 0
+
+    def test_record_has_required_fields(self):
+        rec = self._build_with_eviction()[0]
+        assert {"title", "claims", "source_refs", "status", "evicted_at"} <= rec.keys()
+
+    def test_title_truncated_to_200_chars(self):
+        rec = self._build_with_eviction()[0]
+        assert len(rec["title"]) <= 200
+
+    def test_empty_when_no_eviction(self):
+        evicted: list = []
+        _build_research_context(
+            prior_context=None,
+            finding_titles=["Tiny"],
+            key_finding_descriptions=["Short."],
+            cycle_insights=[],
+            history_entry={},
+            evicted_out=evicted,
+        )
+        assert evicted == []
+
+    def test_none_evicted_out_is_noop(self):
+        prior = _make_large_context(established_count=80, entry_len=90)
+        result = _build_research_context(
+            prior_context=prior,
+            finding_titles=["New"],
+            key_finding_descriptions=["Desc."],
+            cycle_insights=[],
+            history_entry={},
+        )
+        assert "## Eviction Summary" in result

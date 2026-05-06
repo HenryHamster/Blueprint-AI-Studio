@@ -2213,6 +2213,86 @@ async def test_sr_blind_spot_deploy_monitoring_defers(db_session):
 
 
 # ---------------------------------------------------------------------------
+# MTTD — signal_first_seen_at population tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_signal_first_seen_at_set_for_sr_catch_rate(db_session):
+    """signal_first_seen_at is populated when a new SR catch-rate case is opened."""
+    from app.models import RegressionRemediationCase
+    from app.time_utils import _utcnow
+
+    before = _utcnow()
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+            RegressionRemediationCase.regression_class == "sr_catch_rate",
+        )
+    )).scalars().first()
+    assert case is not None
+    assert case.signal_first_seen_at is not None
+    # For SR catch-rate there is no durable first_seen timestamp, so the
+    # dispatcher records ~now (detection time ≈ spawn time).
+    assert case.signal_first_seen_at >= before
+
+
+@pytest.mark.asyncio
+async def test_signal_first_seen_at_uses_anomaly_first_seen(db_session):
+    """signal_first_seen_at reflects the anomaly's first_seen, enabling accurate MTTD."""
+    import app.shared_state as _ss
+    from app.models import RegressionRemediationCase
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    # first_seen is 2 days before spawn — MTTD should be ~2 days.
+    first_seen_dt = now - timedelta(days=2)
+    first_seen_iso = first_seen_dt.isoformat()
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "vm_provision_failure_mttd"
+    _ss.persistent_anomalies[str(project.id)] = {
+        fingerprint: {
+            "occurrence_count": 5,
+            "last_seen": now.isoformat(),
+            "first_seen": first_seen_iso,
+            "severity": "high",
+        },
+    }
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        case = (await db_session.execute(
+            select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == project.id,
+                RegressionRemediationCase.regression_class == f"anomaly:{fingerprint}",
+            )
+        )).scalars().first()
+        assert case is not None
+        assert case.signal_first_seen_at is not None
+        # Should match the anomaly's first_seen, not spawn time.
+        delta = abs((case.signal_first_seen_at - first_seen_dt).total_seconds())
+        assert delta < 2, f"signal_first_seen_at mismatch: {case.signal_first_seen_at} vs {first_seen_dt}"
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+# ---------------------------------------------------------------------------
 # Divergence detector — investigations-diverged escalation
 # ---------------------------------------------------------------------------
 

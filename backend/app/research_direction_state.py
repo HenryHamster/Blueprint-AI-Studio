@@ -36,6 +36,25 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+_EVICTED_FINDINGS_CAP = 50
+
+
+def _append_evicted_findings(direction: dict, new_entries: list) -> None:
+    """Append evicted finding records to direction.history_aggregate.evicted_findings.
+
+    Maintains a FIFO list capped at _EVICTED_FINDINGS_CAP entries to bound storage.
+    """
+    if not new_entries:
+        return
+    agg = direction.get("history_aggregate") or {}
+    existing = list(agg.get("evicted_findings") or [])
+    existing.extend(new_entries)
+    if len(existing) > _EVICTED_FINDINGS_CAP:
+        existing = existing[-_EVICTED_FINDINGS_CAP:]
+    agg["evicted_findings"] = existing
+    direction["history_aggregate"] = agg
+
+
 def _compute_saturation(history: list) -> bool:
     """Return True if last 3 cycles all produced 0 or 1 tasks."""
     if len(history) < 3:
@@ -335,6 +354,7 @@ async def apply_post_spawn_state(
                                 f"{_consec} consecutive empty cycles (task {task.id})"
                             )
 
+                    _evicted_out: list = []
                     d["research_context"] = _build_research_context(
                         prior_context=d.get("research_context"),
                         finding_titles=finding_titles_by_dir.get(did, [])[:5],
@@ -345,7 +365,9 @@ async def apply_post_spawn_state(
                         cycle_insights=[i["summary"][:200] for i in insights[:3]],
                         history_entry=entry,
                         prior_history=d.get("research_history", [])[:-1],
+                        evicted_out=_evicted_out,
                     )
+                    _append_evicted_findings(d, _evicted_out)
                     prior_rfe = list(d.get("recent_findings_evidence") or [])
                     cur_rfe = build_recent_findings_evidence(
                         finding_titles=finding_titles_by_dir.get(did, []),

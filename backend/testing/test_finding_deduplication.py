@@ -7,6 +7,11 @@ from datetime import datetime, timedelta
 from app.finding_deduplication import (
     CODE_ERROR_COOLDOWN,
     DedupOutcome,
+    _check_evidence_overlap,
+    _extract_normalized_claims,
+    _extract_source_refs,
+    _jaccard_overlap,
+    _normalize_source_ref,
     build_dedup_state,
     deduplicate_findings,
     finding_hash,
@@ -668,3 +673,51 @@ def test_deduplicate_findings_evidence_overlap_records_reason():
     assert len(outcome.filtered) == 1
     rec = outcome.filtered[0]
     assert rec["reason"].startswith("evidence overlap with: implement caching")
+
+
+# --- Direct unit tests for source-ref helper functions ---
+
+def test_normalize_source_ref_formats():
+    assert _normalize_source_ref("backend/app/foo.py") == "backend/app/foo.py"
+    assert _normalize_source_ref("backend/app/foo.py:42") == "backend/app/foo.py"
+    assert _normalize_source_ref("backend/app/foo.py#L10-L20") == "backend/app/foo.py"
+    assert _normalize_source_ref("backend/app/foo.py:42-50") == "backend/app/foo.py"
+    assert _normalize_source_ref("") == ""
+
+
+def test_extract_source_refs_normalizes_and_filters():
+    sources = [
+        {"type": "file", "ref": "backend/app/foo.py:42"},
+        {"type": "file", "ref": "backend/app/bar.py#L10"},
+        {"type": "file"},  # no ref key
+        "not-a-dict",
+    ]
+    refs = _extract_source_refs(sources)
+    assert refs == {"backend/app/foo.py", "backend/app/bar.py"}
+
+
+def test_extract_source_refs_empty_and_invalid():
+    assert _extract_source_refs([]) == set()
+    assert _extract_source_refs("not-a-list") == set()
+
+
+def test_jaccard_overlap_boundary_values():
+    assert _jaccard_overlap({"a", "b", "c"}, {"a", "b", "c"}) == 1.0
+    assert _jaccard_overlap({"a", "b"}, {"c", "d"}) == 0.0
+    assert _jaccard_overlap(set(), set()) == 0.0
+    # |intersection|=1, |union|=3
+    result = _jaccard_overlap({"a", "b"}, {"a", "c"})
+    assert abs(result - 1 / 3) < 1e-9
+
+
+def test_extract_normalized_claims_deduplicates_and_lowercases():
+    claims = ["Performance Improved by 10x", "performance improved by 10x", "Another claim"]
+    result = _extract_normalized_claims(claims)
+    assert result == {"performance improved by 10x", "another claim"}
+
+
+def test_check_evidence_overlap_empty_guard():
+    # No sources → no overlap regardless of claims
+    assert _check_evidence_overlap([], ["claim A"], [("t", [{"ref": "foo.py"}], ["claim A"])]) == (False, "")
+    # No claims → no overlap
+    assert _check_evidence_overlap([{"ref": "foo.py"}], [], [("t", [{"ref": "foo.py"}], ["claim A"])]) == (False, "")

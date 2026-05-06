@@ -1153,6 +1153,12 @@ async def _spawn_strategic_review(project: Project, session: AsyncSession, cycle
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]
+        _rfe = d.get("recent_findings_evidence") or []
+        if _rfe:
+            from app.research_context import filter_direction_evidence  # noqa: PLC0415
+            _filtered_ev = filter_direction_evidence(ctx, _rfe)
+            if _filtered_ev:
+                stat_entry["recent_findings_evidence"] = _filtered_ev
         if recent_findings:
             stat_entry["recent_findings"] = recent_findings[:10]
         if any(_agg_grade.values()):

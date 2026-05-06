@@ -550,6 +550,10 @@ async def test_handle_research_completion_updates_last_researched_at(db_session,
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
     mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
+    mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[{
             "title": "Add unit tests for directions",
@@ -1791,6 +1795,10 @@ async def test_auto_completion_triggers(db_session, mocker):
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[{
@@ -4624,6 +4632,12 @@ def _mock_escalation_externals(mocker, direction_id):
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    # Disable structural-actionability gate so simplified test findings (without
+    # claims/sources/long descriptions) are not deferred as low_actionability.
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[{
@@ -4858,6 +4872,10 @@ async def test_complexity_modulates_medium_exploration_fraction(db_session, mock
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     mocker.patch("app.research_completion._validate_plan_dependencies", return_value=True)
     mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
     mocker.patch(
         "app.research_completion._parse_research_findings",
         return_value=[

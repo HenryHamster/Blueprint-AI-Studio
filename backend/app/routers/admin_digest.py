@@ -42,6 +42,7 @@ from app.sr_blind_spots import (
     aggregate_sr_reviewer_disagreements,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
 )
+from app.research_completion import lookup_findings_by_source_ref
 
 logger = logging.getLogger(__name__)
 
@@ -1637,6 +1638,8 @@ async def list_regression_cases(
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+                "time_to_detect_sec": c.time_to_detect_sec,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "sample_message": c.sample_message,
                 "escalation_reason": c.escalation_reason,
@@ -1716,6 +1719,8 @@ async def list_regression_manual_intervention_cases(
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+                "time_to_detect_sec": c.time_to_detect_sec,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
@@ -1754,6 +1759,8 @@ async def list_regression_stalled_cases(
                 "signal_name": c.regression_class.replace("_", " "),
                 "status": c.status,
                 "attempts": c.attempts,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+                "time_to_detect_sec": c.time_to_detect_sec,
                 "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "hit_count": c.hit_count,
@@ -1807,6 +1814,8 @@ async def list_recently_closed_regression_cases(
             "fix_pr_number": fix_pr_number,
             "recovered_at": recovered_at,
             "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+            "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+            "time_to_detect_sec": c.time_to_detect_sec,
             "time_to_recover_sec": time_to_recover_sec,
         })
 
@@ -4603,7 +4612,6 @@ def _compute_actionability_rates(
     )
     return grade_merge_rate, grade_merge_rate_of_tasked, calibration_score
 
-
 @router.get("/projects/{project_id}/research-actionability")
 async def get_research_actionability(
     project_id: uuid.UUID,
@@ -4713,6 +4721,10 @@ async def get_research_actionability(
             "cycle_id": cyc.id,
             "cycle_created_at": cyc.created_at.isoformat(),
             "total_findings": sum(b_counts.values()),
+            "structural_downgrades": sum(
+                int((t.context or {}).get("_actionability_structural_downgrades", 0) or 0)
+                for t in bucket_tasks
+            ),
             "grade_distribution": b_counts,
             "grade_merged": b_merged,
             "grade_merge_rate": b_rate,
@@ -5490,3 +5502,61 @@ async def get_sr_recent_misses(
             row["pr_url"] = pr_map.get(row["task_id"])
 
     return {"misses": rows, "total": len(rows)}
+
+
+@router.get("/projects/{project_id}/findings-by-source")
+async def get_findings_by_source(
+    project_id: uuid.UUID,
+    ref: str = Query(..., description="File path or PR ref to look up (e.g. 'backend/app/foo.py')"),
+    limit: int = Query(100, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return all findings (across directions) whose source_refs cited the given ref.
+
+    Supports file paths (e.g. 'backend/app/foo.py') and PR/message refs.
+    Prefix matching is applied for file paths — e.g. 'backend/app' matches
+    any finding that cites a file under that path.
+    """
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+    findings = await lookup_findings_by_source_ref(session, project_id, ref, limit=limit)
+    return {"ref": ref, "findings": findings, "total": len(findings)}
+
+
+@router.get("/projects/{project_id}/directions/{direction_id}/evicted-findings")
+async def get_evicted_findings(
+    project_id: uuid.UUID,
+    direction_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return findings that were evicted from a direction's active context.
+
+    Evicted findings are stored in direction.history_aggregate.evicted_findings
+    (FIFO, capped at 50) when the active context exceeds the 7500-char threshold.
+    Each entry has: title, claims, source_refs, status, evicted_at.
+    Supports offset/limit pagination over the stored list.
+    """
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    directions = project.directions or []
+    direction = next(
+        (d for d in directions if str(d.get("id") or d.get("direction_id") or "") == direction_id),
+        None,
+    )
+    if direction is None:
+        raise HTTPException(status_code=404, detail="Direction not found")
+    agg = direction.get("history_aggregate") or {}
+    all_evicted = list(agg.get("evicted_findings") or [])
+    page = all_evicted[offset: offset + limit]
+    return {
+        "direction_id": direction_id,
+        "total": len(all_evicted),
+        "offset": offset,
+        "limit": limit,
+        "evicted_findings": page,
+    }

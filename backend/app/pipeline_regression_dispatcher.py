@@ -571,6 +571,7 @@ async def _maybe_spawn(
     extra_snapshot_fields: dict | None = None,
     prompt_override: str | None = None,
     extra_context_fields: dict | None = None,
+    signal_first_seen_at: Optional[datetime] = None,
 ) -> Optional[Task]:
     """Apply dedup + cooldown gates and spawn an investigate task on green light."""
     logger.info(
@@ -708,6 +709,7 @@ async def _maybe_spawn(
             last_remediation_task_id=new_task.id,
             last_seen_at=now,
             hit_count=1,
+            signal_first_seen_at=signal_first_seen_at or now,
         ))
     else:
         existing_case.signal_snapshot_at_spawn = signal_snapshot
@@ -1294,6 +1296,15 @@ async def _evaluate_anomaly_signal(
             continue
         regression_class = f"anomaly:{anomaly_key}"
         sample_msg = entry.get("example_message") or entry.get("latest_details") or ""
+        _first_seen_raw = entry.get("first_seen")
+        _anomaly_first_seen: Optional[datetime] = None
+        if _first_seen_raw:
+            try:
+                _anomaly_first_seen = datetime.fromisoformat(
+                    str(_first_seen_raw).replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except ValueError:
+                pass
         spawn = await _maybe_spawn(
             session,
             project_id,
@@ -1316,6 +1327,7 @@ async def _evaluate_anomaly_signal(
                 "last_seen": last_seen,
                 "sample_message": sample_msg[:500],
             },
+            signal_first_seen_at=_anomaly_first_seen,
         )
         if spawn is not None:
             spawned += 1

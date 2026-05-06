@@ -23,6 +23,8 @@ interface ManualInterventionCase {
   fingerprint_to_fix_log: FixLogEntry[];
   last_seen_at: string | null;
   needs_manual_intervention_at: string | null;
+  signal_first_seen_at: string | null;
+  time_to_detect_sec: number | null;
   escalation_reason: string | null;
 }
 
@@ -35,6 +37,13 @@ const ESCALATION_REASON_LABELS: Record<string, string> = {
 
 interface Props {
   projectId: string;
+}
+
+function formatMttd(sec: number | null): string {
+  if (sec === null || sec < 0) return '—';
+  if (sec < 60) return `${Math.round(sec)}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  return `${(sec / 3600).toFixed(1)}h`;
 }
 
 function snapshotSummary(snap: Record<string, unknown> | null): string {
@@ -174,6 +183,11 @@ export function ManualInterventionPanel({ projectId }: Props) {
                       {c.last_seen_at && (
                         <span className="text-[10px] text-neutral-500">
                           last seen {timeAgo(c.last_seen_at)}
+                        </span>
+                      )}
+                      {c.time_to_detect_sec !== null && c.time_to_detect_sec !== undefined && (
+                        <span className="text-[10px] text-amber-500/80" title="Time from signal crossing threshold to case opening (MTTD)">
+                          MTTD {formatMttd(c.time_to_detect_sec)}
                         </span>
                       )}
                     </div>

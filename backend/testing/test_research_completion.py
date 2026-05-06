@@ -7,7 +7,12 @@ from app.spawn_calibration import (
     SCOPE_FILE_BUDGETS,
     check_scope_budget_mismatch,
 )
-from app.source_ref_validation import _parse_ref, validate_source_refs
+from app.source_ref_validation import (
+    _parse_ref,
+    collect_stale_refs,
+    extract_source_file_paths,
+    validate_source_refs,
+)
 from app.time_utils import _utcnow
 
 
@@ -204,7 +209,6 @@ class TestActionabilityGradeNormalization:
 
     def _normalize(self, findings: list, caplog=None) -> list:
         """Simulate the normalization loop in research_completion.py."""
-        import logging as _logging
         _valid_grades = {"HIGH", "MEDIUM", "LOW"}
         result = [dict(f) for f in findings]
         for _f in result:
@@ -268,6 +272,12 @@ class TestActionabilityGradeNormalization:
         assert normalized[2]["actionability_grade"] == "LOW"
         assert normalized[3]["actionability_grade"] == "MEDIUM"
         assert normalized[4]["actionability_grade"] == "MEDIUM"
+
+    def test_thin_finding_is_downgraded_to_low(self):
+        """A finding missing claims, sources, and sufficient description is forced to LOW."""
+        finding = {"title": "thin", "actionability_grade": "HIGH", "description": "too short"}
+        structural_grade = "MEDIUM" if (finding.get("claims") or []) and len((finding.get("description") or "").strip()) >= 40 else "LOW"
+        assert structural_grade == "LOW"
 
 
 class TestSourceRefParsing:
@@ -481,3 +491,60 @@ class TestSourceRefValidation:
         validated = validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0]["type"] == "custom_type"
+
+
+class TestExtractSourceFilePaths:
+    """extract_source_file_paths: reverse-index helper for file citations."""
+
+    def test_extracts_file_type_sources(self):
+        sources = [
+            {"type": "file", "ref": "backend/app/foo.py"},
+            {"type": "file", "ref": "backend/app/bar.py:10-20"},
+            {"type": "pr", "ref": "1234"},
+        ]
+        paths = extract_source_file_paths(sources)
+        assert paths == ["backend/app/foo.py", "backend/app/bar.py"]
+
+    def test_deduplicates_same_path(self):
+        sources = [
+            {"type": "file", "ref": "backend/app/foo.py:5"},
+            {"type": "file", "ref": "backend/app/foo.py:10"},
+        ]
+        paths = extract_source_file_paths(sources)
+        assert paths == ["backend/app/foo.py"]
+
+    def test_skips_non_file_types(self):
+        sources = [{"type": "pr", "ref": "42"}, {"type": "message", "ref": "m-123"}]
+        assert extract_source_file_paths(sources) == []
+
+    def test_none_returns_empty(self):
+        assert extract_source_file_paths(None) == []
+
+    def test_skips_sources_missing_ref(self):
+        sources = [{"type": "file"}]
+        assert extract_source_file_paths(sources) == []
+
+
+class TestCollectStaleRefs:
+    """collect_stale_refs: extract invalid refs from validate_source_refs output."""
+
+    def test_returns_invalid_refs(self):
+        validated = [
+            {"type": "file", "ref": "backend/app/gone.py", "valid": False},
+            {"type": "file", "ref": "backend/app/present.py"},
+        ]
+        stale = collect_stale_refs(validated)
+        assert stale == ["backend/app/gone.py"]
+
+    def test_empty_when_all_valid(self):
+        validated = [{"type": "file", "ref": "backend/app/foo.py"}]
+        assert collect_stale_refs(validated) == []
+
+    def test_multiple_stale_refs(self):
+        validated = [
+            {"type": "file", "ref": "a.py", "valid": False},
+            {"type": "file", "ref": "b.py", "valid": False},
+            {"type": "file", "ref": "c.py"},
+        ]
+        stale = collect_stale_refs(validated)
+        assert stale == ["a.py", "b.py"]

@@ -122,6 +122,47 @@ def _file_has_line_count(path: str, min_line: int) -> bool:
         return False
 
 
+def extract_source_file_paths(sources: Optional[list]) -> list:
+    """Extract normalized file paths from all file-type sources.
+
+    Returns a deduplicated list of file paths (line numbers stripped) from
+    file-type sources. Used by the reverse-index machinery to determine which
+    source files a finding cites — e.g. to detect overlap with a PR's changed
+    files during revalidation.
+    """
+    if not isinstance(sources, list):
+        return []
+    seen: set = set()
+    paths = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("type", "").lower() != "file":
+            continue
+        ref = source.get("ref")
+        if not ref:
+            continue
+        path, _, _ = _parse_ref(ref)
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def collect_stale_refs(validated_sources: list) -> list:
+    """Return refs marked invalid by validate_source_refs.
+
+    Given the output of validate_source_refs, returns the ref strings for
+    sources marked valid=False. Callers use this to surface affected findings
+    for re-evaluation when a file no longer exists at HEAD.
+    """
+    return [
+        s["ref"]
+        for s in validated_sources
+        if isinstance(s, dict) and s.get("valid") is False and s.get("ref")
+    ]
+
+
 def validate_source_refs(sources: Optional[list]) -> list:
     """Validate all file-type source refs in a sources list.
 

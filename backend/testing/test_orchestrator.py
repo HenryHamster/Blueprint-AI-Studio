@@ -895,6 +895,7 @@ class TestResearchCompletion:
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
 
         project = Project(name="Dedup findings test", user_id="user1")
         db_session.add(project)
@@ -965,6 +966,7 @@ class TestResearchCompletion:
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
 
         project = Project(name="Deps ordering test", user_id="user1")
         db_session.add(project)
@@ -1035,6 +1037,7 @@ class TestResearchCompletion:
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
 
         project = Project(name="Priority ordering test", user_id="user1")
         db_session.add(project)
@@ -1100,6 +1103,7 @@ class TestResearchCompletion:
         mocker.patch("app.task_completion.get_github_token_for_task", new_callable=AsyncMock, return_value=("fake-token", "owner", "repo"))
         mocker.patch("app.task_completion.get_branch_sha", new_callable=AsyncMock, return_value="abc123")
         mocker.patch("app.task_completion.create_branch", new_callable=AsyncMock, return_value=None)
+        mocker.patch("app.research_completion._apply_structural_actionability_downgrade", return_value=0)
 
         direction_id = f"d-{uuid.uuid4().hex[:8]}"
         direction = {

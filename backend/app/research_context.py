@@ -5,6 +5,7 @@ markdown documents. Extracted from app.research_completion to keep that
 module focused on pipeline orchestration. These functions have no coupling
 to DB, LLM, or broadcast layers — they operate only on strings and dicts.
 """
+import datetime
 import re
 from typing import Optional
 
@@ -104,6 +105,48 @@ def _format_eviction_body(established: int, failed: int, open_questions: int, fa
     return "\n".join(lines)
 
 
+def _parse_established_entry(entry_text: str) -> dict:
+    """Parse a formatted established-findings entry into a structured eviction record.
+
+    Returns {title, claims, source_refs, status} — safe to store in history_aggregate.
+    """
+    title: str = entry_text
+    claims: list = []
+    source_refs: list = []
+    status: str = "established"
+
+    # Extract status tag: (proposed), (merged), (failed: category)
+    status_m = re.search(r"\((proposed|merged|failed:[^)]*)\)", entry_text)
+    if status_m:
+        status = status_m.group(1).strip()
+
+    # Title is everything before the first [scope] tag
+    scope_m = re.match(r"^(.*?)\s*\[", entry_text)
+    if scope_m:
+        title = scope_m.group(1).strip()
+    else:
+        paren_m = re.search(r"\s*\((?:proposed|merged|failed)", entry_text)
+        if paren_m:
+            title = entry_text[: paren_m.start()].strip()
+
+    if ". Claims: " in entry_text:
+        claims_raw = entry_text.split(". Claims: ", 1)[1]
+        if ". Sources: " in claims_raw:
+            claims_raw = claims_raw.split(". Sources: ", 1)[0]
+        claims = [c.strip() for c in claims_raw.split(";") if c.strip()]
+
+    if ". Sources: " in entry_text:
+        sources_raw = entry_text.split(". Sources: ", 1)[1]
+        source_refs = [s.strip() for s in sources_raw.split(",") if s.strip()]
+
+    return {
+        "title": title[:200],
+        "claims": [c[:200] for c in claims[:3]],
+        "source_refs": source_refs[:3],
+        "status": status[:50],
+    }
+
+
 def _apply_prior_outcomes(established: list, prior_history: list) -> list:
     """Retag '(proposed)' entries as '(merged)' or '(failed: CATEGORY)' from prior outcomes.
 
@@ -156,6 +199,7 @@ def _build_research_context(
     prior_history: Optional[list] = None,
     finding_claims: Optional[list] = None,
     finding_sources: Optional[list] = None,
+    evicted_out: Optional[list] = None,
 ) -> str:
     """Build a compounding research_context document deterministically (no LLM)."""
     parsed = _parse_research_context(prior_context or "")
@@ -261,6 +305,18 @@ def _build_research_context(
         [_format_evicted_failed(e) for e in before["failed"][:new_failed]] if new_failed > 0 else []
     )
 
+    # Populate structured eviction records for callers that want audit history
+    if evicted_out is not None:
+        _evicted_at = datetime.datetime.utcnow().isoformat()
+        for e in before["established"][:new_established]:
+            rec = _parse_established_entry(e)
+            rec["evicted_at"] = _evicted_at
+            evicted_out.append(rec)
+        for e in before["failed"][:new_failed]:
+            evicted_out.append({"title": e[:200], "claims": [], "source_refs": [], "status": "failed", "evicted_at": _evicted_at})
+        for e in before["open_questions"][:new_oq]:
+            evicted_out.append({"title": e[:200], "claims": [], "source_refs": [], "status": "open_question", "evicted_at": _evicted_at})
+
     # Merge with prior eviction summary
     total_established = prior_eviction["established"] + new_established
     total_failed = prior_eviction["failed"] + new_failed
@@ -269,6 +325,48 @@ def _build_research_context(
 
     eviction_body = _format_eviction_body(total_established, total_failed, total_oq, all_failed_titles)
     return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
+
+
+_EVIDENCE_TITLE_RE = re.compile(r'^(.*?)\s*(?:\[.*?\])?\s*\(([^)]+)\)')
+
+
+def filter_direction_evidence(
+    research_context_str: Optional[str],
+    raw_evidence: list,
+    max_findings: int = 5,
+    max_claims: int = 3,
+    max_source_refs: int = 3,
+) -> list:
+    """Filter recent_findings_evidence to merged/proposed findings only.
+
+    Cross-references titles against research_context status tags. Findings with
+    status starting with 'failed' are excluded. Returns capped evidence entries.
+    """
+    if not raw_evidence:
+        return []
+    status_map: dict[str, str] = {}
+    if research_context_str:
+        parsed = _parse_research_context(research_context_str)
+        for entry in parsed.get("established", []):
+            m = _EVIDENCE_TITLE_RE.match(entry)
+            if m:
+                status_map[m.group(1).strip()] = m.group(2).strip().lower()
+    result = []
+    for ev in raw_evidence:
+        title = (ev.get("title") or "").strip()
+        status = status_map.get(title, "proposed")
+        if status.startswith("failed"):
+            continue
+        entry = {
+            "title": title,
+            "claims": (ev.get("claims") or [])[:max_claims],
+            "source_refs": (ev.get("source_refs") or [])[:max_source_refs],
+        }
+        if entry["claims"] or entry["source_refs"]:
+            result.append(entry)
+            if len(result) >= max_findings:
+                break
+    return result
 
 
 def build_recent_findings_evidence(

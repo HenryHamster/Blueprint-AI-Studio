@@ -6982,6 +6982,7 @@ async def test_research_actionability_grade_distribution(client: AsyncClient, db
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
+        context={"_actionability_structural_downgrades": 2},
         plan_output=[
             {"title": "Finding A", "actionability_grade": "HIGH", "direction_id": "dir-h1"},
             {"title": "Finding B", "actionability_grade": "HIGH", "direction_id": "dir-h2"},
@@ -6999,6 +7000,7 @@ async def test_research_actionability_grade_distribution(client: AsyncClient, db
     assert data["grade_distribution"]["HIGH"] == 2
     assert data["grade_distribution"]["MEDIUM"] == 1
     assert data["grade_distribution"]["LOW"] == 1
+    assert data["cycle_history"][0]["structural_downgrades"] == 2
 
 
 @pytest.mark.asyncio
