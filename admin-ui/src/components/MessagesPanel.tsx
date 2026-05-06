@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNote, ChevronDown, PlusCircle, Trash2, CheckSquare, ArrowDown, Reply } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
+import { classifySignalLevel, routineSummary } from './MessagesPanel.utils';
 
 interface ProjectMessage {
   id: string;
@@ -176,41 +177,46 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [showScrollDown, setShowScrollDown] = useState(false);
   const prevMessageCountRef = useRef(0);
 
-  // Collapsed resolved + "show older" for mobile perf
+  // Collapsed resolved
   const [showResolved, setShowResolved] = useState(false);
-  const INITIAL_VISIBLE = 20;
-  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
+  // Routine ops group collapsed by default
+  const [routineExpanded, setRoutineExpanded] = useState(false);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
 
-  // Sort ALL messages chronologically (oldest first for chat layout)
-  const sortedMessages = [...messages].sort((a, b) => {
+  // Track seen messages to detect new arrivals and avoid initial-load toast spam
+  const seenMessageIdsRef = useRef<Set<string>>(new Set());
+  const hasInitiallyLoadedRef = useRef(false);
+
+  // Reset toast suppression state when switching projects so that the next
+  // fetch is treated as an initial load for the new project (avoids a flood
+  // of toasts for project B's pre-existing open BLOCKER/BUG/FEEDBACK items).
+  useEffect(() => {
+    seenMessageIdsRef.current = new Set();
+    hasInitiallyLoadedRef.current = false;
+  }, [selectedProjectId]);
+
+  const byTime = (a: ProjectMessage, b: ProjectMessage) => {
     const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
     const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
     return ta - tb;
-  });
+  };
 
   const openMessages = messages.filter(m => m.status === 'open');
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
   const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
 
-  // Show all open + last few resolved for context; toggle to show all resolved
+  // Split open messages by signal level
+  const highSignalOpen = [...openMessages.filter(m => classifySignalLevel(m) === 'high')].sort(byTime);
+  const routineOpen = [...openMessages.filter(m => classifySignalLevel(m) === 'routine')].sort(byTime);
+
+  // Resolved: show last 5 by default, toggle to show all
   const RECENT_RESOLVED = 5;
-  const sortedResolved = [...resolvedMessages].sort((a, b) => {
-    const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
-    const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
-    return ta - tb;
-  });
-  const recentResolvedIds = new Set(
-    showResolved ? resolvedMessages.map(m => m.id)
-      : sortedResolved.slice(-RECENT_RESOLVED).map(m => m.id)
-  );
+  const sortedResolved = [...resolvedMessages].sort(byTime);
+  const visibleResolved = showResolved ? sortedResolved : sortedResolved.slice(-RECENT_RESOLVED);
   const hiddenResolvedCount = showResolved ? 0 : Math.max(0, resolvedMessages.length - RECENT_RESOLVED);
-  const filteredMessages = sortedMessages.filter(m => m.status === 'open' || recentResolvedIds.has(m.id));
-  const hiddenOlderCount = Math.max(0, filteredMessages.length - visibleCount);
-  const visibleMessages = hiddenOlderCount > 0 ? filteredMessages.slice(hiddenOlderCount) : filteredMessages;
 
   const fetchMessages = useCallback(async () => {
     if (!selectedProjectId) { setLoading(false); return; }
@@ -220,6 +226,31 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const msgs: ProjectMessage[] = data.messages ?? [];
+
+      // Detect new high-signal messages for toast alerts
+      if (hasInitiallyLoadedRef.current) {
+        const highSignalTypes = new Set(['BLOCKER', 'BUG_REPORT', 'FEEDBACK']);
+        const newHighSignal = msgs.filter(m =>
+          m.status === 'open' &&
+          highSignalTypes.has(m.message_type) &&
+          !seenMessageIdsRef.current.has(m.id)
+        );
+
+        if (newHighSignal.length > 0) {
+          const summary = newHighSignal.length === 1
+            ? `New ${newHighSignal[0].message_type === 'BLOCKER' ? 'BLOCKER' : newHighSignal[0].message_type === 'BUG_REPORT' ? 'BUG' : 'FEEDBACK'}: ${newHighSignal[0].content.slice(0, 80)}`
+            : `${newHighSignal.length} new high-signal messages (${newHighSignal.filter(m => m.message_type === 'BLOCKER').length} BLOCKERs, ${newHighSignal.filter(m => m.message_type === 'BUG_REPORT').length} BUGs, ${newHighSignal.filter(m => m.message_type === 'FEEDBACK').length} FEEDBACKs)`;
+
+          // Determine toast type based on presence of BLOCKERs or BUG_REPORTs
+          const hasCritical = newHighSignal.some(m => m.message_type === 'BLOCKER' || m.message_type === 'BUG_REPORT');
+          addToastRef.current(summary, hasCritical ? 'error' : 'info');
+        }
+      }
+
+      // Update tracking of seen message IDs
+      msgs.forEach(m => seenMessageIdsRef.current.add(m.id));
+      hasInitiallyLoadedRef.current = true;
+
       // Only update state if messages actually changed — prevents scroll jumps from polling
       setMessages(prev => {
         if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
@@ -245,7 +276,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const currentCount = visibleMessages.length;
+    const currentCount = highSignalOpen.length + routineOpen.length + visibleResolved.length;
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
       // First load — jump to bottom instantly
@@ -259,7 +290,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [visibleMessages]);
+  }, [highSignalOpen, routineOpen, visibleResolved]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
@@ -557,6 +588,11 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
         <div className="flex items-center gap-2">
           <MessageSquare className="w-4 h-4 text-neutral-400" />
           <h2 className="text-sm font-semibold text-neutral-100">Messages</h2>
+          {highSignalOpen.length > 0 && (
+            <span className="bg-amber-500/20 text-amber-400 border border-amber-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
+              {highSignalOpen.length} high
+            </span>
+          )}
           {openMessages.length > 0 && (
             <span className="bg-blue-500/20 text-blue-400 border border-blue-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
               {openMessages.length}
@@ -595,20 +631,30 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           </div>
         ) : (
           <>
-            {/* Load older messages button */}
-            {hiddenOlderCount > 0 && (
-              <div className="flex justify-center pb-2">
+            {/* High-signal open messages */}
+            {highSignalOpen.map(msg => renderBubble(msg))}
+
+            {/* Routine ops group — collapsed by default */}
+            {routineOpen.length > 0 && (
+              <div className="border border-neutral-800/50 rounded-xl overflow-hidden">
                 <button
-                  onClick={() => setVisibleCount(c => c + 20)}
-                  className="text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-800/50 border border-neutral-700/50 px-3 py-1.5 rounded-lg transition-colors"
+                  onClick={() => setRoutineExpanded(e => !e)}
+                  className="w-full flex items-center gap-2 px-4 py-2.5 bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors text-left"
                 >
-                  Load {Math.min(hiddenOlderCount, 20)} older messages ({hiddenOlderCount} hidden)
+                  <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
+                  <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
+                  <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
                 </button>
+                {routineExpanded && (
+                  <div className="space-y-3 p-3 border-t border-neutral-800/40">
+                    {routineOpen.map(msg => renderBubble(msg))}
+                  </div>
+                )}
               </div>
             )}
 
-            {/* Visible messages — resolved ones are faded */}
-            {visibleMessages.map(msg => renderBubble(msg, msg.status === 'resolved'))}
+            {/* Resolved messages (faded) */}
+            {visibleResolved.map(msg => renderBubble(msg, true))}
 
             {/* Resolved toggle + clear */}
             {hiddenResolvedCount > 0 && (
