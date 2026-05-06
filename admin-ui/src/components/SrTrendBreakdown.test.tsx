@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
+import { SrTrendBreakdown, EdgesTrendBreakdown, type SrTrendData, type EdgesTrend } from './SrTrendBreakdown';
 
 function makeTrends(): SrTrendData {
   return {
@@ -262,5 +262,73 @@ describe('SrTrendBreakdown skip rate line', () => {
     render(<SrTrendBreakdown trends={trends} variant="card" />);
     const line = screen.getByTestId('sr-skip-rate-line');
     expect(line.className).not.toContain('amber');
+  });
+});
+
+describe('EdgesTrendBreakdown', () => {
+  function makeEdgesTrend(overrides: Partial<EdgesTrend> = {}): EdgesTrend {
+    return {
+      computed_at: '2026-05-01T00:00:00',
+      bucket_mode: 'cycle',
+      current_cycle_id: 'abcdef123456',
+      previous_cycle_id: 'fedcba654321',
+      current: {
+        sample_size: 10,
+        tasks_with_edges_rate: 0.7,
+      },
+      previous: {
+        sample_size: 8,
+        tasks_with_edges_rate: 0.5,
+      },
+      tasks_with_edges_rate_delta: 0.2,
+      trend: 'improving',
+      rate_history: [0.3, 0.4, 0.6],
+      ...overrides,
+    };
+  }
+
+  it('renders the edges-trend block when data is present', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    expect(screen.getByTestId('edges-trend-breakdown')).toBeTruthy();
+    expect(screen.getByText('Edges considered')).toBeTruthy();
+    expect(screen.getByText('70%')).toBeTruthy();
+  });
+
+  it('renders null when trend is null', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={null} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders null when trend.current is missing', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={{ trend: 'stable' }} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('shows cycle label when bucket_mode is cycle', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    expect(screen.getByText(/123456 vs 654321/)).toBeTruthy();
+  });
+
+  it('shows sample size', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    expect(screen.getByText('n=10')).toBeTruthy();
+  });
+
+  it('shows rate history entries', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    expect(screen.getByText('30%')).toBeTruthy();
+    expect(screen.getByText('40%')).toBeTruthy();
+    expect(screen.getByText('60%')).toBeTruthy();
+  });
+
+  it('shows previous rate in footer when available', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    const prevItems = screen.getAllByText('50%');
+    expect(prevItems.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('does not show cycle label in calendar mode', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend({ bucket_mode: 'calendar', current_cycle_id: null })} />);
+    expect(screen.queryByText(/vs/)).toBeNull();
   });
 });

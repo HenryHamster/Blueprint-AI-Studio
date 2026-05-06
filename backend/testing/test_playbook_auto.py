@@ -5870,3 +5870,279 @@ def test_compute_cat_fp_stats_false_positive_rate_formula():
     assert tp == 1
     fpr = round(fp / (fp + tp), 3)
     assert fpr == 0.667
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_edges_trend
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_edges_task(
+    project_id,
+    *,
+    age_days: float,
+    edges_considered: list | None = None,
+    task_type: str = "create",
+    cycle_id: str | None = None,
+) -> Task:
+    """Build a Task for edges-trend tests with _self_review_outcome.edges_considered."""
+    ctx: dict = {
+        "_self_review_outcome": {
+            "edges_considered": edges_considered if edges_considered is not None else [],
+        }
+    }
+    task = Task(
+        project_id=project_id,
+        title="Edges task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    if cycle_id:
+        task.strategic_cycle_id = cycle_id
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_returns_none_below_sample_size(db_session: AsyncSession):
+    """Returns None when either window has fewer than _MIN_SR_SAMPLE qualifying tasks."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(3):
+        t = _make_edges_task(project.id, age_days=2, edges_considered=[{"id": "e1"}])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_edges_task(project.id, age_days=20, edges_considered=[{"id": "e1"}])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_calendar_fallback(db_session: AsyncSession):
+    """Falls back to calendar bucketing when no completed cycles exist."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window (0-14d): 5 tasks, 3 with edges
+    for i in range(5):
+        t = _make_edges_task(
+            project.id, age_days=2,
+            edges_considered=[{"id": "e1"}] if i < 3 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window (14-28d): 5 tasks, all with edges
+    for _ in range(5):
+        t = _make_edges_task(project.id, age_days=20, edges_considered=[{"id": "e1"}])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "calendar"
+    assert result["current_cycle_id"] is None
+    assert result["current"]["tasks_with_edges_rate"] == round(3 / 5, 3)
+    assert result["previous"]["tasks_with_edges_rate"] == 1.0
+    assert result["trend"] == "regressing"
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_cycle_mode_happy_path(db_session: AsyncSession):
+    """Uses cycle bucketing when two completed cycles each have ≥5 qualifying tasks."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    c1 = _make_cycle(project.id, age_days=5)
+    c2 = _make_cycle(project.id, age_days=30)
+    db_session.add_all([c1, c2])
+    await db_session.flush()
+
+    tasks = []
+    # c1 (current): 5 tasks, 4 with edges → rate=0.8
+    for i in range(5):
+        t = _make_edges_task(
+            project.id, age_days=3,
+            edges_considered=[{"id": "e1"}] if i < 4 else [],
+            cycle_id=str(c1.id),
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # c2 (previous): 5 tasks, 1 with edges → rate=0.2
+    for i in range(5):
+        t = _make_edges_task(
+            project.id, age_days=25,
+            edges_considered=[{"id": "e1"}] if i < 1 else [],
+            cycle_id=str(c2.id),
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_cycle_id"] == c1.id
+    assert result["previous_cycle_id"] == c2.id
+    assert result["current"]["tasks_with_edges_rate"] == 0.8
+    assert result["previous"]["tasks_with_edges_rate"] == 0.2
+    assert result["tasks_with_edges_rate_delta"] == pytest.approx(0.6, abs=0.01)
+    assert result["trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_stable_classification(db_session: AsyncSession):
+    """Delta < 5pp → trend='stable'."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current: 5 tasks, 4/5 with edges → 0.8
+    for i in range(5):
+        t = _make_edges_task(
+            project.id, age_days=2,
+            edges_considered=[{"id": "e1"}] if i < 4 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous: 5 tasks, 4/5 with edges → 0.8 (delta=0 → stable)
+    for i in range(5):
+        t = _make_edges_task(
+            project.id, age_days=20,
+            edges_considered=[{"id": "e1"}] if i < 4 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_persists_to_design_doc(db_session: AsyncSession):
+    """Writes edges_trend to project.design_doc."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    for window_age in (2, 20):
+        for _ in range(5):
+            t = _make_edges_task(project.id, age_days=window_age, edges_considered=[{"id": "e1"}])
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+    await db_session.flush()
+    await db_session.refresh(project)
+
+    assert result is not None
+    assert project.design_doc.get("edges_trend") is not None
+    assert project.design_doc["edges_trend"]["computed_at"] == result["computed_at"]
+    assert project.design_doc["edges_trend"]["trend"] == result["trend"]
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_history_capped_at_5(db_session: AsyncSession):
+    """rate_history never exceeds 5 entries across repeated calls with distinct cycles."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+
+    for call_idx in range(6):
+        c_cycle = _make_cycle(project.id, age_days=call_idx * 10 + 1)
+        p_cycle = _make_cycle(project.id, age_days=call_idx * 10 + 20)
+        db_session.add_all([c_cycle, p_cycle])
+        await db_session.flush()
+
+        tasks = []
+        for _ in range(5):
+            t = _make_edges_task(
+                project.id, age_days=call_idx * 10 + 0.5,
+                edges_considered=[{"id": "e1"}],
+                cycle_id=str(c_cycle.id),
+            )
+            db_session.add(t)
+            tasks.append(t)
+        for _ in range(5):
+            t = _make_edges_task(
+                project.id, age_days=call_idx * 10 + 15,
+                edges_considered=[{"id": "e1"}],
+                cycle_id=str(p_cycle.id),
+            )
+            db_session.add(t)
+            tasks.append(t)
+        await db_session.flush()
+
+        await compute_edges_trend(project.id, db_session, tasks)
+        await db_session.flush()
+        await db_session.refresh(project)
+
+    history = project.design_doc["edges_trend"]["rate_history"]
+    assert len(history) <= 5
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(db_session: AsyncSession):
+    """When both functions run on the same tasks, they pick the same cycle pair."""
+    from app.playbook_learning import compute_edges_trend, compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    c1 = _make_cycle(project.id, age_days=5)
+    c2 = _make_cycle(project.id, age_days=30)
+    db_session.add_all([c1, c2])
+    await db_session.flush()
+
+    tasks = []
+    # c1: 5 SR tasks + 5 edges tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=3,
+            human_cats={"correctness": 1}, sr_failed_cats=["correctness"],
+        )
+        t.strategic_cycle_id = c1.id
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_edges_task(project.id, age_days=3, edges_considered=[{"id": "e1"}], cycle_id=str(c1.id))
+        db_session.add(t)
+        tasks.append(t)
+    # c2: 5 SR tasks + 5 edges tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=25,
+            human_cats={"correctness": 1}, sr_failed_cats=["correctness"],
+        )
+        t.strategic_cycle_id = c2.id
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_edges_task(project.id, age_days=25, edges_considered=[{"id": "e1"}], cycle_id=str(c2.id))
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    sr_result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    edges_result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert sr_result is not None
+    assert edges_result is not None
+    assert sr_result["bucket_mode"] == "cycle"
+    assert edges_result["bucket_mode"] == "cycle"
+    assert sr_result["current_cycle_id"] == edges_result["current_cycle_id"]
+    assert sr_result["previous_cycle_id"] == edges_result["previous_cycle_id"]

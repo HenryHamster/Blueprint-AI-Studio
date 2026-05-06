@@ -877,6 +877,17 @@ async def _maybe_spawn_followup_investigation(
     earlier_attempts = [
         h for h in prior_history if h.get("task_id") != str(task.id)
     ]
+    regression_case = None
+    regression_class = ctx.get("regression_class")
+    if regression_class:
+        from app.models import RegressionRemediationCase  # noqa: PLC0415
+        rr_result = await session.execute(
+            select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == project.id,
+                RegressionRemediationCase.regression_class == regression_class,
+            )
+        )
+        regression_case = rr_result.scalar_one_or_none()
     prompt_parts = [
         "A remediation task spawned from a prior diagnosis on this direction "
         "has failed. Re-investigate the root cause — the earlier recommended "
@@ -943,6 +954,28 @@ async def _maybe_spawn_followup_investigation(
                 parts.append(f"error={err[:200]!r}")
             lines.append("; ".join(parts))
         prompt_parts.extend(lines)
+    if regression_case is not None and (regression_case.attempts or 0) >= 2:
+        rc_lines: list[str] = [
+            "",
+            "PRIOR ATTEMPT CONTEXT (pipeline regression)",
+            f"This regression has been investigated {regression_case.attempts} time(s) without recovering the signal.",
+        ]
+        pr = regression_case.last_remediation_pr_number
+        if pr is not None:
+            rc_lines.append(
+                f"Prior remediation PR: #{pr}. Read its diff to understand what was already tried "
+                f"before forming a new hypothesis."
+            )
+        snap = regression_case.signal_snapshot_at_merge or {}
+        post_val = snap.get("current_rate")
+        if post_val is not None:
+            rc_lines.append(f"Signal value after prior fix merged: {post_val:.1%}.")
+        rc_lines.append(
+            "Do NOT converge on the same diagnosis as prior attempts. "
+            "Approach from a different angle — look for a deeper root cause or a "
+            "different contributing factor that the prior fix missed."
+        )
+        prompt_parts.extend(rc_lines)
     prompt_parts.extend([
         "",
         "Produce a recommended_fix that is materially different from all prior "

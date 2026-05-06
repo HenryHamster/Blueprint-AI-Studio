@@ -610,6 +610,61 @@ last_idle_check: Optional[datetime] = None
 # project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
 persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
 
+# Key used inside Project.design_doc for anomaly fingerprint persistence.
+_ANOMALY_FINGERPRINTS_KEY = "_anomaly_fingerprints"
+
+
+async def hydrate_persistent_anomalies(session) -> int:
+    """Load anomaly fingerprint state from Project.design_doc into the in-memory cache.
+
+    Call once at startup so persistent_anomalies survives pod restarts.
+    In-memory entries always win over stored ones (no clobber on concurrent startup).
+    Returns the total number of anomaly entries loaded across all projects.
+    """
+    from app.models import Project  # noqa: PLC0415
+    from sqlmodel import select  # noqa: PLC0415
+
+    loaded = 0
+    try:
+        projects = (await session.execute(select(Project))).scalars().all()
+        for project in projects:
+            stored = (project.design_doc or {}).get(_ANOMALY_FINGERPRINTS_KEY)
+            if not isinstance(stored, dict) or not stored:
+                continue
+            proj_key = str(project.id)
+            target = persistent_anomalies.setdefault(proj_key, {})
+            for key, entry in stored.items():
+                if key not in target:
+                    target[key] = entry
+            loaded += len(stored)
+    except Exception:
+        logger.warning("[ANOMALY_PERSIST] hydrate_persistent_anomalies failed", exc_info=True)
+    return loaded
+
+
+async def persist_anomaly_snapshot(project_id: str, proj_anomalies: dict, session) -> None:
+    """Write anomaly fingerprints for one project into Project.design_doc.
+
+    Called after each anomaly detection cycle so the state survives the next
+    pod restart. Safe to call within an already-open session (caller commits).
+    """
+    from app.models import Project  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    try:
+        pid = _uuid.UUID(project_id)
+    except (TypeError, ValueError):
+        return
+    project = await session.get(Project, pid)
+    if project is None:
+        return
+    doc = dict(project.design_doc or {})
+    doc[_ANOMALY_FINGERPRINTS_KEY] = {k: dict(v) for k, v in proj_anomalies.items()}
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
 # --- Anomaly-Driven Pipeline Adjustments ---
 # When high-severity anomalies (PROVISION_FAILURE, EXTERNAL_API) persist,
 # the system automatically reduces blast radius by lowering max_concurrent_vms

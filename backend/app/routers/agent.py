@@ -1275,6 +1275,15 @@ async def claim_task(
             except Exception:
                 logger.exception("[AGENT] Failed to compute sr_catch_rate_trends (non-critical)")
             try:
+                from app.playbook_learning import compute_edges_trend
+                await compute_edges_trend(
+                    project_id=task.project_id,
+                    session=session,
+                    all_tasks=list(high_iter_rows),
+                )
+            except Exception:
+                logger.exception("[AGENT] Failed to compute edges_trend (non-critical)")
+            try:
                 await _stamp_reviewer_recovery_count(session, task.project_id, high_iter_rows)
             except Exception:
                 logger.exception("[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)")
@@ -1946,6 +1955,15 @@ async def claim_task(
                     )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)")
+                try:
+                    from app.playbook_learning import compute_edges_trend
+                    await compute_edges_trend(
+                        project_id=task.project_id,
+                        session=session,
+                        all_tasks=list(high_iter_rows),
+                    )
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute research edges_trend (non-critical)")
                 try:
                     await _stamp_reviewer_recovery_count(session, task.project_id, high_iter_rows)
                 except Exception:

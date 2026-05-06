@@ -1148,6 +1148,23 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 "approval_rate_lift": fr_trends.get("approval_rate_lift") or {},
             }
 
+    # Edges-considered cycle-over-cycle trend from compute_edges_trend stored in project.design_doc.
+    edges_trend: Optional[Dict[str, Any]] = None
+    if project and project.design_doc:
+        et = project.design_doc.get("edges_trend") or {}
+        if et:
+            edges_trend = {
+                "computed_at": et.get("computed_at"),
+                "bucket_mode": et.get("bucket_mode"),
+                "current_cycle_id": et.get("current_cycle_id"),
+                "previous_cycle_id": et.get("previous_cycle_id"),
+                "current": et.get("current") or {},
+                "previous": et.get("previous") or {},
+                "tasks_with_edges_rate_delta": et.get("tasks_with_edges_rate_delta"),
+                "trend": et.get("trend"),
+                "rate_history": et.get("rate_history") or [],
+            }
+
     direction_first_attempt_feedback: Optional[Dict[str, Any]] = None
     if project and project.design_doc:
         dfa = project.design_doc.get("direction_first_attempt_feedback")
@@ -1210,6 +1227,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "fresh_reviewer_trend": fresh_reviewer_trend,
+        "edges_trend": edges_trend,
         "edges_considered_metrics": edges_considered_metrics,
         "review_accuracy": review_accuracy,
         "persistent_review_issues": persistent_review_issues,
@@ -3442,6 +3460,7 @@ async def _compute_digest(
     latest_cycle = None
     prediction_calibration: Dict[str, Any] | None = None
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
+    edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     if project_id:
         _proj = await session.get(Project, project_id)
@@ -3484,6 +3503,20 @@ async def _compute_digest(
                     "per_category_hit_rate": _fr_trends.get("per_category_hit_rate") or {},
                     "added_value": _fr_trends.get("added_value") or {},
                     "approval_rate_lift": _fr_trends.get("approval_rate_lift") or {},
+                }
+            # Edges-considered cycle-over-cycle trend persisted by compute_edges_trend.
+            _et = (_proj.design_doc or {}).get("edges_trend") or {}
+            if _et:
+                edges_trend = {
+                    "computed_at": _et.get("computed_at"),
+                    "bucket_mode": _et.get("bucket_mode"),
+                    "current_cycle_id": _et.get("current_cycle_id"),
+                    "previous_cycle_id": _et.get("previous_cycle_id"),
+                    "current": _et.get("current") or {},
+                    "previous": _et.get("previous") or {},
+                    "tasks_with_edges_rate_delta": _et.get("tasks_with_edges_rate_delta"),
+                    "trend": _et.get("trend"),
+                    "rate_history": _et.get("rate_history") or [],
                 }
 
     _rejected_in_window = [
@@ -4197,6 +4230,7 @@ async def _compute_digest(
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
         "fresh_reviewer_trend": fresh_reviewer_trend,
+        "edges_trend": edges_trend,
         "edges_considered_metrics": _review_quality["edges_considered_metrics"],
         "merge_early_exit_count": merge_early_exit_count,
         "generated_at": _utcnow().isoformat(),

@@ -1223,6 +1223,45 @@ class TestPipelineRegressionCloseLoop:
         pr_numbers = [e["fix_pr_number"] for e in case.fingerprint_to_fix_log]
         assert pr_numbers == [10, 20]
 
+    # prior_attempt_context_suffix tests
+
+    def test_prior_attempt_context_suffix_attempts_1_empty(self):
+        """attempts == 1: suffix is empty so first-attempt prompts are unchanged."""
+        case = self._make_case()
+        case.attempts = 1
+        case.last_remediation_pr_number = 999
+        assert case.prior_attempt_context_suffix() == ""
+
+    def test_prior_attempt_context_suffix_attempts_2_with_pr_and_signal(self):
+        """attempts == 2: suffix names prior PR and post-merge signal value."""
+        case = self._make_case()
+        case.attempts = 2
+        case.last_remediation_pr_number = 5678
+        case.signal_snapshot_at_merge = {"current_rate": 0.65, "prior_rate": 0.80}
+        suffix = case.prior_attempt_context_suffix()
+        assert "PRIOR ATTEMPT CONTEXT" in suffix
+        assert "#5678" in suffix
+        assert "65.0%" in suffix
+        assert "different angle" in suffix.lower() or "different contributing" in suffix.lower()
+
+    def test_prior_attempt_context_suffix_no_pr_no_pr_reference(self):
+        """attempts >= 2 but no prior PR: suffix must not mention a PR number."""
+        case = self._make_case()
+        case.attempts = 2
+        case.last_remediation_pr_number = None
+        suffix = case.prior_attempt_context_suffix()
+        assert "PRIOR ATTEMPT CONTEXT" in suffix
+        assert "PR #" not in suffix
+
+    def test_prior_attempt_context_suffix_no_signal_snapshot_skips_rate(self):
+        """attempts >= 2 with empty merge snapshot: suffix omits the signal line."""
+        case = self._make_case()
+        case.attempts = 3
+        case.signal_snapshot_at_merge = {}
+        suffix = case.prior_attempt_context_suffix()
+        assert "PRIOR ATTEMPT CONTEXT" in suffix
+        assert "Signal value" not in suffix
+
 
 class TestDeriveFailureStageMigration:
     """Migration-specific keywords map to the 'migration' stage."""

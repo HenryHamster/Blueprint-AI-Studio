@@ -661,6 +661,108 @@ async def test_anomaly_cooldown_blocks_re_trigger(db_session):
 
 
 @pytest.mark.asyncio
+async def test_anomaly_dispatch_hydrates_from_design_doc(db_session):
+    """After simulated pod restart (persistent_anomalies cleared), dispatch reads
+    anomaly state from project.design_doc and spawns when threshold is met."""
+    import app.shared_state as _ss
+    from app.shared_state import _ANOMALY_FINGERPRINTS_KEY
+
+    fingerprint = "provision_timeout"
+    entry = _make_anomaly_entry(occurrence_count=5)
+    project = make_project(design_doc={_ANOMALY_FINGERPRINTS_KEY: {fingerprint: entry}})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _ss.persistent_anomalies.pop(str(project.id), None)
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1, "Dispatcher must hydrate from design_doc and spawn"
+
+        task = (await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )).scalars().first()
+        assert task is not None
+        assert (task.context or {}).get("regression_class") == f"anomaly:{fingerprint}"
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_anomaly_closed_via_durable_state(db_session):
+    """Recovery scan closes a MERGED anomaly case using project.design_doc after
+    simulated pod restart (persistent_anomalies cleared). Anomaly count below threshold
+    signals recovery."""
+    import app.shared_state as _ss
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.shared_state import _ANOMALY_FINGERPRINTS_KEY
+
+    fingerprint = "gcp_quota_exhaustion"
+    # Entry with count below threshold — anomaly has recovered.
+    recovered_entry = _make_anomaly_entry(occurrence_count=1)
+    project = make_project(design_doc={_ANOMALY_FINGERPRINTS_KEY: {fingerprint: recovered_entry}})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(minutes=20)).isoformat()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=f"anomaly:{fingerprint}",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    _ss.persistent_anomalies.pop(str(project.id), None)
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_anomaly_rearmed_via_durable_state(db_session):
+    """Recovery scan re-arms a MERGED anomaly case when durable state shows the
+    anomaly still exceeds the threshold (pod-restart simulation)."""
+    import app.shared_state as _ss
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.shared_state import _ANOMALY_FINGERPRINTS_KEY
+
+    fingerprint = "vm_provision_failure"
+    active_entry = _make_anomaly_entry(occurrence_count=10)
+    project = make_project(design_doc={_ANOMALY_FINGERPRINTS_KEY: {fingerprint: active_entry}})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(minutes=20)).isoformat()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=f"anomaly:{fingerprint}",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    _ss.persistent_anomalies.pop(str(project.id), None)
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+
+
+@pytest.mark.asyncio
 async def test_pipeline_regressions_endpoint_enriches_crash_investigation(client, db_session):
     """A background-service crash alert is enriched with the lifecycle-spawned
     crash_investigation task — even though crash investigations use
@@ -1383,6 +1485,116 @@ async def test_two_sr_categories_coalesce_into_one_task(db_session):
     assert case is not None
 
 
+# ---------------------------------------------------------------------------
+# Context-aware second-attempt prompts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_second_attempt_prompt_unchanged(db_session):
+    """attempts==1: prompt has no prior-attempt context (existing behavior preserved)."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        attempts=1,
+        last_remediation_pr_number=1234,
+    ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "PRIOR ATTEMPT CONTEXT" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_third_attempt_prompt_enriched(db_session):
+    """attempts==2: spawned prompt includes prior-attempt context with PR and post-merge value."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=2,
+        attempts=2,
+        last_remediation_pr_number=5678,
+        signal_snapshot_at_merge={
+            "current_rate": 0.65,
+            "prior_rate": 0.80,
+            "captured_at": "2026-01-01T00:00:00",
+        },
+    ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "PRIOR ATTEMPT CONTEXT" in prompt
+    assert "#5678" in prompt
+    assert "65.0%" in prompt
+    assert "different angle" in prompt.lower() or "different contributing" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_prior_attempt_no_pr_no_pr_reference(db_session):
+    """attempts>=2 but no prior PR: enriched prompt does not mention a PR number."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=2,
+        attempts=2,
+        last_remediation_pr_number=None,
+    ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "PRIOR ATTEMPT CONTEXT" in prompt
+    assert "PR #" not in prompt
+
+
 @pytest.mark.asyncio
 async def test_recovery_scan_bucket_class_closes_when_all_recovered(db_session):
     """Bucket-level MERGED case closes when all constituent signals recover."""
@@ -1416,3 +1628,366 @@ async def test_recovery_scan_bucket_class_closes_when_all_recovered(db_session):
 
     await db_session.refresh(case)
     assert case.status == RegressionCaseStatus.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# SR blind-spot signal evaluator tests
+# ---------------------------------------------------------------------------
+
+
+def _make_sr_blind_spot_task(
+    project_id,
+    *,
+    category: str = "correctness",
+    task_type: str = "create",
+    miss: bool = True,
+    true_positive: bool = False,
+    created_at=None,
+) -> Task:
+    """Build a COMPLETED code-change task with SR vs reviewer data.
+
+    miss=True: reviewer caught `category` but SR passed it (miss in SR).
+    true_positive=True: reviewer caught `category` AND SR also flagged it
+      (contributes to denominator with 0 miss — used for recovery tests to
+      get denom >= _MIN_SR_SAMPLE while keeping miss rate = 0%).
+    """
+    from testing.factories import _utcnow as _fac_utcnow
+    ts = created_at or _fac_utcnow()
+    if miss:
+        reviewer_findings = [
+            {"category": category, "severity": "HIGH",
+             "description": f"Reviewer caught missing {category} check in func()"}
+        ]
+        check_results = {category: {"passed": True}}  # SR passed — miss
+    elif true_positive:
+        reviewer_findings = [
+            {"category": category, "severity": "HIGH",
+             "description": f"Reviewer confirmed {category} issue"}
+        ]
+        check_results = {category: {"passed": False}}  # SR also flagged — tp
+    else:
+        reviewer_findings = []
+        check_results = {category: {"passed": True}}
+    sro = {
+        "verdict": "pass",
+        "check_results": check_results,
+        "blind_spots": [],
+        "reviewer_findings": reviewer_findings,
+    }
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "do the thing", "base_branch": "main"}],
+        context={"_self_review_outcome": sro},
+        created_at=ts,
+    )
+
+
+def _get_investigate_task(tasks):
+    """Return the first investigate task from a list (filters out seed tasks)."""
+    for t in tasks:
+        if (t.first_payload or {}).get("type") == "investigate":
+            return t
+    return None
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_disagreement_trips_both_windows(db_session):
+    """Both 7d windows exceed _TREND_DELTA_THRESHOLD with adequate sample → spawns sr_blind_spot:{cat}."""
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, category="correctness", miss=True,
+            created_at=now - timedelta(days=3),
+        ))
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, category="correctness", miss=True,
+            created_at=now - timedelta(days=10),
+        ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    ctx = task.context or {}
+    assert ctx["regression_class"] == "sr_blind_spot:correctness"
+    assert ctx["signal_name"] == "sr_blind_spot"
+    prompt = payload.get("prompt", "")
+    assert "correctness" in prompt
+    assert "reviewer finding" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_disagreement_one_window_only_no_spawn(db_session):
+    """Only current window has miss rate > threshold (prior window has no samples) → no spawn."""
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # Current window: all miss (rate = 100%)
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=3),
+        ))
+    # Prior window: no reviewer findings → p_denom = 0 < _MIN_SR_SAMPLE → suppressed
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=False, created_at=now - timedelta(days=10),
+        ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_disagreement_below_sample_floor_no_spawn(db_session):
+    """Current window denominator < _MIN_SR_SAMPLE → signal suppressed (no spawn)."""
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # Current window: _MIN_SR_SAMPLE - 1 miss tasks (denominator below floor)
+    for _ in range(_MIN_SR_SAMPLE - 1):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=3),
+        ))
+    # Prior window: adequate samples
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=10),
+        ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_trips_at_count_floor(db_session):
+    """Theme count >= _SR_BLIND_SPOT_THEME_FLOOR → spawns sr_blind_spot:theme:* investigate."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    theme_text = "edge case not tested in the new path"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+            context={"_self_review_outcome": sro},
+            created_at=now - timedelta(days=3),
+        ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    all_tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    task = _get_investigate_task(all_tasks)
+    assert task is not None
+    ctx = task.context or {}
+    assert ctx["regression_class"].startswith("sr_blind_spot:theme:")
+    assert ctx["signal_name"] == "sr_blind_spot"
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "edge case not" in prompt
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_theme_below_floor_no_spawn(db_session):
+    """Theme count < _SR_BLIND_SPOT_THEME_FLOOR → no spawn."""
+    from app.pipeline_regression_dispatcher import _SR_BLIND_SPOT_THEME_FLOOR
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    theme_text = "rare edge case in parser logic"
+    for _ in range(_SR_BLIND_SPOT_THEME_FLOOR - 1):
+        sro = {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [theme_text],
+            "reviewer_findings": [],
+        }
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+            context={"_self_review_outcome": sro},
+            created_at=now - timedelta(days=3),
+        ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_dedup_inflight_blocks_second_spawn(db_session):
+    """Second run_once with an in-flight sr_blind_spot investigation → no duplicate spawn."""
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=3),
+        ))
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=10),
+        ))
+    await db_session.commit()
+
+    first = await run_once(db_session, project.id)
+    assert first == 1
+
+    second = await run_once(db_session, project.id)
+    assert second == 0
+
+    all_tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    investigate_tasks = [t for t in all_tasks if (t.first_payload or {}).get("type") == "investigate"]
+    assert len(investigate_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_recovery_scan_closes_recovered(db_session):
+    """run_recovery_once closes a MERGED sr_blind_spot case when rate drops below threshold.
+
+    Seeds the current 7d window with true-positive tasks (reviewer confirmed
+    what SR also flagged) so the denominator is >= _MIN_SR_SAMPLE but miss=0 →
+    rate=0% → signal not tripped → case is CLOSED.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    # True-positive tasks: reviewer flagged AND SR flagged (tp) — denom >= floor, miss=0.
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, category="correctness", miss=False, true_positive=True,
+            created_at=now - timedelta(days=3),
+        ))
+    await db_session.commit()
+
+    merged_at = (now - timedelta(minutes=20)).isoformat()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_blind_spot:correctness",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80, "current_rate": 0.80, "signal_name": "sr_blind_spot",
+        },
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_sr_blind_spot_deploy_monitoring_defers(db_session):
+    """Sr_blind_spot signal during MONITORING window → 0 spawns, deferral Alert emitted."""
+    from app.models import Alert, DeploymentState, DeploymentStatus
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.time_utils import _utcnow as _ts_now
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    db_session.add(DeploymentState(
+        id=1,
+        status=DeploymentStatus.MONITORING,
+        deployed_at=_ts_now(),
+    ))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _ts_now()
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=3),
+        ))
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(_make_sr_blind_spot_task(
+            project.id, miss=True, created_at=now - timedelta(days=10),
+        ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    all_tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    investigate_tasks = [t for t in all_tasks if (t.first_payload or {}).get("type") == "investigate"]
+    assert investigate_tasks == []
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert any("monitoring" in (a.title or "").lower() for a in alerts)

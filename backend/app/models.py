@@ -1370,6 +1370,38 @@ class RegressionRemediationCase(SQLModel, table=True):
             }
             self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [entry]
 
+    def prior_attempt_context_suffix(self) -> str:
+        """Return a formatted prior-attempt context block for re-spawned prompts.
+
+        Returns an empty string when attempts < 2 so first-attempt prompts are
+        unchanged.  For attempts >= 2 the block names the prior PR (if any) and
+        includes the post-merge signal value so the agent has a concrete anchor
+        rather than re-investigating from scratch.
+        """
+        if (self.attempts or 0) < 2:
+            return ""
+        lines: list[str] = [
+            "",
+            "PRIOR ATTEMPT CONTEXT",
+            f"This regression has been investigated {self.attempts} time(s) without recovering the signal.",
+        ]
+        pr = self.last_remediation_pr_number
+        if pr is not None:
+            lines.append(
+                f"Prior remediation PR: #{pr}. Read its diff to understand what was already tried "
+                "before forming a new hypothesis."
+            )
+        snap = self.signal_snapshot_at_merge or {}
+        post_val = snap.get("current_rate")
+        if post_val is not None:
+            lines.append(f"Signal value after prior fix merged: {post_val:.1%}.")
+        lines.append(
+            "Do NOT converge on the same diagnosis as prior attempts. "
+            "Approach from a different angle — look for a deeper root cause or a "
+            "different contributing factor that the prior fix missed."
+        )
+        return "\n".join(lines)
+
     def re_arm(self, max_attempts: int = 3) -> None:
         """Handle remediation failure or post-MERGED recurrence.
 
@@ -1430,3 +1462,45 @@ class RegressionRemediationCase(SQLModel, table=True):
         )
 
 
+class AnomalyFingerprintState(SQLModel, table=True):
+    """Durable per-project anomaly fingerprint record.
+
+    Keyed by (project_id, fingerprint_key) so each distinct anomaly type
+    for a project has exactly one row.  The in-memory persistent_anomalies
+    dict in shared_state.py acts as a hot cache; this table is the source of
+    truth that survives pod restarts, deploys, and OOM kills.
+
+    Usage pattern:
+      - Write: upsert after each anomaly detection cycle (see anomaly_detection.py).
+      - Read: hydrate shared_state.persistent_anomalies on startup (see main.py).
+      - Fallback: pipeline_regression_dispatcher reads this table directly when
+        the in-memory cache is empty after a restart.
+    """
+
+    __tablename__ = "anomalyfingerprintstate"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "fingerprint_key",
+            name="ux_anomalyfingerprintstate_project_key",
+        ),
+        Index("ix_anomalyfingerprintstate_project_id", "project_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=False)
+    fingerprint_key: str = Field(max_length=512)
+    occurrence_count: int = Field(default=1)
+    first_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    last_seen_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    severity: Optional[str] = Field(default=None, max_length=64)
+    latest_details: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )

@@ -420,6 +420,80 @@ export function FreshReviewerTrendBreakdown({ trend }: { trend: FreshReviewerTre
   );
 }
 
+export interface EdgesTrendStats {
+  sample_size?: number | null;
+  tasks_with_edges_rate?: number | null;
+  avg_edges_per_task?: number | null;
+  unhandled_edge_flagged_rate?: number | null;
+  correctness_rejection_rate_with_edges?: number | null;
+  correctness_rejection_rate_without_edges?: number | null;
+}
+
+export interface EdgesTrend {
+  computed_at?: string | null;
+  bucket_mode?: 'cycle' | 'calendar' | null;
+  current_cycle_id?: string | null;
+  previous_cycle_id?: string | null;
+  current?: EdgesTrendStats | null;
+  previous?: EdgesTrendStats | null;
+  tasks_with_edges_rate_delta?: number | null;
+  trend?: 'improving' | 'regressing' | 'stable' | null;
+  rate_history?: number[] | null;
+}
+
+export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | undefined }) {
+  if (!trend || !trend.current) return null;
+  const curr = trend.current;
+  const prev = trend.previous;
+  const delta = trend.tasks_with_edges_rate_delta;
+  const trendVal = trend.trend;
+  const history = trend.rate_history ?? [];
+  const cycleLabel =
+    trend.bucket_mode === 'cycle' && trend.current_cycle_id
+      ? `cycle ${trend.current_cycle_id.slice(-6)} vs ${trend.previous_cycle_id ? trend.previous_cycle_id.slice(-6) : '–'}`
+      : null;
+  return (
+    <div data-testid="edges-trend-breakdown" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
+      <div className="flex items-baseline gap-2 mb-1">
+        <p className="text-[9px] text-neutral-500 uppercase tracking-wide">Edges considered</p>
+        {cycleLabel && <span className="text-[9px] text-neutral-600 font-mono">{cycleLabel}</span>}
+        {curr.sample_size != null && (
+          <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={curr.sample_size}</span>
+        )}
+      </div>
+      <div className="flex items-center gap-2 text-[10px]">
+        <span className="text-neutral-400 flex-1">tasks with edges</span>
+        <span className={`font-mono tabular-nums ${frTrendColor(trendVal)}`}>
+          {curr.tasks_with_edges_rate != null ? `${Math.round(curr.tasks_with_edges_rate * 100)}%` : '–'}
+        </span>
+        {delta != null && (
+          <span className={`font-mono tabular-nums text-xs ${deltaColorClass(-delta)}`}>
+            {formatDelta(delta)}
+          </span>
+        )}
+      </div>
+      {history.length > 0 && (
+        <div className="flex items-center gap-1 mt-1">
+          <span className="text-[9px] text-neutral-600">history</span>
+          <div className="flex gap-0.5">
+            {history.map((r, i) => (
+              <span key={i} className="text-[9px] font-mono text-neutral-500">{Math.round(r * 100)}%</span>
+            ))}
+          </div>
+        </div>
+      )}
+      {prev && prev.tasks_with_edges_rate != null && (
+        <div className="flex items-center gap-2 text-[10px] pt-1 border-t border-neutral-800/60">
+          <span className="text-neutral-600 flex-1">prev</span>
+          <span className="font-mono tabular-nums text-neutral-500">
+            {Math.round(prev.tasks_with_edges_rate * 100)}%
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface SrMissedTask {
   task_id: string;
   title: string;

@@ -29,7 +29,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData } from './SrTrendBreakdown';
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, EdgesTrendBreakdown, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -249,6 +249,7 @@ interface DigestData {
     reviewer_finding_added_value: Record<string, number>;
     prediction_sample_size: number;
   } | null;
+  edges_trend?: EdgesTrend | null;
   median_cost_per_merged_pr?: number | null;
   prediction_calibration_factor?: number | null;
   prediction_calibration_note?: string | null;
@@ -1029,6 +1030,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   variant="card"
                   onCategoryClick={onCategoryClick}
                 />
+                <EdgesTrendBreakdown trend={digest?.edges_trend} />
                 {digest?.fresh_reviewer_effectiveness != null && (() => {
                   const fre = digest.fresh_reviewer_effectiveness!;
                   const n = fre.fresh_reviewer_sample_size;

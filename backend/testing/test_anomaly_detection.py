@@ -1113,3 +1113,29 @@ async def test_seed_task_results_from_db_populates_deque():
     assert entries[1][1] == "failure"
     assert entries[1][3] == "fix"
     assert entries[1][2] != ""  # failure_class populated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistence boundary: _compute_research_anomalies calls persist_anomaly_snapshot
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_compute_research_anomalies_persists_snapshot():
+    """_compute_research_anomalies calls persist_anomaly_snapshot after detection."""
+    from unittest.mock import patch
+
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+    session = _make_session(tasks=[], project=project)
+
+    captured: dict = {}
+
+    async def fake_persist(proj_key, proj_anomalies, sess):
+        captured["proj_key"] = proj_key
+        captured["sess"] = sess
+
+    with patch("app.shared_state.persist_anomaly_snapshot", new=fake_persist):
+        await _compute_research_anomalies(project_id, session)
+
+    assert captured.get("proj_key") == str(project_id)
+    assert captured.get("sess") is session

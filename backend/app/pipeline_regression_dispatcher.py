@@ -71,6 +71,11 @@ _WATCHDOG_MERGED_STALE_THRESHOLD = timedelta(hours=6)
 _ANOMALY_DISPATCH_MIN_OCCURRENCES = 3
 _ANOMALY_DISPATCH_RECENCY_HOURS = 48
 
+# SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
+# this many times across the 14d window before it is considered a structural gap
+# in the self-review prompt rather than a one-off observation from a single task.
+_SR_BLIND_SPOT_THEME_FLOOR = 5
+
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
@@ -178,6 +183,36 @@ def _format_signal_lines(
         "recommended_fix, severity, confidence, affected_files}). "
         "Do NOT prescribe a fix — let the investigate→fix chain produce the "
         "remediation."
+    )
+    return "\n".join(lines)
+
+
+def _format_prior_attempt_context(case: "RegressionRemediationCase") -> str:
+    """Build a prior-attempt notice to append when re-spawning after >= 2 failures.
+
+    Only called when existing_case.attempts >= 2 so the first re-arm (attempts==1)
+    keeps the original prompt unchanged — this avoids noise on the second attempt
+    and reserves the enrichment for cases that have already failed twice.
+    """
+    lines = [
+        "",
+        "PRIOR ATTEMPT CONTEXT",
+        f"This regression has been investigated {case.attempts} time(s) without recovering the signal.",
+    ]
+    pr = case.last_remediation_pr_number
+    if pr is not None:
+        lines.append(
+            f"Prior remediation PR: #{pr}. Read its diff to understand what was already tried "
+            f"before forming a new hypothesis."
+        )
+    snap = case.signal_snapshot_at_merge or {}
+    post_val = snap.get("current_rate")
+    if post_val is not None:
+        lines.append(f"Signal value after prior fix merged: {post_val:.1%}.")
+    lines.append(
+        "Do NOT converge on the same diagnosis as prior attempts. "
+        "Approach from a different angle — look for a deeper root cause or a "
+        "different contributing factor that the prior fix missed."
     )
     return "\n".join(lines)
 
@@ -309,6 +344,62 @@ async def _current_signal_value_for_class(
             "extras": [f"Fix-loop '{loop}' divergence rate is rising: {pd}/{pn} → {cd}/{cn} divergent."],
         }
 
+    if regression_class.startswith("sr_blind_spot:theme:"):
+        from app.sr_blind_spots import aggregate_sr_blind_spot_themes  # noqa: PLC0415
+        theme = regression_class.split(":", 2)[2]
+        themes = await aggregate_sr_blind_spot_themes(session, project_id, days=14, limit=100)
+        count = next((e["count"] for e in themes if e["theme"] == theme), 0)
+        return {
+            "signal_name": "sr_blind_spot",
+            "prior_rate": None,
+            "current_rate": None,
+            "sample_size": count,
+            "magnitude": float(count),
+            "tripped": count >= _SR_BLIND_SPOT_THEME_FLOOR,
+            "extras": [f"SR blind-spot theme '{theme}' appeared {count}x in the last 14 days."],
+        }
+
+    if regression_class.startswith("sr_blind_spot:"):
+        from app.sr_blind_spots import _count_reviewer_disagreement_directions  # noqa: PLC0415
+        from app.models import Task as TaskModel  # noqa: PLC0415
+
+        cat = regression_class.split(":", 1)[1]
+        now = _utcnow()
+        tasks = (await session.execute(
+            select(TaskModel).where(
+                TaskModel.project_id == project_id,
+                TaskModel.status == TaskStatus.COMPLETED,
+                TaskModel.created_at >= now - timedelta(days=7),
+            )
+        )).scalars().all()
+
+        def _naive(dt: datetime) -> datetime:
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+        dirs = _count_reviewer_disagreement_directions(tasks)
+        c_rate, c_denom = None, 0
+        for (k_cat, _k_type), bucket in dirs.items():
+            if k_cat != cat:
+                continue
+            denom = bucket["miss"] + bucket["tp"] + bucket["fp"]
+            if denom < _MIN_SR_SAMPLE:
+                continue
+            rate = bucket["miss"] / denom
+            if c_denom == 0 or denom > c_denom:
+                c_rate = round(rate, 3)
+                c_denom = denom
+        if c_denom < _MIN_SR_SAMPLE:
+            return None
+        return {
+            "signal_name": "sr_blind_spot",
+            "prior_rate": None,
+            "current_rate": c_rate,
+            "sample_size": c_denom,
+            "magnitude": c_rate,
+            "tripped": (c_rate or 0.0) >= _TREND_DELTA_THRESHOLD,
+            "extras": [f"SR blind-spot for category '{cat}' (reviewer-disagreement rate in current 7d window)."],
+        }
+
     if regression_class == "pipeline_success_rate":
         from app.models import Task as TaskModel  # noqa: PLC0415
         from app.routers.admin_digest import compute_pipeline_health_summary  # noqa: PLC0415
@@ -340,6 +431,25 @@ async def _current_signal_value_for_class(
             "tripped": summary.get("trend") == "declining",
             "extras": extras,
         }
+
+    if regression_class.startswith("anomaly:"):
+        anomaly_key = regression_class[len("anomaly:"):]
+        import app.shared_state as _ss  # noqa: PLC0415
+        from app.shared_state import _ANOMALY_FINGERPRINTS_KEY  # noqa: PLC0415
+        entry = (_ss.persistent_anomalies.get(str(project_id)) or {}).get(anomaly_key)
+        if entry is None:
+            # Durable fallback: project.design_doc survives pod restarts.
+            entry = ((project_design_doc or {}).get(_ANOMALY_FINGERPRINTS_KEY) or {}).get(anomaly_key)
+        if not isinstance(entry, dict):
+            return {"signal_name": "persistent_anomaly", "prior_rate": None, "current_rate": None,
+                    "sample_size": 0, "magnitude": None, "tripped": False, "extras": []}
+        n = int(entry.get("occurrence_count") or 0)
+        last_seen = str(entry.get("last_seen") or "")
+        cutoff = (_utcnow() - timedelta(hours=_ANOMALY_DISPATCH_RECENCY_HOURS)).isoformat()
+        tripped = n >= _ANOMALY_DISPATCH_MIN_OCCURRENCES and last_seen >= cutoff
+        return {"signal_name": "persistent_anomaly", "prior_rate": None, "current_rate": None,
+                "sample_size": n, "magnitude": float(n), "tripped": tripped,
+                "extras": [f"Persistent anomaly '{anomaly_key}' seen {n}x."]}
 
     return None
 
@@ -432,6 +542,8 @@ async def _maybe_spawn(
         sample_size=sample_size,
         extras=extras,
     )
+    if existing_case is not None and (existing_case.attempts or 0) >= 2:
+        prompt += _format_prior_attempt_context(existing_case)
     payload = validate_internal_payload(
         {
             "type": "investigate",
@@ -658,6 +770,193 @@ async def _evaluate_pipeline_success_signal(
     return 1 if spawn is not None else 0
 
 
+async def _probe_sr_blind_spot_any_trip(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> bool:
+    """Side-effect-free probe: would any sr_blind_spot signal trip right now?"""
+    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
+    from app.sr_blind_spots import (  # noqa: PLC0415
+        _count_reviewer_disagreement_directions,
+        aggregate_sr_blind_spot_themes,
+    )
+    from app.models import Task as TaskModel  # noqa: PLC0415
+
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    tasks = (await session.execute(
+        select(TaskModel).where(
+            TaskModel.project_id == project_id,
+            TaskModel.status == TaskStatus.COMPLETED,
+            TaskModel.created_at >= now - timedelta(days=14),
+        )
+    )).scalars().all()
+
+    c7 = _naive(now - timedelta(days=7))
+    curr_tasks = [t for t in tasks if t.created_at and _naive(t.created_at) >= c7]
+    prev_tasks = [t for t in tasks if t.created_at and _naive(t.created_at) < c7]
+    curr_dirs = _count_reviewer_disagreement_directions(curr_tasks)
+    prev_dirs = _count_reviewer_disagreement_directions(prev_tasks)
+
+    for (cat, task_type), c_bucket in curr_dirs.items():
+        p_bucket = prev_dirs.get((cat, task_type), {"miss": 0, "tp": 0, "fp": 0})
+        c_denom = c_bucket["miss"] + c_bucket["tp"] + c_bucket["fp"]
+        p_denom = p_bucket["miss"] + p_bucket["tp"] + p_bucket["fp"]
+        if c_denom < _MIN_SR_SAMPLE or p_denom < _MIN_SR_SAMPLE:
+            continue
+        c_rate = c_bucket["miss"] / c_denom
+        p_rate = p_bucket["miss"] / p_denom
+        if c_rate >= _TREND_DELTA_THRESHOLD and p_rate >= _TREND_DELTA_THRESHOLD:
+            return True
+
+    themes = await aggregate_sr_blind_spot_themes(session, project_id, days=14, limit=10)
+    for theme_entry in themes:
+        if theme_entry["count"] >= _SR_BLIND_SPOT_THEME_FLOOR:
+            return True
+    return False
+
+
+async def _evaluate_sr_blind_spot_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Evaluate SR blind-spot drift: reviewer-disagreement rate and recurring themes.
+
+    Trips when either:
+    (a) a (category, task_type)'s miss rate exceeds _TREND_DELTA_THRESHOLD in
+        BOTH the current 7d window AND the prior 7-14d window (sustained drift,
+        not a one-off), with at least _MIN_SR_SAMPLE denominator in each window;
+    (b) a recurring blind_spot theme reaches _SR_BLIND_SPOT_THEME_FLOOR
+        occurrences in the 14d window.
+    """
+    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
+    from app.sr_blind_spots import (  # noqa: PLC0415
+        _count_reviewer_disagreement_directions,
+        aggregate_sr_blind_spot_themes,
+    )
+    from app.models import Task as TaskModel  # noqa: PLC0415
+
+    if spawn_budget_left <= 0:
+        return 0
+
+    spawned = 0
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    # --- Disagreement-rate signal ---
+    tasks = (await session.execute(
+        select(TaskModel).where(
+            TaskModel.project_id == project_id,
+            TaskModel.status == TaskStatus.COMPLETED,
+            TaskModel.created_at >= now - timedelta(days=14),
+        )
+    )).scalars().all()
+
+    c7 = _naive(now - timedelta(days=7))
+    curr_tasks = [t for t in tasks if t.created_at and _naive(t.created_at) >= c7]
+    prev_tasks = [t for t in tasks if t.created_at and _naive(t.created_at) < c7]
+    curr_dirs = _count_reviewer_disagreement_directions(curr_tasks)
+    prev_dirs = _count_reviewer_disagreement_directions(prev_tasks)
+
+    # Dedupe by category: one spawn per category regardless of task_type.
+    # Iterate sorted pairs; for each category, try each (cat, task_type)
+    # until one trips (or none do for that category).
+    from collections import defaultdict  # noqa: PLC0415
+    cat_to_pairs: dict[str, list[str]] = defaultdict(list)
+    for cat, task_type in sorted(curr_dirs):
+        cat_to_pairs[cat].append(task_type)
+
+    for cat, task_types in sorted(cat_to_pairs.items()):
+        if spawned >= spawn_budget_left:
+            break
+        for task_type in task_types:
+            c_bucket = curr_dirs.get((cat, task_type), {"miss": 0, "tp": 0, "fp": 0})
+            p_bucket = prev_dirs.get((cat, task_type), {"miss": 0, "tp": 0, "fp": 0})
+            c_denom = c_bucket["miss"] + c_bucket["tp"] + c_bucket["fp"]
+            p_denom = p_bucket["miss"] + p_bucket["tp"] + p_bucket["fp"]
+            if c_denom < _MIN_SR_SAMPLE or p_denom < _MIN_SR_SAMPLE:
+                continue
+            c_rate = c_bucket["miss"] / c_denom
+            p_rate = p_bucket["miss"] / p_denom
+            if c_rate < _TREND_DELTA_THRESHOLD or p_rate < _TREND_DELTA_THRESHOLD:
+                continue
+
+            # Both windows trip — collect prompt evidence then spawn.
+            reviewer_examples: list[str] = []
+            for t in curr_tasks:
+                sro = (t.context or {}).get("_self_review_outcome") or {}
+                for finding in (sro.get("reviewer_findings") or []):
+                    if not isinstance(finding, dict):
+                        continue
+                    if finding.get("category") == cat:
+                        desc = str(finding.get("description", ""))[:120]
+                        if desc:
+                            reviewer_examples.append(desc)
+                    if len(reviewer_examples) >= 2:
+                        break
+                if len(reviewer_examples) >= 2:
+                    break
+
+            extras = [
+                f"SR blind-spot: category '{cat}' consistently caught by reviewers "
+                f"but missed by SR ({task_type} tasks).",
+                f"Current 7d miss rate: {c_rate:.1%} ({c_bucket['miss']}/{c_denom})",
+                f"Prior 7-14d miss rate: {p_rate:.1%} ({p_bucket['miss']}/{p_denom})",
+            ]
+            for ex in reviewer_examples:
+                extras.append(f"Example reviewer finding: {ex}")
+
+            regression_class = f"sr_blind_spot:{cat}"
+            spawn = await _maybe_spawn(
+                session, project_id,
+                signal_name="sr_blind_spot",
+                regression_class=regression_class,
+                prior_rate=round(p_rate, 3),
+                current_rate=round(c_rate, 3),
+                sample_size=c_denom,
+                magnitude=round(c_rate - p_rate, 3),
+                extras=extras,
+                title_hint=f"SR blind-spot: {cat} ({task_type})"[:80],
+            )
+            if spawn is not None:
+                spawned += 1
+            break  # one spawn per category
+
+    # --- Theme signal ---
+    themes = await aggregate_sr_blind_spot_themes(session, project_id, days=14, limit=100)
+    for theme_entry in themes:
+        if spawned >= spawn_budget_left:
+            break
+        count = theme_entry["count"]
+        if count < _SR_BLIND_SPOT_THEME_FLOOR:
+            break  # sorted descending — subsequent entries also below floor
+        theme = theme_entry["theme"]
+        regression_class = f"sr_blind_spot:theme:{theme}"
+        spawn = await _maybe_spawn(
+            session, project_id,
+            signal_name="sr_blind_spot",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=count,
+            magnitude=float(count),
+            extras=[
+                f"Recurring SR blind-spot theme: '{theme}' appeared {count}x in the last 14 days.",
+            ],
+            title_hint=f"SR blind-spot theme: {theme}"[:80],
+        )
+        if spawn is not None:
+            spawned += 1
+
+    return spawned
+
+
 async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Re-evaluate merged regression cases and close or re-arm them."""
     from app.models import Project  # noqa: PLC0415
@@ -718,6 +1017,15 @@ async def _evaluate_anomaly_signal(
         return 0
 
     proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
+    if not proj_anomalies:
+        from app.models import Project as _Proj  # noqa: PLC0415
+        from app.shared_state import _ANOMALY_FINGERPRINTS_KEY  # noqa: PLC0415
+        _proj = await session.get(_Proj, project_id)
+        if _proj is not None:
+            _stored = ((_proj.design_doc or {}).get(_ANOMALY_FINGERPRINTS_KEY)) or {}
+            if _stored:
+                _ss.persistent_anomalies[str(project_id)] = _stored
+                proj_anomalies = _stored
     if not proj_anomalies:
         return 0
 
@@ -868,6 +1176,8 @@ async def _any_signal_would_trip(
         if str(entry.get("last_seen") or "") < recency_cutoff:
             continue
         return True
+    if await _probe_sr_blind_spot_any_trip(session, project_id):
+        return True
     return False
 
 
@@ -937,6 +1247,9 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         session, project_id, spawn_budget - spawned,
     )
     spawned += await _evaluate_anomaly_signal(
+        session, project_id, spawn_budget - spawned,
+    )
+    spawned += await _evaluate_sr_blind_spot_signal(
         session, project_id, spawn_budget - spawned,
     )
 

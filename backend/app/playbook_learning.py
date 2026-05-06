@@ -3354,3 +3354,157 @@ async def compute_sr_reviewer_disagreements(
         project_id, len(entries),
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Edges-considered cycle-over-cycle trend
+# ---------------------------------------------------------------------------
+
+
+async def compute_edges_trend(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> Optional[dict[str, Any]]:
+    """Cycle-bucketed trend for edges_considered metrics.
+
+    Mirrors the cycle-vs-calendar bucketing from ``compute_fresh_reviewer_trend``.
+    Requires at least ``_MIN_SR_SAMPLE`` code-change tasks with
+    ``_self_review_outcome`` in both the current and previous bucket.
+
+    Primary trend signal: ``tasks_with_edges_rate`` — the fraction of code tasks
+    that included an ``edges_considered`` list in their self-review.  Trend is
+    classified as ``'improving'`` | ``'regressing'`` | ``'stable'`` relative to the
+    previous bucket using ``_TREND_DELTA_THRESHOLD``.
+
+    **Side effect**: writes result to ``project.design_doc['edges_trend']`` and
+    maintains a top-level ``rate_history`` list (capped at 5 entries).  Append
+    rule mirrors ``sr_catch_rate_trends``: in cycle mode append on new
+    ``current_cycle_id``; in calendar mode append when ≥14 days since last
+    ``computed_at``.
+    """
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    def _qualifying_count(tasks: list) -> int:
+        return sum(
+            1 for t in tasks
+            if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
+            and "_self_review_outcome" in (t.context or {})
+        )
+
+    # --- Cycle-based bucketing (primary mode) ---
+    use_cycle_mode = False
+    current_cycle_id: Optional[str] = None
+    previous_cycle_id: Optional[str] = None
+    current_bucket: list = []
+    previous_bucket: list = []
+
+    cycle_stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+
+    if len(cycle_rows) >= 2:
+        task_by_cycle: dict[str, list] = {}
+        for t in all_tasks:
+            cid = getattr(t, "strategic_cycle_id", None)
+            if cid:
+                task_by_cycle.setdefault(cid, []).append(t)
+        for i in range(len(cycle_rows) - 1):
+            c_cycle = cycle_rows[i]
+            p_cycle = cycle_rows[i + 1]
+            c_tasks = task_by_cycle.get(c_cycle.id, [])
+            p_tasks = task_by_cycle.get(p_cycle.id, [])
+            if _qualifying_count(c_tasks) >= _MIN_SR_SAMPLE and _qualifying_count(p_tasks) >= _MIN_SR_SAMPLE:
+                use_cycle_mode = True
+                current_cycle_id = c_cycle.id
+                previous_cycle_id = p_cycle.id
+                current_bucket = c_tasks
+                previous_bucket = p_tasks
+                break
+
+    if not use_cycle_mode:
+        cutoff_14d_n = _naive(now - timedelta(days=14))
+        cutoff_28d_n = _naive(now - timedelta(days=28))
+        sentinel_n = datetime(9999, 12, 31)
+        current_bucket = [
+            t for t in all_tasks
+            if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
+        ]
+        previous_bucket = [
+            t for t in all_tasks
+            if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
+        ]
+
+    if _qualifying_count(current_bucket) < _MIN_SR_SAMPLE or _qualifying_count(previous_bucket) < _MIN_SR_SAMPLE:
+        return None
+
+    current_stats = _compute_edges_stats(current_bucket)
+    previous_stats = _compute_edges_stats(previous_bucket)
+
+    if current_stats is None or previous_stats is None:
+        return None
+
+    c_rate = current_stats["tasks_with_edges_rate"]
+    p_rate = previous_stats["tasks_with_edges_rate"]
+    delta = round(c_rate - p_rate, 3)
+    if delta >= _TREND_DELTA_THRESHOLD:
+        trend = "improving"
+    elif delta <= -_TREND_DELTA_THRESHOLD:
+        trend = "regressing"
+    else:
+        trend = "stable"
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "bucket_mode": "cycle" if use_cycle_mode else "calendar",
+        "current_cycle_id": current_cycle_id,
+        "previous_cycle_id": previous_cycle_id,
+        "current": current_stats,
+        "previous": previous_stats,
+        "tasks_with_edges_rate_delta": delta,
+        "trend": trend,
+    }
+
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    existing: dict = dict(doc.get("edges_trend") or {})
+    existing_computed_at: Optional[str] = existing.get("computed_at")
+
+    is_new_window = True
+    if use_cycle_mode:
+        is_new_window = existing.get("current_cycle_id") != current_cycle_id
+    elif existing_computed_at:
+        try:
+            last_dt = datetime.fromisoformat(existing_computed_at)
+            is_new_window = (now - last_dt).days >= 14
+        except (ValueError, TypeError):
+            pass
+
+    rate_history: list = list(existing.get("rate_history") or [])
+    if is_new_window or not rate_history:
+        rate_history.append(c_rate)
+        rate_history = rate_history[-5:]
+    result["rate_history"] = rate_history
+
+    doc["edges_trend"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[EDGES_TREND] project=%s trend=%s bucket_mode=%s",
+        project_id, trend, result["bucket_mode"],
+    )
+
+    return result

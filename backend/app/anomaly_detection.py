@@ -574,6 +574,15 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         initial_last_seen=initial_last_seen,
     )
 
+    # Persist so occurrence counts survive pod restarts (writes to Project.design_doc;
+    # caller owns the commit).
+    try:
+        await _shared_state.persist_anomaly_snapshot(proj_key, proj_anomalies, session)
+    except Exception:
+        logger.warning(
+            "[ANOMALY_PERSIST] Failed to persist anomaly snapshot for %s", proj_key, exc_info=True,
+        )
+
     return anomalies
 
 

@@ -2473,6 +2473,158 @@ class TestFollowupInvestigationOnFailure:
             for n in notes
         )
 
+    @staticmethod
+    def _make_regression_remediation_task(project_id, *, direction_id="dir-1",
+                                          fingerprint="fp-A",
+                                          regression_class="sr_catch_rate:correctness"):
+        return make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message="test suite regressed",
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": direction_id,
+                "diagnosis_fingerprint": fingerprint,
+                "regression_class": regression_class,
+            },
+            payloads=[{"type": "create", "prompt": "apply regression fix", "base_branch": "main"}],
+        )
+
+    @pytest.mark.asyncio
+    async def test_regression_case_attempts_1_no_prior_context_block(self, db_session):
+        """When RegressionRemediationCase.attempts == 1, prompt has no PRIOR ATTEMPT CONTEXT block."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "sr catch rate fix",
+            "diagnosis_summary": "SR catch rate dropped",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:correctness",
+            status=RegressionCaseStatus.ACTIVE,
+            attempts=1,
+            last_remediation_pr_number=42,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        task = self._make_regression_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        spawned = (await db_session.execute(
+            _select(TaskModel).where(
+                TaskModel.project_id == project.id,
+                TaskModel.id != task.id,
+            )
+        )).scalars().all()
+        assert len(spawned) == 1
+        prompt = spawned[0].payloads[0]["prompt"]
+        assert "PRIOR ATTEMPT CONTEXT" not in prompt
+        assert "#42" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_regression_case_attempts_2_injects_prior_context(self, db_session):
+        """When RegressionRemediationCase.attempts >= 2, prompt includes prior PR + signal."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "sr catch rate fix",
+            "diagnosis_summary": "SR catch rate dropped",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:correctness",
+            status=RegressionCaseStatus.ACTIVE,
+            attempts=2,
+            last_remediation_pr_number=99,
+            signal_snapshot_at_merge={"current_rate": 0.55},
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        task = self._make_regression_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        spawned = (await db_session.execute(
+            _select(TaskModel).where(
+                TaskModel.project_id == project.id,
+                TaskModel.id != task.id,
+            )
+        )).scalars().all()
+        assert len(spawned) == 1
+        prompt = spawned[0].payloads[0]["prompt"]
+        assert "PRIOR ATTEMPT CONTEXT" in prompt
+        assert "#99" in prompt
+        assert "55.0%" in prompt
+        assert "different angle" in prompt
+
+    @pytest.mark.asyncio
+    async def test_regression_case_attempts_2_no_pr_omits_pr_line(self, db_session):
+        """When attempts >= 2 but no prior PR, no PR-number line is leaked into prompt."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+        project = make_project(directions=[{
+            "id": "dir-1", "status": "active", "text": "sr catch rate fix",
+        }])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:correctness",
+            status=RegressionCaseStatus.ACTIVE,
+            attempts=2,
+            last_remediation_pr_number=None,
+        )
+        db_session.add(case)
+        await db_session.commit()
+
+        task = self._make_regression_remediation_task(project.id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_if_terminal(task, TaskStatus.FAILED, db_session)
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as TaskModel
+        spawned = (await db_session.execute(
+            _select(TaskModel).where(
+                TaskModel.project_id == project.id,
+                TaskModel.id != task.id,
+            )
+        )).scalars().all()
+        assert len(spawned) == 1
+        prompt = spawned[0].payloads[0]["prompt"]
+        assert "PRIOR ATTEMPT CONTEXT" in prompt
+        assert "Prior remediation PR" not in prompt
+        assert "different angle" in prompt
+
 
 # ── unlinked (project-level) remediation sibling propagation ───────────────
 
