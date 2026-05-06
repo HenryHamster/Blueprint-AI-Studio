@@ -2943,6 +2943,69 @@ async def test_first_attempt_by_review_category_includes_regression_risk(
 
 
 @pytest.mark.asyncio
+async def test_heuristic_regression_risk_not_skipped_in_sr_skip_rate(
+    client: AsyncClient, db_session
+):
+    """Heuristic-derived regression_risk entries (issue text tagged [heuristic-derived])
+    are treated as valid SR outcomes — not as 'skipped' fallback envelopes — so they
+    contribute to catch-rate metrics the same way baseline-derived entries do."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+
+    def _make_sr(issue: str, passed: bool = False) -> dict:
+        return {
+            "verdict": "fail" if not passed else "pass",
+            "fixes_applied": False,
+            "check_results": {
+                "regression_risk": {"passed": passed, "issue": issue},
+            },
+            "blind_spots": [],
+        }
+
+    # 3 fix tasks with heuristic-derived regression_risk (the new signal)
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            payloads=[{"type": "fix"}],
+            context={"_self_review_outcome": _make_sr("[heuristic-derived] +120 source lines / 0 test lines")},
+        ))
+    # 2 fix tasks with baseline-style regression_risk (no heuristic tag)
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id, status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            payloads=[{"type": "fix"}],
+            context={"_self_review_outcome": _make_sr("test_foo.py::test_bar now fails after change", passed=True)},
+        ))
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    data = response.json()
+
+    skip_rate = data.get("self_review_skip_rate")
+    assert skip_rate is not None, "self_review_skip_rate must be present (≥5 code-change tasks)"
+    # All 5 tasks have valid SR outcomes — none should be classified as skipped
+    assert skip_rate["skipped_count"] == 0, (
+        "heuristic-derived regression_risk entries must not count as skipped SR outcomes — "
+        "aggregation should key on category presence, not issue text"
+    )
+    assert skip_rate["sample_size"] == 5
+
+    # self_review_effectiveness sample_size must include both heuristic and baseline tasks
+    sre = data.get("self_review_effectiveness")
+    assert sre is not None, "self_review_effectiveness must be present (≥3 tasks with SR outcomes)"
+    assert sre["sample_size"] == 5
+
+
+@pytest.mark.asyncio
 async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db_session):
     """trend_history entries include failed_by_taxonomy counts parallel to failed_by_class."""
     project = make_project()

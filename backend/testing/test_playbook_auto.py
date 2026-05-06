@@ -7,8 +7,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.routers.agent_status import _check_recurring_failures, _utcnow
+from sqlmodel import select as _sql_select
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4070,6 +4071,23 @@ async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_sess
     assert cats[0]["current_hit_rate"] is not None
     assert cats[0]["sample_size"] > 0
 
+    # AlertsBanner surfacing: the same firing path must insert an
+    # undismissed WARNING Alert row keyed on the regression title prefix.
+    from app.playbook_learning import _SR_REGRESSION_ALERT_TITLE_PREFIX
+    await db_session.commit()
+    alert_rows = (await db_session.execute(
+        _sql_select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.dismissed_at.is_(None),
+        )
+    )).scalars().all()
+    reg_rows = [r for r in alert_rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+    assert len(reg_rows) == 1
+    assert reg_rows[0].severity == AlertSeverity.WARNING
+    assert "test-coverage" in reg_rows[0].title
+    # Message reuses the same description string as the ProjectMessage
+    assert "test-coverage" in reg_rows[0].message
+
 
 @pytest.mark.asyncio
 async def test_sr_catch_rate_regression_no_duplicate_in_same_window(db_session: AsyncSession):
@@ -4099,6 +4117,18 @@ async def test_sr_catch_rate_regression_no_duplicate_in_same_window(db_session: 
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     mock_post2.assert_not_called()
+
+    # The dedup contract also covers the in-app Alert row: still exactly one.
+    from app.playbook_learning import _SR_REGRESSION_ALERT_TITLE_PREFIX
+    await db_session.commit()
+    alert_rows = (await db_session.execute(
+        _sql_select(Alert).where(
+            Alert.project_id == project.id,
+            Alert.dismissed_at.is_(None),
+        )
+    )).scalars().all()
+    reg_rows = [r for r in alert_rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+    assert len(reg_rows) == 1
 
 
 @pytest.mark.asyncio

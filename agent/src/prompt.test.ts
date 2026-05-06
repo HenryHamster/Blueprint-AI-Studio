@@ -3369,6 +3369,56 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     // Verify that it always includes self_review_outcome in payload
     expect(doneScript).toContain('{self_review_outcome: $self_review}');
   });
+
+  it('generates ./pr script with SR section injection for new PR path', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    expect(prScript).toBeDefined();
+
+    // SR file is checked before injection
+    expect(prScript).toContain('SR_FILE="/tmp/self_review_test-task-123.json"');
+    expect(prScript).toContain('SR_SKIP_FILE="/tmp/self_review_skip_reason_test-task-123.txt"');
+
+    // base64-decoded node script renders the section
+    expect(prScript).toContain('base64 -d > /tmp/sr_section_test-task-123.js');
+    expect(prScript).toContain('node /tmp/sr_section_test-task-123.js');
+
+    // Prior marker block is stripped before appending (closing marker appears escaped in sed)
+    expect(prScript).toContain('<!-- blueprint:self-review -->');
+    expect(prScript).toContain("\\/blueprint:self-review");
+    expect(prScript).toContain("sed '/<!-- blueprint:self-review -->/");
+  });
+
+  it('generates ./pr script with existing-PR PATCH logic for review-fix path', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'fix-task-456',
+      workBranch: 'blueprint/fix-task-456',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      existingPrNumber: 42,
+      testsOnMainBranch: false,
+    });
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    expect(prScript).toBeDefined();
+
+    // SR injection bash is still present (shared with new-PR path)
+    expect(prScript).toContain('SR_FILE="/tmp/self_review_fix-task-456.json"');
+
+    // Existing-PR path: PATCH call updates PR body
+    expect(prScript).toContain('PATCH');
+    expect(prScript).toContain('/pulls/42');
+    expect(prScript).toContain('SR body update');
+  });
 });
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
@@ -3635,6 +3685,12 @@ describe('FIX_TASK_FOCUS — content invariants', () => {
     const { FIX_TASK_FOCUS } = await import('./prompt.js');
     expect(FIX_TASK_FOCUS).toContain('root cause');
   });
+
+  it('warns against reusing stale verdicts from the original create task', async () => {
+    const { FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(FIX_TASK_FOCUS).toContain('_self_review_outcome');
+    expect(FIX_TASK_FOCUS).toContain('ORCHESTRATOR');
+  });
 });
 
 describe('DOCS_TASK_FOCUS — content invariants', () => {
@@ -3733,9 +3789,9 @@ describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () 
 // create/fix/docs/deps focus blocks were added. If this test fails, bump the
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "2" after adding create/fix/docs/deps focus blocks', async () => {
+  it('is "3" after adding stale-verdict guard to FIX_TASK_FOCUS', async () => {
     const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
-    expect(SELF_REVIEW_PROMPT_VERSION).toBe('2');
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('3');
   });
 
   it('is a non-empty string (used as prompt_version field in self-review JSON)', async () => {

@@ -1,4 +1,6 @@
 import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { WORKSPACE } from './index.js';
@@ -631,10 +633,32 @@ fi
   fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
 }
 
+// Load the canonical sr-pr-section.js renderer from disk and base64-encode
+// it for safe bash-level injection into the generated ./pr script. Per
+// CLAUDE.md "Generating Code for One Language From Another": the embedded
+// script lives as a real file (lintable, testable) and the generator reads
+// it rather than mirroring its body in a string constant. Lazy-loaded so
+// that test suites which mock fs do not crash on module import.
+const _SR_SECTION_SCRIPT_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'sr-pr-section.js',
+);
+function loadSrSectionScriptB64(): string {
+  try {
+    return Buffer.from(
+      fs.readFileSync(_SR_SECTION_SCRIPT_PATH, 'utf8'),
+    ).toString('base64');
+  } catch {
+    return '';
+  }
+}
+
 function writePrHelper(cfg: CodeChangeHelperConfig): void {
   // Idempotent push + PR creation/update. Gates on ./check first.
   // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
   // pick up the URL without re-querying GitHub.
+  const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
@@ -746,6 +770,23 @@ done
 
 [ -z "$TITLE" ] && { echo "Error: --title is required" >&2; exit 2; }
 
+# ── Self-review section injection ─────────────────────────────────────────────
+# Reads /tmp/self_review_<taskId>.json if present, renders the
+# <!-- blueprint:self-review --> block, strips any prior block from BODY
+# (idempotent), and appends the fresh one.  No-op when JSON is absent.
+SR_FILE="/tmp/self_review_${cfg.taskId}.json"
+SR_SKIP_FILE="/tmp/self_review_skip_reason_${cfg.taskId}.txt"
+SR_SECTION=""
+if [ -f "$SR_FILE" ]; then
+  printf '%s' '${_SR_SECTION_SCRIPT_B64}' | base64 -d > /tmp/sr_section_${cfg.taskId}.js
+  SR_SECTION=$(node /tmp/sr_section_${cfg.taskId}.js "$SR_FILE" "$SR_SKIP_FILE" 2>/dev/null || true)
+  rm -f /tmp/sr_section_${cfg.taskId}.js
+fi
+if [ -n "$SR_SECTION" ]; then
+  BODY=$(printf '%s' "$BODY" | sed '/<!-- blueprint:self-review -->/,/<!-- \\/blueprint:self-review -->/d')
+  BODY=$(printf '%s\\n\\n%s' "$BODY" "$SR_SECTION")
+fi
+
 ${cfg.testsOnMainBranch ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
 # The agent must not be able to skip backend tests on main-branch tasks.
 _BASE_GATE="${cfg.baseBranch}"
@@ -854,6 +895,37 @@ ${cfg.existingPrNumber !== undefined ? `
 # the original create task, so we don't need to call the endpoint here.
 PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/${cfg.existingPrNumber}"
 echo "[pr] Pushed updates to existing PR #${cfg.existingPrNumber}"
+# Update existing PR body with fresh SR section (best-effort — log on failure)
+if [ -n "$SR_SECTION" ]; then
+  _PTRESP=$(curl -f -sS --max-time 30 \\
+    -H "X-Agent-Token: $TOKEN" \\
+    "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || _PTRESP=""
+  _PTOKEN=$(printf '%s' "$_PTRESP" | jq -r '.data.token // empty' 2>/dev/null || true)
+  if [ -n "$_PTOKEN" ]; then
+    # Fetch current PR body. Use -f so non-2xx GET responses (auth/rate-limit/
+    # 5xx/404) fail fast rather than yielding an empty body that would let the
+    # subsequent PATCH wipe the live PR description with just the SR section.
+    _GETBODY_FILE=/tmp/pr_get_body_${cfg.taskId}.json
+    if curl -f -sS --max-time 30 \\
+        "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/${cfg.existingPrNumber}" \\
+        -H "Authorization: token $_PTOKEN" -H "Accept: application/vnd.github+json" \\
+        -o "$_GETBODY_FILE" 2>/dev/null; then
+      _CURBODY=$(jq -r '.body // ""' "$_GETBODY_FILE" 2>/dev/null || printf '')
+      _UPDBODY=$(printf '%s' "$_CURBODY" | sed '/<!-- blueprint:self-review -->/,/<!-- \\/blueprint:self-review -->/d')
+      _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SR_SECTION")
+      _PHTTP=$(jq -n --arg b "$_UPDBODY" '{body: $b}' | curl -sS -o /dev/null -w '%{http_code}' \\
+        --max-time 30 -X PATCH \\
+        "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/${cfg.existingPrNumber}" \\
+        -H "Authorization: token $_PTOKEN" -H "Accept: application/vnd.github+json" \\
+        -H "Content-Type: application/json" --data-binary @- 2>/dev/null) || _PHTTP="000"
+      [ "$_PHTTP" = "200" ] || echo "[pr] Warning: SR body update returned HTTP $_PHTTP — continuing" >&2
+    else
+      echo "[pr] Warning: GET PR body failed — skipping SR section update to avoid wiping description" >&2
+    fi
+    rm -f "$_GETBODY_FILE"
+    unset _PTOKEN
+  fi
+fi
 ` : `
 PR_PAYLOAD=$(jq -n --arg tid "$TASK" --arg owner "${cfg.owner}" --arg repo "${cfg.repo}" \\
   --arg title "$TITLE" --arg head "${cfg.workBranch}" --arg base "${cfg.baseBranch}" --arg body "$BODY" \\
@@ -1148,7 +1220,7 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "2";
+export const SELF_REVIEW_PROMPT_VERSION = "3";
 
 // Task-type-specific self-review focus blocks. Each block overlays the generic
 // CODE_CHANGE_HELPER_GUIDANCE with concrete, type-specific scrutiny targeting
@@ -1234,6 +1306,11 @@ failing, and scope creep into unrelated files. Apply these additional checks:
 3. **Root-cause vs. symptom** — confirm the fix addresses the root cause, not just
    the observable symptom. If you only masked the symptom, record it under
    \`correctness\` with \`passed: false\`.
+4. **Fresh verdict — do not reuse the original create task's SR** — your self-review
+   must reflect THIS iteration's diff only. The original task's self-review (propagated
+   as \`_self_review_outcome\` in context) is reference material, not a template to copy.
+   Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
+   ORCHESTRATOR env — never a prior task's ID.
 `;
 
 export const DOCS_TASK_FOCUS = `
@@ -1392,7 +1469,15 @@ regressions. Compare this list against any test failures surfaced by your most r
 - If all current failures appear in the baseline (or there are no failures), record
   \`regression_risk\` with \`passed: true\`.
 - If the baseline file does not exist (fix tasks, non-main branches, auto-remediation),
-  omit \`regression_risk\` from \`check_results\` entirely.
+  compute a diff-based heuristic instead of omitting:
+  1. Run \`git diff <base>..HEAD --unified=0\`. Classify changed lines by file: test files
+     match \`*.test.ts\`, \`*.spec.*\`, \`test_*.py\`, or paths containing \`__tests__/\`.
+  2. **Signal A — source-to-test ratio**: if ≥80 source lines changed and 0 test lines, flag as risky.
+  3. **Signal B — removed exports**: count removed lines matching
+     \`export (default )?(async )?(function|class|const|let|var|type|interface|enum)\`.
+  Record \`regression_risk\` with \`passed: false\` if any signal fires, \`passed: true\` if none.
+  **Always append \`[heuristic-derived]\`** to the issue text so downstream measurement can
+  distinguish heuristic from baseline-validated results.
 
 Like \`scope-drift\`, this check does NOT block \`./done\` — it is informational and feeds
 the catch-rate dashboard.

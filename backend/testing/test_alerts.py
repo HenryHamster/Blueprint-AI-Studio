@@ -954,3 +954,326 @@ class TestSRCatchRateFloorAlert:
         ]
         assert "sr_catch_rate_regression" in event_types
         assert "sr_catch_rate_below_floor" in event_types
+
+
+# ---------------------------------------------------------------------------
+# SR catch-rate Alert rows (in-app AlertsBanner surfacing)
+# ---------------------------------------------------------------------------
+
+
+class TestSRCatchRateFloorAlertRow:
+    """Verify floor-firing path inserts an ERROR Alert row and dismisses on clear."""
+
+    def _tasks(self, project_id, *, current_hits: int, current_misses: int, prev: int = 5):
+        tasks = []
+        for _ in range(current_hits):
+            tasks.append(_make_sr_floor_task(project_id, age_days=2, hit=True))
+        for _ in range(current_misses):
+            tasks.append(_make_sr_floor_task(project_id, age_days=2, hit=False))
+        for _ in range(prev):
+            tasks.append(_make_sr_floor_task(project_id, age_days=20, hit=True))
+        return tasks
+
+    @pytest.mark.asyncio
+    async def test_floor_alert_creates_error_row(self, db_session):
+        from app.playbook_learning import (
+            compute_sr_catch_rate_trends,
+            _SR_FLOOR_ALERT_TITLE_PREFIX,
+        )
+
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.35, 0.40]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        tasks = self._tasks(project.id, current_hits=2, current_misses=3)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+        await db_session.commit()
+
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        floor_rows = [r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        assert len(floor_rows) == 1
+        row = floor_rows[0]
+        assert row.severity == AlertSeverity.ERROR
+        assert row.task_id is None
+        assert "security" in row.title
+        # Message mirrors the post_failure_alert_message description
+        assert "security" in row.message
+        assert "below floor" in row.message
+
+    @pytest.mark.asyncio
+    async def test_floor_alert_no_duplicate_when_dedup_holds(self, db_session):
+        from app.playbook_learning import (
+            compute_sr_catch_rate_trends,
+            _SR_FLOOR_ALERT_TITLE_PREFIX,
+        )
+
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.35, 0.40]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        tasks = self._tasks(project.id, current_hits=2, current_misses=3)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+            await db_session.commit()
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+            await db_session.commit()
+
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        floor_rows = [r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        assert len(floor_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_floor_alert_dismissed_on_clear(self, db_session):
+        """Firing-then-clearing dismisses the prior Alert row and clears design_doc state."""
+        from app.playbook_learning import (
+            compute_sr_catch_rate_trends,
+            _SR_FLOOR_ALERT_TITLE_PREFIX,
+        )
+
+        yesterday = (_utcnow() - timedelta(days=1)).isoformat()
+        project = make_project(design_doc={
+            "sr_catch_rate_trends": {
+                "computed_at": yesterday,
+                "categories": {"security": {"rate_history": [0.35, 0.40]}},
+            },
+        })
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Phase 1: fire
+        firing_tasks = self._tasks(project.id, current_hits=2, current_misses=3)
+        for t in firing_tasks:
+            db_session.add(t)
+        await db_session.flush()
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, firing_tasks)
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert "sr_catch_rate_floor_alert" in (project.design_doc or {})
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        assert any(r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX) for r in rows)
+
+        # Phase 2: clear (history above floor → no longer below_floor).
+        # Update design_doc rate_history to above-floor values so the next
+        # computation does not register below_floor for this category.
+        doc = dict(project.design_doc)
+        trends = dict(doc["sr_catch_rate_trends"])
+        cats = dict(trends.get("categories") or {})
+        cats["security"] = {"rate_history": [0.80, 0.85]}
+        trends["categories"] = cats
+        doc["sr_catch_rate_trends"] = trends
+        project.design_doc = doc
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        clearing_tasks = self._tasks(project.id, current_hits=4, current_misses=1)
+        for t in clearing_tasks:
+            db_session.add(t)
+        await db_session.flush()
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, clearing_tasks)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert "sr_catch_rate_floor_alert" not in (project.design_doc or {})
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        floor_rows = [r for r in rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        assert floor_rows == []
+        # Original row is still present in the table but dismissed
+        all_rows = await _all_alerts(db_session, project_id=project.id)
+        prior = [r for r in all_rows if r.title.startswith(_SR_FLOOR_ALERT_TITLE_PREFIX)]
+        assert len(prior) >= 1
+        assert all(r.dismissed_at is not None for r in prior)
+
+
+class TestSRCatchRateRegressionAlertRow:
+    """Verify regression-firing path inserts a WARNING Alert row and dismisses on clear."""
+
+    def _make_sr_task(self, project_id, *, age_days, human_cats, sr_failed_cats):
+        # Mirror _make_sr_task in test_playbook_auto.py for self-contained reuse.
+        check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+        task = Task(
+            project_id=project_id,
+            title="SR regression test task",
+            payloads=[{"type": "create", "prompt": "do something"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"check_results": check_results},
+                "_first_attempt_rejection_categories": dict(human_cats),
+            },
+        )
+        task.created_at = _utcnow() - timedelta(days=age_days)
+        return task
+
+    def _decreasing_set(self, project_id):
+        tasks = []
+        # current: 3/5 hits → 0.60
+        for _ in range(3):
+            tasks.append(self._make_sr_task(
+                project_id, age_days=2,
+                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
+            ))
+        for _ in range(2):
+            tasks.append(self._make_sr_task(
+                project_id, age_days=2,
+                human_cats={"test-coverage": 1}, sr_failed_cats=[],
+            ))
+        # previous: 5/5 hits → 1.00
+        for _ in range(5):
+            tasks.append(self._make_sr_task(
+                project_id, age_days=20,
+                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
+            ))
+        return tasks
+
+    @pytest.mark.asyncio
+    async def test_regression_alert_creates_warning_row(self, db_session):
+        from app.playbook_learning import (
+            compute_sr_catch_rate_trends,
+            _SR_REGRESSION_ALERT_TITLE_PREFIX,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        tasks = self._decreasing_set(project.id)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+        await db_session.commit()
+
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        reg_rows = [r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        assert len(reg_rows) == 1
+        row = reg_rows[0]
+        assert row.severity == AlertSeverity.WARNING
+        assert row.task_id is None
+        assert "test-coverage" in row.title
+        # Message mirrors the failure-alert description (per-category transition + arrow)
+        assert "test-coverage" in row.message
+        assert "→" in row.message
+
+    @pytest.mark.asyncio
+    async def test_regression_alert_no_duplicate_when_dedup_holds(self, db_session):
+        from app.playbook_learning import (
+            compute_sr_catch_rate_trends,
+            _SR_REGRESSION_ALERT_TITLE_PREFIX,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        tasks = self._decreasing_set(project.id)
+        for t in tasks:
+            db_session.add(t)
+        await db_session.flush()
+
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+            await db_session.commit()
+            await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+            await db_session.commit()
+
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        reg_rows = [r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        assert len(reg_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_regression_alert_dismissed_on_clear(self, db_session):
+        from app.playbook_learning import (
+            compute_sr_catch_rate_trends,
+            _SR_REGRESSION_ALERT_TITLE_PREFIX,
+        )
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Phase 1: fire
+        firing_tasks = self._decreasing_set(project.id)
+        for t in firing_tasks:
+            db_session.add(t)
+        await db_session.flush()
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, firing_tasks)
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert "sr_catch_rate_trends_alert" in (project.design_doc or {})
+
+        # Phase 2: a fresh stable dataset — both windows hit-rate 1.00, trend stable.
+        # compute_sr_catch_rate_trends operates on the explicitly-passed list, so
+        # we pass only the stable tasks (the firing tasks remain in the DB but are
+        # irrelevant to this call's analysis).
+        stable_tasks = []
+        for _ in range(5):
+            stable_tasks.append(self._make_sr_task(
+                project.id, age_days=2,
+                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
+            ))
+        for _ in range(5):
+            stable_tasks.append(self._make_sr_task(
+                project.id, age_days=20,
+                human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"],
+            ))
+        for t in stable_tasks:
+            db_session.add(t)
+        await db_session.flush()
+        with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock), \
+             patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
+             patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+            await compute_sr_catch_rate_trends(project.id, db_session, stable_tasks)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        assert "sr_catch_rate_trends_alert" not in (project.design_doc or {})
+        rows = await _undismissed_alerts(db_session, project_id=project.id)
+        reg_rows = [r for r in rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        assert reg_rows == []

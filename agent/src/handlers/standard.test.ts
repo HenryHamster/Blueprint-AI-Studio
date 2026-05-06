@@ -112,7 +112,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic } from './standard.js';
 import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -1797,14 +1797,73 @@ describe('task-type self-review focus blocks', () => {
     expect(p).toContain('Task lifecycle — you own it end-to-end');
   });
 
-  it('does not include any focus block for create task type', async () => {
+  it('includes create focus block and generic guidance for create task type', async () => {
     await handleCreate(TASK_ID, { prompt: 'do something', type: 'create' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(capturedPrompt()).not.toContain('Self-review focus:');
+    const p = capturedPrompt();
+    expect(p).toContain('Self-review focus: create tasks');
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
   });
 
   it('does not include any focus block when task type is absent', async () => {
     await handleCreate(TASK_ID, { prompt: 'do something' }, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(capturedPrompt()).not.toContain('Self-review focus:');
+  });
+});
+
+// ── computeRegressionRiskHeuristic ───────────────────────────────────────────
+describe('computeRegressionRiskHeuristic', () => {
+  it('returns passed=true for empty diff', () => {
+    const { passed, issue } = computeRegressionRiskHeuristic('');
+    expect(passed).toBe(true);
+    expect(issue).toContain('[heuristic-derived]');
+  });
+
+  it('flags high source-to-test ratio (>=80 src, 0 test lines)', () => {
+    const srcLines = Array(85).fill('+const x = 1;').join('\n');
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n${srcLines}`;
+    const { passed, issue } = computeRegressionRiskHeuristic(diff);
+    expect(passed).toBe(false);
+    expect(issue).toContain('source lines');
+    expect(issue).toContain('[heuristic-derived]');
+  });
+
+  it('does not flag ratio when test lines accompany source changes', () => {
+    const srcLines = Array(85).fill('+const x = 1;').join('\n');
+    const testLines = Array(40).fill('+expect(x).toBe(1);').join('\n');
+    const diff = [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      srcLines,
+      'diff --git a/src/foo.test.ts b/src/foo.test.ts',
+      '--- a/src/foo.test.ts',
+      '+++ b/src/foo.test.ts',
+      testLines,
+    ].join('\n');
+    const { passed } = computeRegressionRiskHeuristic(diff);
+    expect(passed).toBe(true);
+  });
+
+  it('flags removed exported function', () => {
+    const diff = [
+      'diff --git a/src/api.ts b/src/api.ts',
+      '--- a/src/api.ts',
+      '+++ b/src/api.ts',
+      '-export function handleRequest(req: Request) {}',
+    ].join('\n');
+    const { passed, issue } = computeRegressionRiskHeuristic(diff);
+    expect(passed).toBe(false);
+    expect(issue).toContain('export');
+    expect(issue).toContain('[heuristic-derived]');
+  });
+
+  it('does not flag an added export as a removal', () => {
+    const diff = [
+      'diff --git a/src/api.ts b/src/api.ts',
+      '+export function newHelper() {}',
+    ].join('\n');
+    const { passed } = computeRegressionRiskHeuristic(diff);
+    expect(passed).toBe(true);
   });
 });
 

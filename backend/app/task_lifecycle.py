@@ -2795,6 +2795,23 @@ async def _process_post_commit(
                 base_branch = review_loop.get("base_branch") or task_payload.get("base_branch", "main")
                 original_task_id = review_loop.get("original_task_id", "") or task_payload.get("original_task_id", "")
 
+                # Backend stamp: ensure fix_iteration is set on the self-review
+                # outcome so the catch-rate dashboard and reviewer priming can
+                # identify which fix iteration produced the SR. The agent stamps
+                # it via code-change.ts readSelfReviewOutcome; this is the
+                # fallback for agents that ran before that stamp was added.
+                _fix_sro = (task.context or {}).get("_self_review_outcome")
+                if isinstance(_fix_sro, dict) and "fix_iteration" not in _fix_sro:
+                    _pipeline_iter = int(review_loop.get("iteration", 2))
+                    # Pipeline sequence: review(1)→fix(2)→review(3)→fix(4)→...
+                    # fix_iteration = pipeline_iter // 2
+                    _fix_iter_n = max(1, _pipeline_iter // 2)
+                    _stamped_ctx = dict(task.context)
+                    _stamped_ctx["_self_review_outcome"] = {**_fix_sro, "fix_iteration": _fix_iter_n}
+                    task.context = _stamped_ctx
+                    flag_modified(task, "context")
+                    session.add(task)
+
                 if not pr_number or not branch:
                     logger.info(f"[REVIEW PIPELINE] Fix task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline")
                     task.latest_status_message = "Fix pipeline error: missing pr_number or branch"

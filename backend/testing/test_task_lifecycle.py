@@ -2850,3 +2850,58 @@ async def test_requeue_proceeds_when_debug_fix_failed(tl_db):
 
     await session.refresh(child)
     assert child.status == TaskStatus.CANCELLED
+
+
+# ── Fix-task SR feedback loop: fix_iteration stamp ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_fix_completion_stamps_fix_iteration_on_sr_outcome(tl_db, mocker):
+    """When a fix task completes with _self_review_outcome lacking fix_iteration,
+    the backend stamps it using review_loop.iteration as source of truth."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    # review_loop.iteration=4 → second fix iteration (review1→fix1→review2→fix2)
+    task = await _make_task(
+        session, project.id, task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "check_results": {"regression_risk": {"passed": True}},
+            },
+            "review_loop": {"iteration": 4},
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+    await session.refresh(task)
+    sro = (task.context or {}).get("_self_review_outcome") or {}
+    assert sro.get("fix_iteration") == 2  # 4 // 2 = 2
+    assert sro.get("verdict") == "pass"  # existing fields preserved
+
+
+@pytest.mark.asyncio
+async def test_fix_completion_preserves_agent_stamped_fix_iteration(tl_db, mocker):
+    """When the agent already stamped fix_iteration, the backend does not overwrite it."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fix_iteration": 3,  # already stamped by agent
+            },
+            "review_loop": {"iteration": 4},
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+    await session.refresh(task)
+    sro = (task.context or {}).get("_self_review_outcome") or {}
+    assert sro.get("fix_iteration") == 3  # agent stamp wins, not overwritten by backend

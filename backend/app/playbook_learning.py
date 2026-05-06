@@ -31,7 +31,28 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Task, Project, StrategicCycle, TaskStatus, _utcnow
+from app.models import Alert, AlertSeverity, Task, Project, StrategicCycle, TaskStatus, _utcnow
+
+# In-app Alert row title prefixes for SR catch-rate alerts. The router that
+# powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
+# to format new rows and to find/dismiss prior matching rows on clear-transition.
+_SR_REGRESSION_ALERT_TITLE_PREFIX = "Self-review catch-rate regression"
+_SR_FLOOR_ALERT_TITLE_PREFIX = "Self-review catch-rate below floor"
+# Cap how many regressing categories/severities we name in an Alert title
+# before truncating; the full breakdown lives in `Alert.message`.
+_SR_ALERT_TITLE_MAX_PARTS = 5
+
+
+def _format_sr_alert_title(prefix: str, parts: list[str]) -> str:
+    """Compose an Alert title from a prefix and a list of regressing identifiers."""
+    if not parts:
+        return prefix
+    if len(parts) > _SR_ALERT_TITLE_MAX_PARTS:
+        head = ", ".join(parts[:_SR_ALERT_TITLE_MAX_PARTS])
+        joined = f"{head}, +{len(parts) - _SR_ALERT_TITLE_MAX_PARTS} more"
+    else:
+        joined = ", ".join(parts)
+    return f"{prefix}: {joined}"
 
 # ---------------------------------------------------------------------------
 # Lifecycle constants
@@ -2699,6 +2720,37 @@ async def compute_sr_catch_rate_trends(
 
                 await post_failure_alert_message(session, project_id, description)
 
+                # Surface the regression in AlertsBanner as a real Alert row.
+                # Dedup mirror: any prior undismissed regression Alert rows
+                # for this project are dismissed unless their title matches
+                # what we are about to insert (defense-in-depth — same gate
+                # as the design_doc dedup state above).
+                title_parts = list(current_regressing_cats) + [
+                    f"{s} severity" for s in current_regressing_sevs
+                ]
+                new_alert_title = _format_sr_alert_title(
+                    _SR_REGRESSION_ALERT_TITLE_PREFIX, title_parts
+                )
+                existing_reg_alerts = (await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title.like(f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"),
+                    )
+                )).scalars().all()
+                if not any(a.title == new_alert_title for a in existing_reg_alerts):
+                    for a in existing_reg_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(Alert(
+                        project_id=project_id,
+                        severity=AlertSeverity.WARNING,
+                        title=new_alert_title,
+                        message=description,
+                    ))
+
                 webhook_payload: dict[str, Any] = {
                     "project_id": str(project_id),
                     "computed_at": result["computed_at"],
@@ -2745,6 +2797,25 @@ async def compute_sr_catch_rate_trends(
                     "[SR_CATCH_RATE_TRENDS] project=%s regression_alert categories=%s severities=%s",
                     project_id, current_regressing_cats, current_regressing_sevs,
                 )
+        elif doc.get("sr_catch_rate_trends_alert"):
+            # Clear transition: previously firing, no longer firing this cycle.
+            # Dismiss any matching undismissed Alert rows + clear design_doc state.
+            stale_alerts = (await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like(f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"),
+                )
+            )).scalars().all()
+            for a in stale_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_catch_rate_trends_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
 
@@ -2812,6 +2883,33 @@ async def compute_sr_catch_rate_trends(
 
                 await post_failure_alert_message(session, project_id, description)
 
+                # Surface as ERROR Alert row in AlertsBanner (stricter than the
+                # WARNING regression path — staying below floor for N consecutive
+                # windows is a higher-severity signal). Defense-in-depth dedup
+                # mirrors the regression path.
+                new_floor_title = _format_sr_alert_title(
+                    _SR_FLOOR_ALERT_TITLE_PREFIX, current_floor_cats
+                )
+                existing_floor_alerts = (await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.ERROR,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                    )
+                )).scalars().all()
+                if not any(a.title == new_floor_title for a in existing_floor_alerts):
+                    for a in existing_floor_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(Alert(
+                        project_id=project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=new_floor_title,
+                        message=description,
+                    ))
+
                 floor_payload: dict[str, Any] = {
                     "project_id": str(project_id),
                     "computed_at": result["computed_at"],
@@ -2847,6 +2945,24 @@ async def compute_sr_catch_rate_trends(
                     "[SR_CATCH_RATE_TRENDS] project=%s floor_alert categories=%s",
                     project_id, current_floor_cats,
                 )
+        elif doc.get("sr_catch_rate_floor_alert"):
+            # Clear transition: previously firing, no longer firing this cycle.
+            stale_floor_alerts = (await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.ERROR,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                )
+            )).scalars().all()
+            for a in stale_floor_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_catch_rate_floor_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing")
 

@@ -16,7 +16,7 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
-  getTaskTypeFocusBlock,
+  FIX_TASK_FOCUS, getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
@@ -634,7 +634,6 @@ export function buildBlueprintPrFooter(opts: {
   if (parts.length === 0) return '';
   return `<!-- blueprint:meta -->\n*${parts.join(' · ')}*`;
 }
-
 
 // Medium-scope priority hint based on which subsystem the PR touches. The
 // reviewer otherwise weights every checklist section equally, accumulating
@@ -1304,8 +1303,32 @@ export async function handleFix(
   if (fixTypeHints['fix']) {
     enrichedPrompt = `${enrichedPrompt}\n\n${fixTypeHints['fix']}`;
   }
-  const fixFocusBlock = getTaskTypeFocusBlock(fixOrigTaskType);
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  // Fix iterations always include FIX_TASK_FOCUS so self-review covers regression_risk
+  // and scope-drift for this iteration's diff. Also preserve the original task-type
+  // focus block (e.g. CREATE_TASK_FOCUS) so type-specific checks aren't lost.
+  const origTypeFocusBlock = getTaskTypeFocusBlock(fixOrigTaskType);
+  // Avoid duplicating FIX_TASK_FOCUS when the original task was also a fix task.
+  const fixSrExtra = fixOrigTaskType === 'fix' ? '' : FIX_TASK_FOCUS;
+  // Fix tasks never have a test baseline file, so the diff-based heuristic described
+  // in CODE_CHANGE_HELPER_GUIDANCE always applies. Surface this explicitly so Claude
+  // does not skip regression_risk entirely.
+  const fixHeuristicNote = '\n> **Fix-task note:** No test baseline exists for this iteration. For `regression_risk`, always use the diff-based heuristic (source-to-test ratio + removed exports) described in the Regression-risk check instructions above, and append `[heuristic-derived]` to the issue text.\n';
+  let fixSrFocusBlock = origTypeFocusBlock + fixSrExtra + fixHeuristicNote;
+  if (reviewHistory.length >= 2) {
+    const priorNorms = new Set(reviewHistory.slice(0, -1).flatMap(e =>
+      (e.issues ?? [])
+        .filter(i => ['critical', 'major'].includes(i.severity.toLowerCase()))
+        .map(i => i.description.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 80)),
+    ));
+    const repeating = (reviewHistory[reviewHistory.length - 1]?.issues ?? [])
+      .filter(i => ['critical', 'major'].includes(i.severity.toLowerCase())
+        && priorNorms.has(i.description.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 80)))
+      .map(i => i.description).slice(0, 5);
+    if (repeating.length > 0) {
+      fixSrFocusBlock += `\n4. **Repeating-issues verification** — these CRITICAL/MAJOR issues appeared in multiple prior iterations. Verify each is now resolved and record under \`correctness\` or \`regression_risk\` in your self-review JSON:\n${repeating.map(d => `- ${d}`).join('\n')}\n`;
+    }
+  }
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),

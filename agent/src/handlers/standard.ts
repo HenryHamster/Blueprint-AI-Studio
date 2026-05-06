@@ -21,6 +21,46 @@ import { runCodeChangeTask } from './code-change.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
+/**
+ * Computes a heuristic regression-risk score from a git diff when no test
+ * baseline file is available. Signals: high source-to-test line ratio and
+ * removed exported symbols. Always tags issue text with [heuristic-derived].
+ */
+export function computeRegressionRiskHeuristic(diff: string): { passed: boolean; issue: string } {
+  const lines = diff.split('\n');
+  let srcChanged = 0, testChanged = 0, removedExports = 0;
+  let currentFile = '';
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      currentFile = line.replace(/^diff --git a\/\S+ b\//, '');
+      continue;
+    }
+    if (line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+    const isTest =
+      /\/(test|spec|__tests__)\//.test(currentFile) ||
+      /\.(test|spec)\.(ts|tsx|js|py)$/.test(currentFile) ||
+      /(?:^|\/)test_[^/]+\.py$/.test(currentFile);
+    if (/^[+-]/.test(line)) {
+      if (isTest) testChanged++; else srcChanged++;
+    }
+    if (line.startsWith('-') &&
+        /^-\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|type|interface|enum)\s+\w/.test(line)) {
+      removedExports++;
+    }
+  }
+
+  const signals: string[] = [];
+  if (srcChanged >= 80 && testChanged === 0) signals.push(`+${srcChanged} source lines / 0 test lines`);
+  if (removedExports > 0) signals.push(`${removedExports} export(s) removed`);
+
+  const tag = '[heuristic-derived]';
+  if (signals.length === 0) {
+    return { passed: true, issue: `${tag} no high-risk signals (${srcChanged} src / ${testChanged} test lines)` };
+  }
+  return { passed: false, issue: `${tag} ${signals.join('; ')}` };
+}
+
 
 
 const MODELS_PATH = 'backend/app/models.py';

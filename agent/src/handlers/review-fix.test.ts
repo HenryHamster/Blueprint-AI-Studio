@@ -1974,7 +1974,7 @@ describe('handleFix task-type-specific self-review focus blocks', () => {
     expect(p).toContain('Task lifecycle — you own it end-to-end');
   });
 
-  it('does not include a type-specific block for unknown task types', async () => {
+  it('does not include other type-specific blocks for unknown task types, but always includes fix-task focus', async () => {
     for (const taskType of ['unknown', '']) {
       vi.clearAllMocks();
       await handleFix(
@@ -1988,9 +1988,10 @@ describe('handleFix task-type-specific self-review focus blocks', () => {
       expect(p).not.toContain('Self-review focus: refactor tasks');
       expect(p).not.toContain('Self-review focus: qa tasks');
       expect(p).not.toContain('Self-review focus: create tasks');
-      expect(p).not.toContain('Self-review focus: fix tasks');
       expect(p).not.toContain('Self-review focus: docs tasks');
       expect(p).not.toContain('Self-review focus: deps tasks');
+      // FIX_TASK_FOCUS is always injected for fix iterations regardless of original type
+      expect(p).toContain('Self-review focus: fix tasks');
       expect(p).toContain('Task lifecycle — you own it end-to-end'); // generic always present
     }
   });
@@ -2106,5 +2107,52 @@ describe('handleReview prompt determinism', () => {
       statusRef(),
     );
     expect(vi.mocked(indexMod.setCurrentPromptFingerprint)).toHaveBeenLastCalledWith(expected);
+  });
+});
+
+// ── handleFix: fix-task self-review SR focus ─────────────────────────────────
+describe('handleFix — fix-task SR focus block', () => {
+  it('includes FIX_TASK_FOCUS content (regression_risk, scope-drift) in the fix prompt', async () => {
+    await handleFix(
+      'task-fix-sr-focus',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 200, prompt: 'address review feedback' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('Self-review focus: fix tasks');
+    expect(prompt).toContain('regression_risk');
+    expect(prompt).toContain('scope-drift');
+  });
+
+  it('appends a repeating-issues verification directive when CRITICAL/MAJOR issues recur across iterations', async () => {
+    const reviewHistory = [
+      { iteration: 1, feedback: 'missing null check', issues: [{ severity: 'critical', description: 'null dereference in handler' }] },
+      { iteration: 2, feedback: 'still present',       issues: [{ severity: 'critical', description: 'null dereference in handler' }] },
+    ];
+    await handleFix(
+      'task-fix-sr-repeating',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 201, prompt: 'fix the null dereference' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: reviewHistory } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('Repeating-issues verification');
+    expect(prompt).toContain('null dereference in handler');
+  });
+
+  it('does not append the repeating-issues directive when there are no recurring CRITICAL/MAJOR issues', async () => {
+    const reviewHistory = [
+      { iteration: 1, feedback: 'missing test', issues: [{ severity: 'minor', description: 'add docstring' }] },
+      { iteration: 2, feedback: 'addressed',    issues: [{ severity: 'minor', description: 'style nit' }] },
+    ];
+    await handleFix(
+      'task-fix-sr-no-repeating',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 202, prompt: 'fix style' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: reviewHistory } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('Repeating-issues verification');
   });
 });

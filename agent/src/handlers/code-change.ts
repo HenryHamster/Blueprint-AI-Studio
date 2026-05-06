@@ -41,6 +41,10 @@ export interface CodeChangeTaskOpts {
   /** When set, Claude is fixing an existing PR (review-fix path). ./pr open
    *  pushes to the existing PR's branch instead of creating a new one. */
   existingPrNumber?: number;
+  /** Fix iteration number (1-based). When set alongside existingPrNumber, stamped
+   *  on the SR outcome and written to the fix-SR context file so Claude scopes its
+   *  self-review to THIS iteration's diff, not the cumulative PR diff. */
+  fixIteration?: number;
   /** When true, ./check test runs the Docker backend test suite when changes
    *  touch backend/. Set when baseBranch === 'main'. */
   testsOnMainBranch: boolean;
@@ -69,8 +73,10 @@ export interface CodeChangeTaskOpts {
   incompleteReviewRecoveryFn?: () => Promise<void>;
 }
 
-/** Read Claude's self-review JSON and ensure prompt_version is stamped. */
-function readSelfReviewOutcome(taskId: string): Record<string, unknown> | null {
+/** Read Claude's self-review JSON and ensure prompt_version is stamped.
+ *  For fix tasks, also stamps fix_iteration so the SR outcome carries
+ *  iteration context for the catch-rate dashboard and reviewer priming. */
+function readSelfReviewOutcome(taskId: string, fixIteration?: number): Record<string, unknown> | null {
   const path = `/tmp/self_review_${taskId}.json`;
   try {
     if (!fs.existsSync(path)) return null;
@@ -79,10 +85,71 @@ function readSelfReviewOutcome(taskId: string): Record<string, unknown> | null {
     if (!('prompt_version' in parsed)) {
       parsed.prompt_version = SELF_REVIEW_PROMPT_VERSION;
     }
+    if (fixIteration !== undefined) {
+      parsed.fix_iteration = fixIteration;
+    }
     return parsed;
   } catch {
     return null;
   }
+}
+
+// Mirrors computeRegressionRiskHeuristic from standard.ts — kept local to
+// avoid circular import (standard.ts already imports runCodeChangeTask here).
+function heuristicRegressionRisk(diff: string): { passed: boolean; issue: string } {
+  const lines = diff.split('\n');
+  let srcChanged = 0, testChanged = 0, removedExports = 0;
+  let currentFile = '';
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) { currentFile = line.replace(/^diff --git a\/\S+ b\//, ''); continue; }
+    if (line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+    const isTest =
+      /\/(test|spec|__tests__)\//.test(currentFile) ||
+      /\.(test|spec)\.(ts|tsx|js|py)$/.test(currentFile) ||
+      /(?:^|\/)test_[^/]+\.py$/.test(currentFile);
+    if (/^[+-]/.test(line)) { if (isTest) testChanged++; else srcChanged++; }
+    if (line.startsWith('-') &&
+        /^-\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|type|interface|enum)\s+\w/.test(line)) {
+      removedExports++;
+    }
+  }
+  const signals: string[] = [];
+  if (srcChanged >= 80 && testChanged === 0) signals.push(`+${srcChanged} source lines / 0 test lines`);
+  if (removedExports > 0) signals.push(`${removedExports} export(s) removed`);
+  const tag = '[heuristic-derived]';
+  if (signals.length === 0) return { passed: true, issue: `${tag} no high-risk signals (${srcChanged} src / ${testChanged} test lines)` };
+  return { passed: false, issue: `${tag} ${signals.join('; ')}` };
+}
+
+/** Inject a heuristic regression_risk entry when no baseline file exists. */
+function augmentSelfReview(
+  selfReview: Record<string, unknown> | null,
+  taskId: string,
+  baseCommit: string,
+): Record<string, unknown> | null {
+  if (!selfReview) return null;
+  if (fs.existsSync(`/tmp/test_baseline_${taskId}.json`)) return selfReview;
+  const checkResults = (selfReview.check_results ?? {}) as Record<string, unknown>;
+  if ('regression_risk' in checkResults) return selfReview;
+  try {
+    const diff = git(['diff', `${baseCommit}..HEAD`]);
+    selfReview.check_results = { ...checkResults, regression_risk: heuristicRegressionRisk(diff) };
+  } catch { /* git unavailable — leave check_results unchanged */ }
+  return selfReview;
+}
+
+/** Write a fix-task self-review context file before Claude runs.
+ *  Records the per-iteration base commit so Claude scopes scope-drift and
+ *  regression_risk checks to THIS iteration's diff, not the cumulative PR diff.
+ *  The file is also cleaned up in the stale marker sweep on each run. */
+function writeFixSRContext(taskId: string, baseCommit: string, prNumber: number, fixIteration: number): void {
+  try {
+    fs.writeFileSync(
+      `/tmp/fix_sr_context_${taskId}.json`,
+      JSON.stringify({ is_fix_task: true, fix_base_commit: baseCommit, pr_number: prNumber, fix_iteration: fixIteration, required_sr_categories: ['regression_risk', 'scope-drift'] }, null, 2),
+      { mode: 0o644 },
+    );
+  } catch { /* non-fatal */ }
 }
 
 /**
@@ -120,6 +187,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     `/tmp/base_commit_${taskId}`,
     `/tmp/fix_responses_${taskId}.json`,
     `/tmp/self_review_${taskId}.json`,
+    `/tmp/fix_sr_context_${taskId}.json`,
     `/tmp/task_${taskId}_result.json`,
     `/tmp/test_baseline_${taskId}.json`,
   ]) {
@@ -134,6 +202,13 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   } catch (e) {
     sendLog(ws, `[wrapper] Failed to write base_commit marker: ${e instanceof Error ? e.message : String(e)}\n`);
     // Non-fatal — ./done's enrichment is optional.
+  }
+
+  // 1a. For fix tasks, write a context file that tells Claude what base commit
+  //     to use when computing scope-drift and regression_risk in its SR. This
+  //     ensures SR reflects THIS iteration's diff, not the cumulative PR diff.
+  if (opts.existingPrNumber !== undefined) {
+    writeFixSRContext(taskId, opts.baseCommit, opts.existingPrNumber, opts.fixIteration ?? 1);
   }
 
   // 1. Write helpers (./check, ./pr, ./done, ./fail). Existing helpers
@@ -205,7 +280,11 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
       const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
       changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
     } catch { /* git may be in odd state — best effort */ }
-    const selfReview = readSelfReviewOutcome(taskId);
+    const selfReview = augmentSelfReview(
+      readSelfReviewOutcome(taskId, opts.existingPrNumber !== undefined ? (opts.fixIteration ?? 1) : undefined),
+      taskId,
+      opts.baseCommit,
+    );
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'COMPLETED',
