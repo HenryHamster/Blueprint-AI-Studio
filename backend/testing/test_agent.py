@@ -254,6 +254,74 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
+async def test_agent_heartbeat_persists_valid_prompt_fingerprint(client: AsyncClient, db_session):
+    """Heartbeat accepts the persisted 12-char lowercase-hex fingerprint contract."""
+    project = Project(name="Heartbeat Prompt Fingerprint", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-fingerprint",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-fingerprint")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "prompt_fingerprint": "abcdef123456",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.prompt_fingerprint == "abcdef123456"
+    assert (task.context or {}).get("prompt_fingerprint") == "abcdef123456"
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_rejects_invalid_prompt_fingerprint_shape(client: AsyncClient, db_session):
+    """Heartbeat rejects prompt fingerprints that do not match the 12-hex contract."""
+    project = Project(name="Heartbeat Invalid Prompt Fingerprint", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-invalid-fingerprint",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-invalid-fingerprint")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "prompt_fingerprint": "abcdef1234567890",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 422
+    await db_session.refresh(task)
+    assert task.prompt_fingerprint is None
+    assert (task.context or {}).get("prompt_fingerprint") is None
+
+
+@pytest.mark.asyncio
 async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(client: AsyncClient, db_session):
     """
     Tests that the heartbeat endpoint accepts a heartbeat from an agent whose task

@@ -3,12 +3,14 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, apiGet, runClaudeCode,
+  setCurrentPromptFingerprint, sendHeartbeatSync,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
+  computePromptFingerprint,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 
@@ -231,6 +233,9 @@ Skip full re-analysis of systems with no files in the manifest.
     - There is no reward for playbook volume. Fewer, sharper entries is better than hundreds of vague ones.`;
 
   statusRef.value = 'Running architecture review...';
+  const promptFingerprint = computePromptFingerprint('design_doc_update');
+  setCurrentPromptFingerprint(promptFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   let { exitCode } = await runClaudeCode(prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Post-check: verify the agent actually called ./design-doc

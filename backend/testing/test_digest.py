@@ -7505,6 +7505,239 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     assert body["total_distinct_themes"] == 2
 
 
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/prompt-fingerprint-analytics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_groups_by_fingerprint(
+    client: AsyncClient, db_session
+):
+    """Code-change tasks bucket by prompt_fingerprint with correct success/skip rates."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    # Fingerprint A: 3 tasks, 2 first-attempt successes, 0 SR skips
+    for succ in (True, True, False):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            prompt_fingerprint="aaaaaaaaaaaa",
+            context={
+                "_first_attempt_succeeded": succ,
+                "_self_review_outcome": _sr_valid_outcome(),
+                **(
+                    {} if succ
+                    else {"_first_attempt_rejection_categories": ["correctness"]}
+                ),
+            },
+        ))
+    # Fingerprint B: 3 tasks, 0 first-attempt successes, 1 SR skip
+    for i in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            prompt_fingerprint="bbbbbbbbbbbb",
+            context={
+                "_first_attempt_succeeded": False,
+                "_first_attempt_rejection_categories": ["correctness", "performance"],
+                "_self_review_outcome": (
+                    _sr_skipped_envelope_unknown_verdict() if i == 0
+                    else _sr_valid_outcome()
+                ),
+            },
+        ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["window_days"] == 30
+    assert body["sample_size"] == 6
+
+    by_fp = {fp["fingerprint"]: fp for fp in body["fingerprints"]}
+    assert set(by_fp) == {"aaaaaaaaaaaa", "bbbbbbbbbbbb"}
+
+    a = by_fp["aaaaaaaaaaaa"]
+    assert a["sample_size"] == 3
+    assert a["first_attempt_measured"] == 3
+    assert a["first_attempt_success_rate"] == round(2 / 3, 3)
+    assert a["sr_skip_rate"] == 0.0
+    assert a["rejection_category_counts"] == {"correctness": 1}
+
+    b = by_fp["bbbbbbbbbbbb"]
+    assert b["sample_size"] == 3
+    assert b["first_attempt_success_rate"] == 0.0
+    assert b["sr_skip_rate"] == round(1 / 3, 3)
+    assert b["rejection_category_counts"] == {"correctness": 3, "performance": 3}
+
+    # Project mean = 2/6 successes = 0.333; A above, B below.
+    assert body["project_first_attempt_success_rate"] == round(2 / 6, 3)
+    assert a["delta_vs_project_mean"] is not None and a["delta_vs_project_mean"] > 0
+    assert b["delta_vs_project_mean"] is not None and b["delta_vs_project_mean"] < 0
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_unknown_bucket_for_legacy_rows(
+    client: AsyncClient, db_session
+):
+    """Tasks without a prompt_fingerprint fall into an `unknown` bucket."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            prompt_fingerprint=None,
+            context={"_first_attempt_succeeded": True, "_self_review_outcome": _sr_valid_outcome()},
+        ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics"
+    )
+    assert response.status_code == 200
+    fps = response.json()["fingerprints"]
+    assert len(fps) == 1
+    assert fps[0]["fingerprint"] == "unknown"
+    assert fps[0]["sample_size"] == 3
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_falls_back_to_context_mirror(
+    client: AsyncClient, db_session
+):
+    """Legacy rows use context.prompt_fingerprint when the column is null."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            prompt_fingerprint=None,
+            context={
+                "prompt_fingerprint": "legacyfp12345",
+                "_first_attempt_succeeded": True,
+                "_self_review_outcome": _sr_valid_outcome(),
+            },
+        ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics"
+    )
+    assert response.status_code == 200
+    fps = response.json()["fingerprints"]
+    assert len(fps) == 1
+    assert fps[0]["fingerprint"] == "legacyfp12345"
+    assert fps[0]["sample_size"] == 3
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_excludes_non_code_change(
+    client: AsyncClient, db_session
+):
+    """Research/plan task types are not counted toward fingerprint analytics."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    # 3 research tasks (excluded) sharing a fingerprint
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            prompt_fingerprint="cccccccccccc",
+            context={"_first_attempt_succeeded": True, "_self_review_outcome": _sr_valid_outcome()},
+        ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sample_size"] == 0
+    assert body["fingerprints"] == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_filters_below_min_sample_size(
+    client: AsyncClient, db_session
+):
+    """Fingerprint buckets with sample_size < min_sample_size are excluded."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    # Fingerprint A has 3 tasks; B has 1 task — only A should survive a min of 2.
+    for _ in range(3):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            prompt_fingerprint="aaaaaaaaaaaa",
+            context={"_first_attempt_succeeded": True, "_self_review_outcome": _sr_valid_outcome()},
+        ))
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        prompt_fingerprint="bbbbbbbbbbbb",
+        context={"_first_attempt_succeeded": False, "_self_review_outcome": _sr_valid_outcome()},
+    ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics?min_sample_size=2"
+    )
+    assert response.status_code == 200
+    fps = response.json()["fingerprints"]
+    assert [f["fingerprint"] for f in fps] == ["aaaaaaaaaaaa"]
+    # Project mean still includes the singleton — sample_size counts all 4.
+    assert response.json()["sample_size"] == 4
+
+
+@pytest.mark.asyncio
+async def test_prompt_fingerprint_analytics_requires_project_membership(
+    client: AsyncClient, db_session
+):
+    """Non-member callers get 404 from _get_user_project_with_role."""
+    project = make_project(user_id="some-other-owner")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Intentionally skip make_membership for the test user.
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/prompt-fingerprint-analytics"
+    )
+    assert response.status_code == 404
+
+
 
 # ---------------------------------------------------------------------------
 # SR reviewer-disagreement aggregation

@@ -1,10 +1,11 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, gitAsync,
-  runClaudeCode,
+  runClaudeCode, sendHeartbeatSync, setCurrentPromptFingerprint,
   captureTestBaseline, testFixLoop, extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
 } from '../index.js';
@@ -17,7 +18,7 @@ import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
-  readClaudeMd, formatProjectContext, configureAgentPermissions,
+  readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -105,6 +106,239 @@ type DriftInEntry = {
   flag_count?: number;
 };
 type DriftSignal = { drift_in?: DriftInEntry[]; drift_out?: string[] };
+
+type ReviewPromptFingerprintOptions = {
+  branch?: string;
+  baseBranch?: string;
+  includePlannedFilesClassificationGuidance?: boolean;
+};
+
+// ── Static review-guidance fragments (shared with prompt fingerprint) ────────
+// These constants and helpers are consumed by both `handleReview()`'s launched
+// prompt and `buildReviewPromptFingerprintContent()`. Edits to any fragment
+// move the fingerprint, so review telemetry tracks real prompt changes and
+// cannot silently drift while claiming the same version.
+const REVIEW_CLAUDEMD_PROMPT_HEADER = '## Codebase Instructions\n';
+const REVIEW_CLAUDEMD_PROMPT_FOOTER = '\n\nCheck that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.\n\n';
+const REVIEW_FILE_RESTRICTIONS_NOTE = 'Check that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.';
+
+const REVIEW_HISTORY_INTRO = 'Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):';
+const REVIEW_ITERATION_PRIOR_NOTE = '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.';
+
+function buildReviewBudgetMidHint(maxIters: number): string {
+  return `\nBudget-awareness: you are at or past 50% of the ${maxIters}-iteration budget. Do NOT flag MINOR-severity issues — every iteration now costs a meaningful fraction of remaining budget and cosmetic nits are not worth a round trip. Focus only on CRITICAL and MAJOR findings. If only MINOR issues remain, APPROVE and note them as non-blocking polish in \`feedback\`.`;
+}
+const REVIEW_SMALL_SCOPE_EARLY_HINT = `\nSmall-scope early-iteration guidance: MINOR-severity issues (cosmetic nits, naming preferences, non-critical style) are NON-BLOCKING for small-scope changes. Do NOT include them in the \`issues\` array — mention them in \`feedback\` as optional polish. Only CRITICAL and MAJOR issues should drive a REQUEST_CHANGES verdict. A small-scope PR with only MINOR findings should APPROVE.`;
+
+export function buildReviewIterationPreamble(
+  iteration: number,
+  maxIters: number,
+  midBudget: boolean,
+  smallScopeEarly: boolean,
+): string {
+  const budgetHint = midBudget ? buildReviewBudgetMidHint(maxIters) : '';
+  const smallHint = smallScopeEarly ? REVIEW_SMALL_SCOPE_EARLY_HINT : '';
+  const priorNote = iteration > 1 ? REVIEW_ITERATION_PRIOR_NOTE : '';
+  return `This is review iteration ${iteration} of ${maxIters} in the automated review-fix cycle.${priorNote}${budgetHint}${smallHint}`;
+}
+
+const REVIEW_QA_FOCUS_HINT = 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n';
+const REVIEW_MIGRATE_FOCUS_HINT = 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n';
+
+const REVIEW_SMALL_SCOPE_PREAMBLE = 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n';
+const REVIEW_LARGE_SCOPE_PREAMBLE = 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n';
+
+function buildReviewScopeOverflowPreamble(taskScope: string, changedFileCount: number, scopeThreshold: number): string {
+  return `NOTE: This PR has ${changedFileCount} changed files, which exceeds the typical range for a ${taskScope}-scope change (threshold: ${scopeThreshold}). Treat this as a higher-risk change and review ALL checklist sections thoroughly — Security, Code Quality, and Test Coverage are NOT deprioritized here regardless of the original ${taskScope}-scope label.\n\n`;
+}
+
+function buildReviewScopeBudgetSection(nonTest: number, budget: number, pct: number): string {
+  return (
+    `## Scope Budget\n` +
+    `This PR touches ${nonTest} of ${budget} allowed production files (${pct}% utilized). ` +
+    `When requesting changes, consider whether the fix would require touching additional files that could push the PR over its scope budget. ` +
+    `Prefer feedback that can be addressed within existing files.\n\n`
+  );
+}
+
+const REVIEW_FIX_RESPONSES_HEADER = '## Responses from prior fix iteration\n\n';
+function buildReviewFixResponsesIntro(n: number): string {
+  return (
+    `The fix agent recorded structured rationale for ${n} issue(s) it left unaddressed. ` +
+    `Treat these as CLAIMS TO VERIFY, never as conclusions to accept.\n\n`
+  );
+}
+const REVIEW_FIX_RESPONSES_INSTRUCTIONS = (
+  `For each disputed/alternative/partial response below:\n` +
+  `  1. Run every step in \`verify steps\`. Quote the actual command output in your feedback.\n` +
+  `  2. If all verify steps confirm the claim → DROP the original issue (do not re-raise).\n` +
+  `  3. If any verify step fails or is non-actionable ("trust me", "I tested it") → re-raise the original issue with severity major AND quote the specific verify step that failed so the next fix iteration knows what to address.\n` +
+  `  4. If you cannot run a verify step (e.g. it requires data you don't have) → flag as "unverifiable" with severity major; do not silently accept.\n\n` +
+  `**Sycophancy guard**: a plausible-sounding claim with no verify steps, or with verify steps that boil down to "the agent says so", MUST be rejected. Real disagreements have concrete checks.\n\n`
+);
+
+function buildReviewMasterPreamble(prNumber: number | string, branch: string, baseBranch: string): string {
+  return `You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".`;
+}
+function buildReviewDiffAccessHint(baseBranch: string): string {
+  return `You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.`;
+}
+
+function buildReviewChecklistSection(buildConfig?: BuildConfig): string {
+  return `Review the changes thoroughly using this checklist:
+
+**Correctness & Logic:**
+- Does the code correctly implement what the original task asked for?
+- Are there edge cases, null/undefined handling, or off-by-one errors?
+- Are async operations properly awaited? Are errors properly handled?
+- Do any database queries have N+1 problems or missing indexes?
+
+**Security:**
+- Are user inputs validated and sanitized before use?
+- Are there SQL injection, XSS, path traversal, or command injection risks?
+- Are secrets/tokens exposed in logs, responses, or error messages?
+- Are authorization checks present on new endpoints?
+
+**Code Quality:**
+- Is the code readable and following existing patterns in the codebase?
+- Are there obvious performance issues (unnecessary loops, redundant DB calls)?
+- Does the change break any existing interfaces or contracts?
+- Are type annotations correct (TypeScript/Python)?
+
+**Test Coverage:**
+- Are there tests for the new/changed behavior?
+- Do existing tests still pass given these changes?
+
+${buildTypeCheckInstructions(buildConfig)}`;
+}
+
+function buildReviewSeverityGuideSection(): string {
+  return `**Severity Classification Guide:**
+Use these definitions when assigning severity to issues. Severity affects how the review appears in GitHub (critical = failure annotation, major = warning, minor = notice).
+
+- **CRITICAL** — Issues that could cause security vulnerabilities, data loss, crashes, or correctness bugs in production. Examples:
+  - SQL/command injection from unsanitized user input passed directly to a query or shell
+  - Missing auth check on a new endpoint that exposes sensitive data
+  - Off-by-one in a loop that silently skips or double-processes records in a DB migration
+
+- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, or violations of the codebase's established patterns. Examples:
+  - Async function whose rejection is silently swallowed (missing try/catch or .catch())
+  - New API endpoint with no test coverage at all
+  - New code that bypasses an existing invariant (e.g., writing to a field that has a single designated writer elsewhere in the codebase)
+
+- **MINOR** — Style inconsistencies, naming suggestions, documentation gaps, or optional improvements that do not affect correctness. Examples:
+  - Variable named \`data\` where \`userRecord\` would be clearer
+  - Missing docstring on a public function
+  - Redundant else after a return statement`;
+}
+
+function buildReviewVerdictInstructions(taskId: string): string {
+  return `After your review, output EXACTLY ONE of the following JSON blocks as the last line of your response. There are only two valid verdicts — no third option exists.
+
+**APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
+{"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
+
+**REQUEST_CHANGES** — something actionable must change before this merges. Use this for any bug, missing test, broken invariant, merge conflict, failing CI signal, or behavior that would surprise a reader. If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES — another round is cheap; a missed regression is expensive.
+{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
+
+Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY", or any other verdict — they are not accepted and will be normalized to REQUEST_CHANGES. There is no informational-only path: if the change is acceptable → APPROVE (put observations in \`feedback\`); if anything needs changing → REQUEST_CHANGES.
+
+For each issue in the \`issues\` array:
+- \`file\`: repo-relative path to the file where the issue is located (optional — omit if not tied to a specific file)
+- \`line\`: line number in the file (optional — omit if not applicable)
+- Issues without \`file\`/\`line\` are still valid and will be included in the review body summary
+
+IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
+}
+
+function buildRollupReviewGuidance(branch: string, baseBranch: string): string {
+  const isRollupHead = branch.startsWith('research/') || branch.startsWith('plan/');
+  return isRollupHead
+    ? `
+**Rollup-PR verification (IMPORTANT — head branch "${branch}" looks like a rollup):**
+A rollup PR aggregates subtask squash-merges into one branch. Commits titled like
+"Some feature (#1234)" are subtask merges INTO this rollup branch, not into
+${baseBranch}. Before concluding this PR is "empty" or "already merged", verify
+objectively:
+- Run \`git fetch origin ${baseBranch}\` then \`git merge-base --is-ancestor <sha> origin/${baseBranch}\`
+  for any commit SHA you suspect is already on ${baseBranch}. Exit code 0 means
+  it IS an ancestor; exit code 1 means it is NOT.
+- Run \`git diff --stat origin/${baseBranch}...HEAD\` — a non-empty stat means
+  the PR has real changes relative to ${baseBranch}, regardless of how commit
+  titles look.
+- \`(#NNNN)\` in a commit message is just GitHub's squash-merge format. It does
+  NOT imply the commit is on ${baseBranch}.
+Only claim "empty PR" / "already merged" if BOTH the merge-base check AND the
+diff --stat confirm it. Otherwise treat this as a normal rollup and review the
+actual changes.
+`
+    : '';
+}
+
+function buildPlannedFilesClassificationGuidance(): string {
+  return `Classify each unplanned non-test file before flagging. Apply skepticism — do not assume a stated reason is correct, but do not flag categories that are valid even when unstated:
+  - scope-creep: file has no causal link to anything in the plan or prior reviews. → MAJOR.
+  - caller-impact: a planned file's API change forced consumer updates here. Verify the consumer reference exists (grep the planned file for the new/changed API and confirm this file uses it). → not a violation.
+  - discovered-dependency: planned change required a missing import / helper / flag-flip that lives here. Verify by reading the planned file and confirming the dependency. → not a violation.
+  - cluster-boundary-correction: file logically belongs in this cluster but was misallocated to a sibling task. Verify the PR description explicitly explains the correction. → not a violation IF acknowledged in PR description; flag MAJOR if not acknowledged.
+If unsure on edge cases, do not flag — let the operator decide.`;
+}
+
+function buildReviewCoreGuidance(buildConfig: BuildConfig | undefined, taskId: string): string {
+  return `${buildReviewChecklistSection(buildConfig)}
+
+${buildReviewSeverityGuideSection()}
+
+${buildReviewVerdictInstructions(taskId)}`;
+}
+
+function buildReviewPromptFingerprintContent(
+  buildConfig?: BuildConfig,
+  options: ReviewPromptFingerprintOptions = {},
+): string {
+  // Concatenation of every static review-guidance fragment that handleReview()
+  // can inject into the launched prompt. Conditional branches are forced ON
+  // here (e.g. iteration > 1, mid-budget, small-scope-early) so an edit to any
+  // template fragment moves the fingerprint regardless of whether a specific
+  // task happens to trigger that branch. Per-task data is filled with stable
+  // placeholders so the fingerprint stays invariant across tasks.
+  const sections: string[] = [
+    REVIEW_CLAUDEMD_PROMPT_HEADER,
+    REVIEW_CLAUDEMD_PROMPT_FOOTER,
+    REVIEW_HISTORY_INTRO,
+    buildReviewIterationPreamble(2, 0, true, true),
+    REVIEW_QA_FOCUS_HINT,
+    REVIEW_MIGRATE_FOCUS_HINT,
+    REVIEW_SMALL_SCOPE_PREAMBLE,
+    REVIEW_LARGE_SCOPE_PREAMBLE,
+    buildReviewScopeOverflowPreamble('<SCOPE>', 0, 0),
+    buildReviewScopeBudgetSection(0, 0, 0),
+    REVIEW_FIX_RESPONSES_HEADER,
+    buildReviewFixResponsesIntro(0),
+    REVIEW_FIX_RESPONSES_INSTRUCTIONS,
+    buildReviewMasterPreamble('<PR>', '<BRANCH>', '<BASE>'),
+    buildReviewDiffAccessHint('<BASE>'),
+    REVIEW_FILE_RESTRICTIONS_NOTE,
+    buildReviewCoreGuidance(buildConfig, 'TASK_ID'),
+  ];
+  const rollupGuidance = buildRollupReviewGuidance(options.branch || '', options.baseBranch || 'main');
+  if (rollupGuidance) sections.push(rollupGuidance.trim());
+  if (options.includePlannedFilesClassificationGuidance) {
+    sections.push(buildPlannedFilesClassificationGuidance());
+  }
+  sections.push(DEFAULT_TOOL_GUIDANCE);
+  return sections.join('\n\n');
+}
+
+export function computeReviewPromptFingerprint(
+  buildConfig?: BuildConfig,
+  options: ReviewPromptFingerprintOptions = {},
+): string {
+  return createHash('sha256')
+    .update(buildReviewPromptFingerprintContent(buildConfig, options))
+    .digest('hex')
+    .slice(0, 12);
+}
 
 // Jaccard token-overlap threshold for treating a rephrased issue as the SAME
 // concept. Reviewers often paraphrase between iterations ("missing null check"
@@ -552,11 +786,11 @@ export async function handleReview(
   const scopeThreshold = SCOPE_OVERFLOW_THRESHOLDS[taskScope];
   const isScopeOverflow = !!(scopeThreshold && changedFileCount > scopeThreshold);
   const scopePreamble = isScopeOverflow
-    ? `NOTE: This PR has ${changedFileCount} changed files, which exceeds the typical range for a ${taskScope}-scope change (threshold: ${scopeThreshold}). Treat this as a higher-risk change and review ALL checklist sections thoroughly — Security, Code Quality, and Test Coverage are NOT deprioritized here regardless of the original ${taskScope}-scope label.\n\n`
+    ? buildReviewScopeOverflowPreamble(taskScope, changedFileCount, scopeThreshold)
     : taskScope === 'small'
-      ? 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n'
+      ? REVIEW_SMALL_SCOPE_PREAMBLE
       : taskScope === 'large'
-        ? 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n'
+        ? REVIEW_LARGE_SCOPE_PREAMBLE
         : taskScope === 'medium'
           ? detectMediumScopeSubsystemHint(changedFiles)
           : '';
@@ -564,7 +798,7 @@ export async function handleReview(
   // Read CLAUDE.md for codebase instructions
   const reviewClaudeMd = readClaudeMd();
   const reviewClaudeMdPrefix = reviewClaudeMd
-    ? `## Codebase Instructions\n${reviewClaudeMd}\n\nCheck that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.\n\n`
+    ? `${REVIEW_CLAUDEMD_PROMPT_HEADER}${reviewClaudeMd}${REVIEW_CLAUDEMD_PROMPT_FOOTER}`
     : '';
 
   // Read project_context for active/sibling task awareness
@@ -575,7 +809,7 @@ export async function handleReview(
   // Build prior review history section (for iterations > 1)
   const annotatedReviewHistory = annotateResolvedIssues(reviewHistory);
   const reviewHistorySection = annotatedReviewHistory.length > 0 && iteration > 1
-    ? `Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):\n${annotatedReviewHistory.map(e => {
+    ? `${REVIEW_HISTORY_INTRO}\n${annotatedReviewHistory.map(e => {
         if (e.issues && e.issues.length > 0) {
           const critical = e.issues.filter(i => i.severity === 'critical').map(i => fmtAnnotatedIssue('CRITICAL', i));
           const major = e.issues.filter(i => i.severity === 'major').map(i => fmtAnnotatedIssue('MAJOR', i));
@@ -589,13 +823,10 @@ export async function handleReview(
   // Build iteration preamble with graduated budget guidance
   const reviewMaxIterations = computeMaxFixIterations(task);
   const reviewMidBudget = iteration * 2 >= reviewMaxIterations && iteration < reviewMaxIterations;
-  const reviewBudgetHint = reviewMidBudget
-    ? `\nBudget-awareness: you are at or past 50% of the ${reviewMaxIterations}-iteration budget. Do NOT flag MINOR-severity issues — every iteration now costs a meaningful fraction of remaining budget and cosmetic nits are not worth a round trip. Focus only on CRITICAL and MAJOR findings. If only MINOR issues remain, APPROVE and note them as non-blocking polish in \`feedback\`.`
-    : '';
-  const smallScopeEarlyHint = iteration === 1 && taskScope === 'small' && !isScopeOverflow
-    ? `\nSmall-scope early-iteration guidance: MINOR-severity issues (cosmetic nits, naming preferences, non-critical style) are NON-BLOCKING for small-scope changes. Do NOT include them in the \`issues\` array — mention them in \`feedback\` as optional polish. Only CRITICAL and MAJOR issues should drive a REQUEST_CHANGES verdict. A small-scope PR with only MINOR findings should APPROVE.`
-    : '';
-  const iterationPreamble = `This is review iteration ${iteration} of ${reviewMaxIterations} in the automated review-fix cycle.${iteration > 1 ? '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.' : ''}${reviewBudgetHint}${smallScopeEarlyHint}`;
+  const smallScopeEarly = iteration === 1 && taskScope === 'small' && !isScopeOverflow;
+  const iterationPreamble = buildReviewIterationPreamble(
+    iteration, reviewMaxIterations, reviewMidBudget, smallScopeEarly,
+  );
 
   // Rollup PRs (head branch research/* or plan/*) contain N subtask squash-merge
   // commits whose titles end in "(#NNNN)". The `(#NNNN)` marker means a PR was
@@ -603,27 +834,7 @@ export async function handleReview(
   // the rollup branch. We've seen reviewers misread these as "already-on-main"
   // and flag perfectly valid rollup PRs as empty, looping the fix agent on
   // nothing. Make the verification steps explicit.
-  const isRollupHead = branch.startsWith('research/') || branch.startsWith('plan/');
-  const rollupGuidance = isRollupHead
-    ? `
-**Rollup-PR verification (IMPORTANT — head branch "${branch}" looks like a rollup):**
-A rollup PR aggregates subtask squash-merges into one branch. Commits titled like
-"Some feature (#1234)" are subtask merges INTO this rollup branch, not into
-${baseBranch}. Before concluding this PR is "empty" or "already merged", verify
-objectively:
-- Run \`git fetch origin ${baseBranch}\` then \`git merge-base --is-ancestor <sha> origin/${baseBranch}\`
-  for any commit SHA you suspect is already on ${baseBranch}. Exit code 0 means
-  it IS an ancestor; exit code 1 means it is NOT.
-- Run \`git diff --stat origin/${baseBranch}...HEAD\` — a non-empty stat means
-  the PR has real changes relative to ${baseBranch}, regardless of how commit
-  titles look.
-- \`(#NNNN)\` in a commit message is just GitHub's squash-merge format. It does
-  NOT imply the commit is on ${baseBranch}.
-Only claim "empty PR" / "already merged" if BOTH the merge-base check AND the
-diff --stat confirm it. Otherwise treat this as a normal rollup and review the
-actual changes.
-`
-    : '';
+  const rollupGuidance = buildRollupReviewGuidance(branch, baseBranch);
 
   // Surface which files the create task's self-review verified vs. left unread
   // (truncation blind spots). Only present when _self_review_outcome was
@@ -642,12 +853,7 @@ actual changes.
     plannedFilesSection = `Planned files from the original analysis plan:\n${plannedFiles.map(f => `  - ${f}`).join('\n')}\n` +
       (unplannedNonTest.length > 0
         ? `\nFiles changed but NOT in the original plan:\n${unplannedNonTest.map(f => `  - ${f}`).join('\n')}\n\n` +
-          `Classify each unplanned non-test file before flagging. Apply skepticism — do not assume a stated reason is correct, but do not flag categories that are valid even when unstated:\n` +
-          `  - scope-creep: file has no causal link to anything in the plan or prior reviews. → MAJOR.\n` +
-          `  - caller-impact: a planned file's API change forced consumer updates here. Verify the consumer reference exists (grep the planned file for the new/changed API and confirm this file uses it). → not a violation.\n` +
-          `  - discovered-dependency: planned change required a missing import / helper / flag-flip that lives here. Verify by reading the planned file and confirming the dependency. → not a violation.\n` +
-          `  - cluster-boundary-correction: file logically belongs in this cluster but was misallocated to a sibling task. Verify the PR description explicitly explains the correction. → not a violation IF acknowledged in PR description; flag MAJOR if not acknowledged.\n` +
-          `If unsure on edge cases, do not flag — let the operator decide.\n\n`
+          `${buildPlannedFilesClassificationGuidance()}\n\n`
         : `\nAll non-test changed files are in the original plan.\n\n`);
   }
 
@@ -661,11 +867,7 @@ actual changes.
     const rsNonTest = reviewScopeUtilization.non_test_file_count ?? 0;
     const rsBudget = reviewScopeUtilization.budget ?? 0;
     const rsPct = reviewScopeUtilization.percentage;
-    reviewScopeBudgetSection =
-      `## Scope Budget\n` +
-      `This PR touches ${rsNonTest} of ${rsBudget} allowed production files (${rsPct}% utilized). ` +
-      `When requesting changes, consider whether the fix would require touching additional files that could push the PR over its scope budget. ` +
-      `Prefer feedback that can be addressed within existing files.\n\n`;
+    reviewScopeBudgetSection = buildReviewScopeBudgetSection(rsNonTest, rsBudget, rsPct);
   }
 
   // Verify-mode block: when the prior fix iteration submitted structured
@@ -692,21 +894,18 @@ actual changes.
       );
     });
     fixResponsesSection =
-      `## Responses from prior fix iteration\n\n` +
-      `The fix agent recorded structured rationale for ${fixAgentResponses.length} issue(s) it left unaddressed. ` +
-      `Treat these as CLAIMS TO VERIFY, never as conclusions to accept.\n\n` +
-      `For each disputed/alternative/partial response below:\n` +
-      `  1. Run every step in \`verify steps\`. Quote the actual command output in your feedback.\n` +
-      `  2. If all verify steps confirm the claim → DROP the original issue (do not re-raise).\n` +
-      `  3. If any verify step fails or is non-actionable ("trust me", "I tested it") → re-raise the original issue with severity major AND quote the specific verify step that failed so the next fix iteration knows what to address.\n` +
-      `  4. If you cannot run a verify step (e.g. it requires data you don't have) → flag as "unverifiable" with severity major; do not silently accept.\n\n` +
-      `**Sycophancy guard**: a plausible-sounding claim with no verify steps, or with verify steps that boil down to "the agent says so", MUST be rejected. Real disagreements have concrete checks.\n\n` +
+      REVIEW_FIX_RESPONSES_HEADER +
+      buildReviewFixResponsesIntro(fixAgentResponses.length) +
+      REVIEW_FIX_RESPONSES_INSTRUCTIONS +
       `Responses to verify:\n${responseLines.join('\n\n')}\n\n`;
   }
 
   // Build review prompt — Claude has full repo access, not just a diff blob
   const reviewPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
-  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}You are reviewing PR #${prNumber} on this repository. The PR branch is "${branch}" targeting "${baseBranch}".
+  const taskTypeFocusHint = origTaskType === 'qa' ? REVIEW_QA_FOCUS_HINT
+    : origTaskType === 'migrate' ? REVIEW_MIGRATE_FOCUS_HINT
+    : '';
+  const reviewPrompt = `${reviewClaudeMdPrefix}${reviewPlaybookSection}${reviewProjectCtxSection}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
 ${iterationPreamble}
 ${rollupGuidance}
@@ -716,71 +915,21 @@ ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
 ${selfReviewBlindSpotsSection}
 ${plannedFilesSection}
 
-You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.
+${buildReviewDiffAccessHint(baseBranch)}
+${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId)}`;
 
-Review the changes thoroughly using this checklist:
-
-${reviewScopeBudgetSection}${scopePreamble}${origTaskType === 'qa' ? 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n' : origTaskType === 'migrate' ? 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n' : ''}**Correctness & Logic:**
-- Does the code correctly implement what the original task asked for?
-- Are there edge cases, null/undefined handling, or off-by-one errors?
-- Are async operations properly awaited? Are errors properly handled?
-- Do any database queries have N+1 problems or missing indexes?
-
-**Security:**
-- Are user inputs validated and sanitized before use?
-- Are there SQL injection, XSS, path traversal, or command injection risks?
-- Are secrets/tokens exposed in logs, responses, or error messages?
-- Are authorization checks present on new endpoints?
-
-**Code Quality:**
-- Is the code readable and following existing patterns in the codebase?
-- Are there obvious performance issues (unnecessary loops, redundant DB calls)?
-- Does the change break any existing interfaces or contracts?
-- Are type annotations correct (TypeScript/Python)?
-
-**Test Coverage:**
-- Are there tests for the new/changed behavior?
-- Do existing tests still pass given these changes?
-
-${buildTypeCheckInstructions(reviewBuildConfig)}
-
-**Severity Classification Guide:**
-Use these definitions when assigning severity to issues. Severity affects how the review appears in GitHub (critical = failure annotation, major = warning, minor = notice).
-
-- **CRITICAL** — Issues that could cause security vulnerabilities, data loss, crashes, or correctness bugs in production. Examples:
-  - SQL/command injection from unsanitized user input passed directly to a query or shell
-  - Missing auth check on a new endpoint that exposes sensitive data
-  - Off-by-one in a loop that silently skips or double-processes records in a DB migration
-
-- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, or violations of the codebase's established patterns. Examples:
-  - Async function whose rejection is silently swallowed (missing try/catch or .catch())
-  - New API endpoint with no test coverage at all
-  - New code that bypasses an existing invariant (e.g., writing to a field that has a single designated writer elsewhere in the codebase)
-
-- **MINOR** — Style inconsistencies, naming suggestions, documentation gaps, or optional improvements that do not affect correctness. Examples:
-  - Variable named \`data\` where \`userRecord\` would be clearer
-  - Missing docstring on a public function
-  - Redundant else after a return statement
-
-After your review, output EXACTLY ONE of the following JSON blocks as the last line of your response. There are only two valid verdicts — no third option exists.
-
-**APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
-{"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
-
-**REQUEST_CHANGES** — something actionable must change before this merges. Use this for any bug, missing test, broken invariant, merge conflict, failing CI signal, or behavior that would surprise a reader. If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES — another round is cheap; a missed regression is expensive.
-{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
-
-Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY", or any other verdict — they are not accepted and will be normalized to REQUEST_CHANGES. There is no informational-only path: if the change is acceptable → APPROVE (put observations in \`feedback\`); if anything needs changing → REQUEST_CHANGES.
-
-For each issue in the \`issues\` array:
-- \`file\`: repo-relative path to the file where the issue is located (optional — omit if not tied to a specific file)
-- \`line\`: line number in the file (optional — omit if not applicable)
-- Issues without \`file\`/\`line\` are still valid and will be included in the review body summary
-
-IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
-
+  const launchedReviewPrompt = reviewPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  const promptFingerprint = computeReviewPromptFingerprint(reviewBuildConfig, {
+    branch,
+    baseBranch,
+    includePlannedFilesClassificationGuidance: plannedFiles.length > 0 && plannedFilesSection.includes('Files changed but NOT in the original plan:'),
+  });
   statusRef.value = 'Running code review...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(reviewPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  setCurrentPromptFingerprint(promptFingerprint);
+  // Emit once before the review session starts so short review tasks still
+  // persist a stable prompt fingerprint before the first periodic heartbeat.
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(launchedReviewPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading verdict from /tmp/ file (avoids output truncation), fall back to output parsing
 
@@ -1240,7 +1389,12 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig);
   statusRef.value = 'Addressing review feedback...';
+  setCurrentPromptFingerprint(promptFingerprint);
+  // Emit once before the fix session starts so fast fix/rebase tasks still
+  // persist the stable code-change fingerprint on the backend.
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   const fixBaseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: post-Claude lint/test/push pipeline replaced with
   // runCodeChangeTask. Claude calls ./check + ./pr open (which pushes

@@ -6,11 +6,6 @@ import { AGENT_HELPER_NAMES } from './prompt.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-// `./fetch` is a real helper script written by handlers/research-plan.ts
-// (see writeFileSync of the fetch helper at runtime), but it is NOT registered
-// in AGENT_HELPER_NAMES. Tracked in the playbook (prompt-drift-inventory).
-// Keep this allow-list tiny — it should shrink, not grow.
-const KNOWN_EXTRA_HELPERS = new Set(['fetch']);
 
 function listTsFiles(dir: string): string[] {
   const out: string[] = [];
@@ -34,7 +29,7 @@ describe('helper-script reference drift', () => {
     // Require non-word, non-slash, non-dot, non-hyphen boundary after the
     // word — excludes `./tmp/...`, `./foo.js`, `./check-something`.
     const tokenRe = /\.\/([a-z][a-z-]*)(?![\w/.-])/g;
-    const allowed = new Set([...AGENT_HELPER_NAMES, ...KNOWN_EXTRA_HELPERS]);
+    const allowed = new Set(AGENT_HELPER_NAMES);
 
     const found = new Set<string>();
     const offenders: string[] = [];

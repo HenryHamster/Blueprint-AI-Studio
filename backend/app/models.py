@@ -347,6 +347,8 @@ class Task(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Stable 12-hex prompt digest for the assembled guidance that drove this task.
+    prompt_fingerprint: Optional[str] = Field(default=None, max_length=12)
 
     # Heartbeat audit-trail gate counter (R3-W1 / Round 3 C1, alembic 0066).
     # Round 2 F2 stored this in ``task.context['_heartbeat_count']`` to gate
@@ -1267,6 +1269,9 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(ForeignKey("task.id", ondelete="SET NULL"), nullable=True),
     )
+    # Prompt fingerprint active when this regression was first spawned for remediation.
+    # Lets operators ask: "did this regression appear before or after prompt change X?"
+    prompt_fingerprint_at_spawn: Optional[str] = Field(default=None, max_length=12)
     # Close-loop tracking fields (added 0074). All nullable / default-0 / default-[]
     # so existing rows backfilled by the migration server_default work without a
     # Python-side touch. The dispatcher writes attempts/snapshots at spawn; the

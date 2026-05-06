@@ -2,8 +2,8 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
-  persistAndPostStatus, git, runClaudeCode,
-  listOpenPullRequestsForBranch,
+  persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
+  setCurrentPromptFingerprint, listOpenPullRequestsForBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -14,7 +14,7 @@ import {
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
+  writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -96,6 +96,9 @@ Rules:
   const secTypeHints = getTaskTypeHints(secBuildConfig);
   const secTypeHint = secTypeHints['security_audit'] ? '\n\n' + secTypeHints['security_audit'] : '';
   statusRef.value = 'Running security audit...';
+  const secFingerprint = computePromptFingerprint('security_audit', secBuildConfig);
+  setCurrentPromptFingerprint(secFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: secFingerprint });
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
@@ -239,6 +242,9 @@ CRITICAL RULES:
     + migratePromptSuffix + `
 
 ${DEFAULT_TOOL_GUIDANCE}`;
+  const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig);
+  setCurrentPromptFingerprint(migrateFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: migrateFingerprint });
   // 2026-05-04: post-Claude commit/rebase/push/PR pipeline replaced with
   // runCodeChangeTask. Claude calls ./check + ./pr open + ./done from
   // inside its own session. See agent/src/handlers/code-change.ts.
@@ -332,6 +338,9 @@ IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json even if you cannot 
 ${DEFAULT_TOOL_GUIDANCE}`;
 
   statusRef.value = 'Running smoke tests...';
+  const smoketestFingerprint = computePromptFingerprint('smoketest', smoketestBuildConfig);
+  setCurrentPromptFingerprint(smoketestFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: smoketestFingerprint });
   const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt + PLAYBOOK_GUIDANCE, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
@@ -485,6 +494,9 @@ Set confidence to:
 IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
 
   statusRef.value = 'Analyzing failure...';
+  const debugFingerprint = computePromptFingerprint('debug');
+  setCurrentPromptFingerprint(debugFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: debugFingerprint });
   const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
@@ -581,6 +593,9 @@ Rules:
   const perfTypeHints = getTaskTypeHints(perfBuildConfig);
   const perfTypeHint = perfTypeHints['perf'] ? '\n\n' + perfTypeHints['perf'] : '';
   statusRef.value = 'Running performance analysis...';
+  const perfFingerprint = computePromptFingerprint('perf', perfBuildConfig);
+  setCurrentPromptFingerprint(perfFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: perfFingerprint });
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
@@ -682,6 +697,9 @@ IMPORTANT:
 - Base every claim on code you have actually read.`;
 
   statusRef.value = 'Running investigation...';
+  const investigateFingerprint = computePromptFingerprint('investigate');
+  setCurrentPromptFingerprint(investigateFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: investigateFingerprint });
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
@@ -864,6 +882,9 @@ Rules:
   const typeHints = getTaskTypeHints(buildConfig);
   const typeHint = typeHints['self_audit'] ? '\n\n' + typeHints['self_audit'] : '';
   statusRef.value = 'Running self audit...';
+  const selfAuditFingerprint = computePromptFingerprint('self_audit', buildConfig);
+  setCurrentPromptFingerprint(selfAuditFingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: selfAuditFingerprint });
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object

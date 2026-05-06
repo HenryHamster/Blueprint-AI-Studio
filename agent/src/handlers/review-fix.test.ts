@@ -44,6 +44,7 @@ vi.mock('../index.js', () => ({
   extractInvestigatedFiles: vi.fn().mockReturnValue([]),
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
+  setCurrentPromptFingerprint: vi.fn(),
 }));
 
 vi.mock('../workspacePrep.js', () => ({
@@ -106,7 +107,7 @@ import {
   computeMaxFixIterations, handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS,
   annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
   detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter,
-  formatTrajectorySection, formatDriftSection, verifyStepsOk,
+  formatTrajectorySection, formatDriftSection, verifyStepsOk, computeReviewPromptFingerprint,
 } from './review-fix.js';
 import { runCodeChangeTask } from './code-change.js';
 
@@ -879,6 +880,22 @@ describe('handleReview — verdict file parsing', () => {
     expect(status.status).toBe('FAILED');
     expect(status.failure_category).toBe('claude_code_failed');
     expect(status.artifact_type).toBe('ERROR_LOG');
+  });
+
+  it('sets the review prompt fingerprint and emits an initial heartbeat before running Claude', async () => {
+    await handleReview(
+      'task-fingerprint', basePayload, { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(indexMod.setCurrentPromptFingerprint).toHaveBeenCalledTimes(1);
+    const fingerprint = vi.mocked(indexMod.setCurrentPromptFingerprint).mock.calls[0][0];
+    expect(fingerprint).toMatch(/^[0-9a-f]{12}$/);
+    expect(indexMod.sendHeartbeatSync).toHaveBeenCalledWith(
+      'task-fingerprint',
+      'Running code review...',
+      { prompt_fingerprint: fingerprint },
+    );
   });
 });
 
@@ -2058,5 +2075,36 @@ describe('handleReview prompt determinism', () => {
     vi.clearAllMocks();
     const prompt2 = await invoke();
     expect(prompt1).toBe(prompt2);
+  });
+
+  it('handleReview fingerprints static review guidance rather than task-specific context', async () => {
+    await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const expected = computeReviewPromptFingerprint({});
+    expect(vi.mocked(indexMod.setCurrentPromptFingerprint)).toHaveBeenCalledWith(expected);
+    expect(vi.mocked(indexMod.sendHeartbeatSync)).toHaveBeenCalledWith(
+      'task-rev',
+      'Running code review...',
+      { prompt_fingerprint: expected },
+    );
+
+    vi.clearAllMocks();
+    await handleReview(
+      'task-rev-2',
+      { ...REVIEW_PAYLOAD, pr_number: 999, branch: 'feature/other', original_prompt: 'different task text' },
+      {
+        ...REVIEW_TASK,
+        context: {
+          ...(REVIEW_TASK.context as Record<string, unknown>),
+          review_loop: { iteration: 5, review_history: [{ iteration: 4, feedback: 'prior feedback' }] },
+        },
+        project_context: { direction: 'other-direction' },
+      },
+      'token',
+      'owner',
+      'repo',
+      null,
+      statusRef(),
+    );
+    expect(vi.mocked(indexMod.setCurrentPromptFingerprint)).toHaveBeenLastCalledWith(expected);
   });
 });

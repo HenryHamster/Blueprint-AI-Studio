@@ -1,11 +1,13 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
   getProviderRunner,
 } from '../index.js';
+import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
@@ -661,6 +663,35 @@ export function buildPortfolioComposition(
   return lines.join('\n');
 }
 
+function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'): string {
+  const blocks: string[] = [];
+  if (mode === 'plan') {
+    blocks.push(
+      'research-plan:plan',
+      'You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.',
+      '1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.',
+      '2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones.',
+      '3. Identify dependencies between subtasks — which must complete before others can start.',
+      '4. Write clear, self-contained prompts for each subtask.',
+      'Output EXACTLY one JSON block as the VERY LAST thing in your response:',
+    );
+  } else {
+    blocks.push(
+      'research-plan:research',
+      "You are a strategic executor. Your job is to translate the analysis below into API calls, with JUDGMENT — not blind execution.",
+      '## Ownership',
+      'If a direction is dead, retire it. If there\'s an obvious gap, open it.',
+      'Do NOT analyze code. Do NOT explore the codebase. Think briefly about each operation, then run the commands.',
+      '# Commands available',
+      './strategic set-problem-model',
+      './strategic set-running-update',
+      './strategic create-direction',
+      './strategic set-retirement-critiques',
+    );
+  }
+  return createHash('sha256').update(blocks.join('\n\n')).digest('hex').slice(0, 12);
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -684,6 +715,11 @@ export async function handlePlan(
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
+  const promptFingerprint = computeResearchPlanPromptFingerprint('plan');
+  const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
+  if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
+  const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -1104,7 +1140,13 @@ export async function handleResearch(
   });
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
-  const disallowedTools = configureAgentPermissions(strVal(payload.research_mode as string, 'research'));
+  const researchMode = strVal(payload.research_mode as string, 'research');
+  const disallowedTools = configureAgentPermissions(researchMode);
+  const promptFingerprint = computeResearchPlanPromptFingerprint('research');
+  const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
+  if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
+  const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   let gitLogOutput = '';
   let gitDiffStatOutput = '';

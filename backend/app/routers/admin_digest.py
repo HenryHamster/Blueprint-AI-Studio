@@ -87,6 +87,17 @@ _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 _is_skipped_sr_outcome = _is_skipped_sr_outcome_shared
 
 
+def _task_prompt_fingerprint(task: Task) -> str:
+    """Resolve the task's prompt fingerprint with legacy context fallback."""
+    if isinstance(task.prompt_fingerprint, str) and task.prompt_fingerprint:
+        return task.prompt_fingerprint
+    ctx = task.context or {}
+    legacy = ctx.get("prompt_fingerprint")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+    return "unknown"
+
+
 def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
     """Share of code-change tasks (create/fix/refactor/migrate) where the
     self-review JSON was missing or invalid. Detects the bash ./done
@@ -5013,6 +5024,152 @@ async def list_sr_blind_spots(
     return await aggregate_sr_blind_spot_envelope(
         session, project_id, days=days, limit=limit,
     )
+
+
+@router.get("/projects/{project_id}/prompt-fingerprint-analytics")
+async def get_prompt_fingerprint_analytics(
+    project_id: uuid.UUID,
+    days: int = Query(14, ge=1, le=90),
+    min_sample_size: int = Query(3, ge=1, le=50),
+    top_n: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Group recent code-change task outcomes by prompt fingerprint.
+
+    Lets operators compare prompt revisions side-by-side without bisecting
+    git history. Buckets COMPLETED create/fix/refactor/migrate tasks within
+    the lookback window by `Task.prompt_fingerprint` (with an `"unknown"`
+    fallback for older rows that pre-date the column) and reports per-bucket
+    sample size, first-attempt success rate, SR skip rate, rejection-category
+    counts, and delta vs. the project mean success rate. Buckets below
+    `min_sample_size` are excluded so a single-task fingerprint cannot dominate
+    the view.
+    """
+    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(
+            Task.id,
+            Task.created_at,
+            Task.context,
+            Task.payloads,
+            Task.prompt_fingerprint,
+            Task.project_id,
+        ))
+        .order_by(Task.created_at.desc())
+        .limit(2000)
+    )
+    result = await session.execute(stmt)
+    all_tasks = result.scalars().all()
+
+    code_change_tasks: List[Task] = []
+    for t in all_tasks:
+        ttype = (t.first_payload or {}).get("type")
+        if ttype in _SR_CODE_CHANGE_TYPES:
+            code_change_tasks.append(t)
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+        "sample_size": 0,
+        "first_attempt_measured": 0,
+        "first_attempt_succeeded": 0,
+        "sr_skip_measured": 0,
+        "sr_skipped": 0,
+        "rejection_category_counts": defaultdict(int),
+    })
+
+    project_first_attempt_measured = 0
+    project_first_attempt_succeeded = 0
+    project_sr_measured = 0
+    project_sr_skipped = 0
+
+    for t in code_change_tasks:
+        fp = _task_prompt_fingerprint(t)
+        ctx = t.context or {}
+        bucket = buckets[fp]
+        bucket["sample_size"] += 1
+
+        if "_first_attempt_succeeded" in ctx:
+            bucket["first_attempt_measured"] += 1
+            project_first_attempt_measured += 1
+            if ctx["_first_attempt_succeeded"]:
+                bucket["first_attempt_succeeded"] += 1
+                project_first_attempt_succeeded += 1
+
+        # SR skip rate: every code-change task is eligible — the skipped
+        # envelope is a sentinel written by the bash ./done fallback when
+        # the agent didn't emit a structured self-review.
+        bucket["sr_measured"] = bucket.get("sr_measured", 0) + 1
+        project_sr_measured += 1
+        sro = ctx.get("_self_review_outcome")
+        if _is_skipped_sr_outcome(sro):
+            bucket["sr_skipped"] += 1
+            project_sr_skipped += 1
+
+        # Rejection-category presence per task — works for both dict-shaped
+        # ({"correctness": 1, ...}) and list-shaped (["correctness", ...])
+        # values that already coexist in the wild.
+        for cat in set(ctx.get("_first_attempt_rejection_categories") or {}):
+            bucket["rejection_category_counts"][cat] += 1
+
+    project_first_attempt_rate: Optional[float] = (
+        round(project_first_attempt_succeeded / project_first_attempt_measured, 3)
+        if project_first_attempt_measured
+        else None
+    )
+    project_sr_skip_rate: Optional[float] = (
+        round(project_sr_skipped / project_sr_measured, 3)
+        if project_sr_measured
+        else None
+    )
+
+    fingerprints_out: List[Dict[str, Any]] = []
+    for fp, b in buckets.items():
+        if b["sample_size"] < min_sample_size:
+            continue
+        first_attempt_rate: Optional[float] = (
+            round(b["first_attempt_succeeded"] / b["first_attempt_measured"], 3)
+            if b["first_attempt_measured"]
+            else None
+        )
+        sr_skip_rate: Optional[float] = (
+            round(b["sr_skipped"] / b["sr_measured"], 3)
+            if b.get("sr_measured")
+            else None
+        )
+        delta: Optional[float] = (
+            round(first_attempt_rate - project_first_attempt_rate, 3)
+            if first_attempt_rate is not None and project_first_attempt_rate is not None
+            else None
+        )
+        fingerprints_out.append({
+            "fingerprint": fp,
+            "sample_size": b["sample_size"],
+            "first_attempt_measured": b["first_attempt_measured"],
+            "first_attempt_success_rate": first_attempt_rate,
+            "sr_skip_rate": sr_skip_rate,
+            "rejection_category_counts": dict(b["rejection_category_counts"]),
+            "delta_vs_project_mean": delta,
+        })
+
+    fingerprints_out.sort(key=lambda x: x["sample_size"], reverse=True)
+    fingerprints_out = fingerprints_out[:top_n]
+
+    return {
+        "project_id": str(project_id),
+        "window_days": days,
+        "sample_size": len(code_change_tasks),
+        "project_first_attempt_success_rate": project_first_attempt_rate,
+        "project_sr_skip_rate": project_sr_skip_rate,
+        "fingerprints": fingerprints_out,
+    }
 
 
 @router.get("/projects/{project_id}/sr-reviewer-disagreements")

@@ -2386,6 +2386,17 @@ async def agent_heartbeat(
         if validated:
             apply_fix_loop_events(task, validated)
 
+    # Persist prompt fingerprint on the dedicated column. Mirror to context only
+    # when needed for older readers / backfills, so repeated heartbeats stay
+    # idempotent and don't force unnecessary JSONB rewrites.
+    if req.prompt_fingerprint:
+        if task.prompt_fingerprint != req.prompt_fingerprint:
+            task.prompt_fingerprint = req.prompt_fingerprint
+        if (task.context or {}).get('prompt_fingerprint') != req.prompt_fingerprint:
+            ctx = dict(task.context or {})
+            ctx['prompt_fingerprint'] = req.prompt_fingerprint
+            task.context = ctx
+
     session.add(task)
     await session.commit()
 

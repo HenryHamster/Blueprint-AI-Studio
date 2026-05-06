@@ -4,7 +4,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, runClaudeCode,
-  captureTestBaseline, getProviderRunner,
+  captureTestBaseline, getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
@@ -13,7 +13,7 @@ import {
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   buildAnalysisPrompt, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, extractModuleInterfaces,
-  discoverAffectedConsumers, type PlaybookEntry,
+  discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
@@ -542,8 +542,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
+  const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig);
 
   statusRef.value = `Running ${getProviderRunner().displayName}...`;
+  setCurrentPromptFingerprint(promptFingerprint);
+  // Emit once before Claude starts so short code-change tasks persist the
+  // fingerprint even if they finish before the next periodic heartbeat.
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: wrapper-driven lint/test/push/PR pipeline replaced with

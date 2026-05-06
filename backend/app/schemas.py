@@ -65,6 +65,10 @@ class AgentStatusPayload(BaseModel):
     # terminal event on the same call as a PR open / failure update.
     # Validated by ``app.fix_loop_telemetry``.
     fix_loop_events: List[Dict[str, Any]] | None = Field(None, max_length=20)
+    # Stable 12-hex prompt fingerprint (mirrors HeartbeatRequest.prompt_fingerprint).
+    # Lets the terminal status POST also carry it so tasks that skip heartbeats
+    # (short-lived roles) still get a fingerprint persisted.
+    prompt_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{12}$")
 
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -102,6 +106,11 @@ class HeartbeatRequest(BaseModel):
     # Optional + capped so older agents that don't emit this continue to
     # work, and a runaway loop can't burst-emit thousands per heartbeat.
     fix_loop_events: List[Dict[str, Any]] | None = Field(None, max_length=20)
+    # Stable 12-hex SHA-256 fingerprint of the static prompt guidance blocks
+    # (task-type hints + tool guidance + failure guidance). Set once per task
+    # on the first heartbeat after the handler registers it. Used to correlate
+    # behavioral regressions back to prompt edits cycle-over-cycle.
+    prompt_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{12}$")
 
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")

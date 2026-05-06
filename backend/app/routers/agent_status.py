@@ -777,6 +777,16 @@ async def update_agent_status(
                 logger.info("[FIX_LOOP] dropping invalid event for task %s: %s", payload.task_id, exc)
         if validated:
             apply_fix_loop_events(task, validated)
+    # Persist prompt fingerprint on the terminal status path. Mirrors the
+    # identical block in the heartbeat handler (agent.py) so tasks that emit
+    # their fingerprint only on the final status call still get it recorded.
+    if payload.prompt_fingerprint:
+        if task.prompt_fingerprint != payload.prompt_fingerprint:
+            task.prompt_fingerprint = payload.prompt_fingerprint
+        if (task.context or {}).get('prompt_fingerprint') != payload.prompt_fingerprint:
+            ctx = dict(task.context or {})
+            ctx['prompt_fingerprint'] = payload.prompt_fingerprint
+            task.context = ctx
     session.add(task)
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts).

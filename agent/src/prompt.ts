@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { WORKSPACE } from './index.js';
 import type { BuildConfig } from './index.js';
@@ -332,6 +333,21 @@ export function assembleFailureGuidanceBlocks(): string {
   return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING;
 }
 
+// Compute a stable 12-hex-char fingerprint of the static prompt guidance for
+// a given task type. Used to correlate production task outcomes back to prompt
+// revisions cycle-over-cycle. Only hashes static/deterministic content —
+// task IDs, file paths, and payload-specific text are intentionally excluded.
+export function computePromptFingerprint(taskType: string, buildConfig?: BuildConfig): string {
+  const hints = getTaskTypeHints(buildConfig);
+  const taskHint = hints[taskType] ?? '';
+  const content = [
+    taskHint,
+    DEFAULT_TOOL_GUIDANCE,
+    assembleFailureGuidanceBlocks(),
+  ].join('\n\n');
+  return createHash('sha256').update(content).digest('hex').slice(0, 12);
+}
+
 // Within-task fix-iteration history. Each retry attempt of the within-VM
 // lint/test fix loop currently spawns a fresh Claude subprocess with no
 // memory of what prior iterations tried. When the first attempt picks the
@@ -375,7 +391,7 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;

@@ -934,6 +934,7 @@ export function _getFirstToolUseAtForTesting(): number | null {
 export function _resetTelemetryForTesting(): void {
   firstToolUseAt = null;
   isWarmStart = false;
+  currentPromptFingerprint = null;
 }
 
 /** Test-only: set the warm-start flag (mirrors what the role loop does). */
@@ -1066,6 +1067,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
+        ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
     } catch (e) {
@@ -1108,6 +1110,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
+        ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
     } catch (e: unknown) {
@@ -1134,6 +1137,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
               metrics: retryMetrics,
               tool_trace: snapshotToolTrace(),
+              ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
             }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
             log('Heartbeat retry succeeded');
             traceHeartbeat('retry-409', retryStart, Date.now(), 'ok');
@@ -1748,6 +1752,28 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
 /** Normalized error fingerprint for detecting identical consecutive failures. */
 export function errorFingerprint(msg: string): string {
   return msg.replace(/\s+/g, ' ').trim().slice(0, 2000);
+}
+
+// ── Prompt fingerprint ───────────────────────────────────────────────────────
+// SHA-256 of the static prompt content (guidance blocks + task-type sections),
+// truncated to 12 hex chars. Handlers set this before calling runClaudeCode so
+// heartbeats and task records can correlate behavioral regressions to prompt edits.
+// Task-specific noise (task IDs, file paths, payload text) must NOT be included.
+
+/** Compute a stable 12-hex SHA-256 fingerprint of static prompt content. */
+export function computePromptFingerprint(staticContent: string): string {
+  return createHash('sha256').update(staticContent).digest('hex').slice(0, 12);
+}
+
+let currentPromptFingerprint: string | null = null;
+
+/** Register the fingerprint for the current task's prompt. Call before runClaudeCode. */
+export function setCurrentPromptFingerprint(fp: string): void {
+  currentPromptFingerprint = fp;
+}
+
+export function getCurrentPromptFingerprint(): string | null {
+  return currentPromptFingerprint;
 }
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
@@ -3786,6 +3812,7 @@ async function main() {
       // — without this, the next agent's heartbeat surfaces prior-role tool
       // uses and the reaper's death-trace conflates two roles' work.
       clearToolTrace();
+      currentPromptFingerprint = null;
       // Same rationale for the `./check` synthesizer's monotonic state:
       // without a reset, the next role's synthesized iterations continue
       // numbering from the prior role and carry a stale started_at.

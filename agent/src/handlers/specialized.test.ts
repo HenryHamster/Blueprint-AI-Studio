@@ -991,3 +991,139 @@ describe('specialized handler structural prompt invariants', () => {
     expect(p).toContain(phrase);
   });
 });
+
+// ── Task-specific content contracts (semantic regression detection) ──────────
+// Pins contract elements that define the task scope and LLM behavior.
+// A future reword that drops severity enum, component names, or required keys will fail here.
+describe('specialized handler task-specific content contracts', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  // ── handleSecurityAudit contract ──────────────────────────────────────────
+  describe('handleSecurityAudit', () => {
+    it('prompt documents severity enum and output schema keys', async () => {
+      await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // Severity enum: critical, high, medium, low
+      expect(p).toContain('critical');
+      expect(p).toContain('high');
+      expect(p).toContain('medium');
+      expect(p).toContain('low');
+      // JSON schema keys
+      expect(p).toContain('"title"');
+      expect(p).toContain('"severity"');
+      expect(p).toContain('"file_path"');
+      expect(p).toContain('"fix_prompt"');
+      // Evidence-based guidance
+      expect(p).toContain('Valid severity values');
+    });
+  });
+
+  // ── handlePerf contract ──────────────────────────────────────────────────
+  describe('handlePerf', () => {
+    it('prompt documents evidence-based guidance and area+severity enums', async () => {
+      await handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // Evidence-based guidance
+      expect(p).toContain('Only flag issues you can directly observe');
+      expect(p).toContain('Evidence-based only');
+      // Area enum
+      expect(p).toContain('area');
+      expect(p).toContain('database');
+      expect(p).toContain('api');
+      expect(p).toContain('frontend');
+      expect(p).toContain('agent');
+      // Severity enum
+      expect(p).toContain('"severity"');
+      expect(p).toContain('high');
+      expect(p).toContain('medium');
+      expect(p).toContain('low');
+      // Valid values documentation
+      expect(p).toContain('Valid values:');
+    });
+  });
+
+  // ── handleDebug contract ─────────────────────────────────────────────────
+  describe('handleDebug', () => {
+    it('prompt requires all four output keys: root_cause, affected_files, fix_prompt, confidence', async () => {
+      await handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      expect(p).toContain('"root_cause"');
+      expect(p).toContain('"affected_files"');
+      expect(p).toContain('"fix_prompt"');
+      expect(p).toContain('"confidence"');
+      // Confidence enum values
+      expect(p).toContain('high');
+      expect(p).toContain('medium');
+      expect(p).toContain('low');
+    });
+  });
+
+  // ── handleInvestigate contract ───────────────────────────────────────────
+  describe('handleInvestigate', () => {
+    it('prompt documents severity and confidence enums and recommended_fix self-containment', async () => {
+      await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // Severity enum
+      expect(p).toContain('critical');
+      expect(p).toContain('high');
+      expect(p).toContain('medium');
+      expect(p).toContain('low');
+      // Confidence enum
+      expect(p).toContain('"confidence"');
+      expect(p).toContain('high');
+      expect(p).toContain('medium');
+      expect(p).toContain('low');
+      // recommended_fix self-containment rule
+      expect(p).toContain('recommended_fix');
+      expect(p).toContain('self-contained');
+      expect(p).toContain('will NOT see');
+      // Read-only constraint
+      expect(p).toContain('Do NOT modify any files');
+    });
+  });
+
+  // ── handleSelfAudit contract ────────────────────────────────────────────
+  describe('handleSelfAudit', () => {
+    it('prompt documents four component scores and recommended_mode enum', async () => {
+      await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // Four component scores
+      expect(p).toContain('test_coverage');
+      expect(p).toContain('friction_density');
+      expect(p).toContain('claim_consistency');
+      expect(p).toContain('failure_mix');
+      // recommended_mode enum
+      expect(p).toContain('recommended_mode');
+      expect(p).toContain('audit');
+      expect(p).toContain('fundamentals');
+      expect(p).toContain('ship');
+      expect(p).toContain('pause');
+      // Score range
+      expect(p).toContain('[0, 100]');
+    });
+  });
+
+  // ── handleSmoketest contract ────────────────────────────────────────────
+  describe('handleSmoketest', () => {
+    it('prompt requests suites structure and guardrail_violations array', async () => {
+      await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // Suite structure
+      expect(p).toContain('suites.startup');
+      expect(p).toContain('suites.curated');
+      expect(p).toContain('suites.regression');
+      // Result structure elements
+      expect(p).toContain('startup');
+      expect(p).toContain('curated');
+      expect(p).toContain('regression');
+      expect(p).toContain('guardrail_violations');
+      // Run order
+      expect(p).toContain('IN ORDER');
+    });
+  });
+});
