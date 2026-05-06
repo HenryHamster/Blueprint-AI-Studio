@@ -511,12 +511,13 @@ interface CodeChangeHelperConfig {
   testsOnMainBranch: boolean;
 }
 
-/** Write ./check, ./pr, ./done, ./fail to WORKSPACE. Idempotent. */
+/** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */
 export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
   writeCheckHelper(cfg);
   writePrHelper(cfg);
   writeDoneHelper(cfg);
   writeFailHelper(cfg);
+  writeBlockedHelper(cfg);
   excludeAgentHelpers();
 }
 
@@ -604,8 +605,22 @@ fi
 
 if touches backend/; then
   if command -v ruff >/dev/null 2>&1 || python3 -m ruff --version >/dev/null 2>&1; then
-    run "backend ruff"    bash -c 'python3 -m ruff check backend/ --select E,F,W --ignore E501 2>&1'
-    run "backend ruff fmt" bash -c 'python3 -m ruff format --check backend/ 2>&1'
+    # Scope ruff to changed *.py files only. Repo-wide ruff is a CI/main
+    # concern; on PRs we don't want pre-existing baseline errors to block
+    # unrelated fixes. CHANGED already includes both committed-since-base
+    # and uncommitted/untracked. Filter to existing files so deletions
+    # don't blow up ruff with ENOENT. Write null-delimited entries so xargs
+    # -0 doesn't split on whitespace (path-with-space safe).
+    : > /tmp/check_backend_py.txt
+    printf '%s\\n' "$CHANGED" | grep -E '^backend/.*\\.py$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\\0' "$f" >> /tmp/check_backend_py.txt
+    done
+    if [ -s /tmp/check_backend_py.txt ]; then
+      run "backend ruff (changed)"     bash -c 'xargs -0 -a /tmp/check_backend_py.txt python3 -m ruff check --select E,F,W --ignore E501 2>&1'
+      run "backend ruff fmt (changed)" bash -c 'xargs -0 -a /tmp/check_backend_py.txt python3 -m ruff format --check 2>&1'
+    else
+      echo "[check] no backend/*.py files changed, skipping ruff"
+    fi
   else
     echo "[check] ruff not installed, skipping backend lint"
   fi
@@ -1168,6 +1183,90 @@ echo "[fail] Posted FAILED status. Reason: $REASON"
   fs.writeFileSync(`${WORKSPACE}/fail`, script, { mode: 0o755 });
 }
 
+function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
+  // Explicit precondition-blocked signal — Claude calls this when a real
+  // code change has been made and ./check still fails identically (or the
+  // failure is at the toolchain/system-library layer, where no code edit
+  // can move the needle). Routes to BLOCKED_PRECONDITION (an INFRA class)
+  // rather than CODE_ERROR — review-fix iterations don't burn against the
+  // chain, and the strategic agent gets a ProjectMessage so it can decide
+  // whether to spawn a precondition-fix direction.
+  const script = `#!/bin/bash
+# ./blocked "<reason>" — mark task BLOCKED_PRECONDITION (no retry burn).
+#
+# Use when:
+#   - You've made a real code edit and ./check fails identically to the
+#     previous attempt — the failure isn't moving and another iteration
+#     won't help.
+#   - The failure is at the toolchain / system-library layer (e.g.
+#     "error while loading shared libraries: libatk-1.0.so.0",
+#     "No module named 'ruff'", "playwright is not installed",
+#     "command not found: <tool>"). No code edit can fix this.
+#   - A repo-wide gate fails on files your PR did not touch (baseline
+#     debt — pre-existing lint/test failures unrelated to your change).
+#
+# Don't use for ordinary lint/test failures Claude can fix — keep
+# iterating with ./check instead. Don't use for "I don't know how to fix
+# this" — that's ./fail. ./blocked is specifically for "no code edit
+# CAN fix this on my own."
+#
+# Effect: marks the task FAILED with failure_category=BLOCKED_PRECONDITION
+# (INFRA class — doesn't count toward the review-fix iteration cap), and
+# the orchestrator notifies the strategic agent so it can decide whether
+# to spawn a precondition-fix direction.
+
+set -uo pipefail
+REASON="\${1:?Usage: ./blocked \\"<reason>\\"}"
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+if [ -f /tmp/blocked_${cfg.taskId} ]; then
+  echo "[blocked] already marked — no-op"
+  exit 0
+fi
+
+# "BLOCKER:" prefix is the canonical orchestrator-side signal for the
+# BLOCKED_PRECONDITION class (see backend/app/failure_classification.py).
+# We send both the explicit failure_category AND the prefixed reason so
+# the routing is unambiguous regardless of which path the orchestrator
+# takes (normalize_agent_failure_category vs the BLOCKER:-prefix
+# fast-path in _classify_failure_class).
+PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "BLOCKER: $REASON" \\
+  '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "BLOCKED_PRECONDITION"}')
+POSTED=0
+for attempt in 1 2 3 4 5; do
+  HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/blocked_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+    -X POST "$API/api/agent/status" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || HTTP="000"
+  if [ "$HTTP" = "200" ] || [ "$HTTP" = "202" ]; then
+    POSTED=1; break
+  fi
+  if [ "$HTTP" = "429" ] || [ "\${HTTP:0:1}" = "5" ] || [ "$HTTP" = "000" ]; then
+    BACKOFF=$((attempt * 3))
+    echo "[blocked] POST attempt $attempt got HTTP=$HTTP — retrying in \${BACKOFF}s..." >&2
+    sleep "$BACKOFF"; continue
+  fi
+  echo "[blocked] POST attempt $attempt got HTTP=$HTTP (permanent failure):" >&2
+  cat /tmp/blocked_resp_${cfg.taskId} >&2
+  rm -f /tmp/blocked_resp_${cfg.taskId}
+  exit 1
+done
+rm -f /tmp/blocked_resp_${cfg.taskId}
+if [ "$POSTED" = "0" ]; then
+  echo "[blocked] POST failed after 5 retries — orchestrator unreachable. Marker NOT written." >&2
+  exit 1
+fi
+
+touch /tmp/blocked_${cfg.taskId}
+echo ""
+echo "[blocked] Posted BLOCKED_PRECONDITION status. Reason: $REASON"
+echo "[blocked] Strategic agent will be notified — it may spawn a precondition-fix direction."
+`;
+  fs.writeFileSync(`${WORKSPACE}/blocked`, script, { mode: 0o755 });
+}
+
 export interface PlaybookEntry {
   content: string;
   effectiveness_score: number;
@@ -1433,14 +1532,34 @@ the workspace, executable):
 - \`./done\` — marks the task COMPLETED with the PR URL. Requires
   \`./pr open\` to have run first. Idempotent (safe to re-run).
 - \`./fail "<reason>"\` — marks the task FAILED. Use ONLY when the task
-  fundamentally can't be completed: scope is wrong, blocker found,
-  conflicting requirements. Don't use for transient lint/test failures —
-  keep iterating with \`./check\` instead.
+  fundamentally can't be completed: scope is wrong, conflicting
+  requirements, you genuinely don't know how to make the change. Don't
+  use for transient lint/test failures — keep iterating with \`./check\`
+  instead.
+- \`./blocked "<reason>"\` — marks the task BLOCKED_PRECONDITION (an
+  INFRA class — does NOT burn iteration cap). Use when **no code edit
+  on your part can fix the failure**, specifically:
+    1. You made a real code change and \`./check\` still fails *identically*
+       to the previous attempt. The failure isn't moving — another
+       iteration won't help.
+    2. The failure is at the toolchain or system-library layer (e.g.
+       \`error while loading shared libraries: libatk-1.0.so.0\`,
+       \`No module named 'ruff'\`, \`playwright is not installed\`,
+       \`command not found: <tool>\`). No code edit can install a system
+       package on the agent VM.
+    3. A repo-wide gate fails on files your PR did not touch (e.g. a
+       lint baseline of pre-existing errors elsewhere in the tree).
+  This routes to the strategic agent — it can spawn a direction to fix
+  the precondition (update the packer image, scope the gate to
+  changed files, etc.) if it judges that worthwhile.
+  \`./blocked\` is **not** a "give up" verb — it's a "this needs an
+  upstream fix, not a code edit on this PR" verb. \`./fail\` is the
+  give-up verb.
 
 Required exit pattern (every code-change task):
   edit -> ./check -> (if green) ./pr open --title ... --body ... -> ./done
 
-ALWAYS call \`./done\` or \`./fail\` explicitly. The wrapper has only one
+ALWAYS call \`./done\`, \`./fail\`, or \`./blocked\` explicitly. The wrapper has only one
 fallback: if you opened a PR via \`./pr open\` but didn't call \`./done\`,
 it posts COMPLETED on your behalf using the PR URL marker. Otherwise it
 posts FAILED with no useful reason — which is bad for the operator and

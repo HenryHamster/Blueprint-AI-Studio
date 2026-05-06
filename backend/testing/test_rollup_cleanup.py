@@ -803,6 +803,49 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     mock_alert.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_url", [
+    # Production incident 2026-05-06: haiku retry with wedged ./check viewport
+    # gate improvised this URL into the wrapper's PR-URL marker file.
+    "https://github.com/owner/repo/compare/main...blueprint/task-cb7bb07e",
+    # Bare branch name
+    "blueprint/task-cb7bb07e",
+    # Plain text Claude might write under "I made changes, here's a description"
+    "PR pending — see logs",
+    # /pull/ path but trailing seg isn't numeric (defensive — shouldn't happen
+    # for a real GitHub URL, but the guard is `/pull/ AND last_seg.isdigit()`)
+    "https://github.com/owner/repo/pull/foo",
+])
+async def test_verify_pr_merged_malformed_pr_url_returns_false_without_calling_github(
+    cleanup_db, mocker, bad_url,
+):
+    """Malformed PR URLs in the artifact must not crash int()-parsing — they
+    fall through to the negative cache and the verifier returns False."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, bad_url)
+
+    mock_get_token = mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is False
+    # Crucially: never reached the GitHub API or token fetch — the guard
+    # short-circuits before either is called.
+    mock_get_token.assert_not_called()
+    mock_get_pr.assert_not_called()
+    # Task is not flipped to FAILED on this path.
+    assert task.status != TaskStatus.FAILED
+
+
 # ── Tests for persist_failure_category at rollup parent-failure paths ─────────
 
 @pytest.mark.asyncio

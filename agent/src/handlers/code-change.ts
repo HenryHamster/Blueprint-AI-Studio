@@ -183,6 +183,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   for (const f of [
     `/tmp/done_${taskId}`,
     `/tmp/fail_${taskId}`,
+    `/tmp/blocked_${taskId}`,
     `/tmp/pr_url_${taskId}`,
     `/tmp/base_commit_${taskId}`,
     `/tmp/fix_responses_${taskId}.json`,
@@ -252,6 +253,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   //    terminal status without re-querying GitHub.
   const doneMarker = `/tmp/done_${taskId}`;
   const failMarker = `/tmp/fail_${taskId}`;
+  const blockedMarker = `/tmp/blocked_${taskId}`;
   const prUrlFile = `/tmp/pr_url_${taskId}`;
 
   if (fs.existsSync(doneMarker)) {
@@ -262,39 +264,58 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     sendLog(ws, '[wrapper] ./fail marker present — Claude posted FAILED. Exiting cleanly.\n');
     return;
   }
+  if (fs.existsSync(blockedMarker)) {
+    sendLog(ws, '[wrapper] ./blocked marker present — Claude posted BLOCKED_PRECONDITION. Exiting cleanly.\n');
+    return;
+  }
 
   // Claude exited without calling ./done|./fail.
   // Did it at least open a PR? If yes, treat as success — Claude probably
   // hung post-result-event before getting to ./done; we just complete the
   // handshake on its behalf.
+  //
+  // Shape-validate the marker file before trusting it. ./pr open / ./pr close /
+  // verify-mode all write a canonical pull URL; any other shape means Claude
+  // (or some other code path) wrote the file directly. Production incident
+  // 2026-05-06: Claude on a retry whose ./check gate was blocked by a
+  // missing-libatk viewport failure improvised by writing a /compare/ URL
+  // here, the wrapper trusted it, and downstream PR-merge verifiers crashed
+  // 36×/cycle on int(last-path-segment) of `task-cb7bb07e`. Treat malformed
+  // contents as task-did-not-ship.
   if (fs.existsSync(prUrlFile)) {
     const prUrl = fs.readFileSync(prUrlFile, 'utf-8').trim();
-    // Run incomplete-review recovery before reading the SR for the status post so
-    // any fresh-reviewer findings are included in the COMPLETED payload.
-    await maybeRunIncompleteReviewRecovery(taskId, ws, opts.incompleteReviewRecoveryFn);
-    sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but no ./done marker. Posting COMPLETED on Claude's behalf.\n`);
-    // Capture the diff so review-pipeline scope analysis, direction credit,
-    // and rollup management get real changed_files instead of an empty list.
-    let changedFiles: string[] = [];
-    try {
-      const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
-      changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
-    } catch { /* git may be in odd state — best effort */ }
-    const selfReview = augmentSelfReview(
-      readSelfReviewOutcome(taskId, opts.existingPrNumber !== undefined ? (opts.fixIteration ?? 1) : undefined),
-      taskId,
-      opts.baseCommit,
-    );
-    await persistAndPostStatus(taskId, {
-      task_id: taskId,
-      status: 'COMPLETED',
-      artifact_type: 'PULL_REQUEST',
-      pr_url: prUrl,
-      logs: 'Task completed. Claude opened PR but did not call ./done — wrapper finalised.',
-      ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
-      ...(selfReview ? { self_review_outcome: selfReview } : {}),
-    });
-    return;
+    const PR_URL_RE = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+$/;
+    if (!PR_URL_RE.test(prUrl)) {
+      sendLog(ws, `[wrapper] /tmp/pr_url_${taskId} contains malformed PR URL: ${JSON.stringify(prUrl)}. Treating as task-did-not-ship.\n`);
+      // Fall through to the FAILED path below.
+    } else {
+      // Run incomplete-review recovery before reading the SR for the status post so
+      // any fresh-reviewer findings are included in the COMPLETED payload.
+      await maybeRunIncompleteReviewRecovery(taskId, ws, opts.incompleteReviewRecoveryFn);
+      sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but no ./done marker. Posting COMPLETED on Claude's behalf.\n`);
+      // Capture the diff so review-pipeline scope analysis, direction credit,
+      // and rollup management get real changed_files instead of an empty list.
+      let changedFiles: string[] = [];
+      try {
+        const out = git(['diff', '--name-only', `${opts.baseCommit}..HEAD`]);
+        changedFiles = out.split('\n').filter(Boolean).slice(0, 50);
+      } catch { /* git may be in odd state — best effort */ }
+      const selfReview = augmentSelfReview(
+        readSelfReviewOutcome(taskId, opts.existingPrNumber !== undefined ? (opts.fixIteration ?? 1) : undefined),
+        taskId,
+        opts.baseCommit,
+      );
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'COMPLETED',
+        artifact_type: 'PULL_REQUEST',
+        pr_url: prUrl,
+        logs: 'Task completed. Claude opened PR but did not call ./done — wrapper finalised.',
+        ...(changedFiles.length > 0 ? { changed_files: changedFiles } : {}),
+        ...(selfReview ? { self_review_outcome: selfReview } : {}),
+      });
+      return;
+    }
   }
 
   // No PR opened. Did Claude make any changes?

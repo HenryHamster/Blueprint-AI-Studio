@@ -355,8 +355,25 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         task.context = {**(task.context or {}), "pr_merged": True}
         return True
     if artifact and artifact.pr_url:
+        # Shape-validate before parsing. Production incident 2026-05-06: a
+        # haiku retry whose ./check viewport gate was wedged improvised a
+        # `https://github.com/.../compare/main...blueprint/task-<id>` URL into
+        # the wrapper's PR-URL marker file; the wrapper trusted it and saved
+        # a PULL_REQUEST artifact with that pr_url. Without this guard the
+        # int(...) below crashed every rollup cycle (~36x/window) and dirtied
+        # the log with full tracebacks. The wrapper now validates too
+        # (agent/src/handlers/code-change.ts), but bad rows from before that
+        # fix still exist.
+        last_seg = artifact.pr_url.rstrip("/").split("/")[-1]
+        if "/pull/" not in artifact.pr_url or not last_seg.isdigit():
+            logger.warning(
+                f"[PR_VERIFY] Task {task.id} has malformed PR artifact "
+                f"(pr_url={artifact.pr_url!r}); treating as not-merged"
+            )
+            _pr_merge_negative_cache[task.id] = time.time()
+            return False
         try:
-            pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+            pr_number = int(last_seg)
             gh_token, owner, repo = await get_github_token_for_task(task.id, session)
             try:
                 pr_data = await get_pull_request(gh_token, owner, repo, pr_number)

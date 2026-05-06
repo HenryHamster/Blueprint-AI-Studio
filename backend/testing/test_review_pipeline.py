@@ -21,6 +21,8 @@ from app.models import Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
+    SPAWN_REASON_BLOCKED_REPEAT,
+    SPAWN_REASON_KEY,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_REFACTOR,
@@ -32,6 +34,7 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_REFACTOR,
     _compute_scope_budget_utilization,
     _detect_issue_churn,
+    _failure_fingerprint_msg,
     _repeating_issue_descriptions,
     _format_repeating_issues_section,
     compute_drift_signal,
@@ -5180,3 +5183,413 @@ class TestComputeDriftSignal:
         # field defaults to non-APPROVE) so it's drift_in.
         assert [d["file"] for d in result["drift_in"]] == ["ok.py"]
         assert result["drift_out"] == []
+
+
+# ── _failure_fingerprint_msg + repeat-fingerprint halt ────────────────────────
+
+
+class TestFailureFingerprint:
+    """Pure-function tests for the cross-iteration failure fingerprint.
+
+    The fingerprint must be stable across iteration-specific noise (UUIDs,
+    timestamps, /tmp paths, iter/attempt counters, agent-vm IDs) so two
+    iterations hitting the same underlying blocker produce the same hash.
+    """
+
+    def test_empty_input_returns_empty(self):
+        assert _failure_fingerprint_msg("") == ""
+        assert _failure_fingerprint_msg(None) == ""
+        assert _failure_fingerprint_msg("   ") == ""
+
+    def test_identical_input_produces_identical_fp(self):
+        msg = "[wrapper] ./check failed: viewport missing libatk-1.0.so.0"
+        assert _failure_fingerprint_msg(msg) == _failure_fingerprint_msg(msg)
+
+    def test_uuid_noise_stripped(self):
+        a = "Task abc12345-def6-7890-1234-fedcba987654 failed: libatk missing"
+        b = "Task 11111111-2222-3333-4444-555555555555 failed: libatk missing"
+        assert _failure_fingerprint_msg(a) == _failure_fingerprint_msg(b)
+
+    def test_timestamp_noise_stripped(self):
+        a = "[2026-05-06T09:31:42] ./check failed: libatk missing"
+        b = "[2026-05-06T10:15:03] ./check failed: libatk missing"
+        assert _failure_fingerprint_msg(a) == _failure_fingerprint_msg(b)
+
+    def test_tmp_path_noise_stripped(self):
+        a = "wrote /tmp/check_resp_abc123 — libatk missing"
+        b = "wrote /tmp/check_resp_xyz789 — libatk missing"
+        assert _failure_fingerprint_msg(a) == _failure_fingerprint_msg(b)
+
+    def test_iter_counter_stripped(self):
+        a = "iter=3 ./check failed: libatk missing"
+        b = "iter=12 ./check failed: libatk missing"
+        assert _failure_fingerprint_msg(a) == _failure_fingerprint_msg(b)
+
+    def test_agent_vm_id_stripped(self):
+        a = "VM agent-vm-abc123 failed: libatk missing"
+        b = "VM agent-vm-zzzfff failed: libatk missing"
+        assert _failure_fingerprint_msg(a) == _failure_fingerprint_msg(b)
+
+    def test_distinct_failures_have_distinct_fp(self):
+        a = "./check failed: libatk-1.0.so.0 missing"
+        b = "./check failed: ruff returned 1474 errors"
+        assert _failure_fingerprint_msg(a) != _failure_fingerprint_msg(b)
+
+    def test_returns_12_hex_chars(self):
+        fp = _failure_fingerprint_msg("any non-empty input")
+        assert len(fp) == 12
+        assert all(c in "0123456789abcdef" for c in fp)
+
+
+@pytest.mark.asyncio
+async def test_repeat_fingerprint_halts_chain_and_classifies_blocked(db_session, mocker):
+    """Two same-type FAILED tasks in the same chain with identical failure
+    fingerprints → next spawn returns (None, False), the most-recent FAILED
+    is reclassified as BLOCKED_PRECONDITION, the chain's original task is
+    marked requires_approval=True, ProjectMessage posted to strategic."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    common_failure = "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
+
+    # Two FAILED fixes in same chain on same PR with the same fingerprint.
+    earlier_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 901, "branch": "fix/901", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "review_loop": {"iteration": 2, "original_task_id": str(original_task.id), "pr_number": 901},
+        },
+        latest_status_message=f"[2026-05-06T09:11:42] iter=2 vm=agent-vm-aaa111 {common_failure}",
+    )
+    most_recent_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 901, "branch": "fix/901", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "review_loop": {"iteration": 3, "original_task_id": str(original_task.id), "pr_number": 901},
+        },
+        latest_status_message=f"[2026-05-06T09:42:08] iter=3 vm=agent-vm-bbb222 {common_failure}",
+    )
+    await _persist(db_session, earlier_fix, most_recent_fix)
+
+    # Source is most_recent_fix being handed off (FAILED here, but the halt
+    # fires regardless of source.status — see also EVALUATING test below).
+    result, was_created = await _spawn_pipeline_task(
+        most_recent_fix, "review", db_session,
+        pr_number=901, branch="fix/901", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    assert result is None
+    assert was_created is False
+
+    # most_recent_fix gets reclassified.
+    await db_session.refresh(most_recent_fix)
+    ctx = most_recent_fix.context or {}
+    assert ctx.get("failure_category") == "BLOCKED_PRECONDITION"
+    assert ctx.get("blocked_repeat_fingerprint")
+    assert ctx.get("blocked_repeat_prior_task_id") == str(earlier_fix.id)
+    msg = (most_recent_fix.latest_status_message or "").lstrip().lower()
+    assert msg.startswith("blocker:")
+
+    # source_task gets the spawn-reason marker.
+    ctx_src = most_recent_fix.context or {}
+    assert ctx_src.get(SPAWN_REASON_KEY) == SPAWN_REASON_BLOCKED_REPEAT
+
+    # Original task gets requires_approval=True (mirrors stuck-cycle).
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+    assert "repeat-fingerprint" in (original_task.latest_status_message or "").lower()
+
+    # ProjectMessage posted to strategic so it can decide the next move.
+    from app.models import MessageType, ProjectMessage
+    pms = (await db_session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.message_type == MessageType.BLOCKER,
+        )
+    )).scalars().all()
+    assert len(pms) == 1
+    assert pms[0].from_type == "system"
+    assert pms[0].context.get("trigger") == "repeat_fingerprint_halt"
+    assert pms[0].context.get("pr_number") == 901
+    assert pms[0].context.get("source_task_id") == str(most_recent_fix.id)
+    assert pms[0].context.get("prior_task_id") == str(earlier_fix.id)
+
+
+@pytest.mark.asyncio
+async def test_repeat_fingerprint_halts_when_source_is_evaluating(db_session, mocker):
+    """Production handoff path: agent_status.py transitions FAILED → EVALUATING
+    before calling _spawn_pipeline_task. The halt must still fire because the
+    signal lives in chain history (pr_pipeline_tasks), not in source.status."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    common_fp_msg = "[wrapper] ./check failed: ruff returned 1474 errors in unrelated files"
+    f1 = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 911, "branch": "fix/911", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message=f"[2026-05-06T08:14:11] iter=1 {common_fp_msg}",
+    )
+    f2 = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 911, "branch": "fix/911", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message=f"[2026-05-06T09:42:08] iter=2 {common_fp_msg}",
+    )
+    # Source is now EVALUATING (handoff after FAILED-with-open-PR). Its
+    # latest_status_message is the boilerplate handoff line, NOT the failure.
+    source_evaluating = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "fix", "pr_number": 911, "branch": "fix/911", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message="Reported FAILED with open PR #911; handed off to review pipeline (CODE_ERROR)",
+    )
+    await _persist(db_session, f1, f2, source_evaluating)
+
+    result, _ = await _spawn_pipeline_task(
+        source_evaluating, "review", db_session,
+        pr_number=911, branch="fix/911", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    # Halt must fire even though source.status is EVALUATING.
+    assert result is None
+
+    # f2 (most recent FAILED) reclassified.
+    await db_session.refresh(f2)
+    assert (f2.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
+
+    # Original task marked.
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_distinct_fingerprints_do_not_halt_chain(db_session, mocker):
+    """Two FAILED fix tasks with DIFFERENT failure fingerprints — the chain
+    continues normally (no halt, no reclassification, no requires_approval)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    earlier_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 902, "branch": "fix/902", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message="[wrapper] ./check failed: TypeError in foo.ts:42",
+    )
+    most_recent_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 902, "branch": "fix/902", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message="[wrapper] ./check failed: ReferenceError in bar.ts:17",
+    )
+    await _persist(db_session, earlier_fix, most_recent_fix)
+
+    await _spawn_pipeline_task(
+        most_recent_fix, "review", db_session,
+        pr_number=902, branch="fix/902", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    await db_session.refresh(most_recent_fix)
+    assert (most_recent_fix.context or {}).get("failure_category") != "BLOCKED_PRECONDITION"
+    assert "blocked_repeat_fingerprint" not in (most_recent_fix.context or {})
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_completed_source_task_skips_repeat_check(db_session, mocker):
+    """Repeat-fingerprint halt must NOT fire when source_task is COMPLETED.
+    A successful task means the chain IS making progress, even if prior
+    iterations failed identically — halting here would be a false positive."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Two prior FAILED fixes with identical fingerprints, but the source task
+    # COMPLETED — the halt path must NOT fire.
+    fp_msg = "./check failed: libatk missing"
+    prior_a = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 903, "branch": "fix/903", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message=fp_msg,
+    )
+    prior_b = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 903, "branch": "fix/903", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message=fp_msg,
+    )
+    source_completed = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix", "pr_number": 903, "branch": "fix/903", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        context={
+            "review_loop": {"iteration": 4, "original_task_id": str(original_task.id), "pr_number": 903},
+        },
+    )
+    await _persist(db_session, prior_a, prior_b, source_completed)
+
+    await _spawn_pipeline_task(
+        source_completed, "review", db_session,
+        pr_number=903, branch="fix/903", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    await db_session.refresh(source_completed)
+    ctx = source_completed.context or {}
+    assert ctx.get("failure_category") != "BLOCKED_PRECONDITION"
+    assert ctx.get(SPAWN_REASON_KEY) != SPAWN_REASON_BLOCKED_REPEAT
+
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is False
+
+    # Prior FAILED tasks must NOT be reclassified.
+    await db_session.refresh(prior_a)
+    await db_session.refresh(prior_b)
+    assert (prior_a.context or {}).get("failure_category") != "BLOCKED_PRECONDITION"
+    assert (prior_b.context or {}).get("failure_category") != "BLOCKED_PRECONDITION"
+
+
+@pytest.mark.asyncio
+async def test_repeat_fingerprint_halt_is_idempotent(db_session, mocker):
+    """Calling _spawn_pipeline_task twice for the same chain after a halt has
+    already fired must NOT create a second BLOCKER ProjectMessage or re-mutate
+    the failed task — `blocked_repeat_fingerprint` in context is the dedup key."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    common_failure = "[wrapper] ./check failed: libatk missing"
+    f1 = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 921, "branch": "fix/921", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message=common_failure,
+    )
+    f2 = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 921, "branch": "fix/921", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message=common_failure,
+    )
+    await _persist(db_session, f1, f2)
+
+    # First call fires the halt, posts message #1.
+    await _spawn_pipeline_task(
+        f2, "review", db_session,
+        pr_number=921, branch="fix/921", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    # Second call must NOT post another message.
+    await _spawn_pipeline_task(
+        f2, "review", db_session,
+        pr_number=921, branch="fix/921", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    from app.models import MessageType, ProjectMessage
+    pms = (await db_session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project.id,
+            ProjectMessage.message_type == MessageType.BLOCKER,
+        )
+    )).scalars().all()
+    assert len(pms) == 1, "Repeat-fingerprint halt must be idempotent — only one BLOCKER message per chain"
+
+
+@pytest.mark.asyncio
+async def test_only_one_failure_does_not_halt(db_session, mocker):
+    """Halt requires TWO same-type FAILED tasks in chain. One isn't enough."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    only_failure = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix", "pr_number": 904, "branch": "fix/904", "base_branch": "main",
+                   "original_task_id": str(original_task.id)}],
+        latest_status_message="./check failed: libatk missing",
+    )
+    await _persist(db_session, only_failure)
+
+    await _spawn_pipeline_task(
+        only_failure, "review", db_session,
+        pr_number=904, branch="fix/904", base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+
+    await db_session.refresh(only_failure)
+    assert (only_failure.context or {}).get("failure_category") != "BLOCKED_PRECONDITION"
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is False

@@ -657,6 +657,12 @@ SPAWN_REASON_ALREADY_MERGED = "already_merged"
 SPAWN_REASON_DEFERRED = "deferred_cross_type"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
+# Two consecutive same-type pipeline tasks failed with an identical failure
+# fingerprint — the agent's code edits aren't moving the failure shape, which
+# is the signature of a precondition gap (missing system lib, baseline lint
+# debt, toolchain layer) rather than a code defect. Halt the chain and let
+# the strategic agent (or operator) decide whether to spawn an infra fix.
+SPAWN_REASON_BLOCKED_REPEAT = "blocked_repeat_fingerprint"
 
 _PIPELINE_ACTIVE_STATUSES = (
     TaskStatus.QUEUED,
@@ -697,6 +703,112 @@ def _set_spawn_reason(task: Task, reason: str) -> None:
     ctx = dict(task.context or {})
     ctx[SPAWN_REASON_KEY] = reason
     task.context = ctx
+
+
+_FINGERPRINT_NOISE_RE = (
+    # Canonical UUID with dashes (8-4-4-4-12) — matched before the generic
+    # hex regex so the whole UUID collapses into one token instead of leaving
+    # the 4-char middle groups behind.
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE),
+    # SHAs / hex tokens of 8+ hex chars (no dashes)
+    re.compile(r"\b[0-9a-f]{8,}\b", re.IGNORECASE),
+    # Timestamps "2026-05-06T09:31" / "2026-05-06 09:31"
+    re.compile(r"\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(z|[+-]\d{2}:?\d{2})?", re.IGNORECASE),
+    # /tmp/<noise> paths
+    re.compile(r"/tmp/\S+"),
+    # iter / iteration markers ("iter=3", "iteration 3", "iter:3")
+    re.compile(r"\biter(ation)?[\s=:]+\d+", re.IGNORECASE),
+    # attempt N / attempt: N
+    re.compile(r"\battempt[\s=:]+\d+", re.IGNORECASE),
+    # task-XXXXXX / agent-vm-XXXXX style identifiers
+    re.compile(r"\b(?:task|agent-vm|vm)-[a-z0-9-]+", re.IGNORECASE),
+    # Standalone integers ≥ 4 digits (line numbers, counts, etc. that vary by run)
+    re.compile(r"\b\d{4,}\b"),
+)
+
+
+def _failure_fingerprint_msg(msg: str | None) -> str:
+    """Stable 12-char hash of a failure status message for cross-iteration comparison.
+
+    Mirrors the agent-side ``errorFingerprint`` (in ``agent/src/index.ts``) but
+    additionally strips iteration-specific noise — UUIDs, timestamps, /tmp paths,
+    iter/attempt counters, agent-vm identifiers — so that two iterations hitting
+    the same underlying blocker produce identical fingerprints despite cosmetic
+    differences in their status messages.
+
+    Returns ``""`` for empty input. Returned hashes are 12 hex chars (SHA-256
+    truncated) to match the ``errorFingerprint`` format used elsewhere.
+    """
+    from hashlib import sha256
+    if not msg:
+        return ""
+    s = msg.strip().lower()
+    if not s:
+        return ""
+    for pat in _FINGERPRINT_NOISE_RE:
+        s = pat.sub("X", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+    return sha256(s.encode("utf-8")).hexdigest()[:12]
+
+
+async def _post_repeat_fingerprint_blocker_message(
+    session: AsyncSession,
+    *,
+    source_task: Task,
+    pr_number: int,
+    fingerprint: str,
+    prior_task_id,
+) -> None:
+    """Surface a repeat-fingerprint halt to the strategic agent via ProjectMessage.
+
+    The strategic agent reads ``open`` ProjectMessages on its cycle (see
+    ``directions.py`` open_messages loading), so this becomes the trigger for
+    "decide whether to spawn a precondition-fix direction or defer." Posted
+    with ``from_type="system"`` and ``message_type=BLOCKER`` so it sorts
+    correctly in the strategic agent's context block.
+    """
+    from app.models import MessageType, ProjectMessage  # noqa: PLC0415
+
+    body = (
+        f"Pipeline halt — repeat-fingerprint detected on PR #{pr_number}.\n\n"
+        f"The fix-agent's code edits aren't moving the failure shape: this "
+        f"task ({str(source_task.id)[:8]}) failed with the same fingerprint "
+        f"({fingerprint}) as the prior attempt ({str(prior_task_id)[:8]}). "
+        f"Identical failures across iterations is the signature of a "
+        f"*precondition gap* (missing system library, baseline lint/test "
+        f"debt, toolchain mismatch) rather than a code defect — another "
+        f"review-fix iteration won't help.\n\n"
+        f"Latest failure text:\n"
+        f"  {(source_task.latest_status_message or '')[:600]}\n\n"
+        f"Decision points (yours):\n"
+        f"  - Spawn a direction to fix the precondition (update the packer "
+        f"image, scope the gate to changed files, add a missing dep, etc.) "
+        f"if the unblock is worth the investment for this PR + future ones.\n"
+        f"  - Defer and route around it — leave this PR halted, work on "
+        f"unrelated directions.\n"
+        f"  - Cancel the chain (operator) if the work is no longer worth "
+        f"pursuing.\n\n"
+        f"This task is now classified as BLOCKED_PRECONDITION (INFRA class — "
+        f"does not count toward the per-PR review-fix iteration cap, will "
+        f"not be auto-resurrected by the reaper)."
+    )
+    pm = ProjectMessage(
+        project_id=source_task.project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=source_task.id,
+        content=body,
+        context={
+            "pr_number": pr_number,
+            "fingerprint": fingerprint,
+            "source_task_id": str(source_task.id),
+            "prior_task_id": str(prior_task_id),
+            "trigger": "repeat_fingerprint_halt",
+        },
+    )
+    session.add(pm)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1148,16 @@ async def _spawn_pipeline_task(
             Task.archived,
             Task.project_id,
             Task.created_at,
+            Task.latest_status_message,
+            # status_log must be loaded eagerly: the event listener on
+            # latest_status_message setter (models.py:_on_status_message_set)
+            # reads target.status_log to append. Under async SQLAlchemy, a
+            # lazy-load of a deferred attribute during a setter event raises
+            # MissingGreenlet — see memory note "load_only Task event-listener
+            # gotcha". The repeat-fingerprint halt below mutates
+            # latest_status_message on the most-recent failed task; without
+            # this column the mutation crashes mid-cycle.
+            Task.status_log,
         ))
         .where(
             Task.project_id == source_task.project_id,
@@ -1045,6 +1167,116 @@ async def _spawn_pipeline_task(
             type_match,
         )
     )).scalars().all()
+
+    # ── Repeat-fingerprint halt ─────────────────────────────────────────
+    # If the last two same-type FAILED tasks in this chain share an identical
+    # failure fingerprint, the agent's code edits aren't changing the failure
+    # shape — signature of a precondition gap (missing system lib, baseline
+    # debt, toolchain mismatch). Halt: reclassify the most recent FAILED task
+    # to BLOCKED_PRECONDITION (INFRA-class — won't burn cap or get auto-
+    # resurrected), set requires_approval=True on the chain's original task
+    # (mirrors stuck-cycle), and post a ProjectMessage so the strategic agent
+    # (or operator) can decide whether to spawn a precondition-fix direction.
+    #
+    # This runs regardless of source_task.status (FAILED, EVALUATING-after-
+    # FAILED-with-open-PR, etc.) because the FAILED → EVALUATING transition
+    # in agent_status.py happens before this function is called for the
+    # handoff path. The signal lives in chain history (pr_pipeline_tasks),
+    # not in source_task's current status. Skip on COMPLETED source — a
+    # successful task means the chain IS making progress, even if prior
+    # iterations failed identically.
+    if source_task.status != TaskStatus.COMPLETED:
+        src_payload_type = source_task.first_payload.get("type", "")
+        if src_payload_type:
+            same_type_failures: list[Task] = []
+            for _t in pr_pipeline_tasks:
+                if _t.status != TaskStatus.FAILED:
+                    continue
+                if _t.first_payload.get("type", "") != src_payload_type:
+                    continue
+                _t_chain = (
+                    (_t.context or {}).get("review_loop", {}).get("original_task_id")
+                    or _t.first_payload.get("original_task_id")
+                    or ""
+                )
+                if _t_chain != resolved_original_id:
+                    continue
+                same_type_failures.append(_t)
+            if len(same_type_failures) >= 2:
+                same_type_failures.sort(key=lambda x: x.created_at)
+                a, b = same_type_failures[-2], same_type_failures[-1]
+                fp_a = _failure_fingerprint_msg(a.latest_status_message)
+                fp_b = _failure_fingerprint_msg(b.latest_status_message)
+                if fp_a and fp_a == fp_b:
+                    # Idempotency: if this halt already fired for `b` (we
+                    # stamped blocked_repeat_fingerprint in a prior cycle),
+                    # don't reclassify or re-post the BLOCKER message — just
+                    # halt the spawn and exit. Without this guard, repeated
+                    # _spawn_pipeline_task calls for the same chain (e.g.
+                    # rollup retries) would create duplicate ProjectMessages.
+                    already_halted = bool((b.context or {}).get("blocked_repeat_fingerprint"))
+                    logger.warning(
+                        f"[PIPELINE] Repeat-fingerprint halt on PR #{pr_number} "
+                        f"chain={resolved_original_id[:8]} type={src_payload_type}: "
+                        f"prior={str(a.id)[:8]} and most-recent={str(b.id)[:8]} "
+                        f"both failed with fp={fp_b} — halting spawn"
+                        f"{' (already classified, skipping reclassify)' if already_halted else ', reclassifying most-recent as BLOCKED_PRECONDITION'}."
+                    )
+                    if not already_halted:
+                        # Reclassify b (the most recent FAILED) so its row stops
+                        # contributing to CODE_ERROR cap pressure and so any
+                        # downstream consumer (digest, alerts, direction-health)
+                        # sees the same reason as the BLOCKER message.
+                        _b_ctx = dict(b.context or {})
+                        _b_ctx["failure_category"] = "BLOCKED_PRECONDITION"
+                        _b_ctx["blocked_repeat_fingerprint"] = fp_b
+                        _b_ctx["blocked_repeat_prior_task_id"] = str(a.id)
+                        b.context = _b_ctx
+                        _b_msg = b.latest_status_message or ""
+                        if not _b_msg.lstrip().lower().startswith("blocker:"):
+                            b.latest_status_message = (
+                                f"BLOCKER: identical failure to prior iteration "
+                                f"({str(a.id)[:8]}, fp={fp_b}) — code-shaped fix has "
+                                f"no effect, precondition gap suspected. Original: "
+                                f"{_b_msg[:200]}"
+                            )
+                        session.add(b)
+                        # Surface to operator/strategic via requires_approval
+                        # on the chain's original task — mirrors stuck-cycle.
+                        try:
+                            _orig = await session.get(Task, uuid.UUID(resolved_original_id))
+                            if _orig:
+                                _orig.requires_approval = True
+                                _orig.latest_status_message = (
+                                    f"Repeat-fingerprint halt on PR #{pr_number}: last "
+                                    f"two {src_payload_type} attempts failed identically "
+                                    f"(fp={fp_b}). Likely a precondition gap — manual "
+                                    f"review or strategic-agent decision required."
+                                )
+                                session.add(_orig)
+                        except Exception as _orig_err:
+                            logger.warning(
+                                f"[PIPELINE] Failed to mark requires_approval on chain "
+                                f"original {resolved_original_id[:8]}: {_orig_err}",
+                                exc_info=True,
+                            )
+                        try:
+                            await _post_repeat_fingerprint_blocker_message(
+                                session,
+                                source_task=b,
+                                pr_number=pr_number,
+                                fingerprint=fp_b,
+                                prior_task_id=a.id,
+                            )
+                        except Exception as _msg_err:
+                            logger.warning(
+                                f"[PIPELINE] Failed to post repeat-fingerprint BLOCKER "
+                                f"message for PR #{pr_number}: {_msg_err}",
+                                exc_info=True,
+                            )
+                    _set_spawn_reason(source_task, SPAWN_REASON_BLOCKED_REPEAT)
+                    session.add(source_task)
+                    return (None, False)
 
     def _counts_toward_cap(t: Task) -> bool:
         if t.status == TaskStatus.FAILED:

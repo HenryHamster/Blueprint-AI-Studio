@@ -73,6 +73,13 @@ jobs:
         working-directory: ./admin-ui
         run: npm ci
 
+      - name: Install Playwright Chromium + system deps
+        # Required for the viewport suite (vitest browser-mode + chromium).
+        # Agent VMs lack libatk/libnss/libxkbcommon by default; CI gets a
+        # clean ubuntu-latest each run so we install on every job.
+        working-directory: ./admin-ui
+        run: npx playwright install --with-deps chromium
+
       - name: Build (tsc + vite)
         id: build
         continue-on-error: true
@@ -90,10 +97,21 @@ jobs:
         working-directory: ./admin-ui
         run: npx eslint .
 
+      - name: Viewport tests
+        id: viewport
+        continue-on-error: true
+        working-directory: ./admin-ui
+        env:
+          VITE_API_URL: http://localhost:8080
+          VITE_FIREBASE_API_KEY: ci-placeholder
+          VITE_FIREBASE_AUTH_DOMAIN: ci-placeholder.firebaseapp.com
+          VITE_FIREBASE_PROJECT_ID: ci-placeholder
+        run: npm run test:viewport
+
       - name: Save result for baseline (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          if [ "${{ steps.build.outcome }}" = "failure" ] || [ "${{ steps.lint.outcome }}" = "failure" ]; then
+          if [ "${{ steps.build.outcome }}" = "failure" ] || [ "${{ steps.lint.outcome }}" = "failure" ] || [ "${{ steps.viewport.outcome }}" = "failure" ]; then
             echo "BROKEN" > frontend-status.txt
           else
             echo "OK" > frontend-status.txt
@@ -107,7 +125,7 @@ jobs:
           key: ci-baseline-frontend-${{ github.sha }}
 
       - name: Load main baseline (PR only)
-        if: github.event_name == 'pull_request' && (steps.build.outcome == 'failure' || steps.lint.outcome == 'failure')
+        if: github.event_name == 'pull_request' && (steps.build.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.viewport.outcome == 'failure')
         uses: actions/cache/restore@v4
         with:
           path: frontend-status.txt
@@ -115,12 +133,12 @@ jobs:
           restore-keys: ci-baseline-frontend-
 
       - name: Evaluate result
-        if: steps.build.outcome == 'failure' || steps.lint.outcome == 'failure'
+        if: steps.build.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.viewport.outcome == 'failure'
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ] && [ -f frontend-status.txt ] && grep -q "BROKEN" frontend-status.txt; then
             echo "::warning::Frontend CI failed but is also broken on main — not blocking PR"
           else
-            echo "::error::Frontend CI failed (build=${{ steps.build.outcome }}, lint=${{ steps.lint.outcome }})"
+            echo "::error::Frontend CI failed (build=${{ steps.build.outcome }}, lint=${{ steps.lint.outcome }}, viewport=${{ steps.viewport.outcome }})"
             exit 1
           fi
 

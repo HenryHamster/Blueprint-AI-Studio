@@ -1744,30 +1744,41 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
     sendLog(ws, 'Agent type check passed.\n');
   }
   if (touchesBackend) {
-    sendLog(ws, 'Running backend ruff lint...\n');
-    try {
-      const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', 'backend/', '--select', 'E,F,W', '--ignore', 'E501'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
-      sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
-    } catch (err: unknown) {
-      const errCode = (err as NodeJS.ErrnoException).code;
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
-        sendLog(ws, 'ruff not installed, skipping backend lint.\n');
-      } else {
-        throw err;
+    // Scope ruff to changed *.py files. Repo-wide ruff is enforced in CI on
+    // main; on PRs the pre-existing baseline is not actionable for fix tasks
+    // and would block unrelated work. Filter to files that still exist so
+    // deletions don't ENOENT.
+    const backendPy = changedPaths.filter(p =>
+      p.startsWith('backend/') && p.endsWith('.py') && fs.existsSync(`${WORKSPACE}/${p}`),
+    );
+    if (backendPy.length === 0) {
+      sendLog(ws, 'No backend/*.py files changed, skipping backend ruff.\n');
+    } else {
+      sendLog(ws, `Running backend ruff lint on ${backendPy.length} changed file(s)...\n`);
+      try {
+        const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', '--select', 'E,F,W', '--ignore', 'E501', ...backendPy], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
+        sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
+      } catch (err: unknown) {
+        const errCode = (err as NodeJS.ErrnoException).code;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
+          sendLog(ws, 'ruff not installed, skipping backend lint.\n');
+        } else {
+          throw err;
+        }
       }
-    }
-    sendLog(ws, 'Running backend ruff format check...\n');
-    try {
-      const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', 'backend/'], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
-      sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
-    } catch (err: unknown) {
-      const errCode = (err as NodeJS.ErrnoException).code;
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
-        sendLog(ws, 'ruff not installed, skipping backend format check.\n');
-      } else {
-        throw err;
+      sendLog(ws, 'Running backend ruff format check on changed files...\n');
+      try {
+        const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', ...backendPy], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
+        sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
+      } catch (err: unknown) {
+        const errCode = (err as NodeJS.ErrnoException).code;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
+          sendLog(ws, 'ruff not installed, skipping backend format check.\n');
+        } else {
+          throw err;
+        }
       }
     }
   }

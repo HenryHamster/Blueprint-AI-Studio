@@ -1219,6 +1219,54 @@ describe('runCodeChangeTask marker detection', () => {
     );
   });
 
+  it('posts FAILED with failure_category="incomplete" when /tmp/pr_url_<id> contains a non-pull URL (compare URL improvised by Claude)', async () => {
+    // Production incident 2026-05-06: a haiku retry whose ./check viewport
+    // gate was wedged on a missing libatk system library improvised by
+    // writing a `https://github.com/.../compare/main...blueprint/task-...`
+    // URL into /tmp/pr_url_<id>. The wrapper trusted the file uncritically;
+    // the resulting PULL_REQUEST artifact then crashed downstream merge
+    // verification 36×/cycle. The wrapper now shape-validates and falls
+    // through to the standard FAILED path.
+    const fs = (await import('fs')).default;
+    const idx = await import('../index.js');
+    const compareUrl = 'https://github.com/owner/repo/compare/main...blueprint/task-cb7bb07e';
+    vi.mocked(fs.existsSync).mockImplementation((p: unknown) => p === `/tmp/pr_url_${TASK_ID}`);
+    vi.mocked(fs.readFileSync).mockReturnValue(compareUrl);
+    vi.mocked(idx.git).mockImplementation((args: readonly string[]) => {
+      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return 'basecommit';
+      return '';
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await realRunCodeChangeTask(baseOpts());
+    const calls = vi.mocked(idx.persistAndPostStatus).mock.calls;
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual(expect.objectContaining({
+      status: 'FAILED',
+      failure_category: 'incomplete',
+    }));
+    // Crucially, no COMPLETED with the bogus URL.
+    expect(calls[0][1]).not.toEqual(expect.objectContaining({ pr_url: compareUrl }));
+  });
+
+  it('posts FAILED when /tmp/pr_url_<id> contains arbitrary non-URL text', async () => {
+    const fs = (await import('fs')).default;
+    const idx = await import('../index.js');
+    vi.mocked(fs.existsSync).mockImplementation((p: unknown) => p === `/tmp/pr_url_${TASK_ID}`);
+    vi.mocked(fs.readFileSync).mockReturnValue('PR pending — see logs');
+    vi.mocked(idx.git).mockImplementation((args: readonly string[]) => {
+      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return 'basecommit';
+      return '';
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await realRunCodeChangeTask(baseOpts());
+    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({ status: 'FAILED', failure_category: 'incomplete' }),
+    );
+  });
+
   it('posts FAILED with failure_category="incomplete" when no markers are present and Claude exited 0', async () => {
     const fs = (await import('fs')).default;
     const idx = await import('../index.js');
