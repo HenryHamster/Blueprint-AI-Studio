@@ -1171,6 +1171,16 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if dfa:
             direction_first_attempt_feedback = dfa
 
+    # Idle auto-playbook retirements in the last 24h — surfaces accidental
+    # over-retirement of auto-generated entries whose last_referenced_at
+    # crossed the idle threshold (see playbook_learning.retire_idle_auto_entries).
+    auto_playbook_idle_retired_24h: Optional[int] = None
+    if project and project.design_doc:
+        from app.playbook_learning import count_idle_auto_retired_within  # noqa: PLC0415
+        auto_playbook_idle_retired_24h = count_idle_auto_retired_within(
+            project.design_doc, hours=24
+        )
+
     # Self-review prediction accuracy: compare self-review check_results against human rejection categories
     tasks_with_both_24h = [
         t for t in terminal_tasks_24h
@@ -1238,6 +1248,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "medium_scope_review_iterations": medium_scope_review_iterations,
         "direction_first_attempt_feedback": direction_first_attempt_feedback,
         "medium_scope_measurement": medium_scope_measurement,
+        "auto_playbook_idle_retired_24h": auto_playbook_idle_retired_24h,
     }
 
 
@@ -1628,6 +1639,7 @@ async def list_regression_cases(
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "sample_message": c.sample_message,
+                "escalation_reason": c.escalation_reason,
                 "stalled": c.status == RegressionCaseStatus.ACTIVE and c.last_remediation_pr_number is None and c.first_seen_at < stall_threshold,
             }
             for c in rows
@@ -1707,6 +1719,7 @@ async def list_regression_manual_intervention_cases(
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
+                "escalation_reason": c.escalation_reason,
             }
             for c in rows
         ],

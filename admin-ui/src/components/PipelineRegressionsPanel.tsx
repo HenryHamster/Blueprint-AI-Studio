@@ -23,7 +23,15 @@ interface ManualInterventionCase {
   fingerprint_to_fix_log: FixLogEntry[];
   last_seen_at: string | null;
   needs_manual_intervention_at: string | null;
+  escalation_reason: string | null;
 }
+
+const ESCALATION_REASON_LABELS: Record<string, string> = {
+  investigations_diverged: 'Diverged diagnoses',
+  attempts_exhausted: 'Max attempts',
+  stale_active: 'Stale (watchdog)',
+  stale_merged: 'Stale (watchdog)',
+};
 
 interface Props {
   projectId: string;
@@ -114,6 +122,14 @@ export function ManualInterventionPanel({ projectId }: Props) {
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
                       {c.attempts} attempt{c.attempts !== 1 ? 's' : ''}
                     </span>
+                    {c.escalation_reason && ESCALATION_REASON_LABELS[c.escalation_reason] && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20"
+                        title={`escalation_reason: ${c.escalation_reason}`}
+                      >
+                        {ESCALATION_REASON_LABELS[c.escalation_reason]}
+                      </span>
+                    )}
                   </div>
                   <div className="mt-1.5 space-y-0.5">
                     <div className="text-[10px] text-neutral-500">

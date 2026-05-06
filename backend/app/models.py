@@ -1238,6 +1238,23 @@ class RegressionCaseStatus(str, Enum):
     NEEDS_MANUAL_INTERVENTION = "NEEDS_MANUAL_INTERVENTION"
 
 
+# Distinguishes the path that drove a case into NEEDS_MANUAL_INTERVENTION so the
+# admin UI can render the right badge ('Max attempts' vs 'Diverged diagnoses'
+# vs 'Stale (watchdog)') and the operator timeline survives re-wording of the
+# Alert.message string. Stored as a free-form String column rather than an
+# enum so we don't need a SQL constraint migration to add new reasons.
+ESCALATION_REASON_ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+ESCALATION_REASON_INVESTIGATIONS_DIVERGED = "investigations_diverged"
+ESCALATION_REASON_STALE_ACTIVE = "stale_active"
+ESCALATION_REASON_STALE_MERGED = "stale_merged"
+REGRESSION_ESCALATION_REASONS: frozenset[str] = frozenset({
+    ESCALATION_REASON_ATTEMPTS_EXHAUSTED,
+    ESCALATION_REASON_INVESTIGATIONS_DIVERGED,
+    ESCALATION_REASON_STALE_ACTIVE,
+    ESCALATION_REASON_STALE_MERGED,
+})
+
+
 class RegressionRemediationCase(SQLModel, table=True):
     """Persistent record for a regression fingerprint detected across agent runs.
 
@@ -1299,6 +1316,13 @@ class RegressionRemediationCase(SQLModel, table=True):
     needs_manual_intervention_at: Optional[datetime] = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Path that drove this case into NEEDS_MANUAL_INTERVENTION; one of
+    # REGRESSION_ESCALATION_REASONS. Nullable for legacy rows pre-dating
+    # the field and for cases that have not been escalated yet.
+    escalation_reason: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String, nullable=True),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,
@@ -1416,8 +1440,23 @@ class RegressionRemediationCase(SQLModel, table=True):
         if self.attempts >= max_attempts:
             self.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
             self.needs_manual_intervention_at = _utcnow()
+            self.escalation_reason = ESCALATION_REASON_ATTEMPTS_EXHAUSTED
         else:
             self.status = RegressionCaseStatus.ACTIVE
+
+    def escalate_for_divergence(self, detail: Optional[str] = None) -> None:
+        """Escalate to NEEDS_MANUAL_INTERVENTION because successive investigations diverged.
+
+        Idempotent once already NEEDS_MANUAL_INTERVENTION (preserves the prior
+        escalation_reason — first cause wins). Caller is responsible for
+        persisting the case and emitting the operator-facing Alert.
+        """
+        del detail  # reserved for future use; kept in signature for caller clarity
+        if self.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION:
+            return
+        self.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+        self.needs_manual_intervention_at = _utcnow()
+        self.escalation_reason = ESCALATION_REASON_INVESTIGATIONS_DIVERGED
 
     def record_spawn(
         self,

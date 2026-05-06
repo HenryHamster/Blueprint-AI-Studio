@@ -1121,6 +1121,194 @@ def test_retire_ineffective_patterns_retirement_reason_includes_rate():
     assert "0.10" in reason
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for retire_idle_auto_entries
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_retire_idle_auto_entries_archives_idle_auto():
+    from app.playbook_learning import retire_idle_auto_entries
+
+    old_ts = (_utcnow() - timedelta(days=31)).isoformat()
+    doc = {
+        "playbook/foo": {
+            "content": "stale tip",
+            "source": "auto-generated",
+            "last_referenced_at": old_ts,
+            "updated_at": old_ts,
+        },
+    }
+    retired = retire_idle_auto_entries(doc)
+    assert retired == ["playbook/foo"]
+    assert "playbook/foo" not in doc
+    archive = doc.get("playbook_archive", [])
+    assert len(archive) == 1
+    assert archive[0]["_archived_key"] == "playbook/foo"
+    assert archive[0]["_retirement_reason"].startswith("idle_auto_entry")
+
+
+def test_retire_idle_auto_entries_skips_operator_curated():
+    from app.playbook_learning import retire_idle_auto_entries
+
+    old_ts = (_utcnow() - timedelta(days=60)).isoformat()
+    doc = {
+        # Source missing entirely (treated as operator-curated)
+        "playbook/manual-no-source": {
+            "content": "manual tip",
+            "last_referenced_at": old_ts,
+            "updated_at": old_ts,
+        },
+        # Explicit non-auto source
+        "playbook/review-extracted-x": {
+            "content": "review tip",
+            "source": "review-extracted",
+            "last_referenced_at": old_ts,
+            "updated_at": old_ts,
+        },
+        "playbook/operator-x": {
+            "content": "operator tip",
+            "source": "operator",
+            "last_referenced_at": old_ts,
+            "updated_at": old_ts,
+        },
+    }
+    retired = retire_idle_auto_entries(doc)
+    assert retired == []
+    assert "playbook/manual-no-source" in doc
+    assert "playbook/review-extracted-x" in doc
+    assert "playbook/operator-x" in doc
+
+
+def test_retire_idle_auto_entries_skips_recently_referenced():
+    from app.playbook_learning import retire_idle_auto_entries
+
+    fresh_ts = (_utcnow() - timedelta(days=5)).isoformat()
+    old_updated_ts = (_utcnow() - timedelta(days=120)).isoformat()
+    doc = {
+        # Updated long ago, but referenced 5 days ago — should NOT retire
+        "playbook/active": {
+            "content": "active tip",
+            "source": "auto-generated",
+            "last_referenced_at": fresh_ts,
+            "updated_at": old_updated_ts,
+        },
+    }
+    retired = retire_idle_auto_entries(doc)
+    assert retired == []
+    assert "playbook/active" in doc
+
+
+def test_retire_idle_auto_entries_falls_back_to_updated_at():
+    """Entries lacking last_referenced_at fall back to updated_at."""
+    from app.playbook_learning import retire_idle_auto_entries
+
+    old_ts = (_utcnow() - timedelta(days=45)).isoformat()
+    doc = {
+        "playbook/never-shown": {
+            "content": "tip never shown to a claim",
+            "source": "auto-generated",
+            "updated_at": old_ts,
+        },
+    }
+    retired = retire_idle_auto_entries(doc)
+    assert retired == ["playbook/never-shown"]
+    assert "playbook/never-shown" not in doc
+
+
+def test_retire_idle_auto_entries_no_timestamps_kept():
+    """Defensive: entries with neither timestamp must NOT retire."""
+    from app.playbook_learning import retire_idle_auto_entries
+
+    doc = {
+        "playbook/timeless": {
+            "content": "tip with no timestamps",
+            "source": "auto-generated",
+        },
+    }
+    retired = retire_idle_auto_entries(doc)
+    assert retired == []
+    assert "playbook/timeless" in doc
+
+
+def test_retire_idle_auto_entries_respects_archive_cap():
+    """playbook_archive_max trim still applies after idle retirement."""
+    from app.playbook_learning import retire_idle_auto_entries
+    import app.shared_state as _ss
+
+    old_ts = (_utcnow() - timedelta(days=40)).isoformat()
+    doc = {
+        # Pre-fill archive at the cap
+        "playbook_archive": [
+            {"_archived_key": f"playbook/old-{i}", "_archived_at": old_ts}
+            for i in range(50)
+        ],
+        "playbook/idle1": {
+            "content": "tip 1",
+            "source": "auto-generated",
+            "last_referenced_at": old_ts,
+            "updated_at": old_ts,
+        },
+        "playbook/idle2": {
+            "content": "tip 2",
+            "source": "auto-generated",
+            "last_referenced_at": old_ts,
+            "updated_at": old_ts,
+        },
+    }
+    prev_max = _ss.runtime_config.get("playbook_archive_max")
+    _ss.runtime_config["playbook_archive_max"] = 50
+    try:
+        retired = retire_idle_auto_entries(doc)
+    finally:
+        if prev_max is None:
+            _ss.runtime_config.pop("playbook_archive_max", None)
+        else:
+            _ss.runtime_config["playbook_archive_max"] = prev_max
+    assert sorted(retired) == ["playbook/idle1", "playbook/idle2"]
+    assert len(doc["playbook_archive"]) == 50  # cap preserved
+    # Newest entries (idle1/idle2) should be at the tail after trim
+    tail_keys = {e.get("_archived_key") for e in doc["playbook_archive"][-2:]}
+    assert tail_keys == {"playbook/idle1", "playbook/idle2"}
+
+
+def test_count_idle_auto_retired_within_window():
+    from app.playbook_learning import count_idle_auto_retired_within
+
+    now = _utcnow()
+    doc = {
+        "playbook_archive": [
+            # Within 24h, idle reason → counted
+            {
+                "_archived_key": "playbook/a",
+                "_archived_at": (now - timedelta(hours=2)).isoformat(),
+                "_retirement_reason": "idle_auto_entry:30d",
+            },
+            # Within 24h, but different reason → NOT counted
+            {
+                "_archived_key": "playbook/b",
+                "_archived_at": (now - timedelta(hours=2)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.10",
+            },
+            # Idle reason but older than 24h → NOT counted
+            {
+                "_archived_key": "playbook/c",
+                "_archived_at": (now - timedelta(hours=48)).isoformat(),
+                "_retirement_reason": "idle_auto_entry:30d",
+            },
+            # Within 24h, idle reason → counted
+            {
+                "_archived_key": "playbook/d",
+                "_archived_at": (now - timedelta(hours=23)).isoformat(),
+                "_retirement_reason": "idle_auto_entry:30d",
+            },
+        ],
+    }
+    assert count_idle_auto_retired_within(doc, hours=24) == 2
+    # Empty / missing doc handling
+    assert count_idle_auto_retired_within({}, hours=24) == 0
+    assert count_idle_auto_retired_within({"playbook_archive": []}, hours=24) == 0
+
+
 def test_maybe_archive_for_capacity_triggers_at_threshold():
     """maybe_archive_for_capacity archives when combined size exceeds 25KB."""
     from app.playbook_learning import maybe_archive_for_capacity, _PLAYBOOK_CAPACITY_BYTES

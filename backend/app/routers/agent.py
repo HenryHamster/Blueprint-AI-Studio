@@ -1545,6 +1545,17 @@ async def claim_task(
                         doc = check_and_flag_stale_refs(doc, repo_root)
                 except Exception:  # noqa: BLE001 — stale-ref check is best-effort, never block claim
                     logger.debug("[AGENT] Stale-ref check skipped (non-critical)")
+                # Time-decay maintenance: archive auto-generated playbook entries
+                # whose last_referenced_at is past the idle threshold. Piggybacks
+                # on the already-mutating doc/commit so no extra DB write.
+                try:
+                    from app.playbook_learning import retire_idle_auto_entries
+                    idle_days = int(_shared_state.runtime_config.get(
+                        "playbook_idle_auto_days", 30
+                    ))
+                    retire_idle_auto_entries(doc, idle_days=idle_days)
+                except Exception:  # noqa: BLE001 — best-effort, never block claim
+                    logger.debug("[AGENT] Idle auto-entry retirement skipped (non-critical)")
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)

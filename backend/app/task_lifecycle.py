@@ -2704,6 +2704,7 @@ async def _process_post_commit(
                         return {"status": "accepted"}
 
                     ci_errors_text = ""
+                    ci_check: dict | None = None
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
                         pr_data = await get_pull_request(gh_token, owner, repo, pr_number)

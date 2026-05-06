@@ -59,6 +59,17 @@ DIVERGENCE_EXIT_REASONS: frozenset[str] = frozenset({
 })
 
 
+def normalize_fix_loop_error_fingerprint(message: str | None) -> str:
+    """Normalize fix-loop error text into a stable grouping fingerprint.
+
+    Delegates to the existing failure-classification normalizer so UUIDs,
+    numbers, and size tokens cluster identically across telemetry consumers.
+    """
+    from app.failure_classification import _fingerprint_message  # noqa: PLC0415
+
+    return _fingerprint_message(message or "")
+
+
 class FixLoopEventIn(BaseModel):
     """Ingest payload for one fix-loop attempt.
 

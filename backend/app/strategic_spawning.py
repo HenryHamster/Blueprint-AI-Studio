@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -948,13 +949,25 @@ def _build_playbook_summary(project: Project) -> dict[str, Any] | None:
 async def _find_last_strategic_cycle_time(
     project: Project, session: AsyncSession
 ) -> datetime | None:
-    """Return the updated_at of the most recent completed strategic_review
-    for this project, or None if there isn't one yet."""
+    """Return the updated_at of the most recent completed strategic task
+    (strategic_review or design_doc_update) for this project, or None.
+
+    Both task types constitute strategic-engine activity: design_doc_update is
+    Phase 1 and strategic_review is Phase 2. Including both makes the
+    since_last_strategic window accurate when Phase 1 just completed but
+    Phase 2 hasn't run yet — otherwise the window would anchor to the prior
+    Phase 2 completion and make recent_interventions look artificially stale.
+    This also keeps the definition consistent with the stall detector in
+    pipeline_regression_dispatcher, which treats both types as cycle activity.
+    """
     result = await session.execute(
         select(Task).where(
             Task.project_id == project.id,
             Task.status == TaskStatus.COMPLETED,
-            Task.payloads[0]["type"].as_string() == "strategic_review",
+            or_(
+                Task.payloads[0]["type"].as_string() == "strategic_review",
+                Task.payloads[0]["type"].as_string() == "design_doc_update",
+            ),
         ).order_by(Task.updated_at.desc()).limit(1)
     )
     task = result.scalars().first()

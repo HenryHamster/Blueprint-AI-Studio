@@ -815,6 +815,16 @@ def _fingerprint_message(msg: str) -> str:
     return s[:200]
 
 
+def normalize_error_fingerprint(msg: str | None) -> str:
+    """Public API: normalize an error message into a stable grouping fingerprint.
+
+    Delegates to ``_fingerprint_message`` so all fingerprint consumers —
+    residual store, fix-loop telemetry, regression dispatcher — produce
+    identical keys from the same input.
+    """
+    return _fingerprint_message(msg or "")
+
+
 def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     """Record a CODE_ERROR fallthrough in the residual store.
 

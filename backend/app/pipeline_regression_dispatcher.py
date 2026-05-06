@@ -29,6 +29,7 @@ from app.deploy_health import (
 )
 from app.models import (
     Alert, AlertSeverity, DeploymentState,
+    ESCALATION_REASON_STALE_ACTIVE, ESCALATION_REASON_STALE_MERGED,
     RegressionCaseStatus, RegressionRemediationCase,
     Task, TaskHistory, TaskStatus,
 )
@@ -71,10 +72,23 @@ _WATCHDOG_MERGED_STALE_THRESHOLD = timedelta(hours=6)
 _ANOMALY_DISPATCH_MIN_OCCURRENCES = 3
 _ANOMALY_DISPATCH_RECENCY_HOURS = 48
 
+# Per-fingerprint fix-loop divergence threshold. Same noisy-code-path signal,
+# but grouped by normalized error fingerprint so a poisoned area gets a
+# targeted investigation instead of only the aggregate rate signal.
+_FIX_LOOP_DIVERGENCE_FINGERPRINT_MIN_TASKS = 3
+_FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS = 7
+
 # SR blind-spot theme occurrence floor. A blind_spot theme must appear at least
 # this many times across the 14d window before it is considered a structural gap
 # in the self-review prompt rather than a one-off observation from a single task.
 _SR_BLIND_SPOT_THEME_FLOOR = 5
+
+# Strategic-cycle stall threshold: how many hours without a completed
+# strategic_review or design_doc_update before we flag the engine as stalled.
+_STRATEGIC_CYCLE_STALL_HOURS = 8
+
+# Task types that constitute a strategic cycle completion.
+_STRATEGIC_TASK_TYPES = frozenset({"strategic_review", "design_doc_update"})
 
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
@@ -454,6 +468,81 @@ async def _current_signal_value_for_class(
     return None
 
 
+def _parse_signal_timestamp(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+async def _collect_fix_loop_divergence_fingerprints(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    from app.failure_classification import _fingerprint_message  # noqa: PLC0415
+    from app.fix_loop_telemetry import DIVERGENCE_EXIT_REASONS  # noqa: PLC0415
+    from app.models import Task as TaskModel  # noqa: PLC0415
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=_FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS)
+    rows = (await session.execute(
+        select(TaskModel).where(
+            TaskModel.project_id == project_id,
+            TaskModel.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            TaskModel.updated_at >= cutoff,
+        ).order_by(TaskModel.updated_at.desc())
+    )).scalars().all()
+    grouped: dict[str, dict[str, Any]] = {}
+    for task in rows:
+        ctx = task.context or {}
+        files = [str(f) for f in (ctx.get("related_files") or []) if isinstance(f, str) and f][:10]
+        scope = str(ctx.get("scope") or "unknown")
+        for bucket in (task.fix_loop_history or {}).values():
+            for ev in bucket or []:
+                if not isinstance(ev, dict) or ev.get("exit_reason") not in DIVERGENCE_EXIT_REASONS:
+                    continue
+                ts = _parse_signal_timestamp(ev.get("ended_at") or ev.get("started_at")) or task.updated_at
+                if ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)
+                if ts < cutoff:
+                    continue
+                fingerprint = _fingerprint_message(str(ev.get("error_tail") or ""))
+                if not fingerprint:
+                    continue
+                item = grouped.setdefault(fingerprint, {
+                    "tasks": set(),
+                    "samples": [],
+                    "files": set(),
+                    "scopes": set(),
+                })
+                item["tasks"].add(str(task.id))
+                item["files"].update(files)
+                item["scopes"].add(scope)
+                if ev.get("error_tail") and len(item["samples"]) < 2:
+                    item["samples"].append(str(ev.get("error_tail"))[:240])
+    trips: list[dict[str, Any]] = []
+    for fingerprint, item in grouped.items():
+        count = len(item["tasks"])
+        if count < _FIX_LOOP_DIVERGENCE_FINGERPRINT_MIN_TASKS:
+            continue
+        short_fingerprint = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in fingerprint
+        )[:80].strip("-") or "unknown"
+        trips.append({
+            "fingerprint": fingerprint,
+            "short_fingerprint": short_fingerprint,
+            "count": count,
+            "samples": item["samples"],
+            "files": sorted(item["files"]),
+            "scopes": sorted(item["scopes"]),
+        })
+    return sorted(trips, key=lambda item: (-item["count"], item["fingerprint"]))
+
+
 async def _get_remediation_case(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -744,6 +833,48 @@ async def _evaluate_fix_loop_divergence_signal(
     return 1 if spawn is not None else 0
 
 
+async def _evaluate_fix_loop_divergence_fingerprint_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    if spawn_budget_left <= 0 or not _runtime_config.get("fix_loop_divergence_fingerprint_enabled", False):
+        return 0
+    trips = await _collect_fix_loop_divergence_fingerprints(session, project_id)
+    spawned = 0
+    for trip in trips:
+        if spawned >= spawn_budget_left:
+            break
+        prompt = _format_signal_lines(
+            signal_name="fix_loop_divergence_fingerprint",
+            regression_class=f"fix_loop_divergence_fingerprint:{trip['short_fingerprint']}",
+            prior_rate=None,
+            current_rate=None,
+            sample_size=trip["count"],
+            extras=[
+                f"Normalized fingerprint: {trip['fingerprint']}",
+                f"Affected scope(s): {', '.join(trip['scopes']) or 'unknown'}",
+                f"Affected files: {', '.join(trip['files']) or '(none recorded)'}",
+                *[f"Sample failure tail: {tail}" for tail in trip["samples"]],
+            ],
+        )
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="fix_loop_divergence_fingerprint",
+            regression_class=f"fix_loop_divergence_fingerprint:{trip['short_fingerprint']}",
+            prior_rate=None,
+            current_rate=None,
+            sample_size=trip["count"],
+            magnitude=float(trip["count"]),
+            title_hint=f"fix-loop divergence fingerprint ({trip['short_fingerprint']})"[:80],
+            prompt_override=prompt,
+        )
+        if spawn is not None:
+            spawned += 1
+    return spawned
+
+
 async def _evaluate_pipeline_success_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -957,6 +1088,124 @@ async def _evaluate_sr_blind_spot_signal(
     return spawned
 
 
+def _format_strategic_stall_prompt(
+    *,
+    stall_hours: int,
+    recent_task_count: int,
+    failed_strategic: list[Task],
+) -> str:
+    lines = [
+        "Pipeline regression detected (strategic_cycle_stall).",
+        f"No strategic_review or design_doc_update task has completed in the last {stall_hours}h.",
+        f"Non-strategic task activity in window: {recent_task_count} task(s) created.",
+        "",
+        "The strategic engine normally runs design_doc_update (Phase 1) to refresh project",
+        "context, then strategic_review (Phase 2) to score findings, evaluate directions,",
+        "and queue new research tasks. A prolonged stall leads to stale project context,",
+        "missed signal patterns, and direction drift.",
+        "",
+    ]
+    if failed_strategic:
+        lines.append("Recent FAILED strategic tasks in this window:")
+        for t in failed_strategic:
+            ptype = (t.first_payload or {}).get("type", "unknown")
+            lines.append(f"  - {ptype} task {t.id} FAILED")
+        lines.append("")
+    lines += [
+        "Investigate: why has the strategic engine not completed a cycle? Look for:",
+        "  - strategic_review or design_doc_update tasks stuck in QUEUED/IN_PROGRESS",
+        "  - repeated FAILED outcomes on strategic tasks",
+        "  - orchestrator scheduling not spawning strategic tasks",
+        "  - research slot exhaustion (max_total_research_per_project cap) blocking spawns",
+        "  - recent deploy changes that may correlate with the stall onset",
+        "",
+        "\nDiagnose the underlying root cause of this regression and produce "
+        "the structured diagnosis JSON report ({summary, root_cause, "
+        "recommended_fix, severity, confidence, affected_files}). "
+        "Do NOT prescribe a fix — let the investigate→fix chain produce the "
+        "remediation.",
+    ]
+    return "\n".join(lines)
+
+
+async def _evaluate_strategic_cycle_stall_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Trip strategic_cycle_stall when no strategic task completed in stall window.
+
+    Only fires for projects that have previously completed at least one strategic
+    cycle (so new projects without any history are excluded) AND have non-strategic
+    activity in the current window (so idle/paused projects are excluded).
+    """
+    if spawn_budget_left <= 0:
+        return 0
+
+    stall_cutoff = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS)
+
+    recent_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.created_at >= stall_cutoff,
+        )
+    )).scalars().all()
+
+    # If any strategic task completed recently, no stall.
+    for t in recent_tasks:
+        if (
+            (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
+            and t.status == TaskStatus.COMPLETED
+        ):
+            return 0
+
+    # If no non-strategic tasks exist in the window, the project is idle — skip.
+    if not any(
+        (t.first_payload or {}).get("type") not in _STRATEGIC_TASK_TYPES
+        for t in recent_tasks
+    ):
+        return 0
+
+    # Guard: only fire for projects that have previously had at least one
+    # completed strategic cycle. New projects (no prior strategic history)
+    # are excluded — they have not yet established a cadence to stall against.
+    prior_strategic = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at < stall_cutoff,
+        ).limit(50)
+    )).scalars().all()
+    if not any(
+        (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
+        for t in prior_strategic
+    ):
+        return 0
+
+    failed_strategic = [
+        t for t in recent_tasks
+        if (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
+        and t.status == TaskStatus.FAILED
+    ]
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="strategic_cycle_stall",
+        regression_class="strategic_cycle_stall",
+        prior_rate=None,
+        current_rate=None,
+        sample_size=len(recent_tasks),
+        magnitude=float(_STRATEGIC_CYCLE_STALL_HOURS),
+        title_hint=f"strategic engine stalled (>{_STRATEGIC_CYCLE_STALL_HOURS}h)",
+        prompt_override=_format_strategic_stall_prompt(
+            stall_hours=_STRATEGIC_CYCLE_STALL_HOURS,
+            recent_task_count=len(recent_tasks),
+            failed_strategic=failed_strategic,
+        ),
+    )
+    return 1 if spawn is not None else 0
+
+
 async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Re-evaluate merged regression cases and close or re-arm them."""
     from app.models import Project  # noqa: PLC0415
@@ -1104,9 +1353,11 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
         if case.status == RegressionCaseStatus.ACTIVE:
             threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
             reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
+            escalation_reason = ESCALATION_REASON_STALE_ACTIVE
         else:  # MERGED
             threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
             reason = "MERGED case stale — recovery scan could not evaluate it (signal_snapshot_at_merge may be empty)"
+            escalation_reason = ESCALATION_REASON_STALE_MERGED
 
         if now < updated + threshold:
             continue
@@ -1119,6 +1370,7 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
         )
         case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
         case.needs_manual_intervention_at = now
+        case.escalation_reason = escalation_reason
         session.add(case)
         session.add(Alert(
             project_id=project_id,
@@ -1158,6 +1410,9 @@ async def _any_signal_would_trip(
     )
     if fl_state is not None and fl_state["tripped"]:
         return True
+    if _runtime_config.get("fix_loop_divergence_fingerprint_enabled", False):
+        if await _collect_fix_loop_divergence_fingerprints(session, project_id):
+            return True
     ps_state = await _current_signal_value_for_class(
         session, project_id, "pipeline_success_rate", project_design_doc,
     )
@@ -1178,7 +1433,45 @@ async def _any_signal_would_trip(
         return True
     if await _probe_sr_blind_spot_any_trip(session, project_id):
         return True
+    if await _probe_strategic_stall_any_trip(session, project_id):
+        return True
     return False
+
+
+async def _probe_strategic_stall_any_trip(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> bool:
+    """Side-effect-free probe: would the strategic_cycle_stall signal trip?"""
+    stall_cutoff = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS)
+    recent_tasks = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.created_at >= stall_cutoff,
+        )
+    )).scalars().all()
+    if any(
+        (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
+        and t.status == TaskStatus.COMPLETED
+        for t in recent_tasks
+    ):
+        return False
+    if not any(
+        (t.first_payload or {}).get("type") not in _STRATEGIC_TASK_TYPES
+        for t in recent_tasks
+    ):
+        return False
+    prior_strategic = (await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at < stall_cutoff,
+        ).limit(50)
+    )).scalars().all()
+    return any(
+        (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
+        for t in prior_strategic
+    )
 
 
 async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
@@ -1252,6 +1545,9 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     spawned += await _evaluate_fix_loop_divergence_signal(
         session, project_id, spawn_budget - spawned,
     )
+    spawned += await _evaluate_fix_loop_divergence_fingerprint_signal(
+        session, project_id, spawn_budget - spawned,
+    )
     spawned += await _evaluate_pipeline_success_signal(
         session, project_id, spawn_budget - spawned,
     )
@@ -1259,6 +1555,9 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         session, project_id, spawn_budget - spawned,
     )
     spawned += await _evaluate_sr_blind_spot_signal(
+        session, project_id, spawn_budget - spawned,
+    )
+    spawned += await _evaluate_strategic_cycle_stall_signal(
         session, project_id, spawn_budget - spawned,
     )
 

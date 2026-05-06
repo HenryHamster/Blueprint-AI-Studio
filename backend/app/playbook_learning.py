@@ -84,6 +84,12 @@ _MIN_FOLLOWED_FOR_RATE = 3
 _RETIRE_MIN_FOLLOWED = 5
 _RETIRE_MAX_SUCCESS_RATE = 0.20
 
+# Time-decay retirement for auto-generated playbook entries: entries whose
+# last_referenced_at (or updated_at fallback) is older than _IDLE_RETIRE_DAYS
+# get archived. Operator-curated entries (source != 'auto-generated') are
+# EXEMPT — only entries with source == 'auto-generated' decay on idleness.
+_IDLE_RETIRE_DAYS = 30
+
 # Review-extracted playbook entries are refreshed in-place when their
 # updated_at exceeds _REVIEW_PLAYBOOK_REFRESH_DAYS, and flagged
 # potentially_stale once they exceed _REVIEW_PLAYBOOK_STALE_DAYS without
@@ -490,6 +496,109 @@ def retire_ineffective_patterns(
         )
 
     return retired
+
+
+def retire_idle_auto_entries(
+    doc: dict,
+    *,
+    idle_days: int = _IDLE_RETIRE_DAYS,
+) -> list[str]:
+    """Auto-archive auto-generated playbook entries that have not been referenced
+    for at least ``idle_days``.
+
+    Operator-curated entries (``source != 'auto-generated'``) are EXEMPT; only
+    entries with ``source == 'auto-generated'`` decay on idleness.
+
+    Reuses the existing ``last_referenced_at`` field as the freshness signal
+    (it is stamped in routers/agent.py whenever a playbook entry is shown to
+    a claim). Falls back to ``updated_at`` for entries that were never
+    referenced, so historical entries don't all retire on the first run.
+    Entries lacking both timestamps are skipped (defensive — brand-new
+    entries written without an ``updated_at`` would otherwise look idle).
+
+    Archived entries receive ``_retirement_reason='idle_auto_entry:<N>d'``
+    so the digest counter can distinguish idle-decay retirements from
+    low-success-rate retirements.
+
+    Returns the list of full playbook keys that were archived.
+    """
+    from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
+    archive_max = _rc.get("playbook_archive_max", _PLAYBOOK_ARCHIVE_MAX_DEFAULT)
+    now = _utcnow()
+    threshold = timedelta(days=idle_days)
+    retired: list[str] = []
+
+    for k in list(doc.keys()):
+        if not k.startswith("playbook/"):
+            continue
+        entry = doc.get(k)
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("source") != "auto-generated":
+            continue
+
+        ts_str = entry.get("last_referenced_at") or entry.get("updated_at")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        if (now - ts) < threshold:
+            continue
+
+        victim = dict(doc.pop(k))
+        victim["_archived_key"] = k
+        victim["_archived_at"] = now.isoformat()
+        victim["_retirement_reason"] = f"idle_auto_entry:{idle_days}d"
+        archive = list(doc.get("playbook_archive") or [])
+        archive.append(victim)
+        if archive_max > 0 and len(archive) > archive_max:
+            archive = archive[-archive_max:]
+        doc["playbook_archive"] = archive
+        retired.append(k)
+        logger.info(
+            "[PLAYBOOK] Retired idle auto-entry '%s' (idle >= %dd)",
+            k, idle_days,
+        )
+
+    return retired
+
+
+def count_idle_auto_retired_within(doc: dict, *, hours: int = 24) -> int:
+    """Count playbook_archive entries retired by ``retire_idle_auto_entries``
+    within the last ``hours``. Used by admin_digest to surface accidental
+    over-retirement to operators.
+    """
+    if not doc:
+        return 0
+    archive = doc.get("playbook_archive") or []
+    if not archive:
+        return 0
+    now = _utcnow()
+    cutoff = now - timedelta(hours=hours)
+    count = 0
+    for entry in archive:
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("_retirement_reason") or ""
+        if not reason.startswith("idle_auto_entry"):
+            continue
+        ts_str = entry.get("_archived_at")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        if ts >= cutoff:
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

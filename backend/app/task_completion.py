@@ -2447,6 +2447,166 @@ def _is_structural_diagnosis(root_cause: str, recommended_fix: str) -> bool:
     return any(kw in blob for kw in _STRUCTURAL_WEAK_KEYWORDS)
 
 
+# Stopwords trimmed from root-cause divergence comparison so generic English
+# scaffolding ("the", "this", "test", etc.) doesn't inflate the apparent
+# overlap between diagnoses that actually disagree on substance.
+_DIVERGENCE_STOPWORDS: frozenset[str] = frozenset({
+    "the", "this", "that", "with", "from", "into", "have", "been", "will",
+    "their", "there", "these", "those", "what", "when", "which", "while",
+    "after", "because", "could", "should", "would", "shall", "might",
+    "test", "tests", "code", "fail", "fails", "failed", "failing",
+    "issue", "issues", "error", "errors", "task", "tasks", "task_id",
+    "regression", "investigation", "diagnosis",
+})
+
+
+def _normalize_path_for_divergence(path: str) -> str:
+    """Strip whitespace/quotes and lowercase a file path for set comparison."""
+    return path.strip().strip('"').strip("'").lstrip("./").lower()
+
+
+def _tokenize_for_divergence(text: str) -> set[str]:
+    """Return lowercased alphanumeric tokens of length >= 4 minus stopwords."""
+    if not text:
+        return set()
+    raw = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in raw if len(t) >= 4 and t not in _DIVERGENCE_STOPWORDS}
+
+
+def _jaccard(a: set, b: set) -> Optional[float]:
+    """Jaccard similarity, or None when both sets are empty (undefined)."""
+    union = a | b
+    if not union:
+        return None
+    return len(a & b) / len(union)
+
+
+def _compute_diagnosis_divergence(
+    *,
+    prior_root: str,
+    prior_paths: List[str],
+    new_root: str,
+    new_paths: List[str],
+) -> tuple[bool, str]:
+    """Pure helper: does the new diagnosis diverge from the prior one?
+
+    Returns (diverged, detail). Diverged when EITHER affected-file Jaccard
+    < 0.30 OR root-cause token-set Jaccard < 0.15. ``detail`` is a short
+    human-readable string for the operator alert.
+    """
+    prior_path_set = {_normalize_path_for_divergence(p) for p in prior_paths if p}
+    new_path_set = {_normalize_path_for_divergence(p) for p in new_paths if p}
+    path_jaccard = _jaccard(prior_path_set, new_path_set)
+    root_jaccard = _jaccard(
+        _tokenize_for_divergence(prior_root),
+        _tokenize_for_divergence(new_root),
+    )
+    if path_jaccard is not None and path_jaccard < 0.30:
+        return True, f"affected-file overlap {path_jaccard:.2f} < 0.30."
+    if root_jaccard is not None and root_jaccard < 0.15:
+        return True, f"root-cause token overlap {root_jaccard:.2f} < 0.15."
+    return False, ""
+
+
+async def _maybe_escalate_diagnosis_divergence(
+    *,
+    task: Task,
+    new_root_cause: str,
+    new_affected_paths: List[str],
+    session: AsyncSession,
+) -> bool:
+    """Detect divergence between this and the prior pipeline-regression
+    investigation; escalate the case to NEEDS_MANUAL_INTERVENTION if so.
+
+    Returns True when the case was escalated (caller must skip remediation
+    spawning) and False otherwise. Best-effort: any missing linkage / empty
+    prior diagnosis returns False so the existing spawn path proceeds.
+    """
+    parent_ctx = task.context or {}
+    if parent_ctx.get("spawned_by") != "pipeline_regression_dispatcher":
+        return False
+    regression_class = parent_ctx.get("regression_class")
+    if not regression_class:
+        return False
+
+    from app.models import (  # noqa: PLC0415
+        Alert, AlertSeverity,
+        RegressionCaseStatus, RegressionRemediationCase,
+    )
+
+    case_result = await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == task.project_id,
+            RegressionRemediationCase.regression_class == regression_class,
+        )
+    )
+    case = case_result.scalar_one_or_none()
+    if case is None:
+        return False
+    if (case.attempts or 0) < 2:
+        return False
+    if case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION:
+        return False
+
+    prior_result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id == task.project_id,
+            Task.id != task.id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.context["regression_class"].as_string() == str(regression_class),
+        )
+        .order_by(Task.updated_at.desc())
+        .limit(1)
+    )
+    prior_task = prior_result.scalar_one_or_none()
+    if prior_task is None:
+        return False
+
+    prior_output = prior_task.plan_output or {}
+    if not isinstance(prior_output, dict) or not prior_output:
+        return False
+    prior_root = str(prior_output.get("root_cause") or "")
+    prior_affected_raw = prior_output.get("affected_files") or []
+    prior_paths: List[str] = []
+    for entry in prior_affected_raw if isinstance(prior_affected_raw, list) else []:
+        p = entry.get("path") if isinstance(entry, dict) else entry
+        if isinstance(p, str) and p.strip():
+            prior_paths.append(p.strip())
+    if not (prior_root or prior_paths):
+        return False
+
+    diverged, detail = _compute_diagnosis_divergence(
+        prior_root=prior_root,
+        prior_paths=prior_paths,
+        new_root=new_root_cause,
+        new_paths=new_affected_paths,
+    )
+    if not diverged:
+        return False
+
+    case.escalate_for_divergence()
+    session.add(case)
+    session.add(Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=f"Regression case escalated for diagnosis divergence: {regression_class}"[:200],
+        message=(
+            "investigations diverged: structural/environmental cause likely. "
+            f"{detail} Prior investigation {prior_task.id} and current investigation "
+            f"{task.id} produced incompatible diagnoses for {regression_class} "
+            f"after {case.attempts} attempts. Manual review required."
+        )[:1000],
+    ))
+    logger.warning(
+        "[INVESTIGATION_DIVERGENCE] project=%s class=%s task=%s prior_task=%s "
+        "attempts=%d — case escalated to NEEDS_MANUAL_INTERVENTION (%s)",
+        task.project_id, regression_class, task.id, prior_task.id,
+        case.attempts, detail,
+    )
+    return True
+
+
 async def _handle_investigation_completion(task: Task, payload, session: AsyncSession) -> None:
     """Process investigation report: update diagnosis state and spawn remediation.
 
@@ -2575,6 +2735,26 @@ async def _handle_investigation_completion(task: Task, payload, session: AsyncSe
         and confidence in ("high", "medium")
         and bool(recommended_fix)
     )
+
+    # Diverged-diagnoses early escalation. Only fires for pipeline-regression
+    # investigations at attempts>=2; on hit, skips the remediation spawn so the
+    # case waits for manual review instead of burning a 3rd attempt on a
+    # diagnosis the next investigator will likely also disagree with.
+    if spawn_remediation:
+        diverged_escalated = await _maybe_escalate_diagnosis_divergence(
+            task=task,
+            new_root_cause=root_cause,
+            new_affected_paths=affected_paths,
+            session=session,
+        )
+        if diverged_escalated:
+            session.add(task)
+            logger.info(
+                "[INVESTIGATION] Task %s skipping remediation spawn — case "
+                "escalated for diagnosis divergence",
+                task.id,
+            )
+            return
 
     spawned_child: Optional[Task] = None
     if spawn_remediation and direction is not None:

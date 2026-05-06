@@ -57,6 +57,32 @@ def _design_doc_with_sr_regression(
     }
 
 
+def _make_fix_loop_divergence_task(
+    project_id,
+    *,
+    error_tail: str,
+    related_files: list[str],
+    scope: str = "small",
+) -> Task:
+    now = _utcnow()
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=1),
+        context={"scope": scope, "related_files": related_files},
+        fix_loop_history={
+            "lint": [{
+                "loop": "lint",
+                "iteration": 1,
+                "error_tail": error_tail,
+                "exit_reason": "divergence_detected",
+                "started_at": (now - timedelta(minutes=2)).isoformat(),
+                "ended_at": now.isoformat(),
+            }],
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_payload_shape_and_context(db_session):
     """Spawned investigation has the expected payload + context fields (case d)."""
@@ -216,6 +242,127 @@ async def test_no_spawn_when_caps_exhausted(db_session):
         assert spawned == 0
     finally:
         _shared_state.runtime_config["max_total_research_per_project"] = original_max
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_divergence_fingerprint_trips_on_same_fingerprint(db_session):
+    import app.shared_state as _shared_state
+
+    original = _shared_state.runtime_config.get("fix_loop_divergence_fingerprint_enabled", False)
+    _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = True
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    for tail in (
+        "TypeError: build failed for job 123 size 10MB",
+        "TypeError: build failed for job 456 size 11MB",
+        "TypeError: build failed for job 789 size 12MB",
+    ):
+        db_session.add(_make_fix_loop_divergence_task(project.id, error_tail=tail, related_files=["backend/app/poisoned.py"]))
+    await db_session.commit()
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+        investigate = (await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.context["regression_class"].as_string().startswith("fix_loop_divergence_fingerprint:"),
+            )
+        )).scalars().first()
+        assert investigate is not None
+        prompt = (investigate.first_payload or {})["prompt"]
+        assert "Normalized fingerprint:" in prompt
+        assert "Sample failure tail:" in prompt
+        assert "Affected scope(s): small" in prompt
+        assert "backend/app/poisoned.py" in prompt
+    finally:
+        _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = original
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_divergence_fingerprint_different_fingerprints_do_not_trip(db_session):
+    import app.shared_state as _shared_state
+
+    original = _shared_state.runtime_config.get("fix_loop_divergence_fingerprint_enabled", False)
+    _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = True
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    for tail in ("AssertionError: missing foo", "AssertionError: missing bar", "RuntimeError: missing baz"):
+        db_session.add(_make_fix_loop_divergence_task(project.id, error_tail=tail, related_files=["backend/app/poisoned.py"]))
+    await db_session.commit()
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 0
+    finally:
+        _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = original
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_divergence_fingerprint_cooldown_blocks_repeat_spawn(db_session):
+    import app.shared_state as _shared_state
+
+    original = _shared_state.runtime_config.get("fix_loop_divergence_fingerprint_enabled", False)
+    _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = True
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    for tail in (
+        "TypeError: build failed for job 123 size 10MB",
+        "TypeError: build failed for job 456 size 11MB",
+        "TypeError: build failed for job 789 size 12MB",
+    ):
+        db_session.add(_make_fix_loop_divergence_task(project.id, error_tail=tail, related_files=["backend/app/poisoned.py"]))
+    await db_session.commit()
+    try:
+        first = await run_once(db_session, project.id)
+        assert first == 1
+        investigate = (await db_session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.context["regression_class"].as_string().startswith("fix_loop_divergence_fingerprint:"),
+            )
+        )).scalars().first()
+        assert investigate is not None
+        investigate.status = TaskStatus.COMPLETED
+        db_session.add(investigate)
+        await db_session.commit()
+        second = await run_once(db_session, project.id)
+        assert second == 0
+        investigate.created_at = _utcnow() - _REGRESSION_COOLDOWN - timedelta(minutes=5)
+        db_session.add(investigate)
+        await db_session.commit()
+        third = await run_once(db_session, project.id)
+        assert third == 1
+    finally:
+        _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = original
+
+
+@pytest.mark.asyncio
+async def test_fix_loop_divergence_fingerprint_feature_flag_gates_spawn(db_session):
+    import app.shared_state as _shared_state
+
+    original = _shared_state.runtime_config.get("fix_loop_divergence_fingerprint_enabled", False)
+    _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = False
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    for tail in (
+        "TypeError: build failed for job 123 size 10MB",
+        "TypeError: build failed for job 456 size 11MB",
+        "TypeError: build failed for job 789 size 12MB",
+    ):
+        db_session.add(_make_fix_loop_divergence_task(project.id, error_tail=tail, related_files=["backend/app/poisoned.py"]))
+    await db_session.commit()
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 0
+    finally:
+        _shared_state.runtime_config["fix_loop_divergence_fingerprint_enabled"] = original
 
 
 @pytest.mark.asyncio
@@ -1316,6 +1463,78 @@ async def test_watchdog_excludes_needs_manual_intervention(db_session):
     assert alerts == []
 
 
+@pytest.mark.asyncio
+async def test_watchdog_closed_case_never_escalated(db_session):
+    """CLOSED cases are never escalated by the watchdog (case e)."""
+    from app.models import Alert, RegressionCaseStatus
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Very stale CLOSED case — should still be skipped by watchdog.
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.CLOSED,
+        hours_stale=48,
+    )
+
+    escalated = await run_watchdog_once(db_session, project.id)
+    assert escalated == 0
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_watchdog_merged_escalation_idempotent(db_session):
+    """Running watchdog twice does not double-escalate or duplicate alerts (case f)."""
+    from app.models import Alert, RegressionCaseStatus
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_hours = int(_WATCHDOG_MERGED_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.MERGED,
+        hours_stale=stale_hours,
+    )
+
+    # First watchdog run — escalate the stale MERGED case.
+    escalated_1 = await run_watchdog_once(db_session, project.id)
+    assert escalated_1 == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.needs_manual_intervention_at is not None
+
+    alerts_1 = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts_1) == 1
+
+    # Second watchdog run — case is already NEEDS_MANUAL_INTERVENTION, should not re-escalate.
+    escalated_2 = await run_watchdog_once(db_session, project.id)
+    assert escalated_2 == 0
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+
+    alerts_2 = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts_2) == 1  # No new alert created
+
+
 # ---------------------------------------------------------------------------
 # Deploy-monitoring gate tests
 # ---------------------------------------------------------------------------
@@ -1991,3 +2210,470 @@ async def test_sr_blind_spot_deploy_monitoring_defers(db_session):
         select(Alert).where(Alert.project_id == project.id)
     )).scalars().all()
     assert any("monitoring" in (a.title or "").lower() for a in alerts)
+
+
+# ---------------------------------------------------------------------------
+# Divergence detector — investigations-diverged escalation
+# ---------------------------------------------------------------------------
+
+
+def _diagnosis_payload(*, root_cause: str, files: list[str], confidence: str = "high") -> dict:
+    return {
+        "summary": "synthetic diagnosis",
+        "root_cause": root_cause,
+        "recommended_fix": "apply the fix",
+        "confidence": confidence,
+        "severity": "high",
+        "affected_files": [{"path": p, "issue": "x"} for p in files],
+    }
+
+
+async def _seed_pipeline_regression_case(
+    db_session,
+    project_id,
+    *,
+    attempts: int,
+    regression_class: str = "sr_catch_rate",
+):
+    """Create a RegressionRemediationCase mirroring the dispatcher's spawn shape so
+    divergence detection has a real row to compare against.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    case = RegressionRemediationCase(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=attempts,
+        hit_count=attempts + 1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+    return case
+
+
+async def _make_prior_investigation(
+    db_session,
+    project_id,
+    *,
+    regression_class: str,
+    plan_output: dict,
+):
+    prior = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate", "prompt": "old", "base_branch": "main"}],
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": regression_class,
+        },
+        plan_output=plan_output,
+    )
+    db_session.add(prior)
+    await db_session.commit()
+    await db_session.refresh(prior)
+    return prior
+
+
+@pytest.mark.asyncio
+async def test_divergence_converging_diagnoses_do_not_escalate(db_session, mocker):
+    """Two converging diagnoses at attempts=2 → no escalation, remediation spawns."""
+    from app.models import (
+        Alert, ESCALATION_REASON_INVESTIGATIONS_DIVERGED,
+        RegressionCaseStatus,
+    )
+    from app.task_completion import _handle_investigation_completion
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _seed_pipeline_regression_case(db_session, project.id, attempts=2)
+    prior = await _make_prior_investigation(
+        db_session, project.id,
+        regression_class="sr_catch_rate",
+        plan_output=_diagnosis_payload(
+            root_cause="prompt drift in self-review checklist eroded coverage",
+            files=["agent/src/prompts/self-review.ts", "agent/src/prompt.ts"],
+        ),
+    )
+    assert prior is not None  # fixture used as side-effect, silence linters
+
+    current = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "investigate", "prompt": "new", "base_branch": "main"}],
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    diagnosis = _diagnosis_payload(
+        root_cause="prompt drift in the self-review checklist hurt coverage further",
+        files=["agent/src/prompts/self-review.ts", "agent/src/prompt.ts"],
+    )
+    await _handle_investigation_completion(
+        current, SimpleNamespace(logs=json.dumps(diagnosis)), db_session,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(case)
+    assert case.status != RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.escalation_reason != ESCALATION_REASON_INVESTIGATIONS_DIVERGED
+
+    remediation = (await db_session.execute(
+        select(Task).where(Task.parent_task_id == current.id)
+    )).scalars().first()
+    assert remediation is not None, "converging diagnoses must still spawn remediation"
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert not any(
+        "investigations diverged" in (a.message or "").lower() for a in alerts
+    )
+
+
+@pytest.mark.asyncio
+async def test_divergence_diverging_diagnoses_escalate(db_session, mocker):
+    """Two diverging diagnoses at attempts=2 → escalate; remediation spawn skipped."""
+    from app.models import (
+        Alert, ESCALATION_REASON_INVESTIGATIONS_DIVERGED,
+        RegressionCaseStatus,
+    )
+    from app.task_completion import _handle_investigation_completion
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _seed_pipeline_regression_case(db_session, project.id, attempts=2)
+    await _make_prior_investigation(
+        db_session, project.id,
+        regression_class="sr_catch_rate",
+        plan_output=_diagnosis_payload(
+            root_cause="prompt drift in self-review checklist eroded coverage",
+            files=["agent/src/prompts/self-review.ts"],
+        ),
+    )
+
+    current = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "investigate", "prompt": "new", "base_branch": "main"}],
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    diagnosis = _diagnosis_payload(
+        root_cause="latency spike from upstream provider throttling external API quota",
+        files=["backend/app/orchestrator.py", "backend/app/services.py"],
+    )
+    pre_alert_count = len((await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all())
+
+    await _handle_investigation_completion(
+        current, SimpleNamespace(logs=json.dumps(diagnosis)), db_session,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.escalation_reason == ESCALATION_REASON_INVESTIGATIONS_DIVERGED
+    assert case.needs_manual_intervention_at is not None
+
+    remediation = (await db_session.execute(
+        select(Task).where(Task.parent_task_id == current.id)
+    )).scalars().first()
+    assert remediation is None, "diverged diagnoses must skip remediation spawn"
+
+    alerts = (await db_session.execute(
+        select(Alert).where(Alert.project_id == project.id)
+    )).scalars().all()
+    assert len(alerts) > pre_alert_count
+    assert any(
+        "investigations diverged" in (a.message or "").lower() for a in alerts
+    )
+
+
+@pytest.mark.asyncio
+async def test_re_arm_third_attempt_stamps_attempts_exhausted():
+    """Direct unit test: re_arm at attempts==2 escalates and stamps escalation_reason."""
+    from app.models import (
+        ESCALATION_REASON_ATTEMPTS_EXHAUSTED,
+        RegressionCaseStatus, RegressionRemediationCase,
+    )
+
+    case = RegressionRemediationCase(
+        project_id=uuid.uuid4(),
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        attempts=2,
+        hit_count=1,
+    )
+    case.re_arm()
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.escalation_reason == ESCALATION_REASON_ATTEMPTS_EXHAUSTED
+    assert case.needs_manual_intervention_at is not None
+
+    # Idempotent: re_arm on an already-NMI case does not overwrite the reason.
+    case.re_arm()
+    assert case.escalation_reason == ESCALATION_REASON_ATTEMPTS_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_watchdog_stamps_stale_merged_escalation_reason(db_session):
+    """Watchdog stale-MERGED escalation stamps escalation_reason='stale_merged'."""
+    from app.models import (
+        ESCALATION_REASON_INVESTIGATIONS_DIVERGED,
+        ESCALATION_REASON_STALE_MERGED,
+        RegressionCaseStatus,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_hours = int(_WATCHDOG_MERGED_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session, project.id,
+        status=RegressionCaseStatus.MERGED,
+        hours_stale=stale_hours,
+    )
+
+    escalated = await run_watchdog_once(db_session, project.id)
+    assert escalated == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.escalation_reason == ESCALATION_REASON_STALE_MERGED
+    assert case.escalation_reason != ESCALATION_REASON_INVESTIGATIONS_DIVERGED
+
+
+@pytest.mark.asyncio
+async def test_divergence_attempts_below_two_does_not_trigger(db_session, mocker):
+    """First investigation completing (attempts<2) never enters divergence detection."""
+    from app.models import (
+        ESCALATION_REASON_INVESTIGATIONS_DIVERGED,
+        RegressionCaseStatus,
+    )
+    from app.task_completion import _handle_investigation_completion
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = await _seed_pipeline_regression_case(db_session, project.id, attempts=0)
+
+    current = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "investigate", "prompt": "new", "base_branch": "main"}],
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": "sr_catch_rate",
+        },
+    )
+    db_session.add(current)
+    await db_session.commit()
+    await db_session.refresh(current)
+
+    diagnosis = _diagnosis_payload(
+        root_cause="completely fresh diagnosis with no prior to compare",
+        files=["backend/app/orchestrator.py"],
+    )
+    await _handle_investigation_completion(
+        current, SimpleNamespace(logs=json.dumps(diagnosis)), db_session,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(case)
+    assert case.status != RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.escalation_reason != ESCALATION_REASON_INVESTIGATIONS_DIVERGED
+
+    remediation = (await db_session.execute(
+        select(Task).where(Task.parent_task_id == current.id)
+    )).scalars().first()
+    assert remediation is not None
+
+
+# ---------------------------------------------------------------------------
+# Strategic cycle stall signal tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_spawns_when_stall_breached_and_project_active(db_session):
+    """Spawns when no strategic task completed in stall window + project is active."""
+    from app.pipeline_regression_dispatcher import _STRATEGIC_CYCLE_STALL_HOURS
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Prior strategic cycle (older than stall window) proves project maturity.
+    prior_strategic = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "strategic_review", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(prior_strategic)
+    # Non-strategic activity within the stall window (project is currently active).
+    active_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+
+    prior_strategic.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS + 2)
+    active_task.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS - 1)
+    db_session.add(prior_strategic)
+    db_session.add(active_task)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    tasks = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["regression_class"].as_string() == "strategic_cycle_stall",
+        )
+    )).scalars().all()
+    assert len(tasks) == 1
+    assert (tasks[0].first_payload or {}).get("type") == "investigate"
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_no_spawn_when_project_idle(db_session):
+    """Does NOT spawn when no non-strategic activity exists in the stall window."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No tasks at all — project is idle.
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_no_spawn_when_recent_cycle_exists(db_session):
+    """Does NOT spawn when a strategic_review completed within the stall window."""
+    from app.pipeline_regression_dispatcher import _STRATEGIC_CYCLE_STALL_HOURS
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Prior strategic cycle establishes project maturity.
+    prior_strategic = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "strategic_review", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(prior_strategic)
+    # Recent strategic_review (within the window) — no stall.
+    recent_strategic = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "strategic_review", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(recent_strategic)
+    # Non-strategic activity so the project is not idle.
+    active_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+
+    prior_strategic.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS + 2)
+    recent_strategic.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS - 1)
+    active_task.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS - 2)
+    db_session.add(prior_strategic)
+    db_session.add(recent_strategic)
+    db_session.add(active_task)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_stall_respects_cooldown(db_session):
+    """After a stall spawn, the 6h cooldown prevents a second spawn."""
+    from app.pipeline_regression_dispatcher import _STRATEGIC_CYCLE_STALL_HOURS
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_strategic = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "strategic_review", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(prior_strategic)
+    active_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(active_task)
+    await db_session.commit()
+
+    prior_strategic.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS + 2)
+    active_task.created_at = _utcnow() - timedelta(hours=_STRATEGIC_CYCLE_STALL_HOURS - 1)
+    db_session.add(prior_strategic)
+    db_session.add(active_task)
+    await db_session.commit()
+
+    first = await run_once(db_session, project.id)
+    assert first == 1
+
+    # Second call within cooldown window — must not double-spawn.
+    second = await run_once(db_session, project.id)
+    assert second == 0
+
+    rows = (await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.context["regression_class"].as_string() == "strategic_cycle_stall",
+        )
+    )).scalars().all()
+    assert len(rows) == 1
