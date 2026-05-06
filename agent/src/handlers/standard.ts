@@ -271,7 +271,7 @@ ${diffSnippet}
 
 Check specifically for:
 - regression_risk: removed exports, changed defaults, removed null guards, broken contracts
-- scope-drift: changes outside declared scope files
+- scope-drift: any modified file outside the Declared scope set above is off-scope, UNLESS it is an incidental allowlisted file — lockfiles (package-lock.json, poetry.lock, Cargo.lock, go.sum, yarn.lock, pnpm-lock.yaml), build-generated outputs, .gitignore, or a sibling test file mirroring a declared source file (e.g. foo.test.ts next to foo.ts, test_foo.py next to foo.py). Flag every off-scope file by path under scope-drift.
 - correctness: logic bugs, off-by-one errors, race conditions, edge cases
 - error-handling: unhandled exceptions, missing null checks, async error paths
 - security: injection attacks, auth flaws, exposed secrets, unvalidated user inputs
@@ -279,10 +279,17 @@ Check specifically for:
 - architecture: boundary violations, coupling regressions, abstraction leaks
 - test-coverage: new behavior without tests, untested edge cases or error paths
 
+Also enumerate edge cases YOU spot from a fresh read of the diff. Use the SAME shape the
+implementing author uses for their \`edges_considered\` field — \`{case, handled, evidence?, blind_spot?}\`.
+List cases the author may have missed entirely, cases the author marked handled where you
+disagree (set \`handled: false\` and explain in \`blind_spot\`), and any additional unhandled
+cases. Cite file + line in \`evidence\` when claiming an edge is handled.
+
 Output ONLY a JSON object:
-{"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}]}
+{"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}],
+ "reviewer_edges_considered": [{"case": "...", "handled": true|false, "evidence": "...", "blind_spot": "..."}]}
 Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage
-If no issues found: {"reviewer_findings": []}`;
+If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
   const { exitCode, lastResultText } = await runClaudeCode(
     prompt, ws, statusRef, model, 'low',
@@ -326,6 +333,41 @@ If no issues found: {"reviewer_findings": []}`;
   sr.check_results = checkResults;
   if (incompleteSrRecovery) {
     sr.reviewer_recovery_origin = 'reviewer_recovery_after_incomplete_sr';
+  }
+
+  // Merge reviewer-enumerated edges. Filter defensively to entries with a
+  // string `case` field, then tag with origin: 'reviewer'. Author edges
+  // (if any) are backfilled with origin: 'author' and the combined list is
+  // written to `edges_considered`. The reviewer-only list is also exposed
+  // top-level as `reviewer_edges_considered` for consumers that want to
+  // inspect just the reviewer pass.
+  const rawReviewerEdges = parsed.reviewer_edges_considered;
+  if (Array.isArray(rawReviewerEdges)) {
+    type EdgeRaw = Record<string, unknown>;
+    const reviewerEdges = (rawReviewerEdges as unknown[])
+      .filter((e): e is EdgeRaw => typeof e === 'object' && e !== null && typeof (e as EdgeRaw).case === 'string')
+      .map(e => {
+        const out: Record<string, unknown> = {
+          case: e.case,
+          handled: typeof e.handled === 'boolean' ? e.handled : false,
+          origin: 'reviewer',
+        };
+        if (typeof e.evidence === 'string') out.evidence = e.evidence;
+        if (typeof e.blind_spot === 'string') out.blind_spot = e.blind_spot;
+        return out;
+      });
+
+    const existingEdges = Array.isArray(sr.edges_considered)
+      ? (sr.edges_considered as unknown[]).filter(
+          (e): e is Record<string, unknown> =>
+            typeof e === 'object' && e !== null && typeof (e as Record<string, unknown>).case === 'string',
+        )
+      : [];
+    const taggedAuthorEdges = existingEdges.map(e =>
+      typeof e.origin === 'string' ? e : { ...e, origin: 'author' },
+    );
+    sr.edges_considered = [...taggedAuthorEdges, ...reviewerEdges];
+    sr.reviewer_edges_considered = reviewerEdges;
   }
 
   try {

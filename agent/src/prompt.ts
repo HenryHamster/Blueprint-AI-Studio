@@ -298,6 +298,7 @@ export interface EdgeConsidered {
   handled: boolean;
   evidence?: string;
   blind_spot?: string;
+  origin?: 'author' | 'reviewer';
 }
 
 // Self-review prompt block requesting enumerated edge-case analysis.
@@ -587,7 +588,7 @@ if touches admin-ui/; then
     FAILED+=("admin-ui npm ci")
   }
   run "admin-ui eslint"  bash -c 'cd admin-ui && npx eslint . 2>&1'
-  run "admin-ui viewport" bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport 2>&1 || { status=$?; echo ""; echo "[check] admin-ui viewport suite requires Playwright Chromium. If this VM is missing it, run: cd admin-ui && npx playwright install --with-deps chromium"; exit $status; }'
+  run "admin-ui viewport" bash -c 'cd admin-ui && npx playwright install --with-deps chromium && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport 2>&1 || { status=$?; echo ""; echo "[check] admin-ui viewport suite requires Playwright Chromium. If this VM is missing it, run: cd admin-ui && npx playwright install --with-deps chromium"; exit $status; }'
   run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
 fi
 
@@ -1270,8 +1271,11 @@ export const REFACTOR_TASK_FOCUS = `
 Refactor tasks must guarantee NO new behavior is introduced. The dominant miss
 is accidental scope-drift or subtle behavioral changes that bypass tests.
 
-1. **Scope-drift (mandatory)** — run \`git diff --stat HEAD\` and confirm every
-   changed file is in scope. If ANY externally-observable behavior changed (return
+1. **Scope-drift (mandatory)** — run BOTH \`git diff --stat HEAD\` AND
+   \`git diff --name-only HEAD\`. Both triggers apply: the diff-size threshold
+   (Trigger A) and the file-set check against the declared \`related_files\`
+   (Trigger B, modulo the incidental allowlist — lockfiles, generated outputs,
+   sibling test files). If ANY externally-observable behavior changed (return
    values, side effects, error messages, API shape), record it under \`correctness\`
    with explicit before/after: \`"issue": "behavior changed: foo() returned X, now returns Y"\`.
 2. **Caller inventory** — grep for every caller of renamed or restructured exports.
@@ -1304,9 +1308,14 @@ the declared scope. Apply these additional checks before \`./done\`:
 1. **Test coverage** — for every new function, class, or behavior you shipped,
    confirm there is at least one test. In \`test-coverage\`, attest explicitly:
    \`"issue": "new behavior X has a test in test_foo.py"\` (or note the gap).
-2. **Scope-drift** — run \`git diff --stat HEAD\` and list every changed file.
-   Any file outside the declared scope must be justified; record unexplained
-   additions under \`scope-drift\` with \`passed: false\`.
+2. **Scope-drift** — run BOTH \`git diff --stat HEAD\` AND \`git diff --name-only HEAD\`.
+   Trigger A: diff size against the declared scope threshold. Trigger B: every
+   modified file must be in the declared \`related_files\` set OR in the incidental
+   allowlist (lockfiles like \`package-lock.json\`/\`poetry.lock\`/\`Cargo.lock\`/\`go.sum\`,
+   generated outputs, \`.gitignore\`, sibling \`*.test.*\`/\`*.spec.*\` files). Any
+   modified file outside \`related_files\` and outside the allowlist is off-scope —
+   record under \`scope-drift\` with \`passed: false\` and list the off-scope files
+   (e.g. "modified files outside declared scope: backend/app/foo.py — declared related_files: [agent/src/baz.ts]").
 3. **Caller compatibility** — grep for callers of any function or export you
    added or modified; confirm their call sites still compile and behave correctly.
 `;
@@ -1321,9 +1330,13 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    your fix. Confirm the fix targets ONLY that path and does not silently change
    adjacent behavior. Record in \`regression_risk\` even when passing:
    \`"issue": "fixed path: foo() — adjacent callers bar(), baz() verified unchanged"\`.
-2. **Scope-drift** — run \`git diff --stat HEAD\`. Fixes should be surgical; any
-   file that is not directly on the failure path must be justified. Record
-   unjustified additions under \`scope-drift\` with \`passed: false\`.
+2. **Scope-drift** — run BOTH \`git diff --stat HEAD\` AND \`git diff --name-only HEAD\`.
+   Fixes should be surgical, so both triggers apply: diff-size threshold (Trigger A)
+   AND the file-set check against \`related_files\` (Trigger B). Any modified file
+   outside \`related_files\` (after the incidental allowlist — lockfiles, generated
+   outputs, sibling test files like \`foo.test.ts\` next to \`foo.ts\`) is off-scope.
+   Record unjustified additions under \`scope-drift\` with \`passed: false\` and list
+   the off-scope file paths.
 3. **Root-cause vs. symptom** — confirm the fix addresses the root cause, not just
    the observable symptom. If you only masked the symptom, record it under
    \`correctness\` with \`passed: false\`.
@@ -1345,9 +1358,11 @@ current code behavior. Apply these additional checks before \`./done\`:
 2. **Code-comment vs. behavior** — for every code snippet or function description
    you wrote, re-read the actual implementation and confirm it matches. Divergence
    between docs and code is worse than no docs.
-3. **Production-code untouched** — confirm \`git diff --stat HEAD\` shows only
+3. **Production-code untouched** — confirm \`git diff --name-only HEAD\` shows only
    documentation files (README, docs/, docstrings). Any production-code change
-   belongs in a separate task; record under \`scope-drift\` if found.
+   that is not in \`related_files\` (and not an incidental allowlisted file like a
+   lockfile) belongs in a separate task; record under \`scope-drift\` with
+   \`passed: false\` and list the off-scope files.
 `;
 
 export const DEPS_TASK_FOCUS = `
@@ -1461,6 +1476,12 @@ backend review vocabulary — must match exactly):
 - \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
 
 **Scope-drift check (required for code-change tasks):**
+The \`scope-drift\` category has TWO triggers that both feed the SAME \`scope-drift\` entry
+(do not introduce a new category id). If EITHER trigger fires, record \`scope-drift\` with
+\`passed: false\` and an \`issue\` field that names which trigger fired and the specifics.
+Only when BOTH triggers are clean do you record \`passed: true\`.
+
+*Trigger A — diff size exceeds declared-scope threshold.*
 Run \`git diff --stat HEAD\` (or \`git diff --stat <base>..HEAD\` if you know the base) and count
 total changed lines (insertions + deletions) and the number of files touched.
 Compare against the task's declared scope using these thresholds:
@@ -1471,10 +1492,33 @@ Compare against the task's declared scope using these thresholds:
 | medium | 200       | 5         |
 | large  | 800       | 15        |
 
-If the diff exceeds the threshold for the declared scope, record \`scope-drift\` in
-\`check_results\` with \`passed: false\` and an \`issue\` field explaining the overage (e.g.
-"small task shipped 312 changed lines across 6 files — threshold is 50 lines / 2 files").
-If within bounds, record \`scope-drift\` with \`passed: true\`. The check does NOT block
+If the diff exceeds the threshold for the declared scope, Trigger A fires. The \`issue\`
+field should explain the overage (e.g. "small task shipped 312 changed lines across 6
+files — threshold is 50 lines / 2 files").
+
+*Trigger B — modified files outside the declared \`related_files\` set.*
+Run \`git diff --name-only HEAD\` (or \`git diff --name-only <base>..HEAD\`) to enumerate
+every modified file. Compare that set against the task's declared \`related_files\` (from
+the task prompt / payload). Files in the diff that are NOT in \`related_files\` are
+off-scope UNLESS they fall in the incidental-files allowlist:
+
+- Lockfiles updated as a side-effect of a manifest change: \`package-lock.json\`,
+  \`poetry.lock\`, \`Cargo.lock\`, \`go.sum\`, \`yarn.lock\`, \`pnpm-lock.yaml\`.
+- Generated outputs that the build emits automatically (e.g. compiled bundles,
+  protobuf-generated code, schema dumps the build regenerates).
+- \`.gitignore\` updates that accompany new generated paths.
+- Sibling test files that mirror a declared source file — e.g. if \`agent/src/foo.ts\` is
+  in \`related_files\`, then \`agent/src/foo.test.ts\` and \`agent/src/foo.spec.ts\` are
+  considered in-scope tests for that file. The same applies to \`test_foo.py\` next to
+  \`foo.py\` and \`__tests__/foo.test.tsx\` next to \`foo.tsx\`.
+
+If any non-allowlisted modified file is outside \`related_files\`, Trigger B fires. The
+\`issue\` field should explicitly enumerate the off-scope files and the declared scope, e.g.
+\`"issue": "modified files outside declared scope: backend/app/foo.py, agent/src/bar.ts — declared related_files: [agent/src/baz.ts]"\`.
+If \`related_files\` is unspecified or empty, Trigger B is informational only — record what
+you observed but do not flip \`passed: false\` solely on missing scope metadata.
+
+If both triggers fire, mention both in the same \`issue\` string. The check does NOT block
 \`./done\` — it is informational and feeds the catch-rate dashboard.
 
 **Regression-risk check (conditional on baseline availability):**

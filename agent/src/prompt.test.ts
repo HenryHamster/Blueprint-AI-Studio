@@ -3333,6 +3333,27 @@ describe('formatSelfReviewBlindSpots', () => {
     expect(out).not.toMatch(/Files NOT verified[^\n]*\n( {2}- [ab]\.ts\n)* {2}- [ab]\.ts/);
   });
 
+  it('renders origin labels on edge bullets when origin is present and stays backward-compatible when absent', () => {
+    const outcome = {
+      verdict: 'pass',
+      edges_considered: [
+        { case: 'no-origin handled', handled: true, evidence: 'L1' },
+        { case: 'author-handled', handled: true, evidence: 'L2', origin: 'author' },
+        { case: 'reviewer-handled', handled: true, evidence: 'L3', origin: 'reviewer' },
+        { case: 'no-origin missed', handled: false, blind_spot: 'unknown' },
+        { case: 'reviewer-missed', handled: false, blind_spot: 'spotted by reviewer', origin: 'reviewer' },
+      ],
+    };
+    const out = formatSelfReviewBlindSpots(outcome, ['a.ts']);
+    // Backward-compat: no suffix when origin absent
+    expect(out).toContain('[handled] no-origin handled');
+    expect(out).toContain('[UNHANDLED] no-origin missed');
+    // With origin, suffix is rendered
+    expect(out).toContain('[handled · author] author-handled');
+    expect(out).toContain('[handled · reviewer] reviewer-handled');
+    expect(out).toContain('[UNHANDLED · reviewer] reviewer-missed');
+  });
+
   it('e2e: schema-documented categories: ["incomplete_review"] surfaces INCOMPLETE warning to reviewer', () => {
     const outcome = {
       verdict: 'pass',
@@ -3510,6 +3531,49 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
   it('instructs agent to run git diff --stat', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --stat');
+  });
+
+  it('describes off-scope file modifications as a second trigger', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('related_files');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --name-only');
+  });
+
+  it('shows the off-scope issue format with file list', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('modified files outside declared scope');
+  });
+
+  it('mentions lockfile allowlist for incidental files', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('package-lock.json');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('poetry.lock');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Cargo.lock');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('go.sum');
+  });
+
+  it('mentions sibling test files as allowlisted', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/\.test\.|\.spec\./);
+  });
+
+  it('keeps scope-drift as a single canonical category for both triggers', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    // No new category id introduced — both triggers feed scope-drift.
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('off-scope-files');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('off_scope_files');
+    // Both trigger labels appear in the same scope-drift section.
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger A');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
+  });
+
+  it('per-task-type focus blocks reference the off-scope files concept', async () => {
+    const { CREATE_TASK_FOCUS, FIX_TASK_FOCUS } = await import('./prompt.js');
+    expect(CREATE_TASK_FOCUS).toContain('related_files');
+    expect(CREATE_TASK_FOCUS).toContain('git diff --name-only');
+    expect(FIX_TASK_FOCUS).toContain('related_files');
+    expect(FIX_TASK_FOCUS).toContain('git diff --name-only');
   });
 });
 

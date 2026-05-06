@@ -42,7 +42,7 @@ import {
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
   MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS,
-  FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT,
+  FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT, FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
   AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
   RUFF_TIMEOUT,
   TEST_RUNNER_TIMEOUT, TEST_RUNNER_DOCKER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
@@ -1715,8 +1715,14 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
     execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT });
     sendHeartbeatSync(taskId, 'eslint (admin-ui)...');
     execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT });
-    sendHeartbeatSync(taskId, 'npm run test:viewport (admin-ui)...');
     try {
+      sendHeartbeatSync(taskId, 'npx playwright install --with-deps chromium (admin-ui)...');
+      execFileSync('npx', ['playwright', 'install', '--with-deps', 'chromium'], {
+        cwd: `${WORKSPACE}/admin-ui`,
+        encoding: 'utf-8',
+        timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
+      });
+      sendHeartbeatSync(taskId, 'npm run test:viewport (admin-ui)...');
       execFileSync('npm', ['run', 'test:viewport'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });
     } catch (err: unknown) {
       if (err instanceof Error) {

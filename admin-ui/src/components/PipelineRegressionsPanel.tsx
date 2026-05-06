@@ -169,7 +169,7 @@ export function ManualInterventionPanel({ projectId }: Props) {
                         </div>
                       </div>
                     )}
-                    <div className="flex items-center gap-3 mt-1">
+                    <div className="flex items-center gap-3 mt-1 flex-wrap">
                       {c.last_remediation_pr_number != null && (
                         <span className="text-[10px] text-neutral-400">
                           Last PR: #{c.last_remediation_pr_number}

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus } from 'lucide-react';
 import { apiFetch } from '../api';
-import { timeAgo, formatDurationSec } from '../utils/time';
+import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 
 interface RecentlyClosedCase {
   id: string;
@@ -9,11 +9,18 @@ interface RecentlyClosedCase {
   fix_pr_number: number | null;
   recovered_at: string | null;
   first_seen_at: string | null;
+  signal_first_crossed_at?: string | null;
   time_to_recover_sec: number | null;
 }
 
 interface Props {
   projectId: string;
+}
+
+function formatTimeToDetect(firstSeenAt: string | null, signalFirstCrossedAt?: string | null): string {
+  if (!firstSeenAt || !signalFirstCrossedAt) return 'unknown';
+  const seconds = (parseTimestamp(firstSeenAt).getTime() - parseTimestamp(signalFirstCrossedAt).getTime()) / 1000;
+  return formatDurationSec(Math.max(0, seconds));
 }
 
 export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
@@ -70,7 +77,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    <span className="text-[10px] text-emerald-300 font-mono">{c.regression_class}</span>
+                    <span className="text-[10px] text-emerald-300 font-mono break-all">{c.regression_class}</span>
                     {c.fix_pr_number != null && (
                       <span className="text-[10px] text-neutral-400">
                         PR #{c.fix_pr_number}
@@ -84,6 +91,10 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                         {formatDurationSec(c.time_to_recover_sec)}
                       </span>
                     )}
+                    <span>
+                      <span className="text-neutral-400 font-medium">time-to-detect:</span>{' '}
+                      {formatTimeToDetect(c.first_seen_at, c.signal_first_crossed_at)}
+                    </span>
                     {c.recovered_at && (
                       <span>
                         recovered {timeAgo(c.recovered_at)}

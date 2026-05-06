@@ -1317,6 +1317,14 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Timestamp when the underlying signal first crossed its threshold during
+    # the most recent dispatcher pass. Separate from first_seen_at (case
+    # creation) and last_remediation_task_id spawn time. Enables time-to-detect
+    # metric: signal_first_crossed_at → first_seen_at gap.
+    signal_first_crossed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Timestamp when the underlying signal FIRST crossed threshold. Enables
     # MTTD = first_seen_at → case.created_at. Null for cases opened before
     # this column was added, and for signals without a durable first-seen record.
@@ -1359,12 +1367,15 @@ class RegressionRemediationCase(SQLModel, table=True):
     def time_to_detect_sec(self) -> Optional[float]:
         """Seconds between signal crossing threshold and this case being opened.
 
-        Returns None when signal_first_seen_at is unavailable (pre-column rows
-        or signal classes without a durable first-seen record).
+        Prefers signal_first_crossed_at (current dispatcher writes both fields;
+        the crossed-at column is the canonical time-to-detect anchor). Falls
+        back to signal_first_seen_at for rows written before signal_first_crossed_at
+        existed. Returns None when neither is available.
         """
-        if self.signal_first_seen_at is None:
+        anchor = self.signal_first_crossed_at or self.signal_first_seen_at
+        if anchor is None:
             return None
-        return (self.first_seen_at - self.signal_first_seen_at).total_seconds()
+        return (self.first_seen_at - anchor).total_seconds()
 
     def mark_merged(self, pr_number: int, signal_snapshot: Dict[str, Any]) -> None:
         """Transition ACTIVE → MERGED after remediation PR merges.

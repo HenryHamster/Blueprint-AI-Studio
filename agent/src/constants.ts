@@ -81,6 +81,9 @@ export const MAX_LINT_FIX_ATTEMPTS = 5;
 export const FRONTEND_NPM_TIMEOUT = 120_000;
 export const FRONTEND_ESLINT_TIMEOUT = 60_000;
 export const FRONTEND_BUILD_TIMEOUT = 120_000;
+// Fresh VMs may need to apt-install Playwright deps and download Chromium
+// before the viewport suite can start, which is materially slower than a build.
+export const FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT = 600_000;
 
 // Agent checks (agent/)
 export const AGENT_NPM_TIMEOUT = 120_000;

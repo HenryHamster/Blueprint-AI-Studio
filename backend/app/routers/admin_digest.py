@@ -254,12 +254,74 @@ def _compute_fresh_reviewer_effectiveness(terminal_tasks: List[Task]) -> "Dict[s
     }
 
 
+def _partition_edges_by_origin(edges: List[Any]) -> "tuple[list, list]":
+    """Split an edges_considered list into (author, reviewer) entries.
+
+    Entries without an explicit ``origin`` field are treated as author entries.
+    Non-dict entries are dropped (matches the existing read pattern in
+    aggregation code which silently skips malformed entries).
+    """
+    author: list = []
+    reviewer: list = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        if e.get("origin") == "reviewer":
+            reviewer.append(e)
+        else:
+            author.append(e)
+    return author, reviewer
+
+
+def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -> bool:
+    """Return True iff at least one reviewer entry catches what the author missed.
+
+    A reviewer catch is one of:
+      * reviewer raises a ``case`` not present in the author's entries (mismatch
+        compared by lowercased + trimmed case strings); or
+      * reviewer flags ``handled: false`` for a case the author had marked
+        ``handled: true`` (default-True when missing).
+
+    Entries on either side missing/non-string ``case`` are skipped — we cannot
+    correlate them, and per spec we skip rather than crash.
+    """
+    def _norm(c: Any) -> "str | None":
+        return c.strip().lower() if isinstance(c, str) and c.strip() else None
+
+    author_handled: dict[str, bool] = {}
+    for e in author_entries:
+        c = _norm(e.get("case"))
+        if c is None:
+            continue
+        h = bool(e.get("handled", True))
+        author_handled[c] = author_handled.get(c, False) or h
+
+    for e in reviewer_entries:
+        c = _norm(e.get("case"))
+        if c is None:
+            continue
+        if c not in author_handled:
+            return True
+        if author_handled[c] and not bool(e.get("handled", True)):
+            return True
+    return False
+
+
 def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
     """Rolling metrics for the edges_considered field in self-review outcomes.
 
     Computes avg edges enumerated per task and unhandled-edge-flagged rate.
     Correlates tasks with vs. without enumerated edges against correctness/
     error-handling reviewer rejections to validate field utility.
+
+    Author vs reviewer breakdowns: entries may now carry ``origin: "reviewer"``
+    (from the fresh-reviewer pass) or ``origin: "author"`` (or no origin, the
+    legacy default). The existing ``avg_edges_per_task`` /
+    ``tasks_with_edges_rate`` / ``unhandled_edge_flagged_rate`` keys describe
+    the COMBINED edges array. New per-origin keys break out author vs reviewer
+    contributions and report ``reviewer_caught_count`` — tasks where the
+    reviewer raised an edge the author missed.
+
     Returns None when fewer than 3 qualifying code-change tasks exist.
     """
     code_change_tasks = [
@@ -274,10 +336,24 @@ def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, 
     tasks_without_edges: List[Task] = []
     total_edges = 0
     unhandled_flagged = 0
+    total_author_edges = 0
+    total_reviewer_edges = 0
+    n_with_author = 0
+    n_with_reviewer = 0
+    reviewer_caught = 0
     for t in code_change_tasks:
         edges = (t.context or {}).get("_self_review_outcome", {}).get("edges_considered") or []
         if not isinstance(edges, list):
             edges = []
+        author_e, reviewer_e = _partition_edges_by_origin(edges)
+        total_author_edges += len(author_e)
+        total_reviewer_edges += len(reviewer_e)
+        if author_e:
+            n_with_author += 1
+        if reviewer_e:
+            n_with_reviewer += 1
+            if _reviewer_caught_author_miss(author_e, reviewer_e):
+                reviewer_caught += 1
         if edges:
             tasks_with_edges.append(t)
             total_edges += len(edges)
@@ -299,14 +375,21 @@ def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, 
         return round(flagged / len(measured), 3)
 
     n_with = len(tasks_with_edges)
+    sample_size = len(code_change_tasks)
     return {
-        "sample_size": len(code_change_tasks),
+        "sample_size": sample_size,
         "tasks_with_edges_count": n_with,
-        "tasks_with_edges_rate": round(n_with / len(code_change_tasks), 3),
+        "tasks_with_edges_rate": round(n_with / sample_size, 3),
         "avg_edges_per_task": round(total_edges / n_with, 2) if n_with else None,
         "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3) if n_with else None,
         "correctness_rejection_rate_with_edges": _rejection_rate(tasks_with_edges),
         "correctness_rejection_rate_without_edges": _rejection_rate(tasks_without_edges),
+        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2) if n_with_author else None,
+        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2) if n_with_reviewer else None,
+        "tasks_with_reviewer_edges_count": n_with_reviewer,
+        "tasks_with_reviewer_edges_rate": round(n_with_reviewer / sample_size, 3),
+        "reviewer_caught_count": reviewer_caught,
+        "reviewer_caught_rate": round(reviewer_caught / sample_size, 3),
     }
 
 
@@ -477,9 +560,11 @@ def _compute_regression_case_summary(rows: List[RegressionRemediationCase]) -> D
                     datetime.fromisoformat(str(entry["recovered_at"]).replace("Z", "+00:00"))
                 )
         if case.first_seen_at and merged_at and recovered_at:
-            bucket = by_class.setdefault(case.regression_class, {"to_merged": [], "to_recovered": []})
+            bucket = by_class.setdefault(case.regression_class, {"to_merged": [], "to_recovered": [], "to_detect": []})
             bucket["to_merged"].append((_to_naive_utc(merged_at) - _to_naive_utc(case.first_seen_at)).total_seconds())
             bucket["to_recovered"].append((recovered_at - merged_at).total_seconds())
+            if case.signal_first_crossed_at:
+                bucket["to_detect"].append((_to_naive_utc(case.first_seen_at) - _to_naive_utc(case.signal_first_crossed_at)).total_seconds())
     return {
         "by_regression_class": [
             {
@@ -487,6 +572,7 @@ def _compute_regression_case_summary(rows: List[RegressionRemediationCase]) -> D
                 "count": len(bucket["to_merged"]),
                 "median_time_from_first_seen_to_merged_seconds": round(statistics.median(bucket["to_merged"]), 3),
                 "median_time_from_merged_to_recovered_seconds": round(statistics.median(bucket["to_recovered"]), 3),
+                "median_time_to_detect_seconds": round(statistics.median(bucket["to_detect"]), 3) if bucket["to_detect"] else None,
             }
             for regression_class, bucket in sorted(by_class.items())
         ]
@@ -1642,6 +1728,7 @@ async def list_regression_cases(
                 "time_to_detect_sec": c.time_to_detect_sec,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "sample_message": c.sample_message,
+                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat() if c.signal_first_crossed_at else None,
                 "escalation_reason": c.escalation_reason,
                 "stalled": c.status == RegressionCaseStatus.ACTIVE and c.last_remediation_pr_number is None and c.first_seen_at < stall_threshold,
             }
@@ -1724,6 +1811,8 @@ async def list_regression_manual_intervention_cases(
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
+                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat() if c.signal_first_crossed_at else None,
                 "escalation_reason": c.escalation_reason,
             }
             for c in rows
@@ -1814,6 +1903,7 @@ async def list_recently_closed_regression_cases(
             "fix_pr_number": fix_pr_number,
             "recovered_at": recovered_at,
             "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+            "signal_first_crossed_at": c.signal_first_crossed_at.isoformat() if c.signal_first_crossed_at else None,
             "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
             "time_to_detect_sec": c.time_to_detect_sec,
             "time_to_recover_sec": time_to_recover_sec,

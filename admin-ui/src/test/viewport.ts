@@ -6,10 +6,14 @@ import { page } from 'vitest/browser';
  * - `tolerance`: pixels of slack allowed past the viewport's right edge
  *   (default 1px — accounts for sub-pixel rounding).
  * - `height`: viewport height in px (default 800).
+ * - `waitMs`: extra milliseconds to pause after `render()` before asserting
+ *   (default 0). Use for components that load data asynchronously — a value
+ *   of 50–100ms is usually enough to let initial fetch mocks resolve.
  */
 export interface ExpectNoOverflowOptions {
   tolerance?: number;
   height?: number;
+  waitMs?: number;
 }
 
 /**
@@ -36,6 +40,7 @@ export async function expectNoOverflowAt(
 ): Promise<void> {
   const tolerance = options?.tolerance ?? 1;
   const height = options?.height ?? 800;
+  const waitMs = options?.waitMs ?? 0;
 
   await page.viewport(width, height);
   await render();
@@ -44,6 +49,11 @@ export async function expectNoOverflowAt(
   await new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
   });
+
+  // Optional extra wait for components that resolve async data after mount.
+  if (waitMs > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+  }
 
   const limit = width + tolerance;
   const docScrollWidth = document.documentElement.scrollWidth;

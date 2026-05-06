@@ -6334,3 +6334,59 @@ async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(db_session: A
     assert edges_result["bucket_mode"] == "cycle"
     assert sr_result["current_cycle_id"] == edges_result["current_cycle_id"]
     assert sr_result["previous_cycle_id"] == edges_result["previous_cycle_id"]
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_author_vs_reviewer_breakdown(db_session: AsyncSession):
+    """Per-origin breakdown surfaces author vs reviewer counts and the
+    reviewer_caught signal in the trend dict's `current` stats block."""
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks; 3 have author edges, 2 of those also have a
+    # reviewer edge that catches a case the author missed.
+    current_edge_payloads = [
+        [
+            {"case": "off-by-one", "handled": True, "origin": "author"},
+            {"case": "null guard", "handled": False, "origin": "reviewer"},
+        ],
+        [
+            {"case": "empty list", "handled": True, "origin": "author"},
+            {"case": "race", "handled": False, "origin": "reviewer"},
+        ],
+        [{"case": "type-coerce", "handled": True, "origin": "author"}],
+        [],
+        [],
+    ]
+    for payload in current_edge_payloads:
+        t = _make_edges_task(project.id, age_days=2, edges_considered=payload)
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks, no reviewer edges at all.
+    for i in range(5):
+        t = _make_edges_task(
+            project.id, age_days=20,
+            edges_considered=[{"case": f"prev-{i}", "handled": True}] if i < 3 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    cur = result["current"]
+    assert cur["tasks_with_reviewer_edges_count"] == 2
+    assert cur["tasks_with_reviewer_edges_rate"] == round(2 / 5, 3)
+    assert cur["reviewer_caught_count"] == 2
+    assert cur["reviewer_caught_rate"] == round(2 / 5, 3)
+    assert cur["author_avg_edges_per_task"] == 1.0
+    assert cur["reviewer_avg_edges_per_task"] == 1.0
+
+    prev = result["previous"]
+    assert prev["tasks_with_reviewer_edges_count"] == 0
+    assert prev["reviewer_caught_count"] == 0
+
+    assert result["reviewer_caught_rate_delta"] == round(2 / 5 - 0, 3)
+    assert result["reviewer_caught_trend"] == "improving"

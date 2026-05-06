@@ -1719,6 +1719,178 @@ describe('runFreshReviewerPass merge logic', () => {
   });
 });
 
+// ── Reviewer edges enumeration + merge ────────────────────────────────────────
+describe('runFreshReviewerPass reviewer_edges_considered', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+    vi.mocked(fsModule.writeFileSync).mockClear();
+    vi.mocked(fsModule.readFileSync).mockClear();
+  });
+
+  it('reviewer prompt requests reviewer_edges_considered with the same shape as edges_considered', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+
+    await runFreshReviewerPass('rec-prompt', 'Title', 'Desc', [], null, { value: '' });
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(prompt).toContain('reviewer_edges_considered');
+    expect(prompt).toContain('case');
+    expect(prompt).toContain('handled');
+    expect(prompt).toContain('blind_spot');
+    expect(prompt).toContain('evidence');
+  });
+
+  it('writes reviewer_edges_considered into SR JSON tagged with origin: reviewer', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockImplementation(() => { throw new Error('not found'); });
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [],
+        reviewer_edges_considered: [
+          { case: 'empty input list', handled: true, evidence: 'L42 early return' },
+          { case: 'concurrent calls', handled: false, blind_spot: 'no lock' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('rec-1', 'Title', 'Desc', [], null, { value: '' });
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const reviewerEdges = json.reviewer_edges_considered as Array<Record<string, unknown>>;
+    expect(reviewerEdges.length).toBe(2);
+    expect(reviewerEdges[0]).toMatchObject({ case: 'empty input list', handled: true, origin: 'reviewer', evidence: 'L42 early return' });
+    expect(reviewerEdges[1]).toMatchObject({ case: 'concurrent calls', handled: false, origin: 'reviewer', blind_spot: 'no lock' });
+    const merged = json.edges_considered as Array<Record<string, unknown>>;
+    expect(merged.length).toBe(2);
+    expect(merged.every(e => e.origin === 'reviewer')).toBe(true);
+  });
+
+  it('merges reviewer edges with existing author edges, backfilling origin: author', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {},
+      edges_considered: [
+        { case: 'null payload', handled: true, evidence: 'L10' },
+        { case: 'huge input', handled: false, blind_spot: 'memory' },
+      ],
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [],
+        reviewer_edges_considered: [{ case: 'race condition', handled: false, blind_spot: 'no mutex' }],
+      }),
+    });
+
+    await runFreshReviewerPass('rec-2', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const merged = json.edges_considered as Array<Record<string, unknown>>;
+    expect(merged.length).toBe(3);
+    expect(merged[0]).toMatchObject({ case: 'null payload', origin: 'author' });
+    expect(merged[1]).toMatchObject({ case: 'huge input', origin: 'author' });
+    expect(merged[2]).toMatchObject({ case: 'race condition', origin: 'reviewer' });
+    expect((json.reviewer_edges_considered as unknown[]).length).toBe(1);
+  });
+
+  it('preserves existing author edges untouched when reviewer omits reviewer_edges_considered', async () => {
+    const idx = await import('../index.js');
+    const authorEdges = [{ case: 'empty list', handled: true, evidence: 'L1' }];
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {},
+      edges_considered: authorEdges,
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: '{"reviewer_findings":[]}',
+    });
+
+    await runFreshReviewerPass('rec-3', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    expect(json.reviewer_edges_considered).toBeUndefined();
+    expect(json.edges_considered).toEqual(authorEdges);
+  });
+
+  it('filters malformed reviewer edge entries (missing case)', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockImplementation(() => { throw new Error('not found'); });
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [],
+        reviewer_edges_considered: [
+          { handled: true },                       // missing case → drop
+          { case: 'good edge', handled: true },    // keep
+          'not an object',                         // drop
+          { case: 42, handled: true },             // case not a string → drop
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('rec-4', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const reviewerEdges = json.reviewer_edges_considered as Array<Record<string, unknown>>;
+    expect(reviewerEdges.length).toBe(1);
+    expect(reviewerEdges[0]).toMatchObject({ case: 'good edge', handled: true, origin: 'reviewer' });
+  });
+
+  it('merges reviewer edges with origin: reviewer when incompleteSrRecovery=true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {},
+      categories: ['incomplete_review'],
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'missed' }],
+        reviewer_edges_considered: [{ case: 'recovered edge', handled: false, blind_spot: 'spotted by recovery' }],
+      }),
+    });
+
+    await runFreshReviewerPass('rec-5', 'Title', 'Desc', [], null, { value: '' }, undefined, undefined, true);
+    const json = captured as unknown as Record<string, unknown>;
+    expect(json.reviewer_recovery_origin).toBe('reviewer_recovery_after_incomplete_sr');
+    const reviewerEdges = json.reviewer_edges_considered as Array<Record<string, unknown>>;
+    expect(reviewerEdges.length).toBe(1);
+    expect(reviewerEdges[0]).toMatchObject({ case: 'recovered edge', origin: 'reviewer' });
+  });
+});
+
 // ── Structural prompt invariants (regression-detection) ───────────────────────
 // Pins the cross-cutting guidance blocks that every code-change handler MUST
 // assemble into its prompt. A future PR that drops one of these constants from

@@ -75,7 +75,13 @@ import {
   drainFixLoopEventBuffer,
   _resetFixLoopEventStateForTesting,
 } from './fix-loop-events.js';
-import { MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS, TOOL_USE_STALL_TIMEOUT_MS, CLAUDE_STREAM_STALL_MS } from './constants.js';
+import {
+  MAX_LINT_FIX_ATTEMPTS,
+  MAX_TEST_FIX_ATTEMPTS,
+  TOOL_USE_STALL_TIMEOUT_MS,
+  CLAUDE_STREAM_STALL_MS,
+  FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
+} from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
@@ -391,9 +397,20 @@ describe('runProjectLintChecks', () => {
     expect(adminUiCalls).toEqual([
       'npm ci',
       'npx eslint .',
+      'npx playwright install --with-deps chromium',
       'npm run test:viewport',
       'npm run build',
     ]);
+  });
+
+  it('uses the Playwright install timeout for hardcoded admin-ui browser provisioning', () => {
+    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
+    const installCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && args.join(' ') === 'playwright install --with-deps chromium',
+    );
+    expect(defined(installCall)[2]).toEqual(expect.objectContaining({
+      timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
+    }));
   });
 
   it('falls back to hardcoded agent checks when buildConfig is undefined and agent/ touched', () => {

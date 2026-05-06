@@ -70,14 +70,18 @@ export function formatSelfReviewBlindSpots(
   if (edgesConsidered.length > 0) {
     const unhandled = edgesConsidered.filter(e => e.handled === false);
     const handled = edgesConsidered.filter(e => e.handled !== false);
-    const edgeLines: string[] = ['- Edge cases the agent enumerated:'];
+    const originSuffix = (e: EdgeRaw): string => {
+      const origin = e.origin;
+      return origin === 'author' || origin === 'reviewer' ? ` · ${origin}` : '';
+    };
+    const edgeLines: string[] = ['- Edge cases enumerated:'];
     for (const e of unhandled) {
       const note = typeof e.blind_spot === 'string' ? ` — ${e.blind_spot}` : ' — unhandled, no explanation given';
-      edgeLines.push(`  - [UNHANDLED] ${String(e.case)}${note}`);
+      edgeLines.push(`  - [UNHANDLED${originSuffix(e)}] ${String(e.case)}${note}`);
     }
     for (const e of handled) {
       const evidence = typeof e.evidence === 'string' ? ` (${e.evidence})` : '';
-      edgeLines.push(`  - [handled] ${String(e.case)}${evidence}`);
+      edgeLines.push(`  - [handled${originSuffix(e)}] ${String(e.case)}${evidence}`);
     }
     lines.push(edgeLines.join('\n'));
   }

@@ -472,6 +472,41 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
           </span>
         )}
       </div>
+      {curr.unhandled_edge_flagged_rate != null && (
+        <div className="flex items-center gap-2 text-[10px]" title="Share of enumerated edges the agent itself marked as not handled — its honesty about uncertainty.">
+          <span className="text-neutral-400 flex-1">unhandled flagged</span>
+          <span className="font-mono tabular-nums text-neutral-300">
+            {Math.round(curr.unhandled_edge_flagged_rate * 100)}%
+          </span>
+        </div>
+      )}
+      {(curr.correctness_rejection_rate_with_edges != null || curr.correctness_rejection_rate_without_edges != null) && (() => {
+        const rWith = curr.correctness_rejection_rate_with_edges;
+        const rWithout = curr.correctness_rejection_rate_without_edges;
+        const gap = rWith != null && rWithout != null ? rWithout - rWith : null;
+        return (
+          <div className="flex items-center gap-2 text-[10px]">
+            <span className="text-neutral-400 flex-1" title="Human-reviewer correctness rejection rate, split by whether the task enumerated edges.">
+              correctness rej w/wo
+            </span>
+            <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when edges were enumerated">
+              {rWith != null ? `${Math.round(rWith * 100)}%` : '–'}
+            </span>
+            <span className="text-neutral-600 text-[9px]">/</span>
+            <span className="font-mono tabular-nums text-neutral-300" title="correctness rejection rate when edges were NOT enumerated">
+              {rWithout != null ? `${Math.round(rWithout * 100)}%` : '–'}
+            </span>
+            {gap != null && (
+              <span
+                className={`font-mono tabular-nums text-[9px] ${deltaColorClass(-gap)}`}
+                title="gap = without-edges minus with-edges; positive = edges correlate with fewer correctness rejections"
+              >
+                {`Δ${formatDelta(gap)}`}
+              </span>
+            )}
+          </div>
+        );
+      })()}
       {history.length > 0 && (
         <div className="flex items-center gap-1 mt-1">
           <span className="text-[9px] text-neutral-600">history</span>

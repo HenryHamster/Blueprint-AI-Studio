@@ -709,6 +709,7 @@ async def _maybe_spawn(
             last_remediation_task_id=new_task.id,
             last_seen_at=now,
             hit_count=1,
+            signal_first_crossed_at=now,
             signal_first_seen_at=signal_first_seen_at or now,
         ))
     else:
@@ -716,6 +717,11 @@ async def _maybe_spawn(
         existing_case.hit_count = (existing_case.hit_count or 0) + 1
         existing_case.last_seen_at = now
         existing_case.last_remediation_task_id = new_task.id
+        # A CLOSED case re-tripping starts a new regression cycle — reset
+        # signal_first_crossed_at so time-to-detect reflects the new episode.
+        # For still-ACTIVE cases, preserve the original crossing time.
+        if existing_case.status == RegressionCaseStatus.CLOSED or existing_case.signal_first_crossed_at is None:
+            existing_case.signal_first_crossed_at = now
         # Reactivate so admin state matches the in-flight remediation. A
         # CLOSED case re-tripping is a fresh regression cycle; without this
         # the case would stay CLOSED while a new investigation runs.

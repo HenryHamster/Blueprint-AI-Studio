@@ -1194,6 +1194,12 @@ class TestEdgesConsideredInvariants:
             "unhandled_edge_flagged_rate",
             "correctness_rejection_rate_with_edges",
             "correctness_rejection_rate_without_edges",
+            "author_avg_edges_per_task",
+            "reviewer_avg_edges_per_task",
+            "tasks_with_reviewer_edges_count",
+            "tasks_with_reviewer_edges_rate",
+            "reviewer_caught_count",
+            "reviewer_caught_rate",
         }
 
         def _make_task(edges, rejected_cats=None):
@@ -1248,3 +1254,104 @@ class TestEdgesConsideredInvariants:
             "unhandled_edge_flagged_rate must equal fraction of tasks that have at least "
             "one entry with handled=False."
         )
+
+    def test_reviewer_caught_count_via_unmatched_case(self):
+        """reviewer_caught_count must count a task where the reviewer raised
+        a case the author did not list (case-string mismatch)."""
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        tasks = [
+            _make_task([
+                {"case": "empty list", "handled": True, "origin": "author"},
+                {"case": "null payload", "handled": False, "origin": "reviewer"},
+            ]),
+            _make_task([{"case": "c2", "handled": True, "origin": "author"}]),
+            _make_task([{"case": "c3", "handled": True, "origin": "author"}]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+        assert result["reviewer_caught_count"] == 1
+        assert result["reviewer_caught_rate"] == round(1 / 3, 3)
+        assert result["tasks_with_reviewer_edges_count"] == 1
+
+    def test_reviewer_caught_count_via_handled_downgrade(self):
+        """reviewer_caught_count must count a task where the reviewer flagged
+        handled=false on a case the author had marked handled=true."""
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        tasks = [
+            _make_task([
+                {"case": "shared", "handled": True, "origin": "author"},
+                {"case": "shared", "handled": False, "origin": "reviewer"},
+            ]),
+            _make_task([{"case": "c2", "handled": True}]),
+            _make_task([{"case": "c3", "handled": True}]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+        assert result["reviewer_caught_count"] == 1
+        assert result["reviewer_caught_rate"] == round(1 / 3, 3)
+
+    def test_reviewer_caught_case_match_is_normalized(self):
+        """Case-string comparison must be lowercased + trimmed so that
+        whitespace/case differences don't spuriously trigger a catch."""
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        tasks = [
+            _make_task([
+                {"case": "Empty List ", "handled": True, "origin": "author"},
+                {"case": "empty list", "handled": True, "origin": "reviewer"},
+            ]),
+            _make_task([{"case": "c2", "handled": True}]),
+            _make_task([{"case": "c3", "handled": True}]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+        assert result["reviewer_caught_count"] == 0, (
+            "Reviewer entry whose case matches an author case (modulo case/whitespace) "
+            "and is handled=true must NOT count as a reviewer catch."
+        )
+
+    def test_origin_missing_defaults_to_author(self):
+        """Entries without an explicit origin field count as author entries
+        for the per-origin breakdown."""
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        tasks = [
+            _make_task([{"case": "c1", "handled": True}]),
+            _make_task([{"case": "c2", "handled": True}]),
+            _make_task([{"case": "c3", "handled": True}]),
+        ]
+        result = _compute_edges_considered_metrics(tasks)
+        assert result is not None
+        assert result["author_avg_edges_per_task"] == 1.0
+        assert result["reviewer_avg_edges_per_task"] is None
+        assert result["tasks_with_reviewer_edges_count"] == 0

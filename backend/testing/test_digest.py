@@ -8905,6 +8905,7 @@ async def test_list_regression_cases_response_shape(client: AsyncClient, db_sess
     assert "first_seen_at" in c
     assert "last_seen_at" in c
     assert "last_remediation_task_id" in c
+    assert "signal_first_crossed_at" in c
 
 
 @pytest.mark.asyncio
@@ -8954,18 +8955,21 @@ async def test_list_regression_cases_summary_median_stats(client: AsyncClient, d
             "count": 1,
             "median_time_from_first_seen_to_merged_seconds": 5400.0,
             "median_time_from_merged_to_recovered_seconds": 3600.0,
+            "median_time_to_detect_seconds": None,
         },
         {
             "regression_class": "sr_catch_rate:correctness",
             "count": 1,
             "median_time_from_first_seen_to_merged_seconds": 7200.0,
             "median_time_from_merged_to_recovered_seconds": 3600.0,
+            "median_time_to_detect_seconds": None,
         },
         {
             "regression_class": "sr_catch_rate:latency",
             "count": 1,
             "median_time_from_first_seen_to_merged_seconds": 3600.0,
             "median_time_from_merged_to_recovered_seconds": 10800.0,
+            "median_time_to_detect_seconds": None,
         },
     ]
 
@@ -9015,6 +9019,7 @@ async def test_list_regression_cases_summary_uses_latest_merge_before_recovery(
             "count": 1,
             "median_time_from_first_seen_to_merged_seconds": 10800.0,
             "median_time_from_merged_to_recovered_seconds": 3600.0,
+            "median_time_to_detect_seconds": None,
         }
     ]
 
@@ -9036,6 +9041,38 @@ async def test_list_regression_cases_summary_uses_latest_merge_before_recovery(
             "post_merge_value": 0.74,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_summary_includes_time_to_detect(client: AsyncClient, db_session):
+    """Summary median_time_to_detect_seconds is computed when signal_first_crossed_at is set."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_seen = datetime(2026, 5, 1, 9, 0, 0)
+    signal_crossed = datetime(2026, 5, 1, 8, 55, 0)  # 5 minutes before first_seen → 300s
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=first_seen,
+        signal_first_crossed_at=signal_crossed,
+        fingerprint_to_fix_log=[{"merged_at": "2026-05-01T10:00:00Z", "recovered_at": "2026-05-01T11:00:00Z"}],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    summary = response.json()["summary"]["by_regression_class"]
+    assert len(summary) == 1
+    assert summary[0]["regression_class"] == "fix_loop_divergence"
+    assert summary[0]["median_time_to_detect_seconds"] == 300.0
 
 
 @pytest.mark.asyncio
@@ -9322,3 +9359,37 @@ async def test_list_recently_closed_time_to_recover_none_when_no_recovered_at(
     assert c["fix_pr_number"] == 999
     assert c["recovered_at"] is None
     assert c["time_to_recover_sec"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_time_to_detect_computed_from_signal_first_crossed_at(
+    client: AsyncClient, db_session
+):
+    """time_to_detect_sec is the gap between signal_first_crossed_at and first_seen_at."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_seen = datetime(2026, 5, 5, 10, 0, 0)
+    signal_crossed = datetime(2026, 5, 5, 9, 50, 0)  # 10 minutes before → 600s
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=first_seen,
+        signal_first_crossed_at=signal_crossed,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["time_to_detect_sec"] == 600
+    assert c["signal_first_crossed_at"] is not None
+    assert c["time_to_recover_sec"] is None  # no recovered_at

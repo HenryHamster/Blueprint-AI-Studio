@@ -2757,3 +2757,114 @@ async def test_strategic_stall_respects_cooldown(db_session):
         )
     )).scalars().all()
     assert len(rows) == 1
+
+@pytest.mark.asyncio
+async def test_signal_first_crossed_at_set_on_new_case(db_session):
+    """signal_first_crossed_at is populated when a new RegressionRemediationCase is created."""
+    from app.models import RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    before = _utcnow()
+    spawned = await run_once(db_session, project.id)
+    after = _utcnow()
+    assert spawned == 1
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+        )
+    )).scalars().first()
+    assert case is not None
+    assert case.signal_first_crossed_at is not None
+    crossed = case.signal_first_crossed_at
+    if crossed.tzinfo is not None:
+        crossed = crossed.replace(tzinfo=None)
+    assert before <= crossed <= after
+
+
+@pytest.mark.asyncio
+async def test_signal_first_crossed_at_preserved_for_active_case(db_session):
+    """signal_first_crossed_at is NOT reset when an ACTIVE case spawns again after cooldown."""
+    from app.models import RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First spawn — establishes signal_first_crossed_at.
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+        )
+    )).scalars().first()
+    original_crossed_at = case.signal_first_crossed_at
+    assert original_crossed_at is not None
+
+    # Mark the in-flight task COMPLETED and backdate it past the cooldown.
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    task.status = TaskStatus.COMPLETED
+    task.created_at = _utcnow() - _REGRESSION_COOLDOWN - timedelta(minutes=5)
+    db_session.add(task)
+    await db_session.commit()
+
+    # Second spawn — case is still ACTIVE, crossed_at should be preserved.
+    spawned2 = await run_once(db_session, project.id)
+    assert spawned2 == 1
+
+    await db_session.refresh(case)
+    assert case.signal_first_crossed_at == original_crossed_at
+
+
+@pytest.mark.asyncio
+async def test_signal_first_crossed_at_reset_on_reopen_from_closed(db_session):
+    """signal_first_crossed_at resets to now when a CLOSED case re-trips."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed a pre-existing CLOSED case with an old signal_first_crossed_at.
+    old_time = _utcnow() - timedelta(days=5)
+    existing_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.CLOSED,
+        hit_count=1,
+        signal_first_crossed_at=old_time,
+        signal_snapshot_at_spawn={},
+        signal_snapshot_at_merge={},
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(existing_case)
+    await db_session.commit()
+
+    before = _utcnow()
+    spawned = await run_once(db_session, project.id)
+    after = _utcnow()
+    assert spawned == 1
+
+    await db_session.refresh(existing_case)
+    assert existing_case.signal_first_crossed_at is not None
+    crossed = existing_case.signal_first_crossed_at
+    if crossed.tzinfo is not None:
+        crossed = crossed.replace(tzinfo=None)
+    # Must be a fresh timestamp (not the old_time from 5 days ago).
+    assert before <= crossed <= after

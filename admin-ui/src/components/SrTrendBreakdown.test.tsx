@@ -409,4 +409,71 @@ describe('EdgesTrendBreakdown', () => {
     render(<EdgesTrendBreakdown trend={makeEdgesTrend({ bucket_mode: 'calendar', current_cycle_id: null })} />);
     expect(screen.queryByText(/vs/)).toBeNull();
   });
+
+  it('renders unhandled-flagged and with/without correctness rejection rates when present', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      rate_history: [],
+      current: {
+        sample_size: 10,
+        tasks_with_edges_rate: 0.7,
+        unhandled_edge_flagged_rate: 0.25,
+        correctness_rejection_rate_with_edges: 0.10,
+        correctness_rejection_rate_without_edges: 0.35,
+      },
+    })} />);
+    expect(screen.getByText('unhandled flagged')).toBeTruthy();
+    expect(screen.getByText('25%')).toBeTruthy();
+    expect(screen.getByText('correctness rej w/wo')).toBeTruthy();
+    expect(screen.getByText('10%')).toBeTruthy();
+    expect(screen.getByText('35%')).toBeTruthy();
+  });
+
+  it('shows positive gap when without-edges rejection is higher (edges helping)', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      current: {
+        sample_size: 10,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_edges: 0.10,
+        correctness_rejection_rate_without_edges: 0.30,
+      },
+    })} />);
+    const gap = container.querySelector('[title*="positive = edges correlate"]');
+    expect(gap).not.toBeNull();
+    expect(gap?.textContent).toBe('Δ+20pp');
+    expect(gap?.className).toContain('text-emerald-400');
+  });
+
+  it('shows negative gap colored red when with-edges rejection is higher', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      current: {
+        sample_size: 10,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_edges: 0.40,
+        correctness_rejection_rate_without_edges: 0.20,
+      },
+    })} />);
+    const gap = container.querySelector('[title*="positive = edges correlate"]');
+    expect(gap).not.toBeNull();
+    expect(gap?.textContent).toBe('Δ−20pp');
+    expect(gap?.className).toContain('text-red-400');
+  });
+
+  it('renders without crashing and without new rows when extended fields are absent', () => {
+    render(<EdgesTrendBreakdown trend={makeEdgesTrend()} />);
+    expect(screen.getByTestId('edges-trend-breakdown')).toBeTruthy();
+    expect(screen.queryByText('unhandled flagged')).toBeNull();
+    expect(screen.queryByText('correctness rej w/wo')).toBeNull();
+  });
+
+  it('omits the gap when only one side of correctness rejection is present', () => {
+    const { container } = render(<EdgesTrendBreakdown trend={makeEdgesTrend({
+      current: {
+        sample_size: 10,
+        tasks_with_edges_rate: 0.7,
+        correctness_rejection_rate_with_edges: 0.15,
+      },
+    })} />);
+    expect(screen.getByText('correctness rej w/wo')).toBeTruthy();
+    expect(container.querySelector('[title*="positive = edges correlate"]')).toBeNull();
+  });
 });

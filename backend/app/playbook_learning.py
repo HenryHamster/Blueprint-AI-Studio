@@ -2091,6 +2091,54 @@ _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 _EDGE_CATS = {"correctness", "error-handling"}
 
 
+def _partition_edges_by_origin(edges: list) -> "tuple[list, list]":
+    """Split edges_considered into (author, reviewer) entries.
+
+    Entries without an explicit ``origin`` field count as author entries.
+    Non-dict entries are dropped.
+    """
+    author: list = []
+    reviewer: list = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        if e.get("origin") == "reviewer":
+            reviewer.append(e)
+        else:
+            author.append(e)
+    return author, reviewer
+
+
+def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -> bool:
+    """Whether the reviewer caught a case the author missed in this task.
+
+    A catch is either a reviewer entry whose ``case`` (lowercased + trimmed)
+    is absent from the author entries, OR a reviewer entry that flags
+    ``handled: false`` for a case the author had marked ``handled: true``.
+    Entries with missing/non-string ``case`` are skipped.
+    """
+    def _norm(c: Any) -> Optional[str]:
+        return c.strip().lower() if isinstance(c, str) and c.strip() else None
+
+    author_handled: dict[str, bool] = {}
+    for e in author_entries:
+        c = _norm(e.get("case"))
+        if c is None:
+            continue
+        h = bool(e.get("handled", True))
+        author_handled[c] = author_handled.get(c, False) or h
+
+    for e in reviewer_entries:
+        c = _norm(e.get("case"))
+        if c is None:
+            continue
+        if c not in author_handled:
+            return True
+        if author_handled[c] and not bool(e.get("handled", True)):
+            return True
+    return False
+
+
 def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
     """Compute edges_considered rolling metrics for a task list.
 
@@ -2122,10 +2170,24 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
     without_edges: list = []
     total_edges = 0
     unhandled_flagged = 0
+    total_author_edges = 0
+    total_reviewer_edges = 0
+    n_with_author = 0
+    n_with_reviewer = 0
+    reviewer_caught = 0
     for t in code_tasks:
         edges = (t.context or {}).get("_self_review_outcome", {}).get("edges_considered") or []
         if not isinstance(edges, list):
             edges = []
+        author_e, reviewer_e = _partition_edges_by_origin(edges)
+        total_author_edges += len(author_e)
+        total_reviewer_edges += len(reviewer_e)
+        if author_e:
+            n_with_author += 1
+        if reviewer_e:
+            n_with_reviewer += 1
+            if _reviewer_caught_author_miss(author_e, reviewer_e):
+                reviewer_caught += 1
         if edges:
             with_edges.append(t)
             total_edges += len(edges)
@@ -2153,6 +2215,12 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
         "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3) if n_with else None,
         "correctness_rejection_rate_with_edges": _rejection_rate(with_edges),
         "correctness_rejection_rate_without_edges": _rejection_rate(without_edges),
+        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2) if n_with_author else None,
+        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2) if n_with_reviewer else None,
+        "tasks_with_reviewer_edges_count": n_with_reviewer,
+        "tasks_with_reviewer_edges_rate": round(n_with_reviewer / n_total, 3),
+        "reviewer_caught_count": reviewer_caught,
+        "reviewer_caught_rate": round(reviewer_caught / n_total, 3),
     }
 
 
@@ -3592,6 +3660,20 @@ async def compute_edges_trend(
     else:
         trend = "stable"
 
+    rc_current = current_stats.get("reviewer_caught_rate")
+    rc_previous = previous_stats.get("reviewer_caught_rate")
+    if rc_current is not None and rc_previous is not None:
+        rc_delta = round(rc_current - rc_previous, 3)
+        if rc_delta >= _TREND_DELTA_THRESHOLD:
+            reviewer_caught_trend = "improving"
+        elif rc_delta <= -_TREND_DELTA_THRESHOLD:
+            reviewer_caught_trend = "regressing"
+        else:
+            reviewer_caught_trend = "stable"
+    else:
+        rc_delta = None
+        reviewer_caught_trend = None
+
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
         "bucket_mode": "cycle" if use_cycle_mode else "calendar",
@@ -3601,6 +3683,8 @@ async def compute_edges_trend(
         "previous": previous_stats,
         "tasks_with_edges_rate_delta": delta,
         "trend": trend,
+        "reviewer_caught_rate_delta": rc_delta,
+        "reviewer_caught_trend": reviewer_caught_trend,
     }
 
     project = await session.get(Project, project_id)
