@@ -1265,6 +1265,7 @@ class RegressionRemediationCase(SQLModel, table=True):
     )
     last_remediation_pr_number: Optional[int] = Field(default=None)
     last_remediation_result: Optional[str] = Field(default=None)
+    last_failure_class: Optional[str] = Field(default=None)
     signal_snapshot_at_spawn: Dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),

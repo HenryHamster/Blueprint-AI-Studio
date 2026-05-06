@@ -54,6 +54,7 @@ router = APIRouter(
 )
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
+_REGRESSION_STALL_THRESHOLD_HOURS = 4  # ACTIVE case without PR older than this → stalled
 
 
 def _stash_projected_task_fields(
@@ -444,6 +445,38 @@ def _compute_first_attempt_breakdowns(
         "by_scope": by_scope,
         "trend": trend,
         "first_attempt_by_review_category": first_attempt_by_review_category,
+    }
+
+
+def _compute_regression_case_summary(rows: List[RegressionRemediationCase]) -> Dict[str, Any]:
+    by_class: Dict[str, Dict[str, List[float]]] = {}
+    for case in rows:
+        latest_merged_at = None
+        merged_at = recovered_at = None
+        for entry in case.fingerprint_to_fix_log or []:
+            if entry.get("merged_at"):
+                latest_merged_at = _to_naive_utc(
+                    datetime.fromisoformat(str(entry["merged_at"]).replace("Z", "+00:00"))
+                )
+            if entry.get("recovered_at") and latest_merged_at is not None:
+                merged_at = latest_merged_at
+                recovered_at = _to_naive_utc(
+                    datetime.fromisoformat(str(entry["recovered_at"]).replace("Z", "+00:00"))
+                )
+        if case.first_seen_at and merged_at and recovered_at:
+            bucket = by_class.setdefault(case.regression_class, {"to_merged": [], "to_recovered": []})
+            bucket["to_merged"].append((_to_naive_utc(merged_at) - _to_naive_utc(case.first_seen_at)).total_seconds())
+            bucket["to_recovered"].append((recovered_at - merged_at).total_seconds())
+    return {
+        "by_regression_class": [
+            {
+                "regression_class": regression_class,
+                "count": len(bucket["to_merged"]),
+                "median_time_from_first_seen_to_merged_seconds": round(statistics.median(bucket["to_merged"]), 3),
+                "median_time_from_merged_to_recovered_seconds": round(statistics.median(bucket["to_recovered"]), 3),
+            }
+            for regression_class, bucket in sorted(by_class.items())
+        ]
     }
 
 
@@ -1508,9 +1541,26 @@ async def list_regression_cases(
         .limit(limit)
     )
     rows = (await session.execute(query)).scalars().all()
+    now = _utcnow()
+    stall_threshold = now - timedelta(hours=_REGRESSION_STALL_THRESHOLD_HOURS)
+    closed_rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
+                )
+                .order_by(RegressionRemediationCase.last_seen_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         "count": len(rows),
         "status_filter": status_filter,
+        "summary": _compute_regression_case_summary(closed_rows),
         "cases": [
             {
                 "id": str(c.id),
@@ -1525,10 +1575,12 @@ async def list_regression_cases(
                 "last_remediation_task_id": str(c.last_remediation_task_id) if c.last_remediation_task_id else None,
                 "last_remediation_pr_number": c.last_remediation_pr_number,
                 "last_remediation_result": c.last_remediation_result,
+                "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "sample_message": c.sample_message,
+                "stalled": c.status == RegressionCaseStatus.ACTIVE and c.last_remediation_pr_number is None and c.first_seen_at < stall_threshold,
             }
             for c in rows
         ],
@@ -1601,13 +1653,105 @@ async def list_regression_manual_intervention_cases(
                 "status": c.status,
                 "attempts": c.attempts,
                 "last_remediation_pr_number": c.last_remediation_pr_number,
+                "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
             }
             for c in rows
         ],
+    }
+
+
+@router.get("/regression-cases/stalled")
+async def list_regression_stalled_cases(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """List regression cases stalled without PR (ACTIVE, no PR, and older than threshold)."""
+    now = _utcnow()
+    stall_threshold = now - timedelta(hours=_REGRESSION_STALL_THRESHOLD_HOURS)
+    rows = (await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE,
+            RegressionRemediationCase.last_remediation_pr_number.is_(None),
+            RegressionRemediationCase.first_seen_at < stall_threshold,
+        ).order_by(RegressionRemediationCase.first_seen_at.asc()).limit(limit)
+    )).scalars().all()
+    return {
+        "count": len(rows),
+        "cases": [
+            {
+                "id": str(c.id),
+                "project_id": str(c.project_id),
+                "regression_class": c.regression_class,
+                "signal_name": c.regression_class.replace("_", " "),
+                "status": c.status,
+                "attempts": c.attempts,
+                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+                "hit_count": c.hit_count,
+            }
+            for c in rows
+        ],
+    }
+
+
+@router.get("/regression-cases/recently-closed")
+async def list_recently_closed_regression_cases(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    limit: int = Query(5, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """List recently closed regression cases (autonomous wins)."""
+    rows = (await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
+        ).order_by(RegressionRemediationCase.last_seen_at.desc()).limit(limit)
+    )).scalars().all()
+
+    cases = []
+    for c in rows:
+        fix_pr_number = None
+        recovered_at = None
+
+        if c.fingerprint_to_fix_log:
+            for entry in c.fingerprint_to_fix_log:
+                if "fix_pr_number" in entry:
+                    fix_pr_number = entry["fix_pr_number"]
+                if "recovered_at" in entry:
+                    recovered_at = entry["recovered_at"]
+
+        time_to_recover_sec = None
+        if recovered_at and c.first_seen_at:
+            try:
+                recovered_dt = datetime.fromisoformat(recovered_at.replace("Z", "+00:00"))
+                # first_seen_at is stored as NaiveUTCDateTime; normalize both sides.
+                recovered_naive = _to_naive_utc(recovered_dt)
+                first_seen_naive = _to_naive_utc(c.first_seen_at)
+                time_to_recover_sec = int((recovered_naive - first_seen_naive).total_seconds())
+            except (ValueError, TypeError):
+                pass
+
+        cases.append({
+            "id": str(c.id),
+            "regression_class": c.regression_class,
+            "fix_pr_number": fix_pr_number,
+            "recovered_at": recovered_at,
+            "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+            "time_to_recover_sec": time_to_recover_sec,
+        })
+
+    return {
+        "count": len(cases),
+        "cases": cases,
     }
 
 

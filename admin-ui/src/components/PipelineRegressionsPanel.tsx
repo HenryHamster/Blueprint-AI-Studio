@@ -3,6 +3,13 @@ import { AlertTriangle, CheckCircle, RotateCcw } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
 
+interface FixLogEntry {
+  fix_pr_number?: number;
+  merged_at?: string;
+  recovered_at?: string;
+  post_merge_value?: number;
+}
+
 interface ManualInterventionCase {
   id: string;
   regression_class: string;
@@ -10,8 +17,10 @@ interface ManualInterventionCase {
   status: string;
   attempts: number;
   last_remediation_pr_number: number | null;
+  last_failure_class: string | null;
   signal_snapshot_at_spawn: Record<string, unknown> | null;
   signal_snapshot_at_merge: Record<string, unknown> | null;
+  fingerprint_to_fix_log: FixLogEntry[];
   last_seen_at: string | null;
   needs_manual_intervention_at: string | null;
 }
@@ -115,10 +124,35 @@ export function ManualInterventionPanel({ projectId }: Props) {
                       <span className="text-neutral-400 font-medium">At merge:</span>{' '}
                       {snapshotSummary(c.signal_snapshot_at_merge)}
                     </div>
+                    {c.fingerprint_to_fix_log.length > 0 && (
+                      <div className="mt-1.5 border-t border-red-900/30 pt-1">
+                        <div className="text-[10px] text-neutral-400 font-medium mb-0.5">Prior attempts:</div>
+                        <div className="space-y-0.5">
+                          {c.fingerprint_to_fix_log.map((entry, idx) => (
+                            <div key={idx} className="text-[9px] text-neutral-500">
+                              {entry.fix_pr_number && entry.merged_at && (
+                                <span>
+                                  PR #{entry.fix_pr_number} merged {new Date(entry.merged_at).toLocaleDateString()}
+                                  {entry.recovered_at && ' → recovered'}
+                                </span>
+                              )}
+                              {entry.recovered_at && !entry.fix_pr_number && (
+                                <span>Recovered {new Date(entry.recovered_at).toLocaleDateString()}</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex items-center gap-3 mt-1">
                       {c.last_remediation_pr_number != null && (
                         <span className="text-[10px] text-neutral-400">
                           Last PR: #{c.last_remediation_pr_number}
+                        </span>
+                      )}
+                      {c.last_failure_class && (
+                        <span className="text-[10px] text-neutral-500 font-mono">
+                          last fail: {c.last_failure_class}
                         </span>
                       )}
                       {c.last_seen_at && (

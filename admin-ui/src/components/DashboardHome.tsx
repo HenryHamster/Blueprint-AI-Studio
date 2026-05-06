@@ -32,6 +32,7 @@ import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPo
 import { SrTrendBreakdown, SrMissedRetrospective, type SrTrendData, type SrMissedTask } from './SrTrendBreakdown';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel } from './PipelineRegressionsPanel';
+import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -796,6 +797,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
       {/* Manual Intervention Cases */}
       {selectedProjectId && <ManualInterventionPanel projectId={selectedProjectId} />}
+
+      {/* Recently Resolved Regressions */}
+      {selectedProjectId && <RecentlyResolvedRegressionsPanel projectId={selectedProjectId} />}
 
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />

@@ -7898,6 +7898,7 @@ async def test_list_regression_cases_empty(client: AsyncClient, db_session):
     data = response.json()
     assert data["count"] == 0
     assert data["cases"] == []
+    assert data["summary"] == {"by_regression_class": []}
     assert "status_filter" in data
 
 
@@ -7954,6 +7955,137 @@ async def test_list_regression_cases_response_shape(client: AsyncClient, db_sess
     assert "first_seen_at" in c
     assert "last_seen_at" in c
     assert "last_remediation_task_id" in c
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_summary_median_stats(client: AsyncClient, db_session):
+    """GET /regression-cases includes per-class MTTR summary from CLOSED rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_seen = datetime(2026, 5, 1, 9, 0, 0)
+    cases = [
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:correctness",
+            status=RegressionCaseStatus.CLOSED,
+            first_seen_at=first_seen,
+            fingerprint_to_fix_log=[{"merged_at": "2026-05-01T11:00:00Z", "recovered_at": "2026-05-01T12:00:00Z"}],
+        ),
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="sr_catch_rate:latency",
+            status=RegressionCaseStatus.CLOSED,
+            first_seen_at=first_seen,
+            fingerprint_to_fix_log=[{"merged_at": "2026-05-01T10:00:00Z", "recovered_at": "2026-05-01T13:00:00Z"}],
+        ),
+        RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="fix_loop_divergence",
+            status=RegressionCaseStatus.CLOSED,
+            first_seen_at=first_seen,
+            fingerprint_to_fix_log=[{"merged_at": "2026-05-01T10:30:00Z", "recovered_at": "2026-05-01T11:30:00Z"}],
+        ),
+    ]
+    db_session.add_all(cases)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    summary = response.json()["summary"]["by_regression_class"]
+    assert summary == [
+        {
+            "regression_class": "fix_loop_divergence",
+            "count": 1,
+            "median_time_from_first_seen_to_merged_seconds": 5400.0,
+            "median_time_from_merged_to_recovered_seconds": 3600.0,
+        },
+        {
+            "regression_class": "sr_catch_rate:correctness",
+            "count": 1,
+            "median_time_from_first_seen_to_merged_seconds": 7200.0,
+            "median_time_from_merged_to_recovered_seconds": 3600.0,
+        },
+        {
+            "regression_class": "sr_catch_rate:latency",
+            "count": 1,
+            "median_time_from_first_seen_to_merged_seconds": 3600.0,
+            "median_time_from_merged_to_recovered_seconds": 10800.0,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_summary_uses_latest_merge_before_recovery(
+    client: AsyncClient, db_session, mocker
+):
+    """Recovery is paired with the most recent merged_at in the real lifecycle log shape."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        first_seen_at=datetime(2026, 5, 1, 9, 0, 0),
+        last_seen_at=datetime(2026, 5, 1, 13, 30, 0),
+    )
+
+    mocker.patch(
+        "app.models._utcnow",
+        side_effect=[
+            datetime(2026, 5, 1, 10, 0, 0),
+            datetime(2026, 5, 1, 12, 0, 0),
+        ],
+    )
+    case.mark_merged(101, {"value": 0.61})
+    case.re_arm(max_attempts=3)
+    case.mark_merged(202, {"value": 0.67})
+    case.mark_closed(post_merge_value=0.74, recovered_at="2026-05-01T13:00:00Z")
+
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    summary = response.json()["summary"]["by_regression_class"]
+    assert summary == [
+        {
+            "regression_class": "sr_catch_rate:correctness",
+            "count": 1,
+            "median_time_from_first_seen_to_merged_seconds": 10800.0,
+            "median_time_from_merged_to_recovered_seconds": 3600.0,
+        }
+    ]
+
+    closed_log = case.fingerprint_to_fix_log
+    assert closed_log == [
+        {
+            "fingerprint": "sr_catch_rate:correctness",
+            "fix_pr_number": 101,
+            "merged_at": "2026-05-01T10:00:00",
+        },
+        {
+            "fingerprint": "sr_catch_rate:correctness",
+            "fix_pr_number": 202,
+            "merged_at": "2026-05-01T12:00:00",
+        },
+        {
+            "fingerprint": "sr_catch_rate:correctness",
+            "recovered_at": "2026-05-01T13:00:00Z",
+            "post_merge_value": 0.74,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -8082,3 +8214,161 @@ async def test_list_regression_manual_intervention_response_shape(client: AsyncC
     assert c["needs_manual_intervention_at"] is not None
     assert "last_seen_at" in c
     assert "last_remediation_pr_number" in c
+
+
+# ── GET /regression-cases/recently-closed ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_regression_cases_filters_to_closed_only(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases/recently-closed only returns CLOSED cases."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    closed_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+    )
+    active_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.ACTIVE,
+    )
+    manual_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="pipeline_success_rate",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=_utcnow(),
+    )
+    db_session.add_all([closed_case, active_case, manual_case])
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert len(data["cases"]) == 1
+    assert data["cases"][0]["regression_class"] == "sr_catch_rate:correctness"
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_regression_cases_scoped_by_project(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases/recently-closed only returns cases for the requested project."""
+    project_a = make_project()
+    project_b = make_project()
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    case_a = RegressionRemediationCase(
+        project_id=project_a.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+    )
+    case_b = RegressionRemediationCase(
+        project_id=project_b.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.CLOSED,
+    )
+    db_session.add_all([case_a, case_b])
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project_a.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["cases"][0]["regression_class"] == "sr_catch_rate:correctness"
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_extracts_fix_pr_and_recovered_at_and_time_to_recover(
+    client: AsyncClient, db_session
+):
+    """Multi-entry fingerprint_to_fix_log: latest fix_pr_number/recovered_at win, time_to_recover_sec is computed."""
+    from datetime import timezone
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first_seen = datetime(2026, 5, 5, 12, 0, 0, tzinfo=timezone.utc)
+    recovered_at_str = "2026-05-05T13:30:00+00:00"  # 90 minutes later → 5400s
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=first_seen,
+        fingerprint_to_fix_log=[
+            {"fingerprint": "abc", "fix_pr_number": 1111},
+            {"fingerprint": "def", "fix_pr_number": 2222, "recovered_at": recovered_at_str},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+
+    c = data["cases"][0]
+    # Latest entry's fix_pr_number wins (the loop overwrites earlier values).
+    assert c["fix_pr_number"] == 2222
+    assert c["recovered_at"] == recovered_at_str
+    # 90 minutes = 5400 seconds.
+    assert c["time_to_recover_sec"] == 5400
+    assert c["regression_class"] == "sr_catch_rate:correctness"
+    assert "id" in c
+    assert "first_seen_at" in c
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_time_to_recover_none_when_no_recovered_at(
+    client: AsyncClient, db_session
+):
+    """time_to_recover_sec is None when fingerprint_to_fix_log entries lack recovered_at."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[{"fingerprint": "abc", "fix_pr_number": 999}],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+
+    c = data["cases"][0]
+    assert c["fix_pr_number"] == 999
+    assert c["recovered_at"] is None
+    assert c["time_to_recover_sec"] is None

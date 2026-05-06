@@ -1222,6 +1222,13 @@ async def _close_loop_regression_case_on_failure(
     case = result.scalar_one_or_none()
     if case is None:
         return
+    try:
+        case.last_failure_class = classify_failure(task)
+    except Exception as exc:
+        logger.warning(
+            "classify_failure raised while capturing last_failure_class for case %s: %s",
+            case.id, exc,
+        )
     case.re_arm()
     session.add(case)
 
