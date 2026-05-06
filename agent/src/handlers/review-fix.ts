@@ -13,7 +13,7 @@ import { runCodeChangeTask } from './code-change.js';
 import { runFreshReviewerPass } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
-import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   FIX_TASK_FOCUS, getTaskTypeFocusBlock,
@@ -672,27 +672,80 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
   return '';
 }
 
+// Pre-install node_modules in every node-typed directory in the reviewer's
+// workspace. Best-effort: any individual install failure is logged and
+// swallowed so the review can still proceed — the prompt also instructs
+// reviewers to install before building, this is the belt to that suspenders.
+//
+// For repos with a configured BuildConfig, iterates buildConfig.directories.
+// For Blueprint's self-repo (is_self_repo=true → undefined buildConfig), uses
+// the same hardcoded admin-ui/agent/root list as the fallback prompt.
+function preinstallNodeDeps(
+  workspace: string,
+  buildConfig: BuildConfig | undefined,
+  ws: WebSocket | null,
+  taskId: string,
+): void {
+  const targets: string[] = [];
+  if (buildConfig?.directories) {
+    for (const d of buildConfig.directories) {
+      if (d.type === 'node') targets.push(d.path.replace(/\/$/, ''));
+    }
+  } else {
+    // Blueprint self-repo fallback: every node directory the reviewer might touch.
+    for (const candidate of ['admin-ui', 'agent', '']) {
+      const checkPath = candidate ? `${workspace}/${candidate}` : workspace;
+      if (fs.existsSync(`${checkPath}/package.json`)) {
+        targets.push(candidate);
+      }
+    }
+  }
+  for (const rel of targets) {
+    const cwd = rel ? `${workspace}/${rel}` : workspace;
+    const label = rel || '<root>';
+    try {
+      sendHeartbeatSync(taskId, `npm ci (${label})...`);
+      execFileSync('npm', ['ci'], { cwd, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT });
+      sendLog(ws, `[review-prep] npm ci OK in ${label}\n`);
+    } catch (e) {
+      // Non-fatal: log the failure so a reviewer that DOES try to build can see
+      // why deps are missing, but don't block the review.
+      sendLog(ws, `[review-prep] npm ci failed in ${label}: ${String(e).slice(0, 300)}\n`);
+    }
+  }
+}
+
 // ── Build instruction generator for review prompts ───────────────────────────
+// Build commands are emitted with `npm ci &&` (or equivalent install step)
+// prefixed for node-typed directories so the reviewer's cold-clone workspace
+// always has dependencies available — without the prefix, every reviewer on a
+// fresh VM hits "cannot resolve <package>" and flags it as a build-gate
+// failure even when the underlying PR is fine.
 function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build & Type Safety (MUST run these — do not skip):**
 - For frontend changes (admin-ui/): run \`cd admin-ui && npm ci && npm run build\` — report any errors
 - For agent changes (agent/): run \`cd agent && npm ci && npx tsc --noEmit\` — report any type errors
 - For backend changes (backend/): run \`cd backend && python -m py_compile app/main.py\` or check imports
-- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES.`;
+- Only run the build commands listed above. The repo root may have its own \`npm run build\`, but it is NOT a required gate — do not invent additional build invocations.
+- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
   }
   const checks = buildConfig.directories
     .filter(d => d.build_cmd || d.lint_cmd)
     .map(d => {
       const cmd = d.build_cmd || d.lint_cmd;
-      return `- For changes in \`${d.path}/\`: run \`${cmd}\` — report any errors`;
+      const installPrefix = d.type === 'node'
+        ? 'npm ci && '
+        : d.install_cmd ? `${d.install_cmd} && ` : '';
+      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${cmd}\` — report any errors`;
     });
   if (checks.length === 0) {
     return '**Build & Type Safety:** No build commands configured — review code manually for type correctness.';
   }
   return `**Build & Type Safety (MUST run these — do not skip):**
 ${checks.join('\n')}
-- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES.`;
+- Only run the build commands listed above. Do not invent additional build invocations against directories without configured commands.
+- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect.`;
 }
 
 // ── Handler: Review (review a PR, output verdict) ───────────────────────────
@@ -739,6 +792,13 @@ export async function handleReview(
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('review');
   const reviewBuildConfig = resolveBuildConfig(task);
+
+  // Pre-install node_modules in every node-typed directory the reviewer might
+  // build. Without this, every cold-clone reviewer hits "cannot resolve <pkg>"
+  // when running `npm run build`, mistakes the empty workspace for a real
+  // build defect, and flags it as a blocker — burning review-fix iterations on
+  // a phantom env failure (PR #3884 saga, 2026-05-06).
+  preinstallNodeDeps(WORKSPACE, reviewBuildConfig, ws, taskId);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
   let prTitle = '';

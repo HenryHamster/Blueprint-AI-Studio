@@ -42,6 +42,8 @@ build {
       "# agent VM doesn't hit the unauthenticated Docker Hub rate limit at test time.",
       "sudo docker pull postgres:15",
       "sudo npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli",
+      "sudo apt-get install -y python3-pip",
+      "sudo pip3 install ruff",
       "git config --global user.email 'blueprint-agent@automated.dev'",
       "git config --global user.name 'Blueprint Agent'",
       "sudo mkdir -p /opt/agent /tmp/workspace",

@@ -77,6 +77,91 @@ from app.failure_stage import (  # noqa: F401 — re-exported for legacy callers
 _SCOPE_OVERFLOW_THRESHOLDS = {"small": 6, "medium": 10, "large": 20}
 
 
+# Build/lint complaint patterns the reviewer's local VM might raise that
+# correspond to a CI gate. When CI is GREEN for the matching job and the
+# reviewer flags the gate as red, that's a reviewer-env issue, not a real
+# defect — the fix agent should dispute via /tmp/fix_responses rather than
+# edit config files to satisfy a phantom complaint.
+_BUILD_GATE_PATTERN = re.compile(
+    r"npm run build|npm ci|cannot resolve|"
+    r"vite/client|@tailwindcss|tsc\b|--noEmit|"
+    r"ruff(\s+(check|format))?|"
+    r"build (?:fail|gate|broken|red)|"
+    r"required verification gate|type definition|"
+    r"package\.json.*(?:not.?install|missing)",
+    re.IGNORECASE,
+)
+
+
+def _detect_ci_review_disagreement(
+    issues: list, feedback: str, ci_check: dict | None, pr_number: int | None,
+) -> str:
+    """Return a fix-prompt preamble when reviewer claims a build/lint gate is
+    red but CI shows the matching job green.
+
+    Returns an empty string when there's no disagreement to surface; otherwise
+    a short instructional block ending with ``\\n\\n`` that prepends the
+    fix-prompt issue list. The agent is told to verify CI status via gh and,
+    if confirmed green, write a structured `disputed` response with mechanical
+    verify steps so the next reviewer is forced to re-run them.
+    """
+    if not ci_check or not ci_check.get("details"):
+        return ""
+    details = ci_check.get("details") or []
+    green_jobs = {
+        (d.get("name") or "").lower()
+        for d in details
+        if d.get("conclusion") == "success" and d.get("status") == "completed"
+    }
+    if not green_jobs:
+        return ""
+    haystack = (feedback or "").lower()
+    for i in issues or []:
+        desc = (i.get("description") or "").lower()
+        haystack += "\n" + desc
+    if not _BUILD_GATE_PATTERN.search(haystack):
+        return ""
+    # Map reviewer-complaint domains to CI job-name fragments. A green CI job
+    # that matches a complained-about domain is the disagreement signal.
+    flagged: list[str] = []
+    if (
+        any(kw in haystack for kw in ("admin-ui", "vite", "tailwind", "vite/client", "frontend", "npm run build"))
+        and any("frontend" in n for n in green_jobs)
+    ):
+        flagged.append("CI / Frontend")
+    if (
+        any(kw in haystack for kw in ("agent", "tsc", "noemit", "type def"))
+        and any("agent" in n for n in green_jobs)
+    ):
+        flagged.append("CI / Agent")
+    if (
+        any(kw in haystack for kw in ("ruff", "backend", "py_compile", "lint"))
+        and any("backend" in n for n in green_jobs)
+    ):
+        flagged.append("CI / Backend")
+    if not flagged:
+        return ""
+    pr_ref = f"#{pr_number}" if pr_number else "this PR"
+    job_list = ", ".join(sorted(set(flagged)))
+    return (
+        "## CI vs reviewer build-gate disagreement\n"
+        f"GitHub Actions CI is currently GREEN on {pr_ref} for: {job_list}. "
+        "However, the reviewer flagged build/lint gates as failing in their local environment.\n\n"
+        "This usually means the reviewer's workspace lacks installed dependencies, NOT a real defect. "
+        "Before re-fixing source code:\n"
+        f"  1. Run `gh pr checks {pr_number or '<pr>'}` to confirm CI status.\n"
+        "  2. If CI is green, write a `disputed` response to `/tmp/fix_responses_${TASK_ID}.json` "
+        "with mechanical verify steps that prove the build passes from a fresh install — for example:\n"
+        "     - `cd /tmp/workspace && npm ci && npm run build`\n"
+        "     - `cd /tmp/workspace/admin-ui && npm ci && npm run build`\n"
+        "     - reference the green CI run URL\n"
+        "  3. The next reviewer will re-run those steps. If they pass, the issue is dropped; if they fail, "
+        "the loop escalates to standoff and an operator is paged. Either way, you stop the thrash.\n"
+        "  4. ONLY modify source code if you can REPRODUCE the build failure from a clean install. "
+        "Do not edit config files just to satisfy a complaint you cannot reproduce locally.\n\n"
+    )
+
+
 def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
     """Render a decomposition-hint block from the previous attempt's scope overflow.
 
@@ -2629,6 +2714,15 @@ async def _process_post_commit(
                                 ci_errors_text = f"\n\nCI build errors (also need fixing):\n{ci_check['failed_logs']}"
                     except Exception as e:
                         logger.error(f"[REVIEW PIPELINE] Could not fetch CI errors for fix context: {e}", exc_info=True)
+                    # CI vs reviewer build-gate disagreement detector. When the
+                    # reviewer flags build/lint complaints but CI shows the
+                    # corresponding job GREEN, the issue is almost always a
+                    # broken reviewer-VM env — pre-warn the fix agent so it
+                    # disputes via /tmp/fix_responses rather than thrashing on
+                    # source code that isn't broken (PR #3884 saga, 2026-05-06).
+                    disagreement_hint = _detect_ci_review_disagreement(
+                        issues, feedback, ci_check, pr_number,
+                    )
                     if issues:
                         def _fmt_issue(i):
                             desc = i.get('description', '')
@@ -2649,9 +2743,9 @@ async def _process_post_commit(
                             structured += "\n\nMajor issues:\n" + "\n".join(_fmt_issue(i) for i in major)
                         if minor:
                             structured += "\n\nMinor issues:\n" + "\n".join(_fmt_issue(i) for i in minor)
-                        fix_prompt_text = f"A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
+                        fix_prompt_text = f"{disagreement_hint}A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
                     else:
-                        fix_prompt_text = f"A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
+                        fix_prompt_text = f"{disagreement_hint}A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
                     fix_task, _ = await _spawn_pipeline_task(
                         task, "fix", session, pr_number, branch, base_branch,
                         fix_prompt=fix_prompt_text,
