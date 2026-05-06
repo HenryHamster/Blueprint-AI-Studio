@@ -1202,8 +1202,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         {group.cases.slice(0, 8).map((c) => (
                           <div key={c.fingerprint} className="text-[11px] text-neutral-400 border border-neutral-800/60 rounded px-2 py-1">
                             <div className="flex items-center justify-between gap-2">
-                              <span className="font-mono truncate">{c.fingerprint.slice(0, 18)}…</span>
-                              <span className="text-neutral-500">{c.status} · {c.hit_count} hits · {c.last_seen_at ? timeAgo(c.last_seen_at) : 'unknown age'}</span>
+                              <span className="font-mono truncate min-w-0">{c.fingerprint.slice(0, 18)}…</span>
+                              <span className="text-neutral-500 shrink-0">{c.status} · {c.hit_count} hits · {c.last_seen_at ? timeAgo(c.last_seen_at) : 'unknown age'}</span>
                             </div>
                             {c.sample_message && <div className="truncate text-neutral-500">{c.sample_message}</div>}
                           </div>
@@ -1678,7 +1678,7 @@ function MetricCard({ label, value, color, spark, dataKey, loading }: {
   if (loading) return <Skeleton className="h-20" />;
   const fill = SPARK_COLORS[color] ?? '#a3a3a3';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">{label}</p>
       <p className={`text-2xl font-bold font-mono text-${color}-400`}>{value}</p>
       {spark.length >= 3 && (
@@ -1716,7 +1716,7 @@ function FailedCard({ value, groups, spark, loading }: {
   const fill = SPARK_COLORS['red'];
   const topGroups = (groups ?? []).slice(0, 3);
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Failed (24h)</p>
       <p className="text-2xl font-bold font-mono text-red-400">{value}</p>
       {spark.length >= 3 && (
@@ -1761,7 +1761,7 @@ function SuccessRateCard({ rate, trend, trendHistory, loading }: {
   const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
   const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.success_rate ?? 0 }));
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
       <div className="flex items-center gap-2">
         <p className="text-2xl font-bold font-mono text-neutral-100">{rate != null ? `${Math.round(rate * 100)}%` : '--'}</p>
@@ -1794,7 +1794,7 @@ function ConversionRateCard({ rate, loading }: {
   const pct = rate != null ? Math.round(rate * 100) : null;
   const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Conversion Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
       <p className="text-[10px] text-neutral-600 mt-1">PRs merged / tasks created</p>
@@ -1810,7 +1810,7 @@ function AcceptanceRateCard({ rate, loading }: {
   const pct = rate != null ? Math.round(rate * 100) : null;
   const color = pct == null ? 'text-neutral-500' : pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Acceptance Rate</p>
       <p className={`text-2xl font-bold font-mono ${color}`}>{pct != null ? `${pct}%` : '--'}</p>
       <p className="text-[10px] text-neutral-600 mt-1">PRs merged / (merged + rejected)</p>
@@ -1828,7 +1828,7 @@ function CostCard({ totalCost, trendHistory, loading }: {
   const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 }));
   const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
   return (
-    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4">
+    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Cost (24h)</p>
       <p className="text-2xl font-bold font-mono text-blue-400">{display}</p>
       {sparkPoints.length >= 3 && (

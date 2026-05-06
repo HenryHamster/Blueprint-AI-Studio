@@ -68,12 +68,24 @@ export function TaskDetailDrawer({
   const [editPromptValue, setEditPromptValue] = useState(task.description);
   const [drawerWidth, setDrawerWidth] = useState(680);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  // Detect mobile viewport (< 640px, Tailwind sm: breakpoint)
+  useEffect(() => {
+    const handleResize = () => {
+      setIsMobile(window.innerWidth < 640);
+    };
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   // Report drawer width to parent so sibling panels can offset
   useEffect(() => {
-    onWidthChange?.(isFullscreen ? window.innerWidth : drawerWidth);
-  }, [drawerWidth, isFullscreen, onWidthChange]);
+    const width = isMobile ? window.innerWidth : (isFullscreen ? window.innerWidth : drawerWidth);
+    onWidthChange?.(width);
+  }, [drawerWidth, isFullscreen, isMobile, onWidthChange]);
 
   // Reset log filter when task changes
   useEffect(() => {
@@ -153,10 +165,10 @@ export function TaskDetailDrawer({
       <div className="flex-1 bg-black/40" onClick={onClose} />
       <div
         className="relative bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl"
-        style={isFullscreen ? { width: '100%' } : { width: drawerWidth }}
+        style={isMobile || isFullscreen ? { width: '100%' } : { width: drawerWidth }}
       >
         {/* Drag handle */}
-        {!isFullscreen && (
+        {!isFullscreen && !isMobile && (
           <div
             className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-500/40 transition-colors z-10"
             onMouseDown={handleDragMouseDown}

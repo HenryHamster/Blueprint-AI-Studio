@@ -611,7 +611,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
 
   return (
     <div className="mb-4 shrink-0">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
         <button
           onClick={toggle}
           aria-expanded={!collapsed}
@@ -652,7 +652,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
           )}
         </button>
         {!collapsed && (
-          <div className="flex items-center gap-1 ml-2">
+          <div className="flex flex-wrap items-center gap-1 sm:ml-2">
             {windowLabels.map(({ key, label }) => (
               <button
                 key={key}
@@ -672,13 +672,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
       </div>
 
       {collapsed && digest?.narrative_summary && (
-        <div className="text-[10px] text-neutral-500 mt-0.5 pl-7 truncate max-w-xl">
+        <div className="text-[10px] text-neutral-500 mt-0.5 pl-7 truncate max-w-[calc(100vw-2rem)] sm:max-w-xl">
           {digest.narrative_summary.slice(0, 100)}{digest.narrative_summary.length > 100 ? '…' : ''}
         </div>
       )}
 
       {!collapsed && (
-        <div className="mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4">
+        <div className="mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-3 sm:p-4">
           {loading ? (
             <div className="flex flex-col gap-2">
               <SkeletonRow />
@@ -762,7 +762,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                 </ErrorBoundary>
               )}
               {/* Stats row */}
-              <div className="flex flex-wrap gap-3 text-[11px] text-neutral-400">
+              <div className="flex flex-wrap gap-x-3 gap-y-2 text-[11px] text-neutral-400">
                 {digest.success_rate != null && (
                   <span
                     className={`flex items-center gap-1 ${digest.success_rate >= 0.8 ? 'text-emerald-400' : digest.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}
@@ -1620,7 +1620,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     ))}
                   </div>
                   {digest.scope_mismatch_summary.top_directions.length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1">
+                    <div className="flex flex-col gap-0.5 ml-1 max-w-full">
                       {digest.scope_mismatch_summary.top_directions.map(d => (
                         <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
                           · {(d.direction_text || d.direction_id).slice(0, 60)}{' '}
@@ -1647,7 +1647,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     </button>
                   </div>
                   {digest.rejection_pattern_summary.top_notes.length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1">
+                    <div className="flex flex-col gap-0.5 ml-1 max-w-full">
                       {digest.rejection_pattern_summary.top_notes.map((n) => (
                         <span key={n.snippet} className="text-[10px] text-neutral-500 truncate">
                           · {n.snippet.slice(0, 100)}{n.snippet.length > 100 ? '…' : ''}{' '}
@@ -1670,7 +1670,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       {recurringClusters.length} cluster{recurringClusters.length !== 1 ? 's' : ''}
                     </span>
                   </div>
-                  <div className="flex flex-col gap-1 ml-1">
+                  <div className="flex flex-col gap-1 ml-1 max-w-full">
                     {(() => {
                       const dirTextById = new Map<string, string>(
                         (digest.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
@@ -2343,7 +2343,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                 return next;
                               })}
                               aria-expanded={isGroupExpanded}
-                              className="flex items-center gap-2 w-full text-left hover:opacity-80 transition-opacity mb-1"
+                              className="flex flex-wrap items-center gap-2 w-full text-left hover:opacity-80 transition-opacity mb-1"
                             >
                               {isGroupExpanded ? <ChevronUp className="w-3 h-3 text-neutral-500 shrink-0" /> : <ChevronDown className="w-3 h-3 text-neutral-500 shrink-0" />}
                               <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${badgeClass}`}>
@@ -2358,13 +2358,13 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               )}
                             </button>
                             {isGroupExpanded && (
-                              <div className="flex flex-col gap-1 ml-5">
+                              <div className="flex flex-col gap-1 ml-5 max-w-full">
                                 {group.tasks.map(t => (
                                   <div key={t.task_id} className="flex flex-col gap-0.5">
                                     <div
                                       role="button"
                                       tabIndex={0}
-                                      className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                                      className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
                                       onClick={() => onSelectTask({ id: t.task_id })}
                                       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                                     >
@@ -2376,7 +2376,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                       <span className="flex-1 truncate text-neutral-400">{t.title}</span>
                                       {t.direction_text && (
                                         <span
-                                          className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
+                                          className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[9rem] sm:max-w-[12rem]"
                                           title={t.direction_text}
                                         >
                                           {t.direction_text.length > 40 ? t.direction_text.slice(0, 40) + '…' : t.direction_text}

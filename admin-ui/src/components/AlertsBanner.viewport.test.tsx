@@ -1,0 +1,78 @@
+import { afterEach, describe, test, vi } from 'vitest';
+import { createRoot, type Root } from 'react-dom/client';
+import { act } from 'react';
+import { AlertsBanner } from './AlertsBanner';
+import type { Alert } from '../types/alert';
+import { expectNoOverflowAt } from '../test/viewport';
+
+// AlertsBanner imports `apiFetch` from '../api', which transitively pulls in
+// firebase. We don't pass projectId in this test (so the fetch path never
+// fires), but stubbing the module keeps the canary independent of real auth
+// at module-load time.
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+}));
+
+const sampleAlerts: Alert[] = [
+  {
+    id: 'alert-1',
+    project_id: 'project-canary',
+    severity: 'WARNING',
+    title: 'Self-review catch-rate dropped',
+    message: 'correctness category fell from 0.62 -> 0.41 over the last 3 cycles',
+    task_id: 'task-1234',
+    created_at: '2026-05-06T00:00:00Z',
+    dismissed_at: null,
+  },
+  {
+    id: 'alert-2',
+    project_id: 'project-canary',
+    severity: 'ERROR',
+    title: 'Pipeline regression detected',
+    message: 'agent_timeout_rate breached threshold on three consecutive cycles',
+    task_id: null,
+    created_at: '2026-05-06T00:01:00Z',
+    dismissed_at: null,
+  },
+];
+
+describe('AlertsBanner — viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => {
+        r.unmount();
+      });
+      root = null;
+    }
+    if (host) {
+      host.remove();
+      host = null;
+    }
+  });
+
+  test('renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      // Match the app shell padding (DashboardHome wraps in `p-6`); narrower
+      // than the viewport so we don't accidentally test full-bleed layouts.
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <AlertsBanner
+            alerts={sampleAlerts}
+            onDismiss={() => {}}
+            onDismissAll={() => {}}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+    });
+  });
+});
