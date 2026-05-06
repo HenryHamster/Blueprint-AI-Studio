@@ -4,7 +4,7 @@ Extracted from ``app.research_completion._handle_research_completion`` so the
 dedup logic can be independently unit-tested. These helpers do not touch the
 database session — callers supply already-loaded task lists and artifact files.
 
-Three strategies are applied, in order:
+Four strategies are applied, in order:
   1. Hash dedup (``finding_hash`` collides with a recent task that is either
      already merged, still running, a suppressed cancellation, or a "real"
      failure within cooldown).
@@ -12,6 +12,8 @@ Three strategies are applied, in order:
      direction-aware threshold (same-direction 4 words, cross-direction 6).
   3. File-overlap: skip findings whose ``related_files`` are fully covered by
      open PR artifacts.
+  4. Evidence-overlap: skip findings whose source refs (≥80% Jaccard overlap)
+     and claims (at least one shared) match recent findings.
 """
 from __future__ import annotations
 
@@ -175,14 +177,127 @@ def build_dedup_state(
     return recent_finding_hashes, failed_hashes, prior_failure_by_hash
 
 
+def _normalize_source_ref(ref: str) -> str:
+    """Normalize a source ref by stripping line numbers and line ranges.
+
+    Handles formats like:
+      - path/to/file.py
+      - path/to/file.py:42
+      - path/to/file.py#L10-L20
+    Returns the base file path only.
+    """
+    if not ref:
+        return ""
+    # Strip line numbers (e.g., :42) and line ranges (e.g., #L10-L20)
+    ref = ref.split(':')[0].split('#')[0]
+    return ref.strip()
+
+
+def _extract_source_refs(sources: list) -> set[str]:
+    """Extract and normalize refs from a sources list.
+
+    Sources should be a list of dicts with a 'ref' field.
+    Returns a set of normalized file paths.
+    """
+    refs = set()
+    if not isinstance(sources, list):
+        return refs
+    for source in sources:
+        if isinstance(source, dict) and source.get("ref"):
+            normalized = _normalize_source_ref(source["ref"])
+            if normalized:
+                refs.add(normalized)
+    return refs
+
+
+def _normalize_claim(claim: str) -> str:
+    """Normalize a claim by lowercasing and removing extra whitespace."""
+    if not isinstance(claim, str):
+        return ""
+    return " ".join(claim.lower().split())
+
+
+def _extract_normalized_claims(claims: list) -> set[str]:
+    """Extract and normalize claims from a claims list.
+
+    Returns a set of normalized claim strings for comparison.
+    """
+    normalized = set()
+    if not isinstance(claims, list):
+        return normalized
+    for claim in claims:
+        norm = _normalize_claim(claim)
+        if norm:
+            normalized.add(norm)
+    return normalized
+
+
+def _jaccard_overlap(set_a: set, set_b: set) -> float:
+    """Calculate Jaccard similarity between two sets.
+
+    Returns a value between 0 and 1. Returns 0 if both sets are empty.
+    """
+    if not set_a and not set_b:
+        return 0.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    intersection = set_a & set_b
+    return len(intersection) / len(union)
+
+
+def _check_evidence_overlap(
+    candidate_sources: list,
+    candidate_claims: list,
+    existing_findings: list[tuple],
+    threshold: float = 0.8,
+) -> tuple[bool, str]:
+    """Check if candidate finding has evidence overlap with existing findings.
+
+    Returns (is_duplicate, matched_title) where:
+      - is_duplicate: True if source-ref Jaccard overlap >= threshold AND
+        at least one claim is shared
+      - matched_title: title of the first matching finding (empty string if no match)
+
+    existing_findings should be a list of (title, sources, claims) tuples.
+    """
+    candidate_refs = _extract_source_refs(candidate_sources)
+    candidate_claims_norm = _extract_normalized_claims(candidate_claims)
+
+    # If candidate has no sources or claims, no evidence overlap can occur
+    if not candidate_refs or not candidate_claims_norm:
+        return False, ""
+
+    for title, sources, claims in existing_findings:
+        existing_refs = _extract_source_refs(sources)
+        existing_claims = _extract_normalized_claims(claims)
+
+        # Both must have sources and claims for evidence overlap check
+        if not existing_refs or not existing_claims:
+            continue
+
+        # Check Jaccard overlap on source refs
+        overlap = _jaccard_overlap(candidate_refs, existing_refs)
+        if overlap < threshold:
+            continue
+
+        # Check if at least one claim is shared
+        shared_claims = candidate_claims_norm & existing_claims
+        if shared_claims:
+            return True, title
+
+    return False, ""
+
+
 @dataclass
 class DedupOutcome:
-    """Result of running the three-stage dedup pipeline over findings."""
+    """Result of running the four-stage dedup pipeline over findings."""
 
     deduplicated: list[tuple[int, dict, str]] = field(default_factory=list)
     hash_dedup_count: int = 0
     word_overlap_count: int = 0
     file_overlap_count: int = 0
+    evidence_overlap_count: int = 0
     # Per-skip reason records: {title, direction_id, reason} for each filtered
     # finding, so the research agent can be told exactly what was rejected and
     # why on its next cycle. Reasons are short literals (≤80 chars).
@@ -197,7 +312,7 @@ def deduplicate_findings(
     existing_tasks_with_dirs: list[tuple],
     open_pr_files: set[str],
 ) -> DedupOutcome:
-    """Apply hash, word-overlap, and file-overlap dedup to ``findings``.
+    """Apply hash, word-overlap, file-overlap, and evidence-overlap dedup to ``findings``.
 
     Preserves priority-first ordering (high → medium → low) with stable order
     inside each tier. Returns a :class:`DedupOutcome` carrying the surviving
@@ -212,6 +327,8 @@ def deduplicate_findings(
 
     outcome = DedupOutcome()
     parent_dir_id = (task_context or {}).get("direction_id")
+    # Build evidence list from already-deduped findings for evidence-overlap check
+    evidence_list: list[tuple[str, list, list]] = []
 
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i + 1}")
@@ -259,7 +376,30 @@ def deduplicate_findings(
             })
             continue
 
+        # Evidence-overlap check: compare sources and claims against already-deduped findings
+        is_evidence_dup, matched_evidence_title = _check_evidence_overlap(
+            finding.get("sources", []),
+            finding.get("claims", []),
+            evidence_list,
+        )
+        if is_evidence_dup:
+            logger.info(
+                f"[RESEARCH] Skipping finding '{title}' — evidence overlap with '{matched_evidence_title}'"
+            )
+            outcome.evidence_overlap_count += 1
+            reason = f"evidence overlap with: {matched_evidence_title[:60]}"
+            outcome.filtered.append({
+                "title": title[:120],
+                "direction_id": finding_dir_id,
+                "reason": reason[:80],
+            })
+            continue
+
         outcome.deduplicated.append((orig_i, finding, fhash))
+        # Add to evidence list for future comparisons in this cycle
+        evidence_list.append(
+            (title, finding.get("sources", []), finding.get("claims", []))
+        )
 
     return outcome
 

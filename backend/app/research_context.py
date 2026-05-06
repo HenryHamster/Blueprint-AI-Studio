@@ -178,11 +178,19 @@ def _build_research_context(
         _claims = (finding_claims[i] if finding_claims and i < len(finding_claims) else None) or []
         _sources = (finding_sources[i] if finding_sources and i < len(finding_sources) else None) or []
         if _claims:
-            entry_text += ". Claims: " + "; ".join(str(c)[:80] for c in _claims[:3])
+            entry_text += ". Claims: " + "; ".join(str(c)[:80] for c in _claims[:6])
         if _sources:
-            _refs = [s.get("ref", "") for s in _sources if isinstance(s, dict) and s.get("ref")][:3]
-            if _refs:
-                entry_text += ". Sources: " + ", ".join(_refs)
+            _ref_parts = []
+            for s in _sources:
+                if not isinstance(s, dict):
+                    continue
+                ref = s.get("ref", "")
+                if not ref:
+                    continue
+                excerpt = s.get("excerpt", "")
+                _ref_parts.append(f"{ref} ({excerpt[:60]})" if excerpt else ref)
+            if _ref_parts:
+                entry_text += ". Sources: " + ", ".join(_ref_parts)
         parsed["established"].append(entry_text)
 
     # Add cycle_insights to Open Questions (deduplicate)
@@ -261,3 +269,42 @@ def _build_research_context(
 
     eviction_body = _format_eviction_body(total_established, total_failed, total_oq, all_failed_titles)
     return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
+
+
+def build_recent_findings_evidence(
+    finding_titles: list,
+    finding_claims: Optional[list] = None,
+    finding_sources: Optional[list] = None,
+    max_findings: int = 5,
+    max_chars: int = 2000,
+) -> list:
+    """Return compact structured evidence for the most recent N findings.
+
+    Each entry is {title, claims, source_refs} where source_refs is a list of
+    {ref, excerpt?} dicts. Used by autonomous_research to populate
+    recent_findings_evidence in direction summaries for the strategic agent.
+    Returns an empty list when there are no findings with claims or sources.
+    """
+    n = len(finding_titles)
+    if not n:
+        return []
+    results = []
+    total_chars = 0
+    for i in range(max(0, n - max_findings), n):
+        title = finding_titles[i]
+        claims = list((finding_claims[i] if finding_claims and i < len(finding_claims) else None) or [])
+        raw_sources = (finding_sources[i] if finding_sources and i < len(finding_sources) else None) or []
+        source_refs = [
+            {"ref": s["ref"], **({"excerpt": s["excerpt"][:120]} if s.get("excerpt") else {})}
+            for s in raw_sources
+            if isinstance(s, dict) and s.get("ref")
+        ]
+        if not claims and not source_refs:
+            continue
+        entry: dict = {"title": title, "claims": claims[:6], "source_refs": source_refs}
+        entry_size = len(str(entry))
+        if total_chars + entry_size > max_chars and results:
+            break
+        results.append(entry)
+        total_chars += entry_size
+    return results

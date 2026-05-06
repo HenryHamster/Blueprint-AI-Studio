@@ -29,7 +29,7 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import _fold_evicted_into_aggregate
-from app.research_context import _build_research_context
+from app.research_context import _build_research_context, build_recent_findings_evidence
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.time_utils import _utcnow
 
@@ -89,6 +89,7 @@ async def apply_post_spawn_state(
     hash_dedup_count: int,
     word_overlap_count: int,
     file_overlap_count: int,
+    evidence_overlap_count: int,
     type_filtered_count: int,
     empty_prompt_count: int,
     research_branch: str,
@@ -125,7 +126,7 @@ async def apply_post_spawn_state(
     # subtask failure, malformed output, etc.) left no trace in research_history
     # and _check_direction_health could not see the stalled cycle.
     current_direction_id = (task.context or {}).get("direction_id") or (task.first_payload).get("current_direction_id")
-    skipped_duplicates = hash_dedup_count + word_overlap_count + file_overlap_count
+    skipped_duplicates = hash_dedup_count + word_overlap_count + file_overlap_count + evidence_overlap_count
     all_deduped = len(child_tasks) == 0 and skipped_duplicates > 0
     # Build filter breakdown string (computed here so it's available for summary artifact below)
     _filter_parts = []
@@ -135,6 +136,8 @@ async def apply_post_spawn_state(
         _filter_parts.append(f"{word_overlap_count} word-overlap")
     if file_overlap_count:
         _filter_parts.append(f"{file_overlap_count} file-overlap")
+    if evidence_overlap_count:
+        _filter_parts.append(f"{evidence_overlap_count} evidence-overlap")
     if type_filtered_count:
         _filter_parts.append(f"{type_filtered_count} type-filtered")
     if empty_prompt_count:
@@ -182,6 +185,7 @@ async def apply_post_spawn_state(
             hash_dedup_by_dir: dict = {}
             word_overlap_by_dir: dict = {}
             file_overlap_by_dir: dict = {}
+            evidence_overlap_by_dir: dict = {}
             for rec in (filtered_findings or []):
                 did = rec.get("direction_id") or current_direction_id
                 if not did:
@@ -197,6 +201,8 @@ async def apply_post_spawn_state(
                     word_overlap_by_dir[did] = word_overlap_by_dir.get(did, 0) + 1
                 elif reason.startswith("all files covered"):
                     file_overlap_by_dir[did] = file_overlap_by_dir.get(did, 0) + 1
+                elif reason.startswith("evidence overlap"):
+                    evidence_overlap_by_dir[did] = evidence_overlap_by_dir.get(did, 0) + 1
 
             # Count raw actionable findings per direction so each direction's
             # history entry records only its own findings_produced instead of
@@ -237,6 +243,7 @@ async def apply_post_spawn_state(
                             "hash_dedup": hash_dedup_by_dir.get(did, 0),
                             "word_overlap_dedup": word_overlap_by_dir.get(did, 0),
                             "file_overlap_dedup": file_overlap_by_dir.get(did, 0),
+                            "evidence_overlap_dedup": evidence_overlap_by_dir.get(did, 0),
                             "type_filtered": type_filtered_count,
                             "empty_prompt": empty_prompt_count,
                         },
@@ -339,6 +346,13 @@ async def apply_post_spawn_state(
                         history_entry=entry,
                         prior_history=d.get("research_history", [])[:-1],
                     )
+                    prior_rfe = list(d.get("recent_findings_evidence") or [])
+                    cur_rfe = build_recent_findings_evidence(
+                        finding_titles=finding_titles_by_dir.get(did, []),
+                        finding_claims=finding_claims_by_dir.get(did, []),
+                        finding_sources=finding_sources_by_dir.get(did, []),
+                    )
+                    d["recent_findings_evidence"] = (prior_rfe + cur_rfe)[-5:]
 
                     # Auto-complete direction if saturated with sufficient merged PRs
                     if (

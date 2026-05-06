@@ -58,6 +58,7 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
     _detect_dedup_deadlock,
     apply_post_spawn_state,
 )
+from app.source_ref_validation import validate_source_refs
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE, scope_to_effort
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
@@ -557,6 +558,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _f["sources"] = []
             else:
                 _f["sources"] = [s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")]
+                # Validate file-type source refs at write time
+                _f["sources"] = validate_source_refs(_f["sources"])
 
     # Store all findings for admin visibility before filtering
     task.plan_output = findings
@@ -805,6 +808,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     hash_dedup_count = _dedup_outcome.hash_dedup_count
     word_overlap_count = _dedup_outcome.word_overlap_count
     file_overlap_count = _dedup_outcome.file_overlap_count
+    evidence_overlap_count = _dedup_outcome.evidence_overlap_count
     filtered_findings = _dedup_outcome.filtered
     type_filtered_count = 0
     empty_prompt_count = 0
@@ -1614,6 +1618,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         hash_dedup_count=hash_dedup_count,
         word_overlap_count=word_overlap_count,
         file_overlap_count=file_overlap_count,
+        evidence_overlap_count=evidence_overlap_count,
         type_filtered_count=type_filtered_count,
         empty_prompt_count=empty_prompt_count,
         batch_cap_applied_count=batch_cap_applied_count,

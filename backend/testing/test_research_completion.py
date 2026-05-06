@@ -1,4 +1,4 @@
-"""Unit tests for research_completion.py pre-spawn scope-budget gate, low_actionability decay, and grade normalization."""
+"""Unit tests for research_completion.py pre-spawn scope-budget gate, low_actionability decay, grade normalization, and source ref validation."""
 
 import logging
 
@@ -7,6 +7,7 @@ from app.spawn_calibration import (
     SCOPE_FILE_BUDGETS,
     check_scope_budget_mismatch,
 )
+from app.source_ref_validation import _parse_ref, validate_source_refs
 from app.time_utils import _utcnow
 
 
@@ -267,3 +268,216 @@ class TestActionabilityGradeNormalization:
         assert normalized[2]["actionability_grade"] == "LOW"
         assert normalized[3]["actionability_grade"] == "MEDIUM"
         assert normalized[4]["actionability_grade"] == "MEDIUM"
+
+
+class TestSourceRefParsing:
+    """Parsing of file source refs into (path, start_line, end_line)."""
+
+    def test_parse_plain_path(self):
+        """Plain path with no line numbers."""
+        path, start, end = _parse_ref("backend/app/research_completion.py")
+        assert path == "backend/app/research_completion.py"
+        assert start is None
+        assert end is None
+
+    def test_parse_with_colon_line(self):
+        """Path with colon-delimited line number (format: path:42)."""
+        path, start, end = _parse_ref("backend/app/research_completion.py:42")
+        assert path == "backend/app/research_completion.py"
+        assert start == 42
+        assert end is None
+
+    def test_parse_with_colon_range(self):
+        """Path with colon-delimited line range (format: path:10-20)."""
+        path, start, end = _parse_ref("backend/app/research_completion.py:10-20")
+        assert path == "backend/app/research_completion.py"
+        assert start == 10
+        assert end == 20
+
+    def test_parse_with_hash_l_line(self):
+        """Path with GitHub #L syntax for single line."""
+        path, start, end = _parse_ref("backend/app/research_completion.py#L42")
+        assert path == "backend/app/research_completion.py"
+        assert start == 42
+        assert end is None
+
+    def test_parse_with_hash_l_range(self):
+        """Path with GitHub #L syntax for line range."""
+        path, start, end = _parse_ref("backend/app/research_completion.py#L10-L20")
+        assert path == "backend/app/research_completion.py"
+        assert start == 10
+        assert end == 20
+
+    def test_parse_invalid_ref(self):
+        """Invalid or empty ref returns the ref unchanged with no line numbers."""
+        path, start, end = _parse_ref("")
+        assert path == ""
+        assert start is None
+        assert end is None
+
+    def test_parse_none_ref(self):
+        """None ref returns (None, None, None)."""
+        path, start, end = _parse_ref(None)
+        assert path is None
+        assert start is None
+        assert end is None
+
+
+class TestSourceRefValidation:
+    """Validation of research finding source file references."""
+
+    def test_pr_source_passes_through(self):
+        """PR-type sources require no validation."""
+        sources = [
+            {
+                "type": "pr",
+                "ref": "https://github.com/owner/repo/pull/123",
+                "description": "PR that added feature X",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        assert len(validated) == 1
+        assert validated[0]["type"] == "pr"
+        # No "valid" field should be added for PR sources
+        assert "valid" not in validated[0] or validated[0].get("valid") is not False
+
+    def test_message_source_passes_through(self):
+        """Message-type sources require no validation."""
+        sources = [
+            {
+                "type": "message",
+                "ref": "Slack message from @user",
+                "description": "Team feedback on design",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        assert len(validated) == 1
+        assert validated[0]["type"] == "message"
+
+    def test_file_source_valid(self, monkeypatch):
+        """Valid file source (file exists) passes validation."""
+        # Mock the workspace helpers so the test doesn't depend on /tmp/workspace
+        # being present in the test environment (it isn't, inside the Docker
+        # backend test container).
+        from app import source_ref_validation as srv
+        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
+        sources = [
+            {
+                "type": "file",
+                "ref": "backend/testing/test_research_completion.py",
+                "description": "Test file",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        assert len(validated) == 1
+        # Should not have valid: false marker if validation passed
+        assert validated[0].get("valid") != False
+
+    def test_file_source_missing_file(self, monkeypatch):
+        """Missing file gets marked with valid: false."""
+        from app import source_ref_validation as srv
+        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: False)
+        sources = [
+            {
+                "type": "file",
+                "ref": "nonexistent/file_that_does_not_exist_12345.py",
+                "description": "Missing file",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        assert len(validated) == 1
+        # Should be marked as invalid
+        assert validated[0].get("valid") == False
+
+    def test_file_source_missing_ref(self):
+        """File source without ref field is dropped."""
+        sources = [
+            {
+                "type": "file",
+                "description": "File source without ref",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        # Should be dropped (not in validated list)
+        assert len(validated) == 0
+
+    def test_file_source_with_line_valid(self, monkeypatch):
+        """File source with valid line number."""
+        from app import source_ref_validation as srv
+        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
+        monkeypatch.setattr(srv, "_file_has_line_count", lambda path, n: True)
+        sources = [
+            {
+                "type": "file",
+                "ref": "backend/testing/test_research_completion.py:5",
+                "description": "File at line 5",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        assert len(validated) == 1
+        assert validated[0].get("valid") != False
+
+    def test_non_dict_source_dropped(self):
+        """Non-dict source entries are dropped."""
+        sources = [
+            "not a dict",
+            {"type": "file", "ref": "backend/app/research_completion.py"},
+        ]
+        validated = validate_source_refs(sources)
+        # The string should be dropped, only the dict should remain
+        assert len(validated) == 1
+        assert validated[0]["type"] == "file"
+
+    def test_none_sources_returns_empty_list(self):
+        """None sources input returns empty list."""
+        validated = validate_source_refs(None)
+        assert validated == []
+
+    def test_non_list_sources_returns_empty_list(self):
+        """Non-list sources input returns empty list."""
+        validated = validate_source_refs("not a list")
+        assert validated == []
+
+    def test_mixed_source_types(self):
+        """Batch with mixed source types is validated correctly."""
+        sources = [
+            {
+                "type": "pr",
+                "ref": "https://github.com/owner/repo/pull/999",
+            },
+            {
+                "type": "file",
+                "ref": "backend/testing/test_research_completion.py",
+            },
+            {
+                "type": "message",
+                "ref": "Slack feedback",
+            },
+            {
+                "type": "file",
+                "ref": "nonexistent/missing.py",
+            },
+        ]
+        validated = validate_source_refs(sources)
+        # All sources should be present (even the missing file gets marked invalid)
+        assert len(validated) == 4
+        # Check types are preserved
+        assert validated[0]["type"] == "pr"
+        assert validated[1]["type"] == "file"
+        assert validated[2]["type"] == "message"
+        assert validated[3]["type"] == "file"
+        # Check invalid file is marked
+        assert validated[3].get("valid") == False
+
+    def test_unknown_source_type_passes_through(self):
+        """Unknown source types pass through unchanged."""
+        sources = [
+            {
+                "type": "custom_type",
+                "ref": "some_reference",
+                "description": "Custom source",
+            }
+        ]
+        validated = validate_source_refs(sources)
+        assert len(validated) == 1
+        assert validated[0]["type"] == "custom_type"

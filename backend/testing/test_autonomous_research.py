@@ -3727,6 +3727,117 @@ async def test_research_context_updates_on_task_failure(db_session, mocker):
     assert "Improve caching layer (proposed)" not in ctx
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# recent_findings_evidence — structured evidence for strategic agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_recent_findings_evidence_populated_with_claims_and_sources(db_session, mocker):
+    """recent_findings_evidence is stored on the direction when findings have claims and sources."""
+    direction_id = "d-rfe0001"
+    direction = _active_direction(direction_id, "Evidence test")
+    project = Project(
+        name="Evidence Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[{
+            "title": "Improve caching layer",
+            "description": "Cache miss rate is 40%.",
+            "prompt": "Add LRU cache",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+            "claims": ["Cache miss rate is 40%", "LRU cache reduces latency by 30%"],
+            "sources": [{"ref": "backend/app/cache.py:42", "excerpt": "def get_cache():"}],
+        }],
+    )
+
+    task = await _make_research_task(project, direction, db_session)
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next((x for x in dirs if x.get("id") == direction_id), None)
+    assert d is not None
+    rfe = d.get("recent_findings_evidence")
+    assert rfe, "recent_findings_evidence should be set when findings have claims/sources"
+    assert len(rfe) >= 1
+    entry = rfe[0]
+    assert entry["title"] == "Improve caching layer"
+    assert "Cache miss rate is 40%" in entry["claims"]
+    assert any(s["ref"] == "backend/app/cache.py:42" for s in entry["source_refs"])
+
+
+@pytest.mark.asyncio
+async def test_recent_findings_evidence_absent_when_no_findings(db_session, mocker):
+    """Directions with no findings produce no recent_findings_evidence field."""
+    direction_id = "d-rfe0002"
+    direction = _active_direction(direction_id, "No findings direction")
+    project = Project(
+        name="No Findings",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_insights", return_value=[])
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+
+    task = await _make_research_task(project, direction, db_session)
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next((x for x in dirs if x.get("id") == direction_id), None)
+    assert d is not None
+    rfe = d.get("recent_findings_evidence")
+    assert not rfe, "recent_findings_evidence should be empty when no findings with claims/sources"
+
+
+@pytest.mark.asyncio
+async def test_recent_findings_evidence_in_direction_summary_payload(db_session, mocker):
+    """recent_findings_evidence on a direction is included in the spawned research task payload."""
+    direction_id = "d-rfe0003"
+    evidence = [{"title": "Fix N+1 query", "claims": ["query runs 100x"], "source_refs": []}]
+    direction = {**_active_direction(direction_id, "Payload evidence test"), "recent_findings_evidence": evidence}
+    project = Project(
+        name="Payload Evidence",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    research = [t for t in tasks if (t.payloads or [{}])[0].get("type") == "research"]
+    assert len(research) == 1
+    spawned_dirs = research[0].payloads[0].get("directions", [])
+    target = next((d for d in spawned_dirs if d.get("id") == direction_id), None)
+    assert target is not None
+    assert target.get("recent_findings_evidence") == evidence
+
+
 @pytest.mark.asyncio
 async def test_type_distribution_and_product_ratio(db_session):
     """type_distribution and product_ratio are correctly populated in the history entry."""

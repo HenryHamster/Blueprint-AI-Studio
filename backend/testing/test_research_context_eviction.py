@@ -9,6 +9,7 @@ from app.research_context import (
     _parse_research_context,
     _parse_eviction_counts,
     _format_eviction_body,
+    build_recent_findings_evidence,
 )
 
 
@@ -425,12 +426,70 @@ class TestClaimsAndSources:
         )
         assert "Sources" not in result
 
-    def test_claims_capped_at_three(self):
+    def test_claims_capped_at_six(self):
         result = self._build(
             titles=["feat: many claims"],
             descs=["Description."],
-            claims=[["claim1", "claim2", "claim3", "claim4", "claim5"]],
+            claims=[["claim1", "claim2", "claim3", "claim4", "claim5", "claim6", "claim7"]],
         )
         assert "claim1" in result
-        assert "claim3" in result
-        assert "claim4" not in result
+        assert "claim6" in result
+        assert "claim7" not in result
+
+
+class TestBuildRecentFindingsEvidence:
+    """build_recent_findings_evidence: structured evidence field for strategic agent."""
+
+    def test_populated_when_findings_have_claims(self):
+        result = build_recent_findings_evidence(
+            finding_titles=["feat: caching"],
+            finding_claims=[["cache hit rate low", "redis available"]],
+        )
+        assert len(result) == 1
+        assert result[0]["title"] == "feat: caching"
+        assert "cache hit rate low" in result[0]["claims"]
+        assert "redis available" in result[0]["claims"]
+
+    def test_populated_when_findings_have_sources(self):
+        result = build_recent_findings_evidence(
+            finding_titles=["feat: caching"],
+            finding_sources=[[{"ref": "backend/app/cache.py", "excerpt": "line 42"}]],
+        )
+        assert len(result) == 1
+        assert result[0]["source_refs"][0]["ref"] == "backend/app/cache.py"
+        assert result[0]["source_refs"][0]["excerpt"] == "line 42"
+
+    def test_empty_when_no_findings_have_claims_or_sources(self):
+        result = build_recent_findings_evidence(
+            finding_titles=["feat: a", "feat: b"],
+            finding_claims=[[], []],
+            finding_sources=[[], []],
+        )
+        assert result == []
+
+    def test_empty_when_no_findings(self):
+        result = build_recent_findings_evidence(finding_titles=[])
+        assert result == []
+
+    def test_capped_at_max_findings(self):
+        titles = [f"feat: finding {i}" for i in range(10)]
+        claims = [[f"claim for {i}"] for i in range(10)]
+        result = build_recent_findings_evidence(
+            finding_titles=titles,
+            finding_claims=claims,
+            max_findings=5,
+        )
+        assert len(result) <= 5
+        # Should contain the most recent findings
+        assert result[-1]["title"] == "feat: finding 9"
+
+    def test_respects_max_chars_budget(self):
+        titles = [f"feat: finding {i}" for i in range(10)]
+        claims = [["x" * 100] for _ in range(10)]
+        result = build_recent_findings_evidence(
+            finding_titles=titles,
+            finding_claims=claims,
+            max_chars=200,
+        )
+        # Budget is too small for all findings
+        assert len(result) < 10

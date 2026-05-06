@@ -353,6 +353,7 @@ def test_dedup_outcome_default_empty():
     assert outcome.hash_dedup_count == 0
     assert outcome.word_overlap_count == 0
     assert outcome.file_overlap_count == 0
+    assert outcome.evidence_overlap_count == 0
     assert outcome.filtered == []
 
 
@@ -426,3 +427,244 @@ def test_deduplicate_findings_records_file_overlap_reason():
     assert rec["title"] == "cover already-shipped files"
     assert rec["direction_id"] == "dir-2"
     assert rec["reason"] == "all files covered by open PR"
+
+
+def test_deduplicate_findings_evidence_overlap_identical_sources_and_claims():
+    """Two findings with identical sources + identical claim → dropped."""
+    first_finding = {
+        "title": "implement caching layer",
+        "description": "Add cache to improve performance",
+        "priority": "high",
+        "direction_id": "dir-1",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py", "excerpt": "line 42"},
+            {"type": "file", "ref": "backend/app/models.py:100", "excerpt": "line 100"},
+        ],
+        "claims": ["caching improves performance by 10x"],
+    }
+    second_finding = {
+        "title": "optimize with caching layer",
+        "description": "Add a cache layer for optimization",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py", "excerpt": "different part"},
+            {"type": "file", "ref": "backend/app/models.py:200", "excerpt": "different part"},
+        ],
+        "claims": ["caching improves performance by 10x"],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    # First finding passes through all dedup stages
+    assert len(outcome.deduplicated) == 1
+    assert outcome.evidence_overlap_count == 1
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["reason"].startswith("evidence overlap with:")
+
+
+def test_deduplicate_findings_evidence_overlap_identical_sources_different_claims():
+    """Identical sources but different claims → kept."""
+    first_finding = {
+        "title": "implement caching",
+        "description": "Add cache layer",
+        "priority": "high",
+        "direction_id": "dir-1",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py"},
+            {"type": "file", "ref": "backend/app/models.py"},
+        ],
+        "claims": ["caching improves performance"],
+    }
+    second_finding = {
+        "title": "optimize caching strategy",
+        "description": "Improve cache hit rate",
+        "priority": "high",
+        "direction_id": "dir-1",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py"},
+            {"type": "file", "ref": "backend/app/models.py"},
+        ],
+        "claims": ["cache hit rate needs improvement"],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    # Both findings pass because they have different claims
+    assert len(outcome.deduplicated) == 2
+    assert outcome.evidence_overlap_count == 0
+    assert len(outcome.filtered) == 0
+
+
+def test_deduplicate_findings_evidence_overlap_below_threshold():
+    """Less than 80% source overlap → kept."""
+    first_finding = {
+        "title": "cache optimization",
+        "description": "desc",
+        "priority": "high",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py"},
+            {"type": "file", "ref": "backend/app/models.py"},
+            {"type": "file", "ref": "backend/app/db.py"},
+            {"type": "file", "ref": "backend/app/api.py"},
+            {"type": "file", "ref": "backend/app/utils.py"},
+        ],
+        "claims": ["caching improves performance"],
+    }
+    second_finding = {
+        "title": "optimize cache strategy",
+        "description": "desc",
+        "priority": "high",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py"},
+            {"type": "file", "ref": "backend/app/redis.py"},
+        ],
+        "claims": ["caching improves performance"],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    # Jaccard overlap = 1/(5+2-1) = 1/6 ≈ 0.17 < 0.8, so no evidence overlap
+    assert len(outcome.deduplicated) == 2
+    assert outcome.evidence_overlap_count == 0
+
+
+def test_deduplicate_findings_evidence_overlap_no_sources():
+    """Findings with no sources → no evidence overlap regardless of claims."""
+    first_finding = {
+        "title": "some finding",
+        "description": "desc",
+        "priority": "high",
+        "claims": ["claim A"],
+    }
+    second_finding = {
+        "title": "reworded finding",
+        "description": "desc",
+        "priority": "high",
+        "claims": ["claim A"],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    # No sources means no evidence overlap check can occur
+    assert len(outcome.deduplicated) == 2
+    assert outcome.evidence_overlap_count == 0
+
+
+def test_deduplicate_findings_evidence_overlap_no_claims():
+    """Findings with sources but no claims → no evidence overlap."""
+    first_finding = {
+        "title": "caching changes",
+        "description": "desc",
+        "priority": "high",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py"},
+            {"type": "file", "ref": "backend/app/models.py"},
+        ],
+    }
+    second_finding = {
+        "title": "cache optimization",
+        "description": "desc",
+        "priority": "high",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py"},
+            {"type": "file", "ref": "backend/app/models.py"},
+        ],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    # No claims means no evidence overlap check can occur
+    assert len(outcome.deduplicated) == 2
+    assert outcome.evidence_overlap_count == 0
+
+
+def test_deduplicate_findings_evidence_overlap_normalizes_refs():
+    """Evidence overlap check normalizes file refs (strips line numbers)."""
+    first_finding = {
+        "title": "fix bug",
+        "description": "desc",
+        "priority": "high",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py:42"},
+            {"type": "file", "ref": "backend/app/models.py#L100-L200"},
+        ],
+        "claims": ["bug needs fixing"],
+    }
+    second_finding = {
+        "title": "address issue",
+        "description": "desc",
+        "priority": "high",
+        "sources": [
+            {"type": "file", "ref": "backend/app/cache.py:999"},  # Different line number, same file
+            {"type": "file", "ref": "backend/app/models.py:50"},   # Different line number, same file
+        ],
+        "claims": ["bug needs fixing"],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    # After normalization, both findings have identical refs + shared claims
+    assert len(outcome.deduplicated) == 1
+    assert outcome.evidence_overlap_count == 1
+
+
+def test_deduplicate_findings_evidence_overlap_records_reason():
+    """Evidence overlap rejection records proper reason."""
+    first_finding = {
+        "title": "implement caching layer",
+        "description": "desc",
+        "priority": "high",
+        "sources": [{"type": "file", "ref": "backend/app/cache.py"}],
+        "claims": ["improves performance"],
+    }
+    second_finding = {
+        "title": "optimize cache",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-2",
+        "sources": [{"type": "file", "ref": "backend/app/cache.py"}],
+        "claims": ["improves performance"],
+    }
+    outcome = deduplicate_findings(
+        [first_finding, second_finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+    )
+    assert len(outcome.filtered) == 1
+    rec = outcome.filtered[0]
+    assert rec["reason"].startswith("evidence overlap with: implement caching")

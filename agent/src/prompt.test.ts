@@ -432,6 +432,46 @@ describe('buildContextPrefix', () => {
     expect(result).toContain('**Last productive cycle:** 3/3 merged');
   });
 
+  it('renders recent_findings_evidence with claims and sources in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'Research caching',
+        priority: 'high',
+        recent_findings_evidence: [
+          {
+            title: 'Redis TTL tuning reduces latency',
+            claims: ['p99 dropped 40ms', 'no cache stampede observed'],
+            source_refs: [{ ref: 'pr#42', excerpt: 'TTL set to 300s' }, { ref: 'log/bench' }],
+          },
+          {
+            title: 'Memcached not viable',
+            claims: ['no cluster mode support'],
+            source_refs: [],
+          },
+        ],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Recent findings evidence (canonical — full claims and sources):**');
+    expect(result).toContain('"Redis TTL tuning reduces latency"');
+    expect(result).toContain('Claims: p99 dropped 40ms; no cache stampede observed');
+    expect(result).toContain('Sources: pr#42 ("TTL set to 300s"); log/bench');
+    expect(result).toContain('"Memcached not viable"');
+    expect(result).toContain('Claims: no cluster mode support');
+  });
+
+  it('omits recent_findings_evidence section when array is empty', () => {
+    const task = {
+      direction_context: {
+        title: 'x',
+        priority: 'medium',
+        recent_findings_evidence: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).not.toContain('Recent findings evidence');
+  });
+
   it('renders scope_success_rates as a concise merge-rate line in Direction Context', () => {
     const task = {
       direction_context: {

@@ -1802,6 +1802,36 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         }
       }
     }
+    // recent_findings_evidence: structured claims+sources for the most recent findings.
+    // Canonical evidence view — use this for cross-referencing claims and sources.
+    const recentFindingsEvidence = Array.isArray(dirCtx.recent_findings_evidence)
+      ? dirCtx.recent_findings_evidence as Array<Record<string, unknown>>
+      : [];
+    if (recentFindingsEvidence.length > 0) {
+      dcLines.push('**Recent findings evidence (canonical — full claims and sources):**');
+      for (const entry of recentFindingsEvidence) {
+        const ftitle = strVal(entry.title);
+        if (!ftitle) continue;
+        dcLines.push(`- "${ftitle}"`);
+        const claims = Array.isArray(entry.claims)
+          ? (entry.claims as unknown[]).map(c => strVal(c)).filter(Boolean)
+          : [];
+        if (claims.length > 0) {
+          dcLines.push(`  Claims: ${claims.join('; ')}`);
+        }
+        const sourceRefs = Array.isArray(entry.source_refs)
+          ? entry.source_refs as Array<Record<string, unknown>>
+          : [];
+        if (sourceRefs.length > 0) {
+          const parts = sourceRefs.map(s => {
+            const ref = strVal(s.ref);
+            const excerpt = strVal(s.excerpt);
+            return excerpt ? `${ref} ("${excerpt}")` : ref;
+          }).filter(Boolean);
+          if (parts.length > 0) dcLines.push(`  Sources: ${parts.join('; ')}`);
+        }
+      }
+    }
     const failedApproaches = Array.isArray(dirCtx.failed_approaches) ? dirCtx.failed_approaches as unknown[] : [];
     if (failedApproaches.length > 0) {
       dcLines.push('**Avoid (already tried and failed):**');
