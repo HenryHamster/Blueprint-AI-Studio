@@ -3410,6 +3410,27 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(doneScript).toContain('{self_review_outcome: $self_review}');
   });
 
+  it('generates ./check with the admin-ui viewport gate and no jsdom test command', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).toContain('npm run test:viewport');
+    expect(checkScript).toContain('Playwright Chromium');
+    expect(checkScript).toContain('npx playwright install --with-deps chromium');
+    expect(checkScript).not.toContain('npm run test:run');
+    expect(checkScript.indexOf('admin-ui eslint')).toBeLessThan(checkScript.indexOf('admin-ui viewport'));
+    expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui build'));
+  });
+
   it('generates ./pr script with SR section injection for new PR path', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     writeCodeChangeHelpers({

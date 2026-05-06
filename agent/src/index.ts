@@ -1702,13 +1702,31 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
   const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
   const touchesBackend = changedPaths.some(p => p.startsWith('backend/'));
   if (touchesFrontend) {
-    sendLog(ws, 'Running frontend lint + build...\n');
+    const adminUiEnv = {
+      ...process.env,
+      VITE_API_URL: 'http://localhost:8080',
+      VITE_FIREBASE_API_KEY: 'ci',
+      VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com',
+      VITE_FIREBASE_PROJECT_ID: 'ci',
+    };
+    const viewportFailureGuidance = '\nadmin-ui viewport regression suite requires Playwright Chromium. If this VM is missing it, run `cd admin-ui && npx playwright install --with-deps chromium` and rerun the check.';
+    sendLog(ws, 'Running frontend lint + viewport + build...\n');
     sendHeartbeatSync(taskId, 'npm ci (admin-ui)...');
     execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT });
     sendHeartbeatSync(taskId, 'eslint (admin-ui)...');
     execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT });
+    sendHeartbeatSync(taskId, 'npm run test:viewport (admin-ui)...');
+    try {
+      execFileSync('npm', ['run', 'test:viewport'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        err.message += viewportFailureGuidance;
+        throw err;
+      }
+      throw new Error(`${String(err)}${viewportFailureGuidance}`);
+    }
     sendHeartbeatSync(taskId, 'npm run build (admin-ui)...');
-    execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: { ...process.env, VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_API_KEY: 'ci', VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com', VITE_FIREBASE_PROJECT_ID: 'ci' } });
+    execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });
     sendLog(ws, 'Frontend checks passed.\n');
   }
   if (touchesAgent) {

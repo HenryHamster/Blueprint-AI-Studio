@@ -318,18 +318,18 @@ function TreeBranch({
             {depTasks.map(dep => {
               const depStyle = dep.task_type ? TASK_TYPE_STYLES[dep.task_type] : null;
               return (
-                <div key={dep.id} className="flex items-center gap-1.5">
-                  <div className="w-4 border-t-2 border-dashed border-neutral-600" />
-                  <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[200px]" title={`Depends on: ${dep.title}`}>
+                <div key={dep.id} className="flex items-center gap-1.5 min-w-0">
+                  <div className="w-4 border-t-2 border-dashed border-neutral-600 shrink-0" />
+                  <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[120px] sm:max-w-[200px]" title={`Depends on: ${dep.title}`}>
                     &#8594; {depStyle ? <span className={depStyle.text}>[{depStyle.label}]</span> : null} {dep.title}
                   </span>
                 </div>
               );
             })}
             {offPageDepIds.map(id => (
-              <div key={id} className="flex items-center gap-1.5">
-                <div className="w-4 border-t-2 border-dashed border-amber-500/40" />
-                <span className="text-[9px] text-amber-500/70 font-mono truncate max-w-[200px]" title={`Depends on task ${id} (not on this page)`}>
+              <div key={id} className="flex items-center gap-1.5 min-w-0">
+                <div className="w-4 border-t-2 border-dashed border-amber-500/40 shrink-0" />
+                <span className="text-[9px] text-amber-500/70 font-mono truncate max-w-[120px] sm:max-w-[200px]" title={`Depends on task ${id} (not on this page)`}>
                   &#8594; depends on task not on this page ({id.slice(0, 8)})
                 </span>
               </div>
@@ -339,12 +339,12 @@ function TreeBranch({
 
         {/* PR chain connector: dotted arrow to originating create task */}
         {linkedCreateTask && (
-          <div className="mb-1 ml-1 flex items-center gap-1.5">
-            <div className={`w-4 border-t-2 border-dashed ${chainColor}`} />
-            <span className={`text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${chainBadgeBg}`}>
+          <div className="mb-1 ml-1 flex items-center gap-1.5 min-w-0">
+            <div className={`w-4 border-t-2 border-dashed ${chainColor} shrink-0`} />
+            <span className={`text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded border ${chainBadgeBg} shrink-0`}>
               {chainLabel}
             </span>
-            <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[200px]" title={`${node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: ${linkedCreateTask.title}`}>
+            <span className="text-[9px] text-neutral-500 font-mono truncate max-w-[100px] sm:max-w-[200px]" title={`${node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: ${linkedCreateTask.title}`}>
               ↳ {node.task.task_type === 'fix' ? 'Fixes' : 'Reviews'} PR from: {linkedCreateTask.title}
             </span>
           </div>
@@ -679,8 +679,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
 
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
-      {/* eslint-disable-next-line viewport/no-fixed-width -- intentional horizontal-scroll container */}
-      <div className="space-y-4 min-w-[400px]">
+      <div className="space-y-4">
         <div className="flex items-center gap-1.5">
           {FILTER_CHIPS.map(({ label }) => (
             <button

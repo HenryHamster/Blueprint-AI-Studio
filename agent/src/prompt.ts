@@ -522,9 +522,9 @@ export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
 function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
-  // Runs the corresponding lint/build commands. Optional `./check test` also
-  // runs the Docker backend test suite when backend/ was touched and
-  // tests-on-main is enabled.
+  // Runs the corresponding lint/build commands plus the admin-ui browser-mode
+  // viewport suite. Optional `./check test` also runs the Docker backend test
+  // suite when backend/ was touched and tests-on-main is enabled.
   const script = `#!/bin/bash
 # ./check — run lint/build (and optionally tests) for changed paths.
 # Usage:
@@ -587,6 +587,7 @@ if touches admin-ui/; then
     FAILED+=("admin-ui npm ci")
   }
   run "admin-ui eslint"  bash -c 'cd admin-ui && npx eslint . 2>&1'
+  run "admin-ui viewport" bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport 2>&1 || { status=$?; echo ""; echo "[check] admin-ui viewport suite requires Playwright Chromium. If this VM is missing it, run: cd admin-ui && npx playwright install --with-deps chromium"; exit $status; }'
   run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
 fi
 
@@ -1368,11 +1369,13 @@ does NOT auto-commit or auto-push your work. Use these helpers (already in
 the workspace, executable):
 
 - \`./check\` — runs lint/build for the stacks your changes touched
-  (admin-ui eslint+build, agent tsc+eslint, backend ruff). Fast. Exits
+  (admin-ui eslint+viewport+build, agent tsc+eslint, backend ruff). Fast. Exits
   non-zero on failure with the actual error tail; fix and re-run until
   green. If your changes don't touch admin-ui/, agent/, or backend/,
   \`./check\` returns PASS without running anything — that's expected
-  for pure-docs tasks.
+  for pure-docs tasks. For \`admin-ui/\` changes this includes the
+  browser-mode \`npm run test:viewport\` gate, not the jsdom-only
+  \`npm run test:run\` suite.
 - \`./check test\` — same plus a **lightweight standalone backend test
   pass** (3 invariant files, ~30s). This VM is 8 GB; the FULL Docker
   + Postgres pytest suite OOMs here (production 2026-05-05: tasks

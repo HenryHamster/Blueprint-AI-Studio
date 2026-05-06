@@ -385,12 +385,15 @@ describe('runProjectLintChecks', () => {
 
   it('falls back to hardcoded admin-ui checks when buildConfig is undefined and admin-ui touched', () => {
     runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
-    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['ci'], expect.any(Object),
-    );
-    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['run', 'build'], expect.any(Object),
-    );
+    const adminUiCalls = vi.mocked(execFileSync).mock.calls
+      .filter(([, , options]) => ((options as { cwd?: string } | undefined)?.cwd?.includes('/admin-ui')) ?? false)
+      .map(([cmd, args]) => `${cmd} ${(args as string[]).join(' ')}`);
+    expect(adminUiCalls).toEqual([
+      'npm ci',
+      'npx eslint .',
+      'npm run test:viewport',
+      'npm run build',
+    ]);
   });
 
   it('falls back to hardcoded agent checks when buildConfig is undefined and agent/ touched', () => {
