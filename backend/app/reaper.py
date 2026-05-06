@@ -1319,7 +1319,17 @@ async def reaper_service():
                                 "security_audit": "task", "debug": "task", "smoketest": "task",
                             }
                             _branch_prefix = _type_prefix_map.get(_task_type, "task")
-                            _branch = f"blueprint/{_branch_prefix}-{_short_id}"
+                            # Prefer the source task's existing branch (fix tasks
+                            # carry the PR's HEAD ref; create/refactor tasks carry
+                            # the branch the agent already pushed). Only fall back
+                            # to constructing a fresh blueprint/* name when no
+                            # branch is recorded — without this, reaped fix tasks
+                            # spawn review tasks pointing at non-existent branches
+                            # and the review fails on `git clone --branch`.
+                            _branch = (
+                                (task.first_payload or {}).get("branch")
+                                or f"blueprint/{_branch_prefix}-{_short_id}"
+                            )
                             _base_branch = (task.first_payload or {}).get("base_branch", "main")
                             _original_prompt = (task.first_payload or {}).get("prompt", task.description or "")
                             await _spawn_pipeline_task(
