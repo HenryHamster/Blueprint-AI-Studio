@@ -305,7 +305,7 @@ export function DirectionPortfolioSection({
                     {d.auto_paused && <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/30" title={d.paused_reason ?? undefined}>Paused</span>}
                   </div>
                   <p className="text-xs text-neutral-200 line-clamp-2 mb-2">{d.direction_text}</p>
-                  <div className="flex items-center gap-2 text-[10px] text-neutral-500">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-neutral-500">
                     {cvr != null && <span className={cvrColor}>{cvr}% conversion</span>}
                     {acc != null && <span className={accColor} title="PRs merged / (merged + rejected)">{acc}% acc</span>}
                     {fas != null && <span className={fasColor} title={`First-attempt success rate${d.first_attempt_sample_size != null ? ` (n=${d.first_attempt_sample_size})` : ''}`}>{fas}% 1st</span>}

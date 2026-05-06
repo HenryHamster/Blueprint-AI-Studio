@@ -267,7 +267,7 @@ export default function MetricsDashboard({
   return (
     <div className="mb-6">
       {/* Window selector */}
-      <div className="flex items-center gap-1 mb-3">
+      <div className="flex flex-wrap items-center gap-1 mb-3">
         {WINDOW_OPTIONS.map((w) => (
           <button
             key={w}

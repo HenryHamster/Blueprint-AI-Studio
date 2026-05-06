@@ -679,6 +679,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
 
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
+      {/* eslint-disable-next-line viewport/no-fixed-width -- intentional horizontal-scroll container */}
       <div className="space-y-4 min-w-[400px]">
         <div className="flex items-center gap-1.5">
           {FILTER_CHIPS.map(({ label }) => (

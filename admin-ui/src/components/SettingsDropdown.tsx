@@ -1513,6 +1513,7 @@ export function SettingsDropdown({
       {showSettings && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onToggleSettings}>
           <div
+            // eslint-disable-next-line viewport/no-fixed-width -- intentional modal, constrained by max-w-[95vw] on mobile
             className="bg-neutral-950 border border-neutral-700 rounded-xl shadow-2xl flex w-[900px] max-w-[95vw] h-[80vh] max-h-[700px] overflow-hidden"
             onClick={e => e.stopPropagation()}
           >
