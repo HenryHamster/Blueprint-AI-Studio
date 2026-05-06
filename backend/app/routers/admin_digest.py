@@ -1409,6 +1409,72 @@ async def unsuspend_residual_case(
     }
 
 
+@router.get("/regression-cases")
+async def list_regression_cases(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    status: list[str] | None = Query(None, description="Filter by RegressionCaseStatus values; repeatable"),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """List regression remediation cases for a project.
+
+    Defaults to open cases (ACTIVE / REMEDIATING / NEEDS_MANUAL_INTERVENTION).
+    Ordered by last_seen_at desc.
+    """
+    if status:
+        valid = {s.value for s in RegressionCaseStatus}
+        invalid = [s for s in status if s not in valid]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status values: {invalid}. Valid: {sorted(valid)}",
+            )
+        status_filter = list(status)
+    else:
+        status_filter = [
+            RegressionCaseStatus.ACTIVE,
+            RegressionCaseStatus.REMEDIATING,
+            RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        ]
+
+    query = (
+        select(RegressionRemediationCase)
+        .where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.status.in_(status_filter),
+        )
+        .order_by(RegressionRemediationCase.last_seen_at.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(query)).scalars().all()
+    return {
+        "count": len(rows),
+        "status_filter": status_filter,
+        "cases": [
+            {
+                "id": str(c.id),
+                "project_id": str(c.project_id),
+                "regression_class": c.regression_class,
+                "status": c.status,
+                "attempts": c.attempts,
+                "hit_count": c.hit_count,
+                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
+                "last_remediation_task_id": str(c.last_remediation_task_id) if c.last_remediation_task_id else None,
+                "last_remediation_pr_number": c.last_remediation_pr_number,
+                "last_remediation_result": c.last_remediation_result,
+                "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
+                "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
+                "sample_message": c.sample_message,
+            }
+            for c in rows
+        ],
+    }
+
+
 @router.post("/regression-cases/{regression_class}/clear-manual-intervention")
 async def clear_regression_manual_intervention(
     regression_class: str,
@@ -1447,6 +1513,41 @@ async def clear_regression_manual_intervention(
         "status": RegressionCaseStatus.ACTIVE,
         "attempts": case.attempts,
         "needs_manual_intervention_at": None,
+    }
+
+
+@router.get("/regression-cases/manual-intervention")
+async def list_regression_manual_intervention_cases(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+):
+    """List regression cases escalated to manual intervention."""
+    rows = (await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        ).order_by(RegressionRemediationCase.last_seen_at.desc()).limit(limit)
+    )).scalars().all()
+    return {
+        "count": len(rows),
+        "cases": [
+            {
+                "id": str(c.id),
+                "project_id": str(c.project_id),
+                "regression_class": c.regression_class,
+                "signal_name": c.regression_class.replace("_", " "),
+                "status": c.status,
+                "attempts": c.attempts,
+                "last_remediation_pr_number": c.last_remediation_pr_number,
+                "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
+                "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
+            }
+            for c in rows
+        ],
     }
 
 

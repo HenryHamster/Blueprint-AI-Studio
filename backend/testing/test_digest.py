@@ -7627,3 +7627,208 @@ async def test_regression_remediation_case_persists_close_loop_fields(db_session
     assert case.signal_snapshot_at_merge["threshold"] == 0.7
     assert len(case.fingerprint_to_fix_log) == 1
     assert case.fingerprint_to_fix_log[0]["fix_pr_number"] == 4242
+
+
+# ── GET /regression-cases ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_empty(client: AsyncClient, db_session):
+    """GET /regression-cases with no rows returns the expected envelope with empty cases list."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 0
+    assert data["cases"] == []
+    assert "status_filter" in data
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_response_shape(client: AsyncClient, db_session):
+    """GET /regression-cases pins the full response shape for each case."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=2,
+        hit_count=3,
+        sample_message="SR catch rate dropped below threshold",
+        last_remediation_pr_number=1234,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={"value": 0.45, "threshold": 0.6},
+        signal_snapshot_at_merge={"value": 0.62, "threshold": 0.6},
+        fingerprint_to_fix_log=[{"fingerprint": "abc", "fix_pr_number": 1234}],
+        needs_manual_intervention_at=None,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert len(data["cases"]) == 1
+
+    c = data["cases"][0]
+    # Pin every field the frontend consumes — contract drift test.
+    assert "id" in c
+    assert c["project_id"] == str(project.id)
+    assert c["regression_class"] == "sr_catch_rate:correctness"
+    assert c["status"] == "ACTIVE"
+    assert c["attempts"] == 2
+    assert c["hit_count"] == 3
+    assert c["sample_message"] == "SR catch rate dropped below threshold"
+    assert c["last_remediation_pr_number"] == 1234
+    assert c["last_remediation_result"] == "merged"
+    assert c["signal_snapshot_at_spawn"] == {"value": 0.45, "threshold": 0.6}
+    assert c["signal_snapshot_at_merge"] == {"value": 0.62, "threshold": 0.6}
+    assert c["fingerprint_to_fix_log"] == [{"fingerprint": "abc", "fix_pr_number": 1234}]
+    assert c["needs_manual_intervention_at"] is None
+    assert "first_seen_at" in c
+    assert "last_seen_at" in c
+    assert "last_remediation_task_id" in c
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_default_filter_excludes_closed(client: AsyncClient, db_session):
+    """Default status filter includes ACTIVE/REMEDIATING/NEEDS_MANUAL_INTERVENTION; excludes CLOSED/MERGED."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+    )
+    closed_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.CLOSED,
+    )
+    db_session.add_all([active_case, closed_case])
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["cases"][0]["regression_class"] == "sr_catch_rate:correctness"
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_explicit_status_filter(client: AsyncClient, db_session):
+    """Explicit status= query param restricts results to only those statuses."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    active_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+    )
+    manual_case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        needs_manual_intervention_at=_utcnow(),
+    )
+    db_session.add_all([active_case, manual_case])
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id), "status": "NEEDS_MANUAL_INTERVENTION"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["cases"][0]["regression_class"] == "fix_loop_divergence"
+    assert data["cases"][0]["status"] == "NEEDS_MANUAL_INTERVENTION"
+    assert data["status_filter"] == ["NEEDS_MANUAL_INTERVENTION"]
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_invalid_status_returns_400(client: AsyncClient, db_session):
+    """Invalid status value returns 400 with a descriptive error."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id), "status": "BOGUS"},
+    )
+    assert response.status_code == 400
+    assert "Invalid status values" in response.json()["error"]["message"]
+
+
+# ── GET /regression-cases/manual-intervention ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_regression_manual_intervention_response_shape(client: AsyncClient, db_session):
+    """GET /regression-cases/manual-intervention pins the response shape."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    flagged_at = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:architecture",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        attempts=3,
+        needs_manual_intervention_at=flagged_at,
+        signal_snapshot_at_spawn={"value": 0.3, "threshold": 0.6},
+        signal_snapshot_at_merge={},
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/manual-intervention",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert len(data["cases"]) == 1
+
+    c = data["cases"][0]
+    assert "id" in c
+    assert c["project_id"] == str(project.id)
+    assert c["regression_class"] == "sr_catch_rate:architecture"
+    assert c["signal_name"] == "sr catch rate:architecture"
+    assert c["status"] == "NEEDS_MANUAL_INTERVENTION"
+    assert c["attempts"] == 3
+    assert c["signal_snapshot_at_spawn"] == {"value": 0.3, "threshold": 0.6}
+    assert c["signal_snapshot_at_merge"] == {}
+    assert c["needs_manual_intervention_at"] is not None
+    assert "last_seen_at" in c
+    assert "last_remediation_pr_number" in c

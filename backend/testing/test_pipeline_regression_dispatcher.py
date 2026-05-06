@@ -20,7 +20,9 @@ from sqlmodel import select
 from app.models import Project, Task, TaskStatus
 from app.pipeline_regression_dispatcher import (
     _REGRESSION_COOLDOWN,
+    _REGRESSION_RECOVERY_COOLDOWN,
     run_once,
+    run_recovery_once,
 )
 from app.time_utils import _utcnow
 
@@ -272,6 +274,107 @@ async def test_end_to_end_chain_to_remediation(db_session, mocker):
 
 
 # ---------------------------------------------------------------------------
+# RegressionRemediationCase creation / update / suppression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_spawn_creates_remediation_case(db_session):
+    """First spawn for an SR regression creates a RegressionRemediationCase row."""
+    from app.models import RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+            RegressionRemediationCase.regression_class == "sr_catch_rate:correctness",
+        )
+    )).scalars().first()
+    assert case is not None
+    assert case.hit_count == 1
+    snap = case.signal_snapshot_at_spawn or {}
+    assert snap["prior_rate"] == 0.80
+    assert snap["current_rate"] == 0.50
+    assert snap["signal_name"] == "sr_catch_rate"
+    assert "captured_at" in snap
+
+
+@pytest.mark.asyncio
+async def test_sr_repeat_spawn_updates_existing_case(db_session):
+    """A second spawn beyond the cooldown increments hit_count on the existing case."""
+    from app.models import RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    # Expire cooldown: mark the spawned task COMPLETED and backdate it.
+    task = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().first()
+    task.status = TaskStatus.COMPLETED
+    task.created_at = _utcnow() - _REGRESSION_COOLDOWN - timedelta(minutes=5)
+    db_session.add(task)
+    await db_session.commit()
+
+    spawned2 = await run_once(db_session, project.id)
+    assert spawned2 == 1
+
+    case = (await db_session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project.id,
+            RegressionRemediationCase.regression_class == "sr_catch_rate:correctness",
+        )
+    )).scalars().first()
+    assert case is not None
+    assert case.hit_count == 2
+
+
+@pytest.mark.asyncio
+async def test_manual_intervention_case_suppresses_spawn(db_session):
+    """Existing case in NEEDS_MANUAL_INTERVENTION status prevents a new spawn."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        hit_count=3,
+    ))
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0
+
+    tasks = (await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )).scalars().all()
+    assert tasks == []
+
+
+# ---------------------------------------------------------------------------
 # GET /api/admin/pipeline-regressions — endpoint contract tests
 # ---------------------------------------------------------------------------
 
@@ -381,6 +484,179 @@ async def test_pipeline_regressions_endpoint_404_unknown_project(client):
     assert response.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# Anomaly signal evaluator tests
+# ---------------------------------------------------------------------------
+
+
+def _make_anomaly_entry(
+    *,
+    occurrence_count: int = 5,
+    last_seen: str | None = None,
+    first_seen: str | None = None,
+    example_message: str = "GCP quota exhausted",
+    severity: str = "high",
+) -> dict:
+    from app.time_utils import _utcnow
+    now = _utcnow()
+    return {
+        "occurrence_count": occurrence_count,
+        "last_seen": last_seen or now.isoformat(),
+        "first_seen": first_seen or (now.replace(hour=0, minute=0, second=0)).isoformat(),
+        "example_message": example_message,
+        "severity": severity,
+    }
+
+
+@pytest.mark.asyncio
+async def test_anomaly_dispatch_on_threshold(db_session):
+    """Anomaly meeting occurrence + recency thresholds spawns an investigation."""
+    import app.shared_state as _ss
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "gcp_quota_exhaustion"
+    _ss.persistent_anomalies[str(project.id)] = {
+        fingerprint: _make_anomaly_entry(occurrence_count=5),
+    }
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        task = (await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )).scalars().first()
+        assert task is not None
+        payload = task.first_payload or {}
+        assert payload.get("type") == "investigate"
+        ctx = task.context or {}
+        assert ctx["regression_class"] == f"anomaly:{fingerprint}"
+        assert ctx["signal_name"] == "persistent_anomaly"
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_below_threshold_no_spawn(db_session):
+    """Anomaly below occurrence threshold does not spawn."""
+    import app.shared_state as _ss
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _ss.persistent_anomalies[str(project.id)] = {
+        "low_count_anomaly": _make_anomaly_entry(occurrence_count=2),
+    }
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 0
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_stale_last_seen_no_spawn(db_session):
+    """Anomaly outside the recency window does not spawn."""
+    import app.shared_state as _ss
+    from app.time_utils import _utcnow
+    from datetime import timedelta
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_ts = (_utcnow() - timedelta(hours=72)).isoformat()
+    _ss.persistent_anomalies[str(project.id)] = {
+        "old_anomaly": _make_anomaly_entry(occurrence_count=10, last_seen=old_ts),
+    }
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 0
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_signal_snapshot_captured(db_session):
+    """signal_snapshot_at_spawn records the expected anomaly fields."""
+    import app.shared_state as _ss
+    from app.models import RegressionRemediationCase
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    first_seen_iso = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    last_seen_iso = now.isoformat()
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "vm_provision_failure"
+    _ss.persistent_anomalies[str(project.id)] = {
+        fingerprint: {
+            "occurrence_count": 7,
+            "last_seen": last_seen_iso,
+            "first_seen": first_seen_iso,
+            "example_message": "VM provisioning timed out",
+            "severity": "critical",
+        },
+    }
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        case = (await db_session.execute(
+            select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == project.id,
+                RegressionRemediationCase.regression_class == f"anomaly:{fingerprint}",
+            )
+        )).scalars().first()
+        assert case is not None
+        snap = case.signal_snapshot_at_spawn or {}
+        assert snap["occurrence_count"] == 7
+        assert snap["hit_count"] == 7
+        assert snap["first_seen"] == first_seen_iso
+        assert "last_seen" in snap
+        assert snap["sample_message"] == "VM provisioning timed out"
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_cooldown_blocks_re_trigger(db_session):
+    """After an anomaly spawns, cooldown window prevents immediate re-spawn."""
+    import app.shared_state as _ss
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "repeated_timeout"
+    _ss.persistent_anomalies[str(project.id)] = {
+        fingerprint: _make_anomaly_entry(occurrence_count=4),
+    }
+    try:
+        first = await run_once(db_session, project.id)
+        assert first == 1
+
+        second = await run_once(db_session, project.id)
+        assert second == 0
+
+        tasks = (await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )).scalars().all()
+        assert len(tasks) == 1
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
 @pytest.mark.asyncio
 async def test_pipeline_regressions_endpoint_enriches_crash_investigation(client, db_session):
     """A background-service crash alert is enriched with the lifecycle-spawned
@@ -435,3 +711,172 @@ async def test_pipeline_regressions_endpoint_enriches_crash_investigation(client
     assert crash["spawned_task_id"] == str(inflight.id)
     assert crash["spawned_task_status"] == "IN_PROGRESS"
     assert crash["spawned_task_title"] == f"Investigate repeated crash: {service_name} service"
+
+
+# ---------------------------------------------------------------------------
+# Recovery scan — run_recovery_once tests
+# ---------------------------------------------------------------------------
+
+
+def _merged_case(
+    project_id,
+    *,
+    regression_class: str = "sr_catch_rate:correctness",
+    attempts: int = 0,
+    minutes_since_merge: int = 20,
+) -> "RegressionRemediationCase":
+    """Build a MERGED RegressionRemediationCase whose cooldown has elapsed."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    merged_at = (_utcnow() - timedelta(minutes=minutes_since_merge)).isoformat()
+    return RegressionRemediationCase(
+        project_id=project_id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=attempts,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        signal_snapshot_at_spawn={"prior_rate": 0.80, "current_rate": 0.50, "signal_name": "sr_catch_rate"},
+        fingerprint_to_fix_log=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_closes_recovered_signal(db_session):
+    """Signal no longer tripped after merge → mark_closed(), status=CLOSED, log appended."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    # Design doc shows recovery: prior ≈ current (no regression).
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.80,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _merged_case(project.id)
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED
+    # Recovery log entry appended.
+    log = case.fingerprint_to_fix_log or []
+    assert any("recovered_at" in e for e in log)
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_rearms_on_still_tripped(db_session):
+    """Signal still tripped after merge → re_arm(), status=ACTIVE, attempts incremented."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    # SR still regressed: 30pp drop.
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _merged_case(project.id, attempts=0)
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_third_rearm_needs_manual(db_session):
+    """Third re-arm (attempts already at 2) escalates to NEEDS_MANUAL_INTERVENTION."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    # Still tripped.
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _merged_case(project.id, attempts=2)
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.needs_manual_intervention_at is not None
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_no_double_close(db_session):
+    """Already-CLOSED case is not picked up by the recovery scan."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.80,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(minutes=20)).isoformat()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        hit_count=1,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[],
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_scan_respects_cooldown(db_session):
+    """MERGED case whose signal_snapshot_at_merge was captured within the 15-min
+    cooldown is skipped — signals need time to settle post-merge."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness", prior=0.80, current=0.80,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Merge timestamp < 15 min ago — within the cooldown window.
+    case = _merged_case(project.id, minutes_since_merge=5)
+    db_session.add(case)
+    await db_session.commit()
+
+    changed = await run_recovery_once(db_session, project.id)
+    assert changed == 0

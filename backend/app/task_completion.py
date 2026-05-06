@@ -577,9 +577,40 @@ async def _record_regression_signal_if_matching(
 ) -> None:
     """Stamp remediation_regression_signal when a non-remediation failure during
     the monitoring window matches the last-remediated fingerprint."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase  # noqa: PLC0415
+    ctx = task.context or {}
+    if status == TaskStatus.COMPLETED and (task.first_payload or {}).get("type") in {
+        "create", "refactor", "docs", "qa", "deps", "migrate", "fix", "review",
+    }:
+        return
+    regression_class = ctx.get("regression_class")
+    if regression_class:
+        result = await session.execute(
+            select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == task.project_id,
+                RegressionRemediationCase.regression_class == regression_class,
+            )
+        )
+        case = result.scalar_one_or_none()
+        if case is not None and case.status == RegressionCaseStatus.MERGED:
+            snapshot = ctx.get("signal_snapshot") or {}
+            value = snapshot.get("value")
+            threshold = snapshot.get("threshold")
+            recovered = (
+                isinstance(value, (int, float))
+                and isinstance(threshold, (int, float))
+                and value < threshold
+            )
+            hit_count = snapshot.get("hit_count")
+            if not recovered and isinstance(hit_count, int):
+                recovered = hit_count <= int(case.hit_count or 0)
+            if recovered:
+                case.mark_closed()
+            else:
+                case.re_arm()
+            session.add(case)
     if status != TaskStatus.FAILED:
         return
-    ctx = task.context or {}
     direction_id = ctx.get("direction_id")
     if not direction_id or ctx.get("diagnosis_task_id"):
         return

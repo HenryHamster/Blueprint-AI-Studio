@@ -825,6 +825,29 @@ describe('DashboardHome', () => {
     });
   });
 
+  it('renders ManualInterventionPanel empty state when no escalations exist', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    expect(await screen.findByTestId('manual-intervention-panel')).toBeInTheDocument();
+    expect(screen.getByText('No regression cases need manual intervention')).toBeInTheDocument();
+  });
+
+  it('does not render ManualInterventionPanel when no project is selected', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId={null} onViewTask={vi.fn()} />);
+
+    await screen.findByText('No active directions');
+    expect(screen.queryByTestId('manual-intervention-panel')).not.toBeInTheDocument();
+  });
+
   it('does not render digest data when backend returns a response that fails the contract check', async () => {
     setupApiMocks({
       digest: { unexpected_field: 'bad', totally_wrong: true },

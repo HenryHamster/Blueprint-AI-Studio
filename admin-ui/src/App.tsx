@@ -533,6 +533,7 @@ export default function App() {
           s.dismissAllAlerts();
         }}
         onViewTask={handleViewTask}
+        projectId={s.selectedProjectId ?? undefined}
       />
 
       {!s.showArchive && !s.showUserManagement && (

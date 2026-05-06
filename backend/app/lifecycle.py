@@ -316,6 +316,38 @@ async def lifespan(app):
     # Start Auto-Archive Service (archives terminal tasks older than N days)
     auto_archive_task = asyncio.create_task(auto_archive_service())
 
+    # Start the Regression Recovery Scan (closes or re-arms MERGED cases)
+    async def _regression_recovery_scan_service():
+        """Periodic leader-only scan: re-evaluates MERGED regression cases."""
+        from app.pipeline_regression_dispatcher import run_recovery_once  # noqa: PLC0415
+        _SCAN_INTERVAL = 300  # 5 minutes
+        while True:
+            await asyncio.sleep(_SCAN_INTERVAL)
+            try:
+                async with AsyncSessionLocal() as scan_session:
+                    projects = (await scan_session.execute(
+                        select(Project).options(load_only(Project.id))
+                    )).scalars().all()
+                    for project in projects:
+                        try:
+                            changed = await run_recovery_once(scan_session, project.id)
+                            if changed:
+                                logger.info(
+                                    "[RECOVERY_SCAN] project=%s changed=%d",
+                                    project.id, changed,
+                                )
+                        except Exception as proj_exc:
+                            logger.warning(
+                                "[RECOVERY_SCAN] project=%s error=%s",
+                                project.id, proj_exc,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as scan_exc:
+                logger.error("[RECOVERY_SCAN] scan error: %s", scan_exc, exc_info=True)
+
+    regression_recovery_task = asyncio.create_task(_regression_recovery_scan_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -337,6 +369,7 @@ async def lifespan(app):
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
     _bg_tasks["auto_archive"] = auto_archive_task
+    _bg_tasks["regression_recovery_scan"] = regression_recovery_task
     _bg_tasks["config_sync"] = config_sync_task
     _bg_tasks["availability_refresh"] = availability_refresh_task
 
@@ -360,6 +393,7 @@ async def lifespan(app):
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
             "auto_archive": auto_archive_service,
+            "regression_recovery_scan": _regression_recovery_scan_service,
             "config_sync": runtime_config_sync_service,
             "availability_refresh": account_availability_refresh_service,
         }
@@ -514,7 +548,7 @@ async def lifespan(app):
 
     yield
     # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [reaper_task, gcp_cleanup_task, gcp_image_cleanup_task, secret_recon_task, stale_branch_task, orchestrator_task, config_sync_task, monitor_task]
+    tasks_to_cancel = [reaper_task, gcp_cleanup_task, gcp_image_cleanup_task, secret_recon_task, stale_branch_task, auto_archive_task, regression_recovery_task, orchestrator_task, config_sync_task, monitor_task]
     for t in tasks_to_cancel:
         t.cancel()
     try:

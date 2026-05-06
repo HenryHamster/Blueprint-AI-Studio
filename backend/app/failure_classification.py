@@ -1390,3 +1390,103 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
 def classify_failure(task: "Task", logs: str | None = None) -> str:
     """Backward-compatible shim that returns only the failure class string."""
     return classify_failure_with_confidence(task, logs).failure_class
+
+
+# ---------------------------------------------------------------------------
+# Close-loop verification for RegressionRemediationCase
+# ---------------------------------------------------------------------------
+
+async def _transition_regression_case_async(
+    project_id,
+    regression_class: str,
+    action: str,
+    **kwargs,
+) -> None:
+    """Apply a state-machine transition to a RegressionRemediationCase row.
+
+    action values:
+      "merge"   — ACTIVE → MERGED (pr_number, signal_snapshot required in kwargs)
+      "recover" — MERGED → CLOSED
+      "rearm"   — any status → ACTIVE or NEEDS_MANUAL_INTERVENTION (via re_arm)
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import RegressionRemediationCase, RegressionCaseStatus
+    from sqlmodel import select
+
+    _status_filter: dict[str, str | None] = {
+        "merge": RegressionCaseStatus.ACTIVE,
+        "recover": RegressionCaseStatus.MERGED,
+        "rearm": None,
+    }
+    status_filter = _status_filter.get(action)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                stmt = select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.regression_class == regression_class,
+                )
+                if status_filter is not None:
+                    stmt = stmt.where(RegressionRemediationCase.status == status_filter)
+                stmt = stmt.with_for_update(skip_locked=True)
+                case = (await session.execute(stmt)).scalars().first()
+                if case is None:
+                    return
+                if action == "merge":
+                    case.mark_merged(kwargs["pr_number"], kwargs.get("signal_snapshot") or {})
+                elif action == "recover":
+                    case.mark_closed()
+                elif action == "rearm":
+                    case.re_arm()
+                session.add(case)
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Regression case transition failed (class=%r action=%s)",
+            regression_class, action,
+        )
+
+
+def _schedule_regression_case_transition(
+    project_id,
+    regression_class: str,
+    action: str,
+    **kwargs,
+) -> None:
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(
+            _transition_regression_case_async(project_id, regression_class, action, **kwargs)
+        )
+    except RuntimeError:
+        pass  # No running event loop (e.g. sync tests); caller must await directly
+
+
+def schedule_regression_close_loop_merge(
+    project_id,
+    regression_class: str,
+    pr_number: int,
+    signal_snapshot: dict | None = None,
+) -> None:
+    """Fire-and-forget ACTIVE → MERGED after a remediation PR merges."""
+    _schedule_regression_case_transition(
+        project_id, regression_class, "merge",
+        pr_number=pr_number, signal_snapshot=signal_snapshot or {},
+    )
+
+
+def schedule_regression_close_loop_recovery(
+    project_id,
+    regression_class: str,
+) -> None:
+    """Fire-and-forget MERGED → CLOSED when the signal shows recovery."""
+    _schedule_regression_case_transition(project_id, regression_class, "recover")
+
+
+def schedule_regression_close_loop_rearm(
+    project_id,
+    regression_class: str,
+) -> None:
+    """Fire-and-forget re-arm on remediation failure or post-MERGED recurrence."""
+    _schedule_regression_case_transition(project_id, regression_class, "rearm")

@@ -1156,6 +1156,74 @@ class TestResidualStore:
         assert fp not in fc._residual_closed_fingerprints
 
 
+class TestPipelineRegressionCloseLoop:
+    """State-machine unit tests for RegressionRemediationCase close-loop transitions.
+
+    Covers: ACTIVE→MERGED (happy path), MERGED→CLOSED (signal recovery),
+    recurrence after MERGED (re_arm), and failed-remediation escalation to
+    NEEDS_MANUAL_INTERVENTION.
+    """
+
+    def _make_case(self, status: str | None = None):
+        from app.models import RegressionRemediationCase, RegressionCaseStatus
+        case = RegressionRemediationCase(
+            project_id=uuid.uuid4(),
+            regression_class="sr_catch_rate_drop",
+        )
+        if status is not None:
+            case.status = status
+        return case
+
+    def test_mark_merged_happy_path(self):
+        from app.models import RegressionCaseStatus
+        case = self._make_case()
+        snapshot = {"value": 0.75, "threshold": 0.7}
+        case.mark_merged(pr_number=42, signal_snapshot=snapshot)
+        assert case.status == RegressionCaseStatus.MERGED
+        assert case.signal_snapshot_at_merge == snapshot
+        assert case.last_remediation_pr_number == 42
+        assert case.last_remediation_result == "merged"
+        assert len(case.fingerprint_to_fix_log) == 1
+        assert case.fingerprint_to_fix_log[0]["fix_pr_number"] == 42
+        assert case.fingerprint_to_fix_log[0]["fingerprint"] == "sr_catch_rate_drop"
+
+    def test_mark_closed_signal_recovery(self):
+        from app.models import RegressionCaseStatus
+        case = self._make_case(status=RegressionCaseStatus.MERGED)
+        case.mark_closed()
+        assert case.status == RegressionCaseStatus.CLOSED
+        assert case.last_remediation_result == "closed"
+
+    def test_re_arm_below_cap_reactivates(self):
+        from app.models import RegressionCaseStatus
+        case = self._make_case()
+        case.re_arm(max_attempts=3)
+        assert case.status == RegressionCaseStatus.ACTIVE
+        assert case.attempts == 1
+        assert case.last_remediation_result == "failed"
+
+    def test_re_arm_at_cap_escalates(self):
+        from app.models import RegressionCaseStatus
+        case = self._make_case()
+        case.attempts = 2
+        case.re_arm(max_attempts=3)
+        assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+        assert case.needs_manual_intervention_at is not None
+
+    def test_re_arm_after_merged_recurrence(self):
+        from app.models import RegressionCaseStatus
+        case = self._make_case(status=RegressionCaseStatus.MERGED)
+        case.re_arm(max_attempts=3)
+        assert case.status == RegressionCaseStatus.ACTIVE
+
+    def test_fix_log_accumulates_across_merged_prs(self):
+        case = self._make_case()
+        case.mark_merged(pr_number=10, signal_snapshot={})
+        case.mark_merged(pr_number=20, signal_snapshot={})
+        pr_numbers = [e["fix_pr_number"] for e in case.fingerprint_to_fix_log]
+        assert pr_numbers == [10, 20]
+
+
 class TestDeriveFailureStageMigration:
     """Migration-specific keywords map to the 'migration' stage."""
 

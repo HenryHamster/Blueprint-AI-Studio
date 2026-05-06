@@ -1164,11 +1164,33 @@ async def _spawn_ci_auto_remediation_followup(
     return True
 
 
+async def _regression_class_for_task(task: Task, session: AsyncSession) -> str | None:
+    """Return the regression_class associated with a task, checking the parent chain.
+
+    Fix tasks spawned by the investigate→fix chain carry diagnosis_task_id in
+    their context pointing to the investigate task, which holds regression_class.
+    This one-level lookup closes the wiring gap so close-loop handlers work for
+    both the investigate task itself and any downstream fix task it spawned.
+    """
+    ctx = task.context or {}
+    rc = ctx.get("regression_class")
+    if rc:
+        return rc
+    diag_id_str = ctx.get("diagnosis_task_id")
+    if not diag_id_str:
+        return None
+    try:
+        parent = await session.get(Task, uuid.UUID(str(diag_id_str)))
+    except Exception:
+        return None
+    return (parent.context or {}).get("regression_class") if parent else None
+
+
 async def _close_loop_regression_case_on_merge(
     task: Task, pr_number: int, session: AsyncSession
 ) -> None:
     """Advance a RegressionRemediationCase to MERGED when its remediation PR merges."""
-    regression_class = (task.context or {}).get("regression_class")
+    regression_class = await _regression_class_for_task(task, session)
     if not regression_class:
         return
     result = await session.execute(
@@ -1188,7 +1210,7 @@ async def _close_loop_regression_case_on_failure(
     task: Task, session: AsyncSession
 ) -> None:
     """Re-arm or escalate a RegressionRemediationCase when its remediation task fails."""
-    regression_class = (task.context or {}).get("regression_class")
+    regression_class = await _regression_class_for_task(task, session)
     if not regression_class:
         return
     result = await session.execute(

@@ -22,7 +22,10 @@ from typing import Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import Alert, AlertSeverity, Task, TaskHistory, TaskStatus
+from app.models import (
+    Alert, AlertSeverity, RegressionCaseStatus, RegressionRemediationCase,
+    Task, TaskHistory, TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -42,6 +45,16 @@ _REGRESSION_DISPATCHER_SYSTEM_CAP = 2
 # trend label is too noisy to trigger an investigation. 10 completed/failed
 # tasks in 24h is the same threshold operators use to mute "low signal" pages.
 _PIPELINE_SUCCESS_MIN_SAMPLE = 10
+
+# Give merged signals time to settle before the recovery scan re-evaluates them.
+_REGRESSION_RECOVERY_COOLDOWN = timedelta(minutes=15)
+
+# Persistent-anomaly dispatch thresholds. An anomaly must recur at least this
+# many times within the recency window before an investigation is spawned — the
+# same philosophy as the 5pp SR delta floor: one bad cycle is noise, repeated
+# occurrences are signal.
+_ANOMALY_DISPATCH_MIN_OCCURRENCES = 3
+_ANOMALY_DISPATCH_RECENCY_HOURS = 48
 
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
@@ -154,6 +167,134 @@ def _format_signal_lines(
     return "\n".join(lines)
 
 
+async def _current_signal_value_for_class(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    regression_class: str,
+    project_design_doc: dict | None = None,
+) -> Optional[dict[str, Any]]:
+    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
+    from app.models import Task as TaskModel  # noqa: PLC0415
+
+    if regression_class.startswith("sr_catch_rate:"):
+        cat = regression_class.split(":", 1)[1]
+        data = (((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get("categories") or {}).get(cat) or {}
+        prior = data.get("previous_hit_rate")
+        curr = data.get("current_hit_rate")
+        raw_sample = data.get("current_human_count")
+        if prior is None or curr is None:
+            return None
+        sample_size = int(raw_sample) if raw_sample is not None else _MIN_SR_SAMPLE
+        if raw_sample is not None and sample_size < _MIN_SR_SAMPLE:
+            return None
+        return {
+            "signal_name": "sr_catch_rate",
+            "prior_rate": prior,
+            "current_rate": curr,
+            "sample_size": sample_size,
+            "magnitude": round(prior - curr, 3),
+            "tripped": (prior - curr) >= _TREND_DELTA_THRESHOLD,
+            "extras": [f"Self-review catch-rate for category '{cat}' is regressing."],
+        }
+
+    if regression_class.startswith("fix_loop_divergence:"):
+        loop = regression_class.split(":", 1)[1]
+        now = _utcnow()
+        tasks = (await session.execute(
+            select(TaskModel).where(
+                TaskModel.project_id == project_id,
+                TaskModel.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                TaskModel.created_at >= now - timedelta(days=14),
+            )
+        )).scalars().all()
+        def _naive(dt: datetime) -> datetime:
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+        c7 = _naive(now - timedelta(days=7))
+        c14 = _naive(now - timedelta(days=14))
+        stats = {"curr": {"n": 0, "d": 0}, "prev": {"n": 0, "d": 0}}
+        for start, end, bucket in ((c7, datetime(9999, 12, 31), "curr"), (c14, c7, "prev")):
+            for t in tasks:
+                ts = _naive(t.created_at) if t.created_at else None
+                if ts is None or not (start <= ts < end):
+                    continue
+                bucket_hist = (t.fix_loop_history or {}).get(loop) or []
+                if not bucket_hist:
+                    continue
+                last_exit: Optional[str] = None
+                for ev in reversed(bucket_hist):
+                    reason = ev.get("exit_reason") if isinstance(ev, dict) else None
+                    if reason and reason != "in_progress":
+                        last_exit = reason
+                        break
+                if last_exit is None and isinstance(bucket_hist[-1], dict):
+                    last_exit = bucket_hist[-1].get("exit_reason")
+                stats[bucket]["n"] += 1
+                if last_exit and last_exit.startswith("divergence_"):
+                    stats[bucket]["d"] += 1
+        cn, cd = stats["curr"]["n"], stats["curr"]["d"]
+        pn, pd = stats["prev"]["n"], stats["prev"]["d"]
+        if cn < _MIN_SR_SAMPLE or pn < _MIN_SR_SAMPLE:
+            return None
+        curr_rate = cd / cn
+        prior_rate = pd / pn
+        return {
+            "signal_name": "fix_loop_divergence",
+            "prior_rate": round(prior_rate, 3),
+            "current_rate": round(curr_rate, 3),
+            "sample_size": cn,
+            "magnitude": round(curr_rate - prior_rate, 3),
+            "tripped": (curr_rate - prior_rate) >= _TREND_DELTA_THRESHOLD,
+            "extras": [f"Fix-loop '{loop}' divergence rate is rising: {pd}/{pn} → {cd}/{cn} divergent."],
+        }
+
+    if regression_class == "pipeline_success_rate":
+        from app.models import Task as TaskModel  # noqa: PLC0415
+        from app.routers.admin_digest import compute_pipeline_health_summary  # noqa: PLC0415
+
+        summary = await compute_pipeline_health_summary(session, project_id, lookback_hours=24)
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        rows = (await session.execute(
+            select(TaskModel.id, TaskModel.status, TaskModel.updated_at).where(
+                TaskModel.project_id == project_id,
+                TaskModel.updated_at >= window_start,
+                TaskModel.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            )
+        )).all()
+        sample_size = len(rows)
+        if sample_size < _PIPELINE_SUCCESS_MIN_SAMPLE:
+            return None
+        failure_distribution = summary.get("failure_distribution") or {}
+        extras = ["24h pipeline success-rate is declining."]
+        if failure_distribution:
+            top = ", ".join(f"{k}={v}" for k, v in list(failure_distribution.items())[:3])
+            extras.append(f"Top failure classes: {top}")
+        return {
+            "signal_name": "pipeline_success_rate",
+            "prior_rate": None,
+            "current_rate": summary.get("success_rate"),
+            "sample_size": sample_size,
+            "magnitude": None,
+            "tripped": summary.get("trend") == "declining",
+            "extras": extras,
+        }
+
+    return None
+
+
+async def _get_remediation_case(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    regression_class: str,
+) -> Optional[RegressionRemediationCase]:
+    return (await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.regression_class == regression_class,
+        )
+    )).scalars().first()
+
+
 async def _maybe_spawn(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -166,6 +307,7 @@ async def _maybe_spawn(
     magnitude: Optional[float],
     extras: list[str] | None = None,
     title_hint: str,
+    extra_snapshot_fields: dict | None = None,
 ) -> Optional[Task]:
     """Apply dedup + cooldown gates and spawn an investigate task on green light."""
     logger.info(
@@ -179,6 +321,26 @@ async def _maybe_spawn(
         logger.info(
             "[REGRESSION_DISPATCHER] dedup-hit project=%s class=%s in_flight_task=%s",
             project_id, regression_class, in_flight.id,
+        )
+        return None
+
+    existing_case = await _get_remediation_case(session, project_id, regression_class)
+    if existing_case is not None and existing_case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION:
+        logger.info(
+            "[REGRESSION_DISPATCHER] manual-intervention-suppressed project=%s "
+            "class=%s case_id=%s",
+            project_id, regression_class, existing_case.id,
+        )
+        return None
+    if existing_case is not None and existing_case.status == RegressionCaseStatus.MERGED:
+        # Recovery scan owns MERGED cases — let it decide CLOSED vs re_arm()
+        # before any new investigation can fire, otherwise a same-class
+        # spawn within the dispatcher cooldown window would race the
+        # recovery loop this PR adds.
+        logger.info(
+            "[REGRESSION_DISPATCHER] merged-awaiting-recovery-scan project=%s "
+            "class=%s case_id=%s",
+            project_id, regression_class, existing_case.id,
         )
         return None
 
@@ -239,6 +401,7 @@ async def _maybe_spawn(
         created_by="ORCHESTRATOR",
     )
     session.add(new_task)
+    await session.flush()
     session.add(TaskHistory(
         task_id=new_task.id,
         action="SPAWNED",
@@ -258,6 +421,38 @@ async def _maybe_spawn(
             f"task {new_task.id} queued."
         )[:1000],
     ))
+
+    signal_snapshot: dict[str, Any] = {
+        "prior_rate": prior_rate,
+        "current_rate": current_rate,
+        "sample_size": sample_size,
+        "signal_name": signal_name,
+        "magnitude": magnitude,
+        "captured_at": now.isoformat(),
+    }
+    if extra_snapshot_fields:
+        signal_snapshot.update(extra_snapshot_fields)
+    if existing_case is None:
+        session.add(RegressionRemediationCase(
+            project_id=project_id,
+            regression_class=regression_class,
+            status=RegressionCaseStatus.ACTIVE,
+            signal_snapshot_at_spawn=signal_snapshot,
+            last_remediation_task_id=new_task.id,
+            last_seen_at=now,
+            hit_count=1,
+        ))
+    else:
+        existing_case.signal_snapshot_at_spawn = signal_snapshot
+        existing_case.hit_count = (existing_case.hit_count or 0) + 1
+        existing_case.last_seen_at = now
+        existing_case.last_remediation_task_id = new_task.id
+        # Reactivate so admin state matches the in-flight remediation. A
+        # CLOSED case re-tripping is a fresh regression cycle; without this
+        # the case would stay CLOSED while a new investigation runs.
+        existing_case.status = RegressionCaseStatus.ACTIVE
+        session.add(existing_case)
+
     logger.info(
         "[REGRESSION_DISPATCHER] spawn-success project=%s class=%s task_id=%s",
         project_id, regression_class, new_task.id,
@@ -272,8 +467,6 @@ async def _evaluate_sr_catch_rate_signal(
     spawn_budget_left: int,
 ) -> int:
     """Re-read the persisted SR catch-rate trends snapshot and trip per-category."""
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
-
     if spawn_budget_left <= 0:
         return 0
     doc = project_design_doc or {}
@@ -287,36 +480,20 @@ async def _evaluate_sr_catch_rate_signal(
             break
         if not isinstance(data, dict):
             continue
-        prior = data.get("previous_hit_rate")
-        curr = data.get("current_hit_rate")
-        if prior is None or curr is None:
-            continue
-        delta = curr - prior
-        if -delta < _TREND_DELTA_THRESHOLD:
-            continue
-        # Per-category sample sizes are persisted alongside the rates by
-        # compute_sr_catch_rate_trends (current_human_count /
-        # previous_human_count). Fall back to _MIN_SR_SAMPLE only for legacy
-        # snapshots predating the schema bump — which is the floor the trends
-        # function already enforces at the project level (line 2087-2088).
-        raw_sample = data.get("current_human_count")
-        if raw_sample is not None:
-            sample_size = int(raw_sample)
-            if sample_size < _MIN_SR_SAMPLE:
-                continue
-        else:
-            sample_size = _MIN_SR_SAMPLE
         regression_class = f"sr_catch_rate:{cat}"
+        state = await _current_signal_value_for_class(session, project_id, regression_class, project_design_doc)
+        if state is None or not state["tripped"]:
+            continue
         spawn = await _maybe_spawn(
             session,
             project_id,
-            signal_name="sr_catch_rate",
+            signal_name=state["signal_name"],
             regression_class=regression_class,
-            prior_rate=prior,
-            current_rate=curr,
-            sample_size=sample_size,
-            magnitude=round(prior - curr, 3),
-            extras=[f"Self-review catch-rate for category '{cat}' is regressing."],
+            prior_rate=state["prior_rate"],
+            current_rate=state["current_rate"],
+            sample_size=state["sample_size"],
+            magnitude=state["magnitude"],
+            extras=state["extras"],
             title_hint=f"SR catch-rate {cat}",
         )
         if spawn is not None:
@@ -330,84 +507,29 @@ async def _evaluate_fix_loop_divergence_signal(
     spawn_budget_left: int,
 ) -> int:
     """Recompute the fix-loop divergence regression and trip per loop."""
-    from app.playbook_learning import (  # noqa: PLC0415
-        _MIN_SR_SAMPLE,
-        _TREND_DELTA_THRESHOLD,
-    )
-    from app.models import Task as TaskModel  # noqa: PLC0415
-
     if spawn_budget_left <= 0:
         return 0
 
-    now = _utcnow()
-    tasks = (await session.execute(
-        select(TaskModel).where(
-            TaskModel.project_id == project_id,
-            TaskModel.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            TaskModel.created_at >= now - timedelta(days=14),
-        )
-    )).scalars().all()
-
-    def _naive(dt: datetime) -> datetime:
-        return dt.replace(tzinfo=None) if dt.tzinfo else dt
-
-    c7 = _naive(now - timedelta(days=7))
-    c14 = _naive(now - timedelta(days=14))
     loops = ("lint", "test", "check")
-
-    def _stats(start: datetime, end: datetime) -> dict[str, dict]:
-        s: dict[str, dict] = {l: {"n": 0, "d": 0} for l in loops}
-        for t in tasks:
-            ts = _naive(t.created_at) if t.created_at else None
-            if ts is None or not (start <= ts < end):
-                continue
-            for loop in loops:
-                bucket = (t.fix_loop_history or {}).get(loop) or []
-                if not bucket:
-                    continue
-                last_exit: Optional[str] = None
-                for ev in reversed(bucket):
-                    reason = ev.get("exit_reason") if isinstance(ev, dict) else None
-                    if reason and reason != "in_progress":
-                        last_exit = reason
-                        break
-                if last_exit is None and isinstance(bucket[-1], dict):
-                    last_exit = bucket[-1].get("exit_reason")
-                s[loop]["n"] += 1
-                if last_exit and last_exit.startswith("divergence_"):
-                    s[loop]["d"] += 1
-        return s
-
-    curr = _stats(c7, datetime(9999, 12, 31))
-    prev = _stats(c14, c7)
 
     spawned = 0
     for loop in loops:
         if spawned >= spawn_budget_left:
             break
-        cn, cd = curr[loop]["n"], curr[loop]["d"]
-        pn, pd = prev[loop]["n"], prev[loop]["d"]
-        if cn < _MIN_SR_SAMPLE or pn < _MIN_SR_SAMPLE:
-            continue
-        curr_rate = cd / cn
-        prior_rate = pd / pn
-        delta = curr_rate - prior_rate
-        if delta < _TREND_DELTA_THRESHOLD:
-            continue
         regression_class = f"fix_loop_divergence:{loop}"
+        state = await _current_signal_value_for_class(session, project_id, regression_class)
+        if state is None or not state["tripped"]:
+            continue
         spawn = await _maybe_spawn(
             session,
             project_id,
-            signal_name="fix_loop_divergence",
+            signal_name=state["signal_name"],
             regression_class=regression_class,
-            prior_rate=round(prior_rate, 3),
-            current_rate=round(curr_rate, 3),
-            sample_size=cn,
-            magnitude=round(delta, 3),
-            extras=[
-                f"Fix-loop '{loop}' divergence rate is rising: "
-                f"{pd}/{pn} → {cd}/{cn} divergent.",
-            ],
+            prior_rate=state["prior_rate"],
+            current_rate=state["current_rate"],
+            sample_size=state["sample_size"],
+            magnitude=state["magnitude"],
+            extras=state["extras"],
             title_hint=f"fix-loop divergence {loop}",
         )
         if spawn is not None:
@@ -421,52 +543,133 @@ async def _evaluate_pipeline_success_signal(
     spawn_budget_left: int,
 ) -> int:
     """Trip pipeline_success_rate when 24h trend declines on a non-trivial sample."""
-    from app.routers.admin_digest import compute_pipeline_health_summary  # noqa: PLC0415
-    from app.models import Task as TaskModel  # noqa: PLC0415
+    if spawn_budget_left <= 0:
+        return 0
+    state = await _current_signal_value_for_class(session, project_id, "pipeline_success_rate")
+    if state is None or not state["tripped"]:
+        return 0
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name=state["signal_name"],
+        regression_class="pipeline_success_rate",
+        prior_rate=state["prior_rate"],
+        current_rate=state["current_rate"],
+        sample_size=state["sample_size"],
+        magnitude=state["magnitude"],
+        extras=state["extras"],
+        title_hint="24h pipeline success-rate declining",
+    )
+    return 1 if spawn is not None else 0
+
+
+async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int:
+    """Re-evaluate merged regression cases and close or re-arm them."""
+    from app.models import Project  # noqa: PLC0415
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        return 0
+
+    now = _utcnow()
+    rows = (await session.execute(
+        select(RegressionRemediationCase).where(
+            RegressionRemediationCase.project_id == project_id,
+            RegressionRemediationCase.status == RegressionCaseStatus.MERGED,
+        )
+    )).scalars().all()
+    changed = 0
+    for case in rows:
+        snapshot = case.signal_snapshot_at_merge or {}
+        if not snapshot:
+            continue
+        merged_at_raw = snapshot.get("captured_at") or case.updated_at.isoformat()
+        try:
+            merged_at = datetime.fromisoformat(str(merged_at_raw).replace("Z", "+00:00"))
+        except ValueError:
+            merged_at = case.updated_at
+        if merged_at.tzinfo is not None:
+            merged_at = merged_at.replace(tzinfo=None)
+        if now < merged_at + _REGRESSION_RECOVERY_COOLDOWN:
+            continue
+        state = await _current_signal_value_for_class(
+            session, project_id, case.regression_class, project.design_doc,
+        )
+        if state is None:
+            continue
+        if not state["tripped"]:
+            case.mark_closed()
+            case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [{
+                "fingerprint": case.regression_class,
+                "recovered_at": now.isoformat(),
+                "post_merge_value": state["current_rate"],
+            }]
+        else:
+            case.re_arm()
+        session.add(case)
+        changed += 1
+    if changed:
+        await session.commit()
+    return changed
+
+
+async def _evaluate_anomaly_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    spawn_budget_left: int,
+) -> int:
+    """Trip on persistent anomalies that have exceeded the occurrence threshold."""
+    import app.shared_state as _ss  # noqa: PLC0415
 
     if spawn_budget_left <= 0:
         return 0
 
-    summary = await compute_pipeline_health_summary(session, project_id, lookback_hours=24)
-    trend = summary.get("trend")
-    if trend != "declining":
+    proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
+    if not proj_anomalies:
         return 0
-    success_rate = summary.get("success_rate")
 
-    # Recompute total terminal count over the same 24h window — the summary
-    # doesn't expose the raw sample size, but the gate is conservative (>=10).
     now = _utcnow()
-    window_start = now - timedelta(hours=24)
-    rows = (await session.execute(
-        select(TaskModel.id, TaskModel.status, TaskModel.updated_at).where(
-            TaskModel.project_id == project_id,
-            TaskModel.updated_at >= window_start,
-            TaskModel.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+    recency_cutoff = (now - timedelta(hours=_ANOMALY_DISPATCH_RECENCY_HOURS)).isoformat()
+    spawned = 0
+    for anomaly_key, entry in list(proj_anomalies.items()):
+        if spawned >= spawn_budget_left:
+            break
+        if not isinstance(entry, dict):
+            continue
+        occurrence_count = int(entry.get("occurrence_count") or 0)
+        if occurrence_count < _ANOMALY_DISPATCH_MIN_OCCURRENCES:
+            continue
+        last_seen = str(entry.get("last_seen") or "")
+        if last_seen < recency_cutoff:
+            continue
+        regression_class = f"anomaly:{anomaly_key}"
+        sample_msg = entry.get("example_message") or entry.get("latest_details") or ""
+        spawn = await _maybe_spawn(
+            session,
+            project_id,
+            signal_name="persistent_anomaly",
+            regression_class=regression_class,
+            prior_rate=None,
+            current_rate=None,
+            sample_size=occurrence_count,
+            magnitude=float(occurrence_count),
+            extras=[
+                f"Persistent anomaly '{anomaly_key}' detected {occurrence_count}x "
+                f"(severity: {entry.get('severity', 'unknown')}).",
+                (entry.get("latest_details") or "")[:300],
+            ],
+            title_hint=f"persistent anomaly {anomaly_key}"[:80],
+            extra_snapshot_fields={
+                "hit_count": occurrence_count,
+                "occurrence_count": occurrence_count,
+                "first_seen": str(entry.get("first_seen") or ""),
+                "last_seen": last_seen,
+                "sample_message": sample_msg[:500],
+            },
         )
-    )).all()
-    sample_size = len(rows)
-    if sample_size < _PIPELINE_SUCCESS_MIN_SAMPLE:
-        return 0
-
-    failure_distribution = summary.get("failure_distribution") or {}
-    extras_lines = ["24h pipeline success-rate is declining."]
-    if failure_distribution:
-        top = ", ".join(f"{k}={v}" for k, v in list(failure_distribution.items())[:3])
-        extras_lines.append(f"Top failure classes: {top}")
-
-    spawn = await _maybe_spawn(
-        session,
-        project_id,
-        signal_name="pipeline_success_rate",
-        regression_class="pipeline_success_rate",
-        prior_rate=None,
-        current_rate=success_rate,
-        sample_size=sample_size,
-        magnitude=None,
-        extras=extras_lines,
-        title_hint="24h pipeline success-rate declining",
-    )
-    return 1 if spawn is not None else 0
+        if spawn is not None:
+            spawned += 1
+    return spawned
 
 
 async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
@@ -507,6 +710,9 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         session, project_id, spawn_budget - spawned,
     )
     spawned += await _evaluate_pipeline_success_signal(
+        session, project_id, spawn_budget - spawned,
+    )
+    spawned += await _evaluate_anomaly_signal(
         session, project_id, spawn_budget - spawned,
     )
 

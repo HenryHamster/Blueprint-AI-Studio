@@ -31,6 +31,7 @@ import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
 import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
+import { ManualInterventionPanel } from './PipelineRegressionsPanel';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
@@ -782,6 +783,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
 
       {/* Pipeline Regressions */}
       {selectedProjectId && <PipelineRegressionsPanel projectId={selectedProjectId} />}
+
+      {/* Manual Intervention Cases */}
+      {selectedProjectId && <ManualInterventionPanel projectId={selectedProjectId} />}
 
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />

@@ -1217,6 +1217,7 @@ class SystemMaturity(SQLModel, table=True):
 
 class RegressionCaseStatus(str, Enum):
     ACTIVE = "ACTIVE"
+    REMEDIATING = "REMEDIATING"
     MERGED = "MERGED"
     CLOSED = "CLOSED"
     NEEDS_MANUAL_INTERVENTION = "NEEDS_MANUAL_INTERVENTION"
@@ -1299,7 +1300,7 @@ class RegressionRemediationCase(SQLModel, table=True):
             "project_id", "status", "last_seen_at",
         ),
         CheckConstraint(
-            "status IN ('ACTIVE', 'MERGED', 'CLOSED', 'NEEDS_MANUAL_INTERVENTION')",
+            "status IN ('ACTIVE', 'REMEDIATING', 'MERGED', 'CLOSED', 'NEEDS_MANUAL_INTERVENTION')",
             name="ck_regressionremediationcase_status",
         ),
     )
@@ -1321,17 +1322,39 @@ class RegressionRemediationCase(SQLModel, table=True):
         self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [log_entry]
         self.status = RegressionCaseStatus.MERGED
 
-    def mark_closed(self) -> None:
-        """Transition MERGED → CLOSED when the signal shows recovery."""
+    def mark_closed(
+        self,
+        post_merge_value: Optional[float] = None,
+        recovered_at: Optional[str] = None,
+    ) -> None:
+        """Transition MERGED → CLOSED when the signal shows recovery.
+
+        Idempotent: if already CLOSED, returns without side-effects.
+        When ``post_merge_value`` is provided, appends a recovery entry to
+        ``fingerprint_to_fix_log`` so the close-loop log captures the
+        post-merge signal reading alongside the original fix PR.
+        """
+        if self.status == RegressionCaseStatus.CLOSED:
+            return
         self.last_remediation_result = "closed"
         self.status = RegressionCaseStatus.CLOSED
+        if post_merge_value is not None:
+            entry: Dict[str, Any] = {
+                "fingerprint": self.regression_class,
+                "recovered_at": recovered_at or _utcnow().isoformat(),
+                "post_merge_value": post_merge_value,
+            }
+            self.fingerprint_to_fix_log = list(self.fingerprint_to_fix_log or []) + [entry]
 
     def re_arm(self, max_attempts: int = 3) -> None:
         """Handle remediation failure or post-MERGED recurrence.
 
         Increments the attempt counter and either resets to ACTIVE for another
         spawn or escalates to NEEDS_MANUAL_INTERVENTION when the cap is reached.
+        Idempotent once NEEDS_MANUAL_INTERVENTION is reached.
         """
+        if self.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION:
+            return
         self.attempts = (self.attempts or 0) + 1
         self.last_remediation_result = "failed"
         if self.attempts >= max_attempts:
@@ -1339,5 +1362,47 @@ class RegressionRemediationCase(SQLModel, table=True):
             self.needs_manual_intervention_at = _utcnow()
         else:
             self.status = RegressionCaseStatus.ACTIVE
+
+    def record_spawn(
+        self,
+        signal_snapshot: Dict[str, Any],
+        task_id: "uuid.UUID",
+    ) -> None:
+        """Update case fields when a new spawn happens (existing case path).
+
+        Refreshes signal_snapshot_at_spawn with the latest signal data,
+        increments hit_count, and links to the new remediation task.
+        Call on an existing case before session.add(); the dispatcher uses
+        this to keep the snapshot current across repeat trips.
+        """
+        self.signal_snapshot_at_spawn = signal_snapshot
+        self.hit_count = (self.hit_count or 0) + 1
+        self.last_seen_at = _utcnow()
+        self.last_remediation_task_id = task_id
+
+    @classmethod
+    def create_for_spawn(
+        cls,
+        project_id: "uuid.UUID",
+        regression_class: str,
+        signal_snapshot: Dict[str, Any],
+        task_id: "uuid.UUID",
+    ) -> "RegressionRemediationCase":
+        """Factory for the first-time spawn path.
+
+        Returns an unsaved instance ready to be passed to session.add().
+        Sets hit_count=1 and captures signal_snapshot_at_spawn so the
+        recovery scan has a baseline to compare against after remediation.
+        """
+        now = _utcnow()
+        return cls(
+            project_id=project_id,
+            regression_class=regression_class,
+            status=RegressionCaseStatus.ACTIVE,
+            signal_snapshot_at_spawn=signal_snapshot,
+            last_remediation_task_id=task_id,
+            last_seen_at=now,
+            hit_count=1,
+        )
 
 
