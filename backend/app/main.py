@@ -2081,7 +2081,18 @@ async def strategic_operation(
                     text[:60], project.id, (matched.get("text") or "")[:60], matched.get("status"),
                 )
             ctx = task.context or {}
-            task.context = {**ctx, "_strategic_api_called": True}
+            dedup_rejections = list(ctx.get("_strategic_dedup_rejections") or [])
+            rejection_record: dict = {
+                "rejected_text": text,
+                "matched_direction_id": matched.get("id") if matched else None,
+                "rejected_at": _utcnow().isoformat(),
+            }
+            if isinstance(raw_dedup_reasoning, dict):
+                distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                if distinction:
+                    rejection_record["dedup_reasoning"] = distinction[:500]
+            dedup_rejections.append(rejection_record)
+            task.context = {**ctx, "_strategic_api_called": True, "_strategic_dedup_rejections": dedup_rejections}
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
@@ -2172,7 +2183,7 @@ async def strategic_operation(
                     d["priority"] = changes["priority"]
                 if "system_id" in changes:
                     d["system_id"] = _cap_str(changes["system_id"], STRATEGIC_SYSTEM_ID_MAX, "changes.system_id", warnings) if changes["system_id"] else None
-                if "status" in changes and changes["status"] in ("active", "paused", "expired"):
+                if "status" in changes and changes["status"] in ("active", "paused", "expired", "superseded"):
                     if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
                         ctx = task.context or {}
                         task.context = {**ctx, "_strategic_api_called": True}
@@ -2181,6 +2192,17 @@ async def strategic_operation(
                         await session.commit()
                         return _resp({"status": "blocked", "reason": "Cannot reactivate user-paused direction"})
                     d["status"] = changes["status"]
+                    if changes["status"] == "superseded":
+                        superseded_by = changes.get("superseded_by")
+                        if not superseded_by:
+                            succ_id = (
+                                changes.get("successor_id") or changes.get("superseded_by_id")
+                                or data.get("successor_id") or data.get("superseded_by_id")
+                            )
+                            if succ_id:
+                                superseded_by = {"direction_id": str(succ_id), "set_at": _utcnow().isoformat()}
+                        if superseded_by:
+                            d["superseded_by"] = superseded_by
                 if "recommended_mode" in changes:
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:

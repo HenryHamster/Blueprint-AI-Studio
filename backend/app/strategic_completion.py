@@ -1181,12 +1181,23 @@ async def _handle_strategic_completion(
                                 d["system_id"] = sid_new[:STRATEGIC_SYSTEM_ID_MAX]
                             else:
                                 d["system_id"] = None
-                        if "status" in changes and changes["status"] in ("active", "paused", "expired"):
+                        if "status" in changes and changes["status"] in ("active", "paused", "expired", "superseded"):
                             # Block reactivating a direction the user manually paused
                             if changes["status"] == "active" and d.get("status") == "paused" and not d.get("auto_paused"):
                                 logger.warning(f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}")
                             else:
                                 d["status"] = changes["status"]
+                                if changes["status"] == "superseded":
+                                    superseded_by = changes.get("superseded_by")
+                                    if not superseded_by:
+                                        succ_id = (
+                                            changes.get("successor_id") or changes.get("superseded_by_id")
+                                            or op_entry.get("successor_id") or op_entry.get("superseded_by_id")
+                                        )
+                                        if succ_id:
+                                            superseded_by = {"direction_id": str(succ_id), "set_at": _utcnow().isoformat()}
+                                    if superseded_by:
+                                        d["superseded_by"] = superseded_by
                         if "category" in changes:
                             if changes["category"] in ("product", "structural", "mixed"):
                                 d["category"] = changes["category"]

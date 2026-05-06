@@ -2402,3 +2402,252 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(client, db_sess
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 400, resp.text
+
+
+# ── superseded status + successor linkage ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_fallback_superseded_update_persists_superseded_by(db_session, mocker):
+    """Fallback op=update with status=superseded persists superseded_by on the direction."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="SUP-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-old", "text": "Old direction", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {
+                "op": "update",
+                "direction_id": "d-old",
+                "rationale": "superseded by newer approach",
+                "changes": {
+                    "status": "superseded",
+                    "superseded_by": {"direction_id": "d-new", "set_at": "2026-01-01T00:00:00"},
+                },
+            },
+        ],
+    })
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-old")
+    assert target.get("status") == "superseded", f"Expected status=superseded, got: {target.get('status')}"
+    assert target.get("superseded_by") == {"direction_id": "d-new", "set_at": "2026-01-01T00:00:00"}, (
+        f"Expected superseded_by to be persisted, got: {target.get('superseded_by')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_completion_fallback_superseded_derives_superseded_by_from_successor_id(db_session, mocker):
+    """Fallback op=update: when changes lacks superseded_by, derive it from changes.successor_id."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="SUP-FB2",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-legacy", "text": "Legacy direction", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps({
+        "vision": {"purpose": "test", "revision": 2},
+        "direction_operations": [
+            {
+                "op": "update",
+                "direction_id": "d-legacy",
+                "successor_id": "d-successor",
+                "rationale": "replaced",
+                "changes": {"status": "superseded"},
+            },
+        ],
+    })
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-legacy")
+    assert target.get("status") == "superseded"
+    sb = target.get("superseded_by")
+    assert sb is not None, "superseded_by must be derived from successor_id"
+    assert sb.get("direction_id") == "d-successor"
+    assert "set_at" in sb
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_superseded_persists_superseded_by(client, db_session, mocker):
+    """HTTP update_direction with status=superseded persists superseded_by and returns 200."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="SUP-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-http-old", "text": "HTTP old direction", "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-sup-http",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-sup-http", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-old",
+                "rationale": "superseded by new direction",
+                "changes": {
+                    "status": "superseded",
+                    "superseded_by": {"direction_id": "d-http-new", "set_at": "2026-01-01T00:00:00"},
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-http-old")
+    assert target.get("status") == "superseded"
+    assert target.get("superseded_by") == {"direction_id": "d-http-new", "set_at": "2026-01-01T00:00:00"}
+
+
+# ── _strategic_dedup_rejections persistence ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_create_direction_dedup_persists_rejection_record(client, db_session, mocker):
+    """HTTP create_direction on a semantic duplicate appends a structured record to
+    task.context['_strategic_dedup_rejections'] and still returns 409."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    existing_text = "Migrate authentication service to OAuth2 tokens"
+    project = Project(
+        name="DEDUP-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-exist", "text": existing_text, "status": "active",
+             "priority": "medium", "notes": [], "research_history": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-dedup",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-dedup", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": existing_text,
+                "priority": "medium",
+                "rationale": "same direction",
+                "success_evidence": "All tasks pass",
+                "retirement_condition": "No open tasks",
+                "dedup_reasoning": {
+                    "distinction": "slightly different framing",
+                    "closest_directions": ["d-exist"],
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 409, resp.text
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    rejections = ctx.get("_strategic_dedup_rejections")
+    assert isinstance(rejections, list) and len(rejections) == 1, (
+        f"Expected 1 rejection record, got: {rejections}"
+    )
+    record = rejections[0]
+    assert record.get("matched_direction_id") == "d-exist"
+    assert existing_text in record.get("rejected_text", "")
+    assert record.get("dedup_reasoning") == "slightly different framing"
+    assert "rejected_at" in record
