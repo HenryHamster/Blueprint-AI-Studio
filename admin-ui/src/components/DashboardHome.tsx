@@ -261,6 +261,28 @@ interface DigestData {
   tasks_truncated?: boolean;
 }
 
+// Per-direction SR catch-rate breakdown types (endpoint: GET /projects/{id}/direction-sr-breakdown)
+interface DirectionSrCategoryStats {
+  human_count: number;
+  hit_count: number;
+  miss_rate: number | null;
+  miss_examples?: string[];
+}
+
+export interface DirectionSrEntry {
+  direction_id: string;
+  direction_text: string;
+  sample_size: number;
+  overall_catch_rate: number | null;
+  categories: Record<string, DirectionSrCategoryStats>;
+  worst_category: string | null;
+}
+
+interface DirectionSrBreakdownData {
+  directions: DirectionSrEntry[];
+  min_sample: number;
+}
+
 /**
  * Type guard for the /api/admin/digest response. Checks the fields the
  * dashboard requires so any backend rename or removal is caught at fetch
@@ -574,6 +596,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
+  const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [loading, setLoading] = useState(true);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
@@ -700,6 +723,12 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
               const data = await res.json();
               setSrRecentMisses(data.misses ?? []);
             }
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/direction-sr-breakdown`);
+            if (res.ok) setDirectionSrBreakdown(await res.json());
           } catch { /* silent */ }
         })(),
       );
@@ -1107,6 +1136,60 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {srReviewerDisagreements.total_entries} categor{srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}</span>
               </p>
               <SrReviewerDisagreementsPanel data={srReviewerDisagreements} />
+            </section>
+          )}
+
+          {/* Per-Direction SR Catch-Rate */}
+          {!loading && directionSrBreakdown && directionSrBreakdown.directions.length > 0 && (
+            <section data-testid="direction-sr-breakdown">
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+                SR Catch-Rate by Direction
+                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
+                  · {directionSrBreakdown.directions.length} direction{directionSrBreakdown.directions.length !== 1 ? 's' : ''} · worst-first
+                </span>
+              </p>
+              <div className="flex flex-col gap-1.5">
+                {directionSrBreakdown.directions.map(d => {
+                  const rate = d.overall_catch_rate;
+                  const rateColor = rate == null ? 'text-neutral-500' : rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
+                  return (
+                    <div
+                      key={d.direction_id}
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2"
+                    >
+                      <div className="flex items-baseline gap-2 mb-1">
+                        <span
+                          className={`font-mono font-bold tabular-nums text-sm ${rateColor}`}
+                          title="overall SR catch rate for this direction"
+                        >
+                          {rate != null ? `${Math.round(rate * 100)}%` : '–'}
+                        </span>
+                        <span
+                          className="text-[10px] text-neutral-300 truncate flex-1"
+                          title={d.direction_text}
+                          onClick={() => onDirectionClick?.(d.direction_id)}
+                          role={onDirectionClick ? 'button' : undefined}
+                          style={onDirectionClick ? { cursor: 'pointer' } : undefined}
+                        >
+                          {d.direction_text || d.direction_id}
+                        </span>
+                        <span className="text-[9px] text-neutral-600 shrink-0">n={d.sample_size}</span>
+                      </div>
+                      {d.worst_category && d.categories[d.worst_category] && (() => {
+                        const worst = d.categories[d.worst_category!]!;
+                        return (
+                          <p className="text-[9px] text-neutral-500">
+                            worst: <span className="text-orange-400 font-mono">{d.worst_category}</span>
+                            {worst.miss_rate != null && (
+                              <span className="ml-1 font-mono text-orange-400">{Math.round(worst.miss_rate * 100)}% miss</span>
+                            )}
+                          </p>
+                        );
+                      })()}
+                    </div>
+                  );
+                })}
+              </div>
             </section>
           )}
 

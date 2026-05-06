@@ -8252,6 +8252,92 @@ async def test_digest_sr_trends_fp_fields_passthrough(client: AsyncClient, db_se
 
 
 # ---------------------------------------------------------------------------
+# Per-direction SR breakdown endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_empty(client: AsyncClient, db_session):
+    """No tasks → empty directions list with min_sample key."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/projects/{project.id}/direction-sr-breakdown")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["directions"] == []
+    assert body["min_sample"] == 3
+
+
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_basic(client: AsyncClient, db_session):
+    """Directions with >=3 qualifying tasks appear with correct catch-rate stats."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    ctx_hit = {
+        "direction_id": "d-aaa",
+        "_first_attempt_rejection_categories": ["correctness"],
+        "_self_review_outcome": {"check_results": {"correctness": {"passed": False}}},
+    }
+    ctx_miss = {
+        "direction_id": "d-aaa",
+        "_first_attempt_rejection_categories": ["correctness"],
+        "_self_review_outcome": {"check_results": {"correctness": {"passed": True}}},
+    }
+    for ctx in [ctx_hit, ctx_hit, ctx_miss]:
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context=ctx,
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/direction-sr-breakdown")
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["directions"]) == 1
+    entry = body["directions"][0]
+    assert entry["direction_id"] == "d-aaa"
+    assert entry["sample_size"] == 3
+    assert entry["worst_category"] == "correctness"
+    cat = entry["categories"]["correctness"]
+    assert cat["human_count"] == 3
+    assert cat["hit_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_excludes_insufficient_sample(client: AsyncClient, db_session):
+    """Directions with fewer than 3 qualifying tasks are omitted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(2):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "direction_id": "d-bbb",
+                "_first_attempt_rejection_categories": ["correctness"],
+                "_self_review_outcome": {"check_results": {"correctness": {"passed": False}}},
+            },
+        ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/direction-sr-breakdown")
+    assert response.status_code == 200
+    assert response.json()["directions"] == []
+
+
+# ---------------------------------------------------------------------------
 # SR recent misses endpoint
 # ---------------------------------------------------------------------------
 

@@ -2210,6 +2210,7 @@ def compute_sr_catch_rate_by_direction(
         {
           "d-abc123": {
             "sample_count": 5,
+            "miss_rate": 0.6,
             "categories": {
               "regression_risk": {
                 "hit_rate": 0.4,
@@ -2224,7 +2225,8 @@ def compute_sr_catch_rate_by_direction(
         }
 
     Directions with fewer than _MIN_DIRECTION_SR_SAMPLE qualifying tasks are
-    omitted (insufficient signal).
+    omitted (insufficient signal). Both directions and categories are sorted
+    worst-first by miss rate for stable admin/UI rendering.
     """
     by_direction: dict[str, list] = {}
     for t in all_tasks:
@@ -2252,11 +2254,30 @@ def compute_sr_catch_rate_by_direction(
                 entry["examples"] = ex
             categories[cat] = entry
         if categories:
+            categories = dict(
+                sorted(
+                    categories.items(),
+                    key=lambda item: (-item[1]["miss_rate"], item[0]),
+                )
+            )
+            total_samples = sum(entry["sample_count"] for entry in categories.values())
+            weighted_miss_rate = (
+                round(
+                    sum(
+                        entry["miss_rate"] * entry["sample_count"]
+                        for entry in categories.values()
+                    ) / total_samples,
+                    3,
+                )
+                if total_samples
+                else None
+            )
             result[direction_id] = {
                 "sample_count": count,
+                "miss_rate": weighted_miss_rate,
                 "categories": categories,
             }
-    return result
+    return dict(sorted(result.items(), key=lambda item: (-item[1]["miss_rate"], item[0])))
 
 
 def _compute_cat_fp_stats(

@@ -494,6 +494,94 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
   );
 }
 
+export interface DirectionSrCatStat {
+  human_count: number;
+  hit_count: number;
+  miss_rate: number | null;
+  miss_examples: Array<{ desc: string; severity: string }>;
+}
+
+export interface DirectionSrEntry {
+  direction_id: string;
+  direction_text?: string;
+  sample_size: number;
+  overall_catch_rate: number | null;
+  worst_category: string | null;
+  categories: Record<string, DirectionSrCatStat>;
+}
+
+export function DirectionSrBreakdownPanel({
+  entries,
+  onDirectionClick,
+}: {
+  entries: DirectionSrEntry[];
+  onDirectionClick?: (directionId: string) => void;
+}) {
+  const sorted = [...entries].sort(
+    (a, b) => (a.overall_catch_rate ?? 1) - (b.overall_catch_rate ?? 1),
+  );
+  if (sorted.length === 0) return null;
+  return (
+    <div data-testid="direction-sr-breakdown-panel" className="flex flex-col gap-1.5">
+      {sorted.map(d => {
+        const rate = d.overall_catch_rate;
+        const rateColor =
+          rate == null ? 'text-neutral-500' :
+          rate >= 0.7 ? 'text-emerald-400' :
+          rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
+        const cats = Object.entries(d.categories).sort(
+          ([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0),
+        );
+        return (
+          <div key={d.direction_id} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2">
+            <div className="flex items-baseline gap-2 mb-0.5">
+              <span
+                className={`font-mono font-bold tabular-nums ${rateColor}`}
+                title="overall SR catch rate for this direction"
+              >
+                {rate != null ? `${Math.round(rate * 100)}%` : '–'}
+              </span>
+              <span
+                className={`text-[10px] text-neutral-300 truncate flex-1${onDirectionClick ? ' cursor-pointer hover:underline' : ''}`}
+                title={d.direction_text}
+                onClick={() => onDirectionClick?.(d.direction_id)}
+                role={onDirectionClick ? 'button' : undefined}
+              >
+                {d.direction_text || d.direction_id}
+              </span>
+              <span className="text-[9px] text-neutral-600 shrink-0">n={d.sample_size}</span>
+            </div>
+            {cats.length > 0 && (
+              <div className="flex flex-col gap-0.5">
+                {cats.map(([cat, s]) => (
+                  <div key={cat} className="text-[10px]">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-neutral-400">{cat}</span>
+                      {s.miss_rate != null && (
+                        <span className="font-mono text-orange-400">{Math.round(s.miss_rate * 100)}% miss</span>
+                      )}
+                      <span className="text-neutral-600 ml-auto">n={s.human_count}</span>
+                    </div>
+                    {s.miss_examples.length > 0 && (
+                      <ExampleList
+                        examples={s.miss_examples.map(e => ({
+                          severity: e.severity as SrMissExample['severity'],
+                          desc: e.desc,
+                        }))}
+                        indent
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export interface SrMissedTask {
   task_id: string;
   title: string;

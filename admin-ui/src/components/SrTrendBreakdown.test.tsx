@@ -1,7 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { SrTrendBreakdown, EdgesTrendBreakdown, type SrTrendData, type EdgesTrend } from './SrTrendBreakdown';
+import {
+  SrTrendBreakdown,
+  DirectionSrBreakdownPanel,
+  EdgesTrendBreakdown,
+  type SrTrendData,
+  type DirectionSrEntry,
+  type EdgesTrend,
+} from './SrTrendBreakdown';
 
 function makeTrends(): SrTrendData {
   return {
@@ -262,6 +269,77 @@ describe('SrTrendBreakdown skip rate line', () => {
     render(<SrTrendBreakdown trends={trends} variant="card" />);
     const line = screen.getByTestId('sr-skip-rate-line');
     expect(line.className).not.toContain('amber');
+  });
+});
+
+describe('DirectionSrBreakdownPanel', () => {
+  it('returns null when entries array is empty', () => {
+    const { container } = render(<DirectionSrBreakdownPanel entries={[]} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders entries sorted worst-first (lowest overall catch rate first)', () => {
+    const entries: DirectionSrEntry[] = [
+      { direction_id: 'd1', direction_text: 'Dir A', sample_size: 10, overall_catch_rate: 0.8, worst_category: null, categories: {} },
+      { direction_id: 'd2', direction_text: 'Dir B', sample_size: 10, overall_catch_rate: 0.3, worst_category: null, categories: {} },
+      { direction_id: 'd3', direction_text: 'Dir C', sample_size: 10, overall_catch_rate: 0.5, worst_category: null, categories: {} },
+    ];
+    render(<DirectionSrBreakdownPanel entries={entries} />);
+    const rates = screen.getAllByTitle('overall SR catch rate for this direction');
+    expect(rates[0].textContent).toBe('30%');
+    expect(rates[1].textContent).toBe('50%');
+    expect(rates[2].textContent).toBe('80%');
+  });
+
+  it('shows category breakdown sorted worst-first within each direction', () => {
+    const entries: DirectionSrEntry[] = [{
+      direction_id: 'd1',
+      direction_text: 'Test Direction',
+      sample_size: 5,
+      overall_catch_rate: 0.4,
+      worst_category: 'correctness',
+      categories: {
+        style: { human_count: 2, hit_count: 1, miss_rate: 0.5, miss_examples: [] },
+        correctness: { human_count: 3, hit_count: 1, miss_rate: 0.67, miss_examples: [] },
+      },
+    }];
+    render(<DirectionSrBreakdownPanel entries={entries} />);
+    expect(screen.getByText('67% miss')).toBeInTheDocument();
+    expect(screen.getByText('50% miss')).toBeInTheDocument();
+  });
+
+  it('renders miss examples via ExampleList', () => {
+    const entries: DirectionSrEntry[] = [{
+      direction_id: 'd1',
+      direction_text: 'Test Direction',
+      sample_size: 5,
+      overall_catch_rate: 0.4,
+      worst_category: 'correctness',
+      categories: {
+        correctness: {
+          human_count: 3, hit_count: 1, miss_rate: 0.67,
+          miss_examples: [{ desc: 'null check missed', severity: 'CRITICAL' }],
+        },
+      },
+    }];
+    render(<DirectionSrBreakdownPanel entries={entries} />);
+    expect(screen.getByText('null check missed')).toBeInTheDocument();
+  });
+
+  it('invokes onDirectionClick when direction label is clicked', async () => {
+    const onDirectionClick = vi.fn();
+    const user = userEvent.setup();
+    const entries: DirectionSrEntry[] = [{
+      direction_id: 'd1',
+      direction_text: 'Clickable Direction',
+      sample_size: 5,
+      overall_catch_rate: 0.4,
+      worst_category: null,
+      categories: {},
+    }];
+    render(<DirectionSrBreakdownPanel entries={entries} onDirectionClick={onDirectionClick} />);
+    await user.click(screen.getByText('Clickable Direction'));
+    expect(onDirectionClick).toHaveBeenCalledWith('d1');
   });
 });
 

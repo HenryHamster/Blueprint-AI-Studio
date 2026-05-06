@@ -431,6 +431,7 @@ interface SelfReviewOutcome {
   blind_spots?: string[];
   reviewer_findings?: ReviewerFinding[];
   edges_considered?: EdgeConsidered[];
+  fix_iteration?: number;
 }
 
 function getSeverityColor(severity: string): string {
@@ -441,6 +442,17 @@ function getSeverityColor(severity: string): string {
     case 'LOW': return 'bg-yellow-950/40 border-yellow-800/40 text-yellow-400';
     default: return 'bg-neutral-800 border-neutral-700 text-neutral-400';
   }
+}
+
+function getSRPredictionBadge(category: string, checkResults: Record<string, SelfReviewCheckResult>): { icon: string; label: string; color: string } | null {
+  if (!checkResults || !(category in checkResults)) {
+    return { icon: '–', label: 'no SR signal', color: 'bg-neutral-900/40 border-neutral-700/40 text-neutral-500' };
+  }
+  const result = checkResults[category];
+  if (!result.passed) {
+    return { icon: '✓', label: 'caught by SR', color: 'bg-emerald-950/40 border-emerald-800/40 text-emerald-400' };
+  }
+  return { icon: '✗', label: 'missed by SR', color: 'bg-red-950/40 border-red-800/40 text-red-400' };
 }
 
 function SelfReviewPanel({ task }: { task: Task }) {
@@ -491,6 +503,12 @@ function SelfReviewPanel({ task }: { task: Task }) {
                   <span className="text-neutral-500">Verdict</span>
                   <span className={`font-semibold uppercase ${verdictColor}`}>{verdict}</span>
                 </div>
+                {outcome.fix_iteration !== undefined && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-neutral-500">Iteration</span>
+                    <span className="font-semibold text-blue-400">#{outcome.fix_iteration}</span>
+                  </div>
+                )}
                 {outcome.fixes_applied !== undefined && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-neutral-500">Fixes applied</span>
@@ -580,15 +598,23 @@ function SelfReviewPanel({ task }: { task: Task }) {
                     {reviewerFindings.sort((a, b) => {
                       const severityOrder: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
                       return (severityOrder[a.severity] ?? 4) - (severityOrder[b.severity] ?? 4);
-                    }).map((finding, i) => (
-                      <div key={i} className={`text-xs rounded border px-2 py-1.5 ${getSeverityColor(finding.severity)}`}>
-                        <div className="flex items-center gap-2 mb-0.5">
-                          <span className="font-semibold uppercase text-[9px] tracking-wide">{finding.severity}</span>
-                          <span className="font-mono text-[10px]">{finding.category}</span>
+                    }).map((finding, i) => {
+                      const srBadge = getSRPredictionBadge(finding.category, checkResults);
+                      return (
+                        <div key={i} className={`text-xs rounded border px-2 py-1.5 ${getSeverityColor(finding.severity)}`}>
+                          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                            <span className="font-semibold uppercase text-[9px] tracking-wide">{finding.severity}</span>
+                            <span className="font-mono text-[10px]">{finding.category}</span>
+                            {srBadge && (
+                              <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border inline-block ml-auto ${srBadge.color}`}>
+                                {srBadge.icon} {srBadge.label}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-neutral-200 break-words">{finding.description}</p>
                         </div>
-                        <p className="text-neutral-200 break-words">{finding.description}</p>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
