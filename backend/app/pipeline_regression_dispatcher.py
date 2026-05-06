@@ -22,8 +22,14 @@ from typing import Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.deploy_health import (
+    _DEPLOY_MONITORING_DEFER_WINDOW,
+    get_deploy_monitoring_defer_until,
+    record_deploy_monitoring_deferral,
+)
 from app.models import (
-    Alert, AlertSeverity, RegressionCaseStatus, RegressionRemediationCase,
+    Alert, AlertSeverity, DeploymentState,
+    RegressionCaseStatus, RegressionRemediationCase,
     Task, TaskHistory, TaskStatus,
 )
 from app.payload_schemas import validate_internal_payload
@@ -176,6 +182,31 @@ def _format_signal_lines(
     return "\n".join(lines)
 
 
+def _format_bundle_signal_lines(signals: list[dict]) -> str:
+    """Format a single investigate prompt covering a bundle of related signals."""
+    lines = [
+        f"Pipeline regression bundle: {len(signals)} related signal(s) tripped this cycle.",
+        "Investigate the shared root cause across all signals below.\n",
+    ]
+    for s in signals:
+        rc = s.get("regression_class", s["signal_name"])
+        prior_str = f"{s['prior_rate']:.1%}" if s.get("prior_rate") is not None else "N/A"
+        curr_str = f"{s['current_rate']:.1%}" if s.get("current_rate") is not None else "N/A"
+        lines += [
+            f"Signal: {s['signal_name']} / class={rc}",
+            f"  Prior: {prior_str}  Current: {curr_str}  n={s.get('sample_size', 0)}",
+        ]
+        for extra in (s.get("extras") or []):
+            lines.append(f"  {extra}")
+    lines.append(
+        "\nDiagnose the shared root cause and produce the structured diagnosis "
+        "JSON ({summary, root_cause, recommended_fix, severity, confidence, "
+        "affected_files}). Do NOT prescribe a fix — let the investigate→fix "
+        "chain produce the remediation."
+    )
+    return "\n".join(lines)
+
+
 async def _current_signal_value_for_class(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -184,6 +215,28 @@ async def _current_signal_value_for_class(
 ) -> Optional[dict[str, Any]]:
     from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
     from app.models import Task as TaskModel  # noqa: PLC0415
+
+    # Bucket-level checks: tripped=True if any constituent signal is still tripped.
+    if regression_class == "sr_catch_rate":
+        categories = (
+            ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get("categories") or {}
+        )
+        for cat in sorted(categories):
+            rc = f"sr_catch_rate:{cat}"
+            state = await _current_signal_value_for_class(session, project_id, rc, project_design_doc)
+            if state is not None and state["tripped"]:
+                return state
+        return {"signal_name": "sr_catch_rate", "prior_rate": None, "current_rate": None,
+                "sample_size": 0, "magnitude": None, "tripped": False, "extras": []}
+
+    if regression_class == "fix_loop_divergence":
+        for loop in ("lint", "test", "check"):
+            rc = f"fix_loop_divergence:{loop}"
+            state = await _current_signal_value_for_class(session, project_id, rc)
+            if state is not None and state["tripped"]:
+                return state
+        return {"signal_name": "fix_loop_divergence", "prior_rate": None, "current_rate": None,
+                "sample_size": 0, "magnitude": None, "tripped": False, "extras": []}
 
     if regression_class.startswith("sr_catch_rate:"):
         cat = regression_class.split(":", 1)[1]
@@ -317,6 +370,8 @@ async def _maybe_spawn(
     extras: list[str] | None = None,
     title_hint: str,
     extra_snapshot_fields: dict | None = None,
+    prompt_override: str | None = None,
+    extra_context_fields: dict | None = None,
 ) -> Optional[Task]:
     """Apply dedup + cooldown gates and spawn an investigate task on green light."""
     logger.info(
@@ -369,7 +424,7 @@ async def _maybe_spawn(
             return None
 
     cooldown_until = (now + _REGRESSION_COOLDOWN).isoformat()
-    prompt = _format_signal_lines(
+    prompt = prompt_override if prompt_override is not None else _format_signal_lines(
         signal_name=signal_name,
         regression_class=regression_class,
         prior_rate=prior_rate,
@@ -396,6 +451,8 @@ async def _maybe_spawn(
         "sample_size": sample_size,
         "dispatcher_cooldown_until_iso": cooldown_until,
     }
+    if extra_context_fields:
+        context.update(extra_context_fields)
     new_task = Task(
         project_id=project_id,
         title=f"Investigate pipeline regression: {title_hint}"[:200],
@@ -475,39 +532,55 @@ async def _evaluate_sr_catch_rate_signal(
     project_design_doc: dict | None,
     spawn_budget_left: int,
 ) -> int:
-    """Re-read the persisted SR catch-rate trends snapshot and trip per-category."""
+    """Collect all tripped SR catch-rate categories and coalesce into one spawn."""
     if spawn_budget_left <= 0:
         return 0
-    doc = project_design_doc or {}
-    trends = doc.get("sr_catch_rate_trends") or {}
-    categories = trends.get("categories") or {}
+    categories = (
+        (project_design_doc or {}).get("sr_catch_rate_trends") or {}
+    ).get("categories") or {}
     if not isinstance(categories, dict):
         return 0
-    spawned = 0
-    for cat, data in categories.items():
-        if spawned >= spawn_budget_left:
-            break
-        if not isinstance(data, dict):
+
+    tripped: list[dict] = []
+    for cat in sorted(categories):
+        if not isinstance(categories[cat], dict):
             continue
-        regression_class = f"sr_catch_rate:{cat}"
-        state = await _current_signal_value_for_class(session, project_id, regression_class, project_design_doc)
-        if state is None or not state["tripped"]:
-            continue
-        spawn = await _maybe_spawn(
-            session,
-            project_id,
-            signal_name=state["signal_name"],
-            regression_class=regression_class,
-            prior_rate=state["prior_rate"],
-            current_rate=state["current_rate"],
-            sample_size=state["sample_size"],
-            magnitude=state["magnitude"],
-            extras=state["extras"],
-            title_hint=f"SR catch-rate {cat}",
+        rc = f"sr_catch_rate:{cat}"
+        state = await _current_signal_value_for_class(session, project_id, rc, project_design_doc)
+        if state is not None and state["tripped"]:
+            state["regression_class"] = rc
+            tripped.append(state)
+
+    if not tripped:
+        return 0
+
+    rep = tripped[0]
+    cats_label = ", ".join(s["regression_class"].split(":")[1] for s in tripped)
+    prompt = (
+        _format_bundle_signal_lines(tripped)
+        if len(tripped) > 1
+        else _format_signal_lines(
+            signal_name=rep["signal_name"],
+            regression_class=rep["regression_class"],
+            prior_rate=rep["prior_rate"],
+            current_rate=rep["current_rate"],
+            sample_size=rep["sample_size"],
+            extras=rep["extras"],
         )
-        if spawn is not None:
-            spawned += 1
-    return spawned
+    )
+    spawn = await _maybe_spawn(
+        session, project_id,
+        signal_name=rep["signal_name"],
+        regression_class="sr_catch_rate",
+        prior_rate=rep["prior_rate"],
+        current_rate=rep["current_rate"],
+        sample_size=rep["sample_size"],
+        magnitude=rep["magnitude"],
+        title_hint=f"SR catch-rate ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"signals": [s["regression_class"] for s in tripped]},
+    )
+    return 1 if spawn is not None else 0
 
 
 async def _evaluate_fix_loop_divergence_signal(
@@ -515,35 +588,48 @@ async def _evaluate_fix_loop_divergence_signal(
     project_id: uuid.UUID,
     spawn_budget_left: int,
 ) -> int:
-    """Recompute the fix-loop divergence regression and trip per loop."""
+    """Collect all tripped fix-loop divergence loops and coalesce into one spawn."""
     if spawn_budget_left <= 0:
         return 0
 
-    loops = ("lint", "test", "check")
+    tripped: list[dict] = []
+    for loop in ("lint", "test", "check"):
+        rc = f"fix_loop_divergence:{loop}"
+        state = await _current_signal_value_for_class(session, project_id, rc)
+        if state is not None and state["tripped"]:
+            state["regression_class"] = rc
+            tripped.append(state)
 
-    spawned = 0
-    for loop in loops:
-        if spawned >= spawn_budget_left:
-            break
-        regression_class = f"fix_loop_divergence:{loop}"
-        state = await _current_signal_value_for_class(session, project_id, regression_class)
-        if state is None or not state["tripped"]:
-            continue
-        spawn = await _maybe_spawn(
-            session,
-            project_id,
-            signal_name=state["signal_name"],
-            regression_class=regression_class,
-            prior_rate=state["prior_rate"],
-            current_rate=state["current_rate"],
-            sample_size=state["sample_size"],
-            magnitude=state["magnitude"],
-            extras=state["extras"],
-            title_hint=f"fix-loop divergence {loop}",
+    if not tripped:
+        return 0
+
+    rep = tripped[0]
+    loops_label = ", ".join(s["regression_class"].split(":")[1] for s in tripped)
+    prompt = (
+        _format_bundle_signal_lines(tripped)
+        if len(tripped) > 1
+        else _format_signal_lines(
+            signal_name=rep["signal_name"],
+            regression_class=rep["regression_class"],
+            prior_rate=rep["prior_rate"],
+            current_rate=rep["current_rate"],
+            sample_size=rep["sample_size"],
+            extras=rep["extras"],
         )
-        if spawn is not None:
-            spawned += 1
-    return spawned
+    )
+    spawn = await _maybe_spawn(
+        session, project_id,
+        signal_name=rep["signal_name"],
+        regression_class="fix_loop_divergence",
+        prior_rate=rep["prior_rate"],
+        current_rate=rep["current_rate"],
+        sample_size=rep["sample_size"],
+        magnitude=rep["magnitude"],
+        title_hint=f"fix-loop divergence ({loops_label})",
+        prompt_override=prompt,
+        extra_context_fields={"signals": [s["regression_class"] for s in tripped]},
+    )
+    return 1 if spawn is not None else 0
 
 
 async def _evaluate_pipeline_success_signal(
@@ -742,6 +828,49 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
     return escalated
 
 
+async def _any_signal_would_trip(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+) -> bool:
+    """Side-effect-free probe: would any subscribed signal trip right now?
+
+    Used to gate the deploy-monitoring defer alert so we don't claim a signal
+    tripped when none actually would. Mirrors the classes scanned in
+    ``run_once``: SR catch-rate, fix-loop divergence, pipeline success-rate,
+    persistent anomalies.
+    """
+    sr_state = await _current_signal_value_for_class(
+        session, project_id, "sr_catch_rate", project_design_doc,
+    )
+    if sr_state is not None and sr_state["tripped"]:
+        return True
+    fl_state = await _current_signal_value_for_class(
+        session, project_id, "fix_loop_divergence", project_design_doc,
+    )
+    if fl_state is not None and fl_state["tripped"]:
+        return True
+    ps_state = await _current_signal_value_for_class(
+        session, project_id, "pipeline_success_rate", project_design_doc,
+    )
+    if ps_state is not None and ps_state["tripped"]:
+        return True
+    import app.shared_state as _ss  # noqa: PLC0415
+    proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
+    recency_cutoff = (
+        _utcnow() - timedelta(hours=_ANOMALY_DISPATCH_RECENCY_HOURS)
+    ).isoformat()
+    for entry in proj_anomalies.values():
+        if not isinstance(entry, dict):
+            continue
+        if int(entry.get("occurrence_count") or 0) < _ANOMALY_DISPATCH_MIN_OCCURRENCES:
+            continue
+        if str(entry.get("last_seen") or "") < recency_cutoff:
+            continue
+        return True
+    return False
+
+
 async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Evaluate all subscribed pipeline-regression signals for ``project_id``.
 
@@ -755,6 +884,31 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
 
     project = await session.get(Project, project_id)
     if project is None:
+        return 0
+
+    # Deploy-monitoring guard: if a fresh deploy is in its observation window,
+    # defer spawns to avoid chasing deploy-induced signal noise.  PAUSED/HALTED
+    # are operator-controlled states the dispatcher already skips via other
+    # coordination; only MONITORING needs a time-bounded defer here. Use the
+    # canonical helpers in deploy_health so the defer rule has one home.
+    deploy_state = await session.get(DeploymentState, 1)
+    defer_until = get_deploy_monitoring_defer_until(deploy_state)
+    if defer_until is not None and _utcnow() < defer_until:
+        # Only emit the operator-visible Alert when a signal actually would
+        # have tripped this cycle — otherwise the run_once tick (every 60s)
+        # would spam ~30 misleading "signal tripped" alerts across the 30-min
+        # window. record_deploy_monitoring_deferral additionally dedupes by
+        # title so a single alert covers the whole monitoring window.
+        if await _any_signal_would_trip(session, project_id, project.design_doc):
+            logger.info(
+                "[REGRESSION_DISPATCHER] deploy-monitoring-defer project=%s "
+                "defer_until=%s — skipping spawn",
+                project_id, defer_until.isoformat(),
+            )
+            await record_deploy_monitoring_deferral(
+                session, project_id, deploy_state, "pipeline_regression_dispatcher",
+            )
+            await session.commit()
         return 0
 
     # Cap 1: research slot budget shared with autonomous research.

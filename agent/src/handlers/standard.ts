@@ -196,6 +196,7 @@ export async function runFreshReviewerPass(
   statusRef: { value: string },
   model?: string,
   projectContext?: Record<string, unknown>,
+  incompleteSrRecovery?: boolean,
 ): Promise<void> {
   let baseCommit = '';
   try { baseCommit = fs.readFileSync(`/tmp/base_commit_${taskId}`, 'utf-8').trim(); } catch { /* ok */ }
@@ -274,11 +275,18 @@ If no issues found: {"reviewer_findings": []}`;
   for (const f of findings) {
     const existing = checkResultsLookup[f.category];
     if (!existing || existing.passed === true) {
-      checkResults[f.category] = { passed: false, issue: `[reviewer] ${f.description}` };
+      const entry: Record<string, unknown> = { passed: false, issue: `[reviewer] ${f.description}` };
+      if (incompleteSrRecovery) {
+        entry.origin = 'reviewer_recovery_after_incomplete_sr';
+      }
+      checkResults[f.category] = entry;
     }
   }
   sr.reviewer_findings = findings;
   sr.check_results = checkResults;
+  if (incompleteSrRecovery) {
+    sr.reviewer_recovery_origin = 'reviewer_recovery_after_incomplete_sr';
+  }
 
   try {
     fs.writeFileSync(srPath, JSON.stringify(sr, null, 2), { mode: 0o644 });
@@ -581,7 +589,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const projectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const freshReviewerEnabled =
     projectMeta?.enable_fresh_reviewer === true || projectMeta?.is_self_repo === true;
+  let freshReviewerAlreadyRan = false;
   if (freshReviewerEnabled && !isAutoRemediation) {
+    freshReviewerAlreadyRan = true;
     const reviewerRelatedFiles = (
       (payload.related_files as string[] | undefined) ||
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
@@ -597,6 +607,41 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       model,
       task.project_context as Record<string, unknown> | undefined,
     );
+  }
+
+  // Auto-trigger fresh-reviewer recovery when SR admits incomplete_review and
+  // the normal fresh-reviewer path hasn't already run. Fires regardless of
+  // project_metadata.enable_fresh_reviewer / is_self_repo. Skipped for
+  // auto-remediation tasks (same exclusion as the normal path).
+  if (!isAutoRemediation && !freshReviewerAlreadyRan) {
+    const srRecoveryPath = `/tmp/self_review_${taskId}.json`;
+    let srRecovery: Record<string, unknown> = {};
+    try {
+      const raw = fs.readFileSync(srRecoveryPath, 'utf-8');
+      if (raw) srRecovery = JSON.parse(raw) as Record<string, unknown>;
+    } catch { /* may not exist */ }
+    const srCategories = Array.isArray(srRecovery.categories) ? srRecovery.categories as string[] : [];
+    const existingFindings = srRecovery.reviewer_findings;
+    const hasExistingFindings = Array.isArray(existingFindings) && existingFindings.length > 0;
+    if (srCategories.includes('incomplete_review') && !hasExistingFindings) {
+      sendLog(ws, '[FreshReview] SR reports incomplete_review — auto-triggering recovery pass.\n');
+      const recoveryRelatedFiles = (
+        (payload.related_files as string[] | undefined) ||
+        ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
+        []
+      );
+      await runFreshReviewerPass(
+        taskId,
+        taskTitle,
+        rawPrompt,
+        recoveryRelatedFiles,
+        ws,
+        statusRef,
+        model,
+        task.project_context as Record<string, unknown> | undefined,
+        true,
+      );
+    }
   }
 }
 

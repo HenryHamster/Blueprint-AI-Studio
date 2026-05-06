@@ -2238,6 +2238,53 @@ def compute_sr_catch_rate_by_direction(
     return result
 
 
+def _compute_cat_fp_stats(
+    tasks: list,
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, dict[str, int]]]]:
+    """Return per-category fp/tp counts for SR failures.
+
+    A category counted as TP when ANY downstream signal independently
+    confirms the SR failure: reviewer_findings, _first_attempt_rejection_categories,
+    or review_loop.review_history (keyword-categorised). Otherwise FP.
+    Returns (cat_fp, type_cat_fp) where keys are category and (task_type, category).
+    """
+    cat_fp: dict[str, dict[str, int]] = {}
+    type_cat_fp: dict[str, dict[str, dict[str, int]]] = {}
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type", "")
+        if task_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro:
+            continue
+        check_results = sro.get("check_results") or {}
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        if not sr_failed:
+            continue
+        reviewer_cats = {
+            f.get("category")
+            for f in (sro.get("reviewer_findings") or [])
+            if isinstance(f, dict) and f.get("category")
+        }
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        rev_hist_cats: set[str] = set()
+        if rev_hist:
+            rev_hist_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
+        confirmed = reviewer_cats | human_cats | rev_hist_cats
+        for cat in sr_failed:
+            bucket = cat_fp.setdefault(cat, {"fp": 0, "tp": 0})
+            tbucket = type_cat_fp.setdefault(task_type, {}).setdefault(cat, {"fp": 0, "tp": 0})
+            if cat in confirmed:
+                bucket["tp"] += 1
+                tbucket["tp"] += 1
+            else:
+                bucket["fp"] += 1
+                tbucket["fp"] += 1
+    return cat_fp, type_cat_fp
+
+
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -2470,6 +2517,16 @@ async def compute_sr_catch_rate_trends(
             and all(r < _floor_thresh for r in history[-_floor_min_win:])
         )
 
+    # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
+    cat_fp_stats, type_cat_fp_stats = _compute_cat_fp_stats(current_window_tasks)
+    for cat, data in categories.items():
+        fp_data = cat_fp_stats.get(cat) or {}
+        fp = fp_data.get("fp", 0)
+        tp = fp_data.get("tp", 0)
+        data["fp_count"] = fp
+        data["tp_count"] = tp
+        data["false_positive_rate"] = round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+
     # Compute per-task-type category breakdown from current window only.
     # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
     by_task_type: dict[str, dict[str, Any]] = {}
@@ -2488,6 +2545,12 @@ async def compute_sr_catch_rate_trends(
             }
             if ex:
                 entry["examples"] = ex
+            tfp = (type_cat_fp_stats.get(ttype) or {}).get(cat) or {}
+            fp_t = tfp.get("fp", 0)
+            tp_t = tfp.get("tp", 0)
+            entry["fp_count"] = fp_t
+            entry["tp_count"] = tp_t
+            entry["false_positive_rate"] = round(fp_t / (fp_t + tp_t), 3) if (fp_t + tp_t) > 0 else None
             type_cats[cat] = entry
         if type_cats:
             by_task_type[ttype] = type_cats

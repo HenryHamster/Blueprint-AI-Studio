@@ -3812,3 +3812,106 @@ describe('assembleFailureGuidanceBlocks — structural invariants', () => {
     expect(padIdx).toBeLessThan(bsrIdx);
   });
 });
+
+// ── Task-type focus block contradiction linter ────────────────────────────────
+// Detects surface-level opposing-instruction patterns within focus blocks.
+// Pairs: (always X, never X) / (do X, don't X) / (must X, must not X).
+// Goal: catch obvious drift at change-time. Allowlist suppresses known
+// false positives documented inline.
+describe('task-type focus blocks — contradiction linter', () => {
+  // Allowlist: pairs of (verb pattern, noun pattern) known to be false positives
+  // across multiple focus blocks. Format: "verb-pattern;noun-pattern" where patterns
+  // are case-insensitive substrings matched in the contradiction pairs.
+  // If a genuine contradiction is found, add a comment here explaining why it's
+  // acceptable, then update the allowlist entry.
+  const allowlist = new Set<string>([
+    // No false positives currently documented.
+  ]);
+
+  function lintFocusBlock(blockName: string, content: string): { violations: string[] } {
+    const violations: string[] = [];
+
+    // Contradiction patterns: paired instructions with opposing intent
+    const patterns = [
+      { affirm: /\balways\b/i, negate: /\b(never|don't|do not)\b/i, verb: 'always' },
+      { affirm: /\bmust\b/i, negate: /\b(must not|cannot)\b/i, verb: 'must' },
+      { affirm: /\brequired\b/i, negate: /\bforbidden\b/i, verb: 'required' },
+      { affirm: /\bdo\b/i, negate: /\b(don't|do not|don not)\b/i, verb: 'do' },
+    ];
+
+    for (const patternPair of patterns) {
+      const sentences = content.split(/[.!?]\s+/);
+      const affirmSentences = sentences.filter(s => patternPair.affirm.test(s));
+      const negateSentences = sentences.filter(s => patternPair.negate.test(s));
+
+      for (const affirmSent of affirmSentences) {
+        for (const negateSent of negateSentences) {
+          // Extract the object/noun being discussed (simple heuristic: word after the modal)
+          const affirmMatch = affirmSent.match(/always\s+(\w+(?:\s+\w+)?)/i);
+          const negateMatch = negateSent.match(/(never|don't|do not|must not|cannot)\s+(\w+(?:\s+\w+)?)/i);
+
+          if (affirmMatch && negateMatch) {
+            const affirmObj = affirmMatch[1].toLowerCase();
+            const negateObj = negateMatch[2].toLowerCase();
+
+            // Check if the objects are the same or similar (basic token overlap)
+            if (affirmObj === negateObj || affirmObj.split(/\s+/)[0] === negateObj.split(/\s+/)[0]) {
+              const pairKey = `${patternPair.verb};${affirmObj}`;
+              if (!allowlist.has(pairKey)) {
+                violations.push(
+                  `${blockName}: contradictory instructions about "${affirmObj}"\n` +
+                  `  Affirm: "${affirmSent.trim()}"\n` +
+                  `  Negate: "${negateSent.trim()}"`
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return { violations };
+  }
+
+  it('MIGRATE_TASK_FOCUS contains no contradictions', async () => {
+    const { MIGRATE_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('MIGRATE_TASK_FOCUS', MIGRATE_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+
+  it('REFACTOR_TASK_FOCUS contains no contradictions', async () => {
+    const { REFACTOR_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('REFACTOR_TASK_FOCUS', REFACTOR_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+
+  it('QA_TASK_FOCUS contains no contradictions', async () => {
+    const { QA_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('QA_TASK_FOCUS', QA_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+
+  it('CREATE_TASK_FOCUS contains no contradictions', async () => {
+    const { CREATE_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('CREATE_TASK_FOCUS', CREATE_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+
+  it('FIX_TASK_FOCUS contains no contradictions', async () => {
+    const { FIX_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('FIX_TASK_FOCUS', FIX_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+
+  it('DOCS_TASK_FOCUS contains no contradictions', async () => {
+    const { DOCS_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('DOCS_TASK_FOCUS', DOCS_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+
+  it('DEPS_TASK_FOCUS contains no contradictions', async () => {
+    const { DEPS_TASK_FOCUS } = await import('./prompt.js');
+    const { violations } = lintFocusBlock('DEPS_TASK_FOCUS', DEPS_TASK_FOCUS);
+    expect(violations).toEqual([]);
+  });
+});

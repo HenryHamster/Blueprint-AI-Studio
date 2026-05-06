@@ -79,6 +79,98 @@ function getStaleness(dateStr: string): 'fresh' | 'stale' | 'very_stale' {
 
 const INCLUDED_STATUSES = new Set(['COMPLETED', 'IN_PROGRESS', 'EVALUATING']);
 
+type SourceLink =
+  | { kind: 'url'; href: string }
+  | { kind: 'pr'; href: string; label: string }
+  | { kind: 'path'; href: string; label: string }
+  | { kind: 'text'; label: string };
+
+function classifySourceRef(ref: string, repoUrl: string | null): SourceLink {
+  if (/^https?:\/\//i.test(ref) && isSafeUrl(ref)) {
+    return { kind: 'url', href: ref };
+  }
+  const prMatch = ref.match(/^pr[#-](\d+)$/i);
+  if (prMatch && repoUrl) {
+    const href = `${repoUrl.replace(/\/$/, '')}/pull/${prMatch[1]}`;
+    if (isSafeUrl(href)) return { kind: 'pr', href, label: ref };
+  }
+  if (ref.includes('/') && repoUrl) {
+    const m = ref.match(/^([\w./-]+?)(?::(\d+))?$/);
+    if (m) {
+      const [, path, line] = m;
+      const href = `${repoUrl.replace(/\/$/, '')}/blob/HEAD/${path}${line ? `#L${line}` : ''}`;
+      if (isSafeUrl(href)) return { kind: 'path', href, label: ref };
+    }
+  }
+  return { kind: 'text', label: ref };
+}
+
+function EvidencePanel({ finding, repoUrl }: { finding: ResearchFinding; repoUrl: string | null }) {
+  const [showAllClaims, setShowAllClaims] = useState(false);
+  const claims = finding.claims ?? [];
+  const sources = finding.sources ?? [];
+  if (claims.length === 0 && sources.length === 0) return null;
+  const visibleClaims = showAllClaims ? claims : claims.slice(0, 3);
+  const hiddenCount = claims.length - 3;
+
+  return (
+    <div className="space-y-1.5 pt-1">
+      {claims.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Claims</div>
+          <ul className="list-disc list-inside text-[11px] text-neutral-300 space-y-0.5">
+            {visibleClaims.map((c, i) => <li key={i}>{c}</li>)}
+          </ul>
+          {hiddenCount > 0 && (
+            <button
+              onClick={e => { e.stopPropagation(); setShowAllClaims(v => !v); }}
+              className="mt-0.5 text-[10px] text-cyan-400 hover:text-cyan-300 transition-colors"
+            >
+              {showAllClaims ? 'Show fewer' : `Show ${hiddenCount} more`}
+            </button>
+          )}
+        </div>
+      )}
+      {sources.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Sources</div>
+          <ul className="space-y-0.5 text-[11px]">
+            {sources.map((s, i) => {
+              const link = classifySourceRef(s.ref, repoUrl);
+              const refNode = link.kind === 'url' ? (
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-mono text-blue-400 hover:text-blue-300 break-all"
+                  onClick={e => e.stopPropagation()}
+                >{s.ref}</a>
+              ) : (link.kind === 'pr' || link.kind === 'path') ? (
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-mono text-blue-400 hover:text-blue-300 break-all"
+                  onClick={e => e.stopPropagation()}
+                >{link.label}</a>
+              ) : (
+                <span className="font-mono text-neutral-300 break-all">{link.label}</span>
+              );
+              return (
+                <li key={i} className="leading-snug">
+                  {s.type && <span className="text-[10px] text-neutral-500 mr-1">[{s.type}]</span>}
+                  {refNode}
+                  {s.excerpt && <div className="ml-3 italic text-[10px] text-neutral-500">{s.excerpt}</div>}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed';
 
 const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING']);
@@ -122,6 +214,12 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
     for (const d of directions) m.set(d.id, d);
     return m;
   }, [directions]);
+
+  // Derive repo URL from any task that has one — same project, so they share repo.
+  const repoUrl = useMemo<string | null>(() => {
+    for (const t of tasks) if (t.repo_url) return t.repo_url;
+    return null;
+  }, [tasks]);
 
   // Build the map of finding key -> child task info
   const implementedFindings = useMemo(() => {
@@ -449,6 +547,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                                   <span className={ef.finding.priority === 'high' ? 'text-amber-400' : 'text-neutral-500'}>{ef.finding.priority} priority</span>
                                 )}
                               </div>
+                              <EvidencePanel finding={ef.finding} repoUrl={repoUrl} />
                               {/* Downstream task chain */}
                               {ef.outcome && (
                                 <div className="flex items-center gap-2 text-[10px] text-neutral-500 mt-1">

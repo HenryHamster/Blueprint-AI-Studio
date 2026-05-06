@@ -4,10 +4,60 @@ import {
   fetchResearchActionability,
   type RetirementCritique,
   type ActionabilityResponse,
+  type CycleHistoryEntry,
 } from '../api';
 
 interface StrategicAuditPanelProps {
   projectId: string;
+  calibrationFloor?: number;
+}
+
+const CALIBRATION_TOOLTIP =
+  'HIGH-grade findings should merge more often than LOW. Negative = miscalibrated.';
+
+function calibrationBadgeStyle(
+  score: number | null | undefined,
+  floor: number,
+): { label: string; className: string; tooltip?: string } {
+  if (score == null) {
+    return {
+      label: 'n/a',
+      className: 'bg-neutral-800/60 text-neutral-500 border-neutral-700/50',
+    };
+  }
+  const pct = Math.round(score * 100);
+  const sign = pct > 0 ? '+' : '';
+  const label = `${sign}${pct}%`;
+  if (score >= floor) {
+    return {
+      label,
+      className: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+    };
+  }
+  if (score >= 0) {
+    return {
+      label,
+      className: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+      tooltip: CALIBRATION_TOOLTIP,
+    };
+  }
+  return {
+    label,
+    className: 'bg-red-500/20 text-red-400 border-red-500/30',
+    tooltip: CALIBRATION_TOOLTIP,
+  };
+}
+
+function cycleSquareClass(score: number | null, floor: number): string {
+  if (score == null) return 'bg-neutral-800/60 border-neutral-700/50';
+  if (score >= floor) return 'bg-emerald-500/40 border-emerald-500/40';
+  if (score >= 0) return 'bg-amber-500/40 border-amber-500/40';
+  return 'bg-red-500/40 border-red-500/40';
+}
+
+function formatRate(rate: number | null | undefined): string {
+  if (rate == null) return '—';
+  return `${Math.round(rate * 100)}%`;
 }
 
 function gradeColor(grade: string) {
@@ -23,11 +73,13 @@ function GradeDistributionRow({
   count,
   tasked,
   merged,
+  mergeRate,
 }: {
   grade: string;
   count: number;
   tasked: number;
   merged: number;
+  mergeRate?: number | null;
 }) {
   return (
     <div className="flex items-center gap-2 text-[11px]">
@@ -44,8 +96,41 @@ function GradeDistributionRow({
           <span className="text-neutral-600">→</span>
           <span className="text-neutral-300 font-mono">{merged}</span>
           <span className="text-neutral-500">merged</span>
+          <span className="text-neutral-600">·</span>
+          <span className="text-neutral-300 font-mono">{formatRate(mergeRate)}</span>
+          <span className="text-neutral-500">merge rate</span>
         </>
       )}
+    </div>
+  );
+}
+
+function CycleHistorySparkline({
+  history,
+  floor,
+}: {
+  history: CycleHistoryEntry[];
+  floor: number;
+}) {
+  return (
+    <div className="flex items-center gap-0.5 mt-1.5" data-testid="calibration-sparkline">
+      {history.map((entry, i) => {
+        const score = entry.calibration_score;
+        const label =
+          score == null
+            ? 'n/a'
+            : `${score > 0 ? '+' : ''}${Math.round(score * 100)}%`;
+        const date = entry.cycle_created_at
+          ? new Date(entry.cycle_created_at).toLocaleDateString()
+          : entry.cycle_id;
+        return (
+          <span
+            key={`${entry.cycle_id}-${i}`}
+            className={`w-3 h-3 rounded-sm border ${cycleSquareClass(score, floor)}`}
+            title={`${date}: ${label}`}
+          />
+        );
+      })}
     </div>
   );
 }
@@ -83,7 +168,7 @@ function CritiqueRow({ critique }: { critique: RetirementCritique }) {
   );
 }
 
-export function StrategicAuditPanel({ projectId }: StrategicAuditPanelProps) {
+export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: StrategicAuditPanelProps) {
   const [critiques, setCritiques] = useState<RetirementCritique[] | null>(null);
   const [actionability, setActionability] = useState<ActionabilityResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -139,27 +224,42 @@ export function StrategicAuditPanel({ projectId }: StrategicAuditPanelProps) {
 
   return (
     <div className="mt-4 space-y-4">
-      {hasActionability && (
-        <div>
-          <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
-            Research Actionability
-            <span className="ml-2 text-neutral-600 font-normal normal-case">
-              ({actionability.cycles_scanned} cycles · {actionability.total_findings} findings)
-            </span>
-          </h3>
-          <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2">
-            {grades.map(g => (
-              <GradeDistributionRow
-                key={g}
-                grade={g}
-                count={actionability.grade_distribution[g] ?? 0}
-                tasked={actionability.grade_tasked[g] ?? 0}
-                merged={actionability.grade_merged[g] ?? 0}
-              />
-            ))}
+      {hasActionability && (() => {
+        const badge = calibrationBadgeStyle(actionability.calibration_score, calibrationFloor);
+        const history = actionability.cycle_history ?? [];
+        return (
+          <div>
+            <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex items-center gap-2">
+              <span>Research Actionability</span>
+              <span
+                data-testid="calibration-badge"
+                className={`px-1.5 py-0.5 rounded border text-[10px] font-medium normal-case ${badge.className}`}
+                title={badge.tooltip}
+              >
+                {badge.label}
+              </span>
+              <span className="text-neutral-600 font-normal normal-case">
+                ({actionability.cycles_scanned} cycles · {actionability.total_findings} findings)
+              </span>
+            </h3>
+            {history.length > 0 && (
+              <CycleHistorySparkline history={history} floor={calibrationFloor} />
+            )}
+            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 mt-2">
+              {grades.map(g => (
+                <GradeDistributionRow
+                  key={g}
+                  grade={g}
+                  count={actionability.grade_distribution[g] ?? 0}
+                  tasked={actionability.grade_tasked[g] ?? 0}
+                  merged={actionability.grade_merged[g] ?? 0}
+                  mergeRate={actionability.grade_merge_rate?.[g] ?? null}
+                />
+              ))}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {hasCritiques && (
         <div>

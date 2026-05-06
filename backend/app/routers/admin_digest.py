@@ -3442,9 +3442,17 @@ async def _compute_digest(
     latest_cycle = None
     prediction_calibration: Dict[str, Any] | None = None
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
+    self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     if project_id:
         _proj = await session.get(Project, project_id)
         if _proj:
+            _sr_trends = (_proj.design_doc or {}).get("sr_catch_rate_trends") or {}
+            if _sr_trends:
+                self_review_prediction_accuracy_trends = {
+                    "computed_at": _sr_trends.get("computed_at"),
+                    "categories": _sr_trends.get("categories") or {},
+                    "by_task_type": _sr_trends.get("by_task_type") or {},
+                }
             cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
             completed_cycles = [c for c in cycle_history if c.get("outcome") not in (None, "in_progress")]
             if completed_cycles:
@@ -4184,6 +4192,7 @@ async def _compute_digest(
         "first_review_approval_rate": _first_review_approval_rate,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
         "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
+        "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "self_review_skip_rate": _self_review_skip_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
@@ -4448,6 +4457,106 @@ async def get_retirement_critiques(
 _MAX_ACTIONABILITY_CYCLES = 50
 
 
+def _aggregate_actionability_bucket(
+    research_tasks_in_bucket: list,
+    followon_tasks: list,
+    research_task_ids: set,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Aggregate (grade_distribution, grade_tasked, grade_merged) for a bucket
+    of research tasks. Reuses the same merge-attribution rules as the global
+    aggregation: research tasks are excluded from follow-ons (self-attribution
+    guard), and a follow-on must be created strictly after the bucket's
+    earliest research task that produced the finding's direction.
+    """
+    finding_direction_ids: set[str] = set()
+    findings_by_dir: dict[str, list[dict]] = {}
+    grade_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    dir_research_first_at: dict[str, datetime] = {}
+
+    for t in research_tasks_in_bucket:
+        raw = t.plan_output
+        if not isinstance(raw, list):
+            continue
+        for f in raw:
+            if not isinstance(f, dict) or not f.get("title"):
+                continue
+            grade = f.get("actionability_grade", "MEDIUM")
+            if grade not in grade_counts:
+                grade = "MEDIUM"
+            grade_counts[grade] += 1
+            dir_id = f.get("direction_id")
+            if dir_id:
+                key = str(dir_id)
+                finding_direction_ids.add(key)
+                findings_by_dir.setdefault(key, []).append({"grade": grade})
+                if t.created_at is not None:
+                    prev = dir_research_first_at.get(key)
+                    if prev is None or t.created_at < prev:
+                        dir_research_first_at[key] = t.created_at
+
+    dir_outcome: dict[str, dict] = {}
+    for t in followon_tasks:
+        if t.id in research_task_ids:
+            continue
+        t_type = (t.first_payload or {}).get("type")
+        if t_type == "research":
+            continue
+        ctx = t.context or {}
+        dir_id = ctx.get("direction_id") or ctx.get("related_direction_id")
+        if not dir_id or str(dir_id) not in finding_direction_ids:
+            continue
+        key = str(dir_id)
+        research_at = dir_research_first_at.get(key)
+        if research_at is not None and t.created_at is not None and t.created_at <= research_at:
+            continue
+        entry = dir_outcome.setdefault(key, {"tasked": False, "merged": False})
+        entry["tasked"] = True
+        if t.status == TaskStatus.COMPLETED and ctx.get("pr_merged") is True:
+            entry["merged"] = True
+
+    grade_tasked: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    grade_merged: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for dir_id, findings in findings_by_dir.items():
+        outcome = dir_outcome.get(dir_id, {})
+        for f in findings:
+            g = f["grade"]
+            if outcome.get("tasked"):
+                grade_tasked[g] = grade_tasked.get(g, 0) + 1
+            if outcome.get("merged"):
+                grade_merged[g] = grade_merged.get(g, 0) + 1
+
+    return grade_counts, grade_tasked, grade_merged
+
+
+def _compute_actionability_rates(
+    grade_counts: dict[str, int],
+    grade_tasked: dict[str, int],
+    grade_merged: dict[str, int],
+) -> tuple[dict[str, Optional[float]], dict[str, Optional[float]], Optional[float]]:
+    """Derive (grade_merge_rate, grade_merge_rate_of_tasked, calibration_score).
+
+    Rates are None (not 0.0) when the denominator is 0 so the UI can
+    distinguish 'no data' from 'zero merges'. calibration_score is HIGH-rate
+    minus LOW-rate, or None when either is None.
+    """
+    grade_merge_rate: dict[str, Optional[float]] = {}
+    grade_merge_rate_of_tasked: dict[str, Optional[float]] = {}
+    for g in ("HIGH", "MEDIUM", "LOW"):
+        gd = grade_counts.get(g, 0)
+        gt = grade_tasked.get(g, 0)
+        gm = grade_merged.get(g, 0)
+        grade_merge_rate[g] = (gm / gd) if gd > 0 else None
+        grade_merge_rate_of_tasked[g] = (gm / gt) if gt > 0 else None
+    high_rate = grade_merge_rate["HIGH"]
+    low_rate = grade_merge_rate["LOW"]
+    calibration_score = (
+        high_rate - low_rate
+        if (high_rate is not None and low_rate is not None)
+        else None
+    )
+    return grade_merge_rate, grade_merge_rate_of_tasked, calibration_score
+
+
 @router.get("/projects/{project_id}/research-actionability")
 async def get_research_actionability(
     project_id: uuid.UUID,
@@ -4505,36 +4614,7 @@ async def get_research_actionability(
         .limit(500)
     )
     research_tasks = research_result.scalars().all()
-
-    # Collect direction_ids that appear in findings, plus the earliest research
-    # task per direction (so follow-on attribution requires created_at > that).
-    finding_direction_ids: set[str] = set()
-    findings_by_dir: dict[str, list[dict]] = {}
-    grade_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    dir_research_first_at: dict[str, datetime] = {}
-    research_task_ids: set[uuid.UUID] = set()
-
-    for t in research_tasks:
-        research_task_ids.add(t.id)
-        raw = t.plan_output
-        if not isinstance(raw, list):
-            continue
-        for f in raw:
-            if not isinstance(f, dict) or not f.get("title"):
-                continue
-            grade = f.get("actionability_grade", "MEDIUM")
-            if grade not in grade_counts:
-                grade = "MEDIUM"
-            grade_counts[grade] += 1
-            dir_id = f.get("direction_id")
-            if dir_id:
-                key = str(dir_id)
-                finding_direction_ids.add(key)
-                findings_by_dir.setdefault(key, []).append({"grade": grade})
-                if t.created_at is not None:
-                    prev = dir_research_first_at.get(key)
-                    if prev is None or t.created_at < prev:
-                        dir_research_first_at[key] = t.created_at
+    research_task_ids: set[uuid.UUID] = {t.id for t in research_tasks}
 
     # Fetch follow-on tasks (same project, after oldest_cycle_at). We pull
     # payloads so we can exclude research-type tasks below.
@@ -4549,42 +4629,48 @@ async def get_research_actionability(
     )
     followon_tasks = followon_result.scalars().all()
 
-    # Build a map: direction_id → {tasked: bool, merged: bool}
-    dir_outcome: dict[str, dict] = {}
-    for t in followon_tasks:
-        # Exclude research tasks themselves — they carry direction_id in context
-        # (see research_completion.py:1721) and would otherwise self-attribute.
-        if t.id in research_task_ids:
-            continue
-        t_type = (t.first_payload or {}).get("type")
-        if t_type == "research":
-            continue
-        ctx = t.context or {}
-        dir_id = ctx.get("direction_id") or ctx.get("related_direction_id")
-        if not dir_id or str(dir_id) not in finding_direction_ids:
-            continue
-        key = str(dir_id)
-        # Only count follow-ons created strictly after the research task that
-        # produced the finding for this direction.
-        research_at = dir_research_first_at.get(key)
-        if research_at is not None and t.created_at is not None and t.created_at <= research_at:
-            continue
-        entry = dir_outcome.setdefault(key, {"tasked": False, "merged": False})
-        entry["tasked"] = True
-        if t.status == TaskStatus.COMPLETED and ctx.get("pr_merged") is True:
-            entry["merged"] = True
+    # Global aggregation across the full window.
+    grade_counts, grade_tasked, grade_merged = _aggregate_actionability_bucket(
+        research_tasks, followon_tasks, research_task_ids,
+    )
+    grade_merge_rate, grade_merge_rate_of_tasked, calibration_score = (
+        _compute_actionability_rates(grade_counts, grade_tasked, grade_merged)
+    )
 
-    # Aggregate tasked/merged counts by grade.
-    grade_tasked: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    grade_merged: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    for dir_id, findings in findings_by_dir.items():
-        outcome = dir_outcome.get(dir_id, {})
-        for f in findings:
-            g = f["grade"]
-            if outcome.get("tasked"):
-                grade_tasked[g] = grade_tasked.get(g, 0) + 1
-            if outcome.get("merged"):
-                grade_merged[g] = grade_merged.get(g, 0) + 1
+    # Per-cycle bucketing. Each cycle window = [cycle.created_at, next_newer_cycle.created_at);
+    # the newest cycle has an open upper bound.
+    cycles_oldest_first = sorted(
+        [c for c in recent_cycles if c.created_at is not None],
+        key=lambda c: c.created_at,
+    )
+    cycle_history: list[dict[str, Any]] = []
+    for idx, cyc in enumerate(cycles_oldest_first):
+        lo = cyc.created_at
+        hi = (
+            cycles_oldest_first[idx + 1].created_at
+            if idx + 1 < len(cycles_oldest_first)
+            else None
+        )
+        bucket_tasks = [
+            t for t in research_tasks
+            if t.created_at is not None and t.created_at >= lo
+            and (hi is None or t.created_at < hi)
+        ]
+        b_counts, b_tasked, b_merged = _aggregate_actionability_bucket(
+            bucket_tasks, followon_tasks, research_task_ids,
+        )
+        b_rate, _b_rate_t, b_calib = _compute_actionability_rates(
+            b_counts, b_tasked, b_merged,
+        )
+        cycle_history.append({
+            "cycle_id": cyc.id,
+            "cycle_created_at": cyc.created_at.isoformat(),
+            "total_findings": sum(b_counts.values()),
+            "grade_distribution": b_counts,
+            "grade_merged": b_merged,
+            "grade_merge_rate": b_rate,
+            "calibration_score": b_calib,
+        })
 
     total = sum(grade_counts.values())
     return {
@@ -4593,6 +4679,10 @@ async def get_research_actionability(
         "grade_distribution": grade_counts,
         "grade_tasked": grade_tasked,
         "grade_merged": grade_merged,
+        "grade_merge_rate": grade_merge_rate,
+        "grade_merge_rate_of_tasked": grade_merge_rate_of_tasked,
+        "calibration_score": calibration_score,
+        "cycle_history": cycle_history,
     }
 
 

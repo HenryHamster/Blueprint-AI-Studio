@@ -13,6 +13,8 @@ export interface ResearchFinding {
   priority: 'high' | 'medium' | 'low';
   related_files: string[];
   direction_id?: string;
+  claims?: string[];
+  sources?: Array<{ type?: string; ref: string; excerpt?: string }>;
 }
 
 export interface Task {

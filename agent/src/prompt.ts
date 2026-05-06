@@ -1437,7 +1437,11 @@ Example of partial verification (verified two of three changed files, diff was t
 **Fresh-reviewer pass (when enabled):** After your session ends, a second
 read-only Claude session may run and augment the self-review JSON with a
 \`reviewer_findings\` array. Reviewer-flagged categories override passing
-self-attestations in \`check_results\`. The final JSON shape is:
+self-attestations in \`check_results\`. Additionally, if \`categories\` contains
+\`"incomplete_review"\`, a recovery fresh-reviewer pass fires automatically even
+when the project has not opted into the fresh-reviewer feature — recovery findings
+carry \`origin: "reviewer_recovery_after_incomplete_sr"\` in their \`check_results\`
+entries and a top-level \`reviewer_recovery_origin\` field on the JSON. The final JSON shape is:
 \`\`\`json
 {
   "verdict": "pass" | "fail",

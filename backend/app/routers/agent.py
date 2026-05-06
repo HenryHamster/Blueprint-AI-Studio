@@ -673,6 +673,44 @@ async def agent_refresh_token(
     return {"token": new_token}
 
 
+async def _stamp_reviewer_recovery_count(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    high_iter_rows,
+) -> None:
+    """Count tasks tagged as reviewer-recovery-after-incomplete-SR and stamp the
+    aggregate onto ``Project.design_doc.sr_catch_rate_trends``.
+
+    Detection scans both the top-level ``reviewer_recovery_origin`` marker and
+    per-category ``check_results[*].origin`` entries — the marker can land in
+    either spot depending on which path tagged it. No-op when nothing matched.
+    """
+    recovery_count = sum(
+        1 for t in high_iter_rows
+        if (
+            (t.context or {}).get("_self_review_outcome", {}).get("reviewer_recovery_origin")
+            == "reviewer_recovery_after_incomplete_sr"
+        ) or any(
+            isinstance(v, dict) and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
+            for v in (
+                (t.context or {}).get("_self_review_outcome", {}).get("check_results") or {}
+            ).values()
+        )
+    )
+    if recovery_count <= 0:
+        return
+    proj = await session.get(Project, project_id)
+    if proj is None:
+        return
+    doc = dict(proj.design_doc or {})
+    trends = dict(doc.get("sr_catch_rate_trends") or {})
+    trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
+    doc["sr_catch_rate_trends"] = trends
+    proj.design_doc = doc
+    flag_modified(proj, "design_doc")
+    session.add(proj)
+
+
 @router.post("/claim")
 @limiter.limit("200/minute")
 async def claim_task(
@@ -1236,6 +1274,10 @@ async def claim_task(
                 )
             except Exception:
                 logger.exception("[AGENT] Failed to compute sr_catch_rate_trends (non-critical)")
+            try:
+                await _stamp_reviewer_recovery_count(session, task.project_id, high_iter_rows)
+            except Exception:
+                logger.exception("[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)")
             try:
                 from app.playbook_learning import compute_sr_reviewer_disagreements
                 await compute_sr_reviewer_disagreements(
@@ -1904,6 +1946,10 @@ async def claim_task(
                     )
                 except Exception:
                     logger.exception("[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)")
+                try:
+                    await _stamp_reviewer_recovery_count(session, task.project_id, high_iter_rows)
+                except Exception:
+                    logger.exception("[AGENT] Failed to compute research reviewer_recovery_after_incomplete_sr_count (non-critical)")
                 try:
                     from app.playbook_learning import compute_sr_reviewer_disagreements
                     await compute_sr_reviewer_disagreements(

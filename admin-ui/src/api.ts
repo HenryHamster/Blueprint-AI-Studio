@@ -145,12 +145,26 @@ export async function fetchRetirementCritiques(
   return res.json();
 }
 
+export interface CycleHistoryEntry {
+  cycle_id: string;
+  cycle_created_at: string | null;
+  total_findings: number;
+  grade_distribution: Record<string, number>;
+  grade_merged: Record<string, number>;
+  grade_merge_rate: Record<string, number | null>;
+  calibration_score: number | null;
+}
+
 export interface ActionabilityResponse {
   cycles_scanned: number;
   total_findings: number;
   grade_distribution: Record<string, number>;
   grade_tasked: Record<string, number>;
   grade_merged: Record<string, number>;
+  grade_merge_rate?: Record<string, number | null>;
+  grade_merge_rate_of_tasked?: Record<string, number | null>;
+  calibration_score?: number | null;
+  cycle_history?: CycleHistoryEntry[];
 }
 
 export async function fetchResearchActionability(

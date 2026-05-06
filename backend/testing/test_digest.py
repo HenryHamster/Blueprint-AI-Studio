@@ -7116,6 +7116,230 @@ async def test_research_actionability_merge_requires_pr_merged_flag(
     # dir-cold's pre-research follow-on must not register.
     assert data["grade_tasked"]["MEDIUM"] == 0
     assert data["grade_merged"]["MEDIUM"] == 0
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_grade_merge_rate_and_calibration(
+    client: AsyncClient, db_session
+):
+    """grade_merge_rate = merged/findings; calibration_score = HIGH_rate - LOW_rate."""
+    from app.models import StrategicCycle
+    from datetime import timedelta as _td
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    research_at = _utcnow() - _td(hours=2)
+    db_session.add(StrategicCycle(
+        id="cycle-mr-1", project_id=project.id, created_at=research_at - _td(hours=1),
+    ))
+    # 3 HIGH findings (2 will merge, 1 just tasked) → HIGH rate = 2/3
+    # 2 MEDIUM findings (1 will merge) → MEDIUM rate = 1/2
+    # 2 LOW findings (0 will merge) → LOW rate = 0/2 = 0.0
+    plan_output = [
+        {"title": "H1", "actionability_grade": "HIGH", "direction_id": "dir-h1"},
+        {"title": "H2", "actionability_grade": "HIGH", "direction_id": "dir-h2"},
+        {"title": "H3", "actionability_grade": "HIGH", "direction_id": "dir-h3"},
+        {"title": "M1", "actionability_grade": "MEDIUM", "direction_id": "dir-m1"},
+        {"title": "M2", "actionability_grade": "MEDIUM", "direction_id": "dir-m2"},
+        {"title": "L1", "actionability_grade": "LOW", "direction_id": "dir-l1"},
+        {"title": "L2", "actionability_grade": "LOW", "direction_id": "dir-l2"},
+    ]
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        created_at=research_at,
+        plan_output=plan_output,
+    ))
+    # Merged follow-ons.
+    for d in ("dir-h1", "dir-h2", "dir-m1"):
+        db_session.add(make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=research_at + _td(minutes=10),
+            context={"direction_id": d, "pr_merged": True},
+        ))
+    # Tasked-only follow-on for HIGH.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=research_at + _td(minutes=10),
+        context={"direction_id": "dir-h3"},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["grade_merge_rate"]["HIGH"] == pytest.approx(2 / 3)
+    assert data["grade_merge_rate"]["MEDIUM"] == pytest.approx(1 / 2)
+    assert data["grade_merge_rate"]["LOW"] == 0.0
+    # of-tasked: HIGH = 2 merged / 3 tasked, MEDIUM = 1/1, LOW = None (0 tasked)
+    assert data["grade_merge_rate_of_tasked"]["HIGH"] == pytest.approx(2 / 3)
+    assert data["grade_merge_rate_of_tasked"]["MEDIUM"] == pytest.approx(1.0)
+    assert data["grade_merge_rate_of_tasked"]["LOW"] is None
+    assert data["calibration_score"] == pytest.approx(2 / 3 - 0.0)
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_calibration_null_when_no_findings(
+    client: AsyncClient, db_session
+):
+    """calibration_score is null when HIGH or LOW has zero findings; merge_rate
+    uses null (not 0.0) when grade_distribution is 0."""
+    from app.models import StrategicCycle
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    db_session.add(StrategicCycle(id="cycle-mr-empty", project_id=project.id))
+    # Only MEDIUM findings — both HIGH and LOW are absent.
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[
+            {"title": "M1", "actionability_grade": "MEDIUM", "direction_id": "dir-m1"},
+        ],
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["grade_merge_rate"]["HIGH"] is None
+    assert data["grade_merge_rate"]["LOW"] is None
+    assert data["grade_merge_rate"]["MEDIUM"] == 0.0  # 0 merged / 1 finding
+    assert data["calibration_score"] is None
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_cycle_history_chronological(
+    client: AsyncClient, db_session
+):
+    """cycle_history has one entry per scanned cycle, oldest→newest, with per-cycle rates."""
+    from app.models import StrategicCycle
+    from datetime import timedelta as _td
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    now = _utcnow()
+    cycle_old_at = now - _td(hours=10)
+    cycle_new_at = now - _td(hours=4)
+    db_session.add(StrategicCycle(
+        id="cycle-old", project_id=project.id, created_at=cycle_old_at,
+    ))
+    db_session.add(StrategicCycle(
+        id="cycle-new", project_id=project.id, created_at=cycle_new_at,
+    ))
+
+    # Research task in OLD cycle window: 1 HIGH (will merge).
+    research_old_at = cycle_old_at + _td(minutes=30)
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        created_at=research_old_at,
+        plan_output=[
+            {"title": "Old HIGH", "actionability_grade": "HIGH", "direction_id": "dir-old-h"},
+        ],
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=research_old_at + _td(minutes=5),
+        context={"direction_id": "dir-old-h", "pr_merged": True},
+    ))
+
+    # Research task in NEW cycle window: 1 LOW (no follow-on).
+    research_new_at = cycle_new_at + _td(minutes=30)
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        created_at=research_new_at,
+        plan_output=[
+            {"title": "New LOW", "actionability_grade": "LOW", "direction_id": "dir-new-l"},
+        ],
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert "cycle_history" in data
+    history = data["cycle_history"]
+    assert len(history) == 2
+    # Oldest → newest order.
+    assert history[0]["cycle_id"] == "cycle-old"
+    assert history[1]["cycle_id"] == "cycle-new"
+    # Old bucket: 1 HIGH finding, merged. HIGH rate = 1.0, LOW absent → None.
+    assert history[0]["total_findings"] == 1
+    assert history[0]["grade_distribution"]["HIGH"] == 1
+    assert history[0]["grade_merged"]["HIGH"] == 1
+    assert history[0]["grade_merge_rate"]["HIGH"] == 1.0
+    assert history[0]["grade_merge_rate"]["LOW"] is None
+    assert history[0]["calibration_score"] is None  # LOW rate is None
+    # New bucket: 1 LOW, not merged. LOW rate = 0.0, HIGH absent → None.
+    assert history[1]["total_findings"] == 1
+    assert history[1]["grade_distribution"]["LOW"] == 1
+    assert history[1]["grade_merge_rate"]["LOW"] == 0.0
+    assert history[1]["grade_merge_rate"]["HIGH"] is None
+    assert history[1]["calibration_score"] is None
+
+
+@pytest.mark.asyncio
+async def test_research_actionability_cycle_history_null_rate_for_zero_findings(
+    client: AsyncClient, db_session
+):
+    """A cycle with zero findings of a grade returns null (not 0.0) for that grade's merge_rate."""
+    from app.models import StrategicCycle
+    from datetime import timedelta as _td
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(make_membership(project.id))
+    cyc_at = _utcnow() - _td(hours=2)
+    db_session.add(StrategicCycle(
+        id="cycle-only-medium", project_id=project.id, created_at=cyc_at,
+    ))
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        created_at=cyc_at + _td(minutes=10),
+        plan_output=[
+            {"title": "M-only", "actionability_grade": "MEDIUM", "direction_id": "dir-m-only"},
+        ],
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["cycle_history"]) == 1
+    entry = data["cycle_history"][0]
+    assert entry["grade_merge_rate"]["HIGH"] is None
+    assert entry["grade_merge_rate"]["LOW"] is None
+    assert entry["grade_merge_rate"]["MEDIUM"] == 0.0
+    assert entry["calibration_score"] is None
 # Self-review skip-rate metric
 # ---------------------------------------------------------------------------
 
@@ -7883,6 +8107,85 @@ async def test_sr_reviewer_disagreements_endpoint(client: AsyncClient, db_sessio
     assert body["disagreements"][0]["category"] == "correctness"
     assert body["disagreements"][0]["task_type"] == "create"
     assert body["disagreements"][0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_fp_fields(client: AsyncClient, db_session):
+    """sr-reviewer-disagreements returns false_positive_count, true_positive_count, false_positive_rate."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # miss: SR passed correctness, reviewer flagged it
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": {
+            "verdict": "pass",
+            "check_results": {"correctness": {"passed": True}},
+            "blind_spots": [],
+            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
+        }},
+    ))
+    # fp: SR flagged correctness failed, reviewer didn't independently flag it
+    db_session.add(make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_self_review_outcome": {
+            "verdict": "fail",
+            "check_results": {"correctness": {"passed": False}},
+            "blind_spots": [],
+            "reviewer_findings": [],
+        }},
+    ))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30")
+    assert response.status_code == 200
+    body = response.json()
+    d = next(e for e in body["disagreements"] if e["category"] == "correctness" and e["task_type"] == "create")
+    assert d["count"] == 1
+    assert d["false_positive_count"] == 1
+    assert d["true_positive_count"] == 0
+    assert d["false_positive_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_trends_fp_fields_passthrough(client: AsyncClient, db_session):
+    """Digest passes fp_count and false_positive_rate from sr_catch_rate_trends in design_doc."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.7,
+                    "miss_rate": 0.3,
+                    "trend": "stable",
+                    "fp_count": 2,
+                    "tp_count": 3,
+                    "false_positive_rate": 0.4,
+                }
+            },
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    body = response.json()
+    trends = body.get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    correctness = trends["categories"]["correctness"]
+    assert correctness["fp_count"] == 2
+    assert correctness["tp_count"] == 3
+    assert correctness["false_positive_rate"] == 0.4
 
 
 # ---------------------------------------------------------------------------

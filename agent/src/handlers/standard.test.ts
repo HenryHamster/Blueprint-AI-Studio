@@ -1807,3 +1807,256 @@ describe('task-type self-review focus blocks', () => {
     expect(capturedPrompt()).not.toContain('Self-review focus:');
   });
 });
+
+// ── incomplete_review auto-trigger recovery pass ──────────────────────────────
+describe('runStandardHandler incomplete_review auto-trigger', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  const TASK = { title: 'T', description: '', context: {}, project_context: {}, project_metadata: {} };
+  const PAYLOAD = { prompt: 'do something' };
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('auto-triggers fresh-reviewer recovery when categories=["incomplete_review"] and no reviewer_findings', async () => {
+    const { default: fs } = await import('fs');
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('self_review_')) {
+        return JSON.stringify({ verdict: 'pass', categories: ['incomplete_review'] });
+      }
+      return '';
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"missed bug"}]}',
+    });
+
+    await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // runClaudeCode should have been called for the recovery fresh-reviewer pass
+    expect(vi.mocked(idx.runClaudeCode)).toHaveBeenCalled();
+    const promptArg = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    expect(typeof promptArg).toBe('string');
+    expect(promptArg).toContain('You are reviewing a PR for a colleague');
+  });
+
+  it('does NOT auto-trigger when reviewer_findings is already populated', async () => {
+    const { default: fs } = await import('fs');
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('self_review_')) {
+        return JSON.stringify({
+          verdict: 'pass',
+          categories: ['incomplete_review'],
+          reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'prior finding' }],
+        });
+      }
+      return '';
+    });
+
+    await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // runClaudeCode should NOT have been called for a reviewer pass
+    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(
+      expect.stringContaining('You are reviewing a PR for a colleague'),
+      expect.anything(), expect.anything(), expect.anything(), expect.anything(), expect.anything(),
+    );
+  });
+
+  it('does NOT auto-trigger when categories does not include incomplete_review', async () => {
+    const { default: fs } = await import('fs');
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('self_review_')) {
+        return JSON.stringify({ verdict: 'pass', categories: [] });
+      }
+      return '';
+    });
+
+    await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(
+      expect.stringContaining('You are reviewing a PR for a colleague'),
+      expect.anything(), expect.anything(), expect.anything(), expect.anything(), expect.anything(),
+    );
+  });
+
+  it('does NOT auto-trigger for auto-remediation tasks even with incomplete_review', async () => {
+    const { default: fs } = await import('fs');
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('self_review_')) {
+        return JSON.stringify({ verdict: 'pass', categories: ['incomplete_review'] });
+      }
+      return '';
+    });
+    const autoRemTask = { ...TASK, context: { auto_remediation: true }, project_metadata: {} };
+
+    await handleCreate(TASK_ID, PAYLOAD, autoRemTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(
+      expect.stringContaining('You are reviewing a PR for a colleague'),
+      expect.anything(), expect.anything(), expect.anything(), expect.anything(), expect.anything(),
+    );
+  });
+
+  it('does NOT auto-trigger when normal fresh-reviewer already ran (is_self_repo=true)', async () => {
+    const { default: fs } = await import('fs');
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockImplementation(() => {
+      return Promise.resolve({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+      if (typeof p === 'string' && p.includes('self_review_')) {
+        // After normal fresh-reviewer runs, it writes reviewer_findings; simulate that
+        return JSON.stringify({
+          verdict: 'pass',
+          categories: ['incomplete_review'],
+          reviewer_findings: [],
+        });
+      }
+      return '';
+    });
+    const selfRepoTask = { ...TASK, project_metadata: { is_self_repo: true } };
+
+    await handleCreate(TASK_ID, PAYLOAD, selfRepoTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Only one reviewer pass (the normal path), not two
+    const reviewerCalls = vi.mocked(idx.runClaudeCode).mock.calls.filter(
+      c => typeof c[0] === 'string' && c[0].includes('You are reviewing a PR for a colleague'),
+    );
+    expect(reviewerCalls.length).toBe(1);
+  });
+});
+
+// ── runFreshReviewerPass incompleteSrRecovery origin stamp ────────────────────
+describe('runFreshReviewerPass origin stamp for incompleteSrRecovery', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+    vi.mocked(fsModule.writeFileSync).mockClear();
+    vi.mocked(fsModule.readFileSync).mockClear();
+  });
+
+  it('stamps origin on check_results entries when incompleteSrRecovery=true', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"missed bug"}]}',
+    });
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({ verdict: 'pass', check_results: {} }));
+
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+
+    await runFreshReviewerPass('rx1', 'Title', 'Desc', [], null, { value: '' }, undefined, undefined, true);
+
+    expect(captured).not.toBeNull();
+    const capturedRx1 = captured as unknown as Record<string, unknown>;
+    const checkResults = capturedRx1.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness).toBeDefined();
+    expect(checkResults.correctness.passed).toBe(false);
+    expect(checkResults.correctness.origin).toBe('reviewer_recovery_after_incomplete_sr');
+    expect(capturedRx1.reviewer_recovery_origin).toBe('reviewer_recovery_after_incomplete_sr');
+  });
+
+  it('does NOT stamp origin on check_results when incompleteSrRecovery is false/absent', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"missed bug"}]}',
+    });
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({ verdict: 'pass', check_results: {} }));
+
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+
+    await runFreshReviewerPass('rx2', 'Title', 'Desc', [], null, { value: '' });
+
+    expect(captured).not.toBeNull();
+    const capturedRx2 = captured as unknown as Record<string, unknown>;
+    const checkResults = capturedRx2.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness).toBeDefined();
+    expect(checkResults.correctness.origin).toBeUndefined();
+    expect(capturedRx2.reviewer_recovery_origin).toBeUndefined();
+  });
+});
+
+// ── maybeRunIncompleteReviewRecovery unit tests ────────────────────────────────
+describe('maybeRunIncompleteReviewRecovery', () => {
+  let realMaybeRunIncompleteReviewRecovery: typeof import('./code-change.js').maybeRunIncompleteReviewRecovery;
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+    const real = await vi.importActual<typeof import('./code-change.js')>('./code-change.js');
+    realMaybeRunIncompleteReviewRecovery = real.maybeRunIncompleteReviewRecovery;
+  });
+
+  it('calls recoveryFn when categories includes incomplete_review and no reviewer_findings', async () => {
+    vi.mocked(fsModule.existsSync).mockReturnValue(true);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(
+      JSON.stringify({ categories: ['incomplete_review'] }),
+    );
+    const recoveryFn = vi.fn().mockResolvedValue(undefined);
+    await realMaybeRunIncompleteReviewRecovery('t-mr1', null, recoveryFn);
+    expect(recoveryFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call recoveryFn when categories does not include incomplete_review', async () => {
+    vi.mocked(fsModule.existsSync).mockReturnValue(true);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(
+      JSON.stringify({ categories: [] }),
+    );
+    const recoveryFn = vi.fn().mockResolvedValue(undefined);
+    await realMaybeRunIncompleteReviewRecovery('t-mr2', null, recoveryFn);
+    expect(recoveryFn).not.toHaveBeenCalled();
+  });
+
+  it('does NOT call recoveryFn when reviewer_findings is already populated', async () => {
+    vi.mocked(fsModule.existsSync).mockReturnValue(true);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(
+      JSON.stringify({
+        categories: ['incomplete_review'],
+        reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'prior' }],
+      }),
+    );
+    const recoveryFn = vi.fn().mockResolvedValue(undefined);
+    await realMaybeRunIncompleteReviewRecovery('t-mr3', null, recoveryFn);
+    expect(recoveryFn).not.toHaveBeenCalled();
+  });
+
+  it('does NOT call recoveryFn when recoveryFn is undefined', async () => {
+    vi.mocked(fsModule.existsSync).mockReturnValue(true);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(
+      JSON.stringify({ categories: ['incomplete_review'] }),
+    );
+    await expect(
+      realMaybeRunIncompleteReviewRecovery('t-mr4', null, undefined),
+    ).resolves.toBeUndefined();
+  });
+
+  it('does NOT call recoveryFn when SR file does not exist', async () => {
+    vi.mocked(fsModule.existsSync).mockReturnValue(false);
+    const recoveryFn = vi.fn().mockResolvedValue(undefined);
+    await realMaybeRunIncompleteReviewRecovery('t-mr5', null, recoveryFn);
+    expect(recoveryFn).not.toHaveBeenCalled();
+  });
+});

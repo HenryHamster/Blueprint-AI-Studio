@@ -5012,6 +5012,146 @@ async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tests for reviewer_recovery_after_incomplete_sr_count tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_recovery_task(project_id, *, use_top_level_origin: bool = True, use_check_results_origin: bool = False) -> Task:
+    """Build a Task whose _self_review_outcome marks a recovery pass."""
+    sro: dict = {}
+    if use_top_level_origin:
+        sro["reviewer_recovery_origin"] = "reviewer_recovery_after_incomplete_sr"
+    if use_check_results_origin:
+        sro["check_results"] = {
+            "correctness": {"passed": False, "origin": "reviewer_recovery_after_incomplete_sr"},
+        }
+    return Task(
+        project_id=project_id,
+        title="Recovery task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": sro},
+    )
+
+
+def _count_recovery_tasks(tasks: list) -> int:
+    """Mirror the counting expression used in agent.py for reviewer_recovery_after_incomplete_sr_count."""
+    return sum(
+        1 for t in tasks
+        if (
+            (t.context or {}).get("_self_review_outcome", {}).get("reviewer_recovery_origin")
+            == "reviewer_recovery_after_incomplete_sr"
+        ) or any(
+            isinstance(v, dict) and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
+            for v in (
+                (t.context or {}).get("_self_review_outcome", {}).get("check_results") or {}
+            ).values()
+        )
+    )
+
+
+def test_reviewer_recovery_count_via_top_level_origin():
+    """Tasks with reviewer_recovery_origin on _self_review_outcome are counted."""
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_recovery_task(project_id, use_top_level_origin=True),
+        _make_recovery_task(project_id, use_top_level_origin=True),
+        Task(  # no recovery fields
+            project_id=project_id,
+            title="Normal task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"check_results": {"correctness": {"passed": True}}}},
+        ),
+    ]
+    assert _count_recovery_tasks(tasks) == 2
+
+
+def test_reviewer_recovery_count_via_check_results_origin():
+    """Tasks with origin on a check_results entry (no top-level field) are counted."""
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_recovery_task(project_id, use_top_level_origin=False, use_check_results_origin=True),
+        Task(
+            project_id=project_id,
+            title="Normal task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"check_results": {"correctness": {"passed": False}}}},
+        ),
+    ]
+    assert _count_recovery_tasks(tasks) == 1
+
+
+def test_reviewer_recovery_count_is_zero_when_no_recovery_tasks():
+    """Returns 0 when no tasks have recovery markers."""
+    project_id = uuid.uuid4()
+    tasks = [
+        Task(
+            project_id=project_id,
+            title="Task A",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"check_results": {}}},
+        ),
+        Task(
+            project_id=project_id,
+            title="Task B",
+            payloads=[{"type": "fix", "prompt": "y"}],
+            status=TaskStatus.COMPLETED,
+            context={},
+        ),
+    ]
+    assert _count_recovery_tasks(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_reviewer_recovery_count_written_to_design_doc(db_session: AsyncSession):
+    """Verifies the count is written to project.design_doc['sr_catch_rate_trends']."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    # Simulate: sr_catch_rate_trends already exists from compute_sr_catch_rate_trends
+    doc = dict(project.design_doc or {})
+    doc["sr_catch_rate_trends"] = {"computed_at": "2026-01-01T00:00:00", "categories": {}}
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    tasks = [
+        _make_recovery_task(project.id, use_top_level_origin=True),
+        _make_recovery_task(project.id, use_top_level_origin=True),
+        Task(
+            project_id=project.id,
+            title="Normal task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"_self_review_outcome": {"check_results": {}}},
+        ),
+    ]
+    recovery_count = _count_recovery_tasks(tasks)
+    assert recovery_count == 2
+
+    # Apply the same update logic as agent.py
+    _proj = await db_session.get(Project, project.id)
+    assert _proj is not None
+    _doc = dict(_proj.design_doc or {})
+    _trends = dict(_doc.get("sr_catch_rate_trends") or {})
+    _trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
+    _doc["sr_catch_rate_trends"] = _trends
+    _proj.design_doc = _doc
+    flag_modified(_proj, "design_doc")
+    db_session.add(_proj)
+    await db_session.flush()
+
+    refreshed = await db_session.get(Project, project.id)
+    assert refreshed is not None
+    trends = (refreshed.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert trends.get("reviewer_recovery_after_incomplete_sr_count") == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for sr_skip_rate / sr_skip_reason_distribution
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5589,3 +5729,114 @@ async def test_compute_sr_reviewer_disagreements_excludes_non_code_types(db_sess
     result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
 
     assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for _compute_cat_fp_stats (false-positive rate aggregator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_fp_task(
+    project_id,
+    *,
+    task_type: str = "create",
+    sr_failed_cats: list[str],
+    reviewer_cats: list[str],
+) -> Task:
+    """Build a Task whose self-review flagged sr_failed_cats and whose reviewer caught reviewer_cats."""
+    check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+    sro: dict = {
+        "check_results": check_results,
+        "reviewer_findings": [
+            {"category": cat, "severity": "HIGH", "description": "found"} for cat in reviewer_cats
+        ],
+    }
+    task = Task(
+        project_id=project_id,
+        title="FP test task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": sro},
+    )
+    return task
+
+
+def test_compute_cat_fp_stats_fp_and_tp_counts():
+    """SR-flagged categories caught by reviewer count as TP; missed by reviewer count as FP."""
+    from app.playbook_learning import _compute_cat_fp_stats
+
+    project_id = uuid.uuid4()
+    tasks = [
+        # correctness: SR flagged, reviewer also flagged → TP
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]),
+        # correctness: SR flagged, reviewer missed → FP
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
+        # security: SR flagged, reviewer missed → FP
+        _make_fp_task(project_id, sr_failed_cats=["security"], reviewer_cats=["correctness"]),
+    ]
+
+    cat_fp, type_cat_fp = _compute_cat_fp_stats(tasks)
+
+    assert cat_fp["correctness"]["tp"] == 1
+    assert cat_fp["correctness"]["fp"] == 1
+    assert cat_fp["security"]["fp"] == 1
+    assert cat_fp["security"].get("tp", 0) == 0
+
+    assert type_cat_fp["create"]["correctness"]["tp"] == 1
+    assert type_cat_fp["create"]["correctness"]["fp"] == 1
+    assert type_cat_fp["create"]["security"]["fp"] == 1
+
+
+def test_compute_cat_fp_stats_skips_non_code_types():
+    """Tasks whose type is not a code-change type are excluded."""
+    from app.playbook_learning import _compute_cat_fp_stats
+
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_fp_task(project_id, task_type="research", sr_failed_cats=["correctness"], reviewer_cats=[]),
+        _make_fp_task(project_id, task_type="plan", sr_failed_cats=["security"], reviewer_cats=[]),
+    ]
+
+    cat_fp, type_cat_fp = _compute_cat_fp_stats(tasks)
+
+    assert cat_fp == {}
+    assert type_cat_fp == {}
+
+
+def test_compute_cat_fp_stats_skips_tasks_without_sro():
+    """Tasks with no _self_review_outcome in context are skipped."""
+    from app.playbook_learning import _compute_cat_fp_stats
+
+    project_id = uuid.uuid4()
+    task = Task(
+        project_id=project_id,
+        title="no sro",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+
+    cat_fp, type_cat_fp = _compute_cat_fp_stats([task])
+
+    assert cat_fp == {}
+
+
+def test_compute_cat_fp_stats_false_positive_rate_formula():
+    """FPR = fp / (fp + tp): 2 FP and 1 TP gives 0.667."""
+    from app.playbook_learning import _compute_cat_fp_stats
+
+    project_id = uuid.uuid4()
+    tasks = [
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]),
+    ]
+
+    cat_fp, _ = _compute_cat_fp_stats(tasks)
+
+    fp = cat_fp["correctness"]["fp"]
+    tp = cat_fp["correctness"]["tp"]
+    assert fp == 2
+    assert tp == 1
+    fpr = round(fp / (fp + tp), 3)
+    assert fpr == 0.667

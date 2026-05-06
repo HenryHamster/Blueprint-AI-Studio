@@ -58,6 +58,7 @@ interface DirectionPortfolioSectionProps {
   medianCostPerMergedPr?: number | null;
   onDirectionClick?: (directionId: string) => void;
   projectId?: string | null;
+  calibrationFloor?: number;
 }
 
 function priorityBadge(p: string) {
@@ -220,6 +221,7 @@ export function DirectionPortfolioSection({
   medianCostPerMergedPr,
   onDirectionClick,
   projectId,
+  calibrationFloor,
 }: DirectionPortfolioSectionProps) {
   const [srBreakdown, setSrBreakdown] = useState<Record<string, DirectionSrEntry>>({});
   useEffect(() => {
@@ -370,7 +372,9 @@ export function DirectionPortfolioSection({
           </div>
         </>
       )}
-      {!!projectId && <StrategicAuditPanel projectId={projectId} />}
+      {!!projectId && (
+        <StrategicAuditPanel projectId={projectId} calibrationFloor={calibrationFloor} />
+      )}
     </section>
   );
 }

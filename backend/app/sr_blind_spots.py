@@ -213,6 +213,40 @@ async def aggregate_sr_blind_spot_envelope(
 _SR_CODE_CHANGE_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
 
 
+def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]]:
+    counts: Dict[tuple, Dict[str, int]] = defaultdict(lambda: {"miss": 0, "tp": 0, "fp": 0})
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type", "")
+        if task_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        reviewer_findings = sro.get("reviewer_findings") or []
+        check_results = sro.get("check_results") or {}
+        reviewer_cats = {
+            finding.get("category")
+            for finding in reviewer_findings
+            if isinstance(finding, dict) and finding.get("category")
+        }
+        sr_failed = {
+            cat for cat, result in check_results.items()
+            if not result.get("passed", True)
+        }
+        for cat in reviewer_cats:
+            cr = check_results.get(cat)
+            if cr is None or cr.get("passed", True):
+                counts[(cat, task_type)]["miss"] += 1
+        for cat in sr_failed:
+            bucket = counts[(cat, task_type)]
+            if cat in reviewer_cats:
+                bucket["tp"] += 1
+            else:
+                bucket["fp"] += 1
+    return counts
+
+
 def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
     """Single source of truth for the (category, task_type) -> count tally.
 
@@ -226,29 +260,8 @@ def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
     self-review envelopes are excluded so the bash ./done fallback does not
     inflate counts.
     """
-    counts: Dict[tuple, int] = defaultdict(int)
-    for t in tasks:
-        task_type = (t.first_payload or {}).get("type", "")
-        if task_type not in _SR_CODE_CHANGE_TYPES:
-            continue
-        ctx = t.context or {}
-        sro = ctx.get("_self_review_outcome")
-        if not sro or is_skipped_sr_outcome(sro):
-            continue
-        reviewer_findings = sro.get("reviewer_findings") or []
-        if not reviewer_findings:
-            continue
-        check_results = sro.get("check_results") or {}
-        for finding in reviewer_findings:
-            if not isinstance(finding, dict):
-                continue
-            cat = finding.get("category")
-            if not cat:
-                continue
-            cr = check_results.get(cat)
-            if cr is None or cr.get("passed", True):
-                counts[(cat, task_type)] += 1
-    return counts
+    counts = _count_reviewer_disagreement_directions(tasks)
+    return {key: bucket["miss"] for key, bucket in counts.items() if bucket["miss"] > 0}
 
 
 async def aggregate_sr_reviewer_disagreements(
@@ -283,6 +296,21 @@ async def aggregate_sr_reviewer_disagreements(
     result = await session.execute(stmt)
     all_tasks = result.scalars().all()
 
-    disagreement_counts = count_reviewer_disagreements_in_tasks(all_tasks)
-    top = sorted(disagreement_counts.items(), key=lambda x: -x[1])[:limit]
-    return [{"category": cat, "task_type": ttype, "count": cnt} for (cat, ttype), cnt in top]
+    direction_counts = _count_reviewer_disagreement_directions(all_tasks)
+    top = [
+        item for item in sorted(direction_counts.items(), key=lambda x: -x[1]["miss"])
+        if item[1]["miss"] > 0
+    ][:limit]
+    return [
+        {
+            "category": cat,
+            "task_type": ttype,
+            "count": bucket["miss"],
+            "false_positive_count": bucket["fp"],
+            "true_positive_count": bucket["tp"],
+            "false_positive_rate": round(
+                bucket["fp"] / (bucket["fp"] + bucket["tp"]), 3
+            ) if (bucket["fp"] + bucket["tp"]) > 0 else None,
+        }
+        for (cat, ttype), bucket in top
+    ]
