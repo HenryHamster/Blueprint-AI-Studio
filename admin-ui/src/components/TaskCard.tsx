@@ -622,14 +622,14 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
           <h3 className={`font-medium text-sm ${task.status === 'CANCELLED' ? 'text-neutral-500 line-through' : 'text-neutral-100'}`}><HighlightText text={task.title} query={searchQuery} /></h3>
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          {/* Hover quick-action toolbar */}
-          <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+          {/* Hover quick-action toolbar — always visible on mobile (≤ sm), hover-only on desktop */}
+          <div className="flex items-center gap-0.5 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-150">
             {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') && (
               <button
                 title="Approve"
                 onClick={(e) => { e.stopPropagation(); onApprove(task.id); }}
                 disabled={!!actionLoading}
-                className="w-6 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               >
                 <CheckCircle className="w-3.5 h-3.5" />
               </button>
@@ -639,7 +639,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title={confirmAction === 'cancel' ? `Confirm cancel (${confirmCountdown}s)` : 'Cancel'}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
                 disabled={!!actionLoading}
-                className={`w-6 h-6 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
+                className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
               >
                 <XCircle className="w-3.5 h-3.5" />
               </button>
@@ -649,7 +649,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title="Retry"
                 onClick={(e) => { e.stopPropagation(); onRetry(task.id); }}
                 disabled={!!actionLoading}
-                className="w-6 h-6 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
               </button>
@@ -659,7 +659,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 title={confirmAction === 'archive' ? `Confirm archive (${confirmCountdown}s)` : 'Archive'}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('archive', () => onArchive(task.id)); }}
                 disabled={!!actionLoading}
-                className={`w-6 h-6 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
+                className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
               >
                 <Archive className="w-3.5 h-3.5" />
               </button>

@@ -119,4 +119,27 @@ describe('KanbanBoard — viewport regression', () => {
       });
     });
   });
+
+  test('action toolbar buttons are touch-accessible (44px) at 375px mobile width', async () => {
+    const tasks = [
+      makeTask({ id: 't1', status: 'FAILED', requires_approval: false }),
+      makeTask({ id: 't2', status: 'QUEUED', requires_approval: true }),
+    ];
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <KanbanBoard
+            {...BASE_PROPS}
+            tasks={tasks}
+            columns={COLUMNS}
+          />,
+        );
+      });
+    });
+  });
 });
