@@ -1262,11 +1262,18 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
     results = []
     try:
         client = compute_v1.InstancesClient()
-        request = compute_v1.ListInstancesRequest(
-            project=GCP_PROJECT_ID, zone=zone, filter='name:agent-vm-'
-        )
+        # NB: the Compute v1 REST API does NOT support gcloud's `name:prefix`
+        # substring operator — gcloud applies it client-side. Passing it as a
+        # server-side filter silently returns an empty page (interpreted as a
+        # nonsensical map-key query on a string field), so cleanup runs forever
+        # finding "0 orphans". Fetch unfiltered and prefix-match in Python.
+        request = compute_v1.ListInstancesRequest(project=GCP_PROJECT_ID, zone=zone)
         # Per-RPC timeout so a single unresponsive zone can't freeze the whole cleanup cycle.
-        results = [(instance.name, zone, instance.status) for instance in client.list(request=request, timeout=30)]
+        results = [
+            (instance.name, zone, instance.status)
+            for instance in client.list(request=request, timeout=30)
+            if instance.name.startswith("agent-vm-")
+        ]
     except Exception:
         logger.exception(f"[GCP CLEANUP] Failed to list VMs in zone {zone}")
     return results
