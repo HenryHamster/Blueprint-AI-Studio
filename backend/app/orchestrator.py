@@ -943,21 +943,32 @@ async def orchestrator_worker():
             global _last_regression_dispatch
             if (_utcnow() - _last_regression_dispatch).total_seconds() >= 60:
                 from app.pipeline_regression_dispatcher import run_once as _run_regression_dispatcher  # noqa: PLC0415
+                # Pull IDs only (no Project ORM rows in any identity map). The
+                # dispatcher's run_once does ``session.get(Project, project_id)``
+                # then accesses ``project.design_doc``; if a partial Project
+                # (from ``load_only(Project.id)``) is already cached on the
+                # session, the get() returns the cached partial and the JSONB
+                # access triggers a sync lazy-load in async context that
+                # poisons the connection — every subsequent project in the
+                # loop then cascade-fails on rollback. Fresh session per
+                # project also isolates failures.
                 try:
-                    async with AsyncSessionLocal() as _rd_session:
-                        _projects = (await _rd_session.execute(
-                            select(Project).options(load_only(Project.id))
+                    async with AsyncSessionLocal() as _rd_id_session:
+                        _project_ids = (await _rd_id_session.execute(
+                            select(Project.id)
                         )).scalars().all()
-                        for _proj in _projects:
-                            try:
-                                await _run_regression_dispatcher(_rd_session, _proj.id)
-                            except Exception:
-                                logger.exception(
-                                    "[REGRESSION_DISPATCHER] run_once failed for project %s",
-                                    _proj.id,
-                                )
                 except Exception:
-                    logger.exception("[REGRESSION_DISPATCHER] outer dispatch loop failed")
+                    logger.exception("[REGRESSION_DISPATCHER] project enumeration failed")
+                    _project_ids = []
+                for _pid in _project_ids:
+                    try:
+                        async with AsyncSessionLocal() as _rd_session:
+                            await _run_regression_dispatcher(_rd_session, _pid)
+                    except Exception:
+                        logger.exception(
+                            "[REGRESSION_DISPATCHER] run_once failed for project %s",
+                            _pid,
+                        )
                 _last_regression_dispatch = _utcnow()
 
             # Independent anomaly maintenance — expires stale entries and restores

@@ -1192,7 +1192,16 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """
     from app.models import Project  # noqa: PLC0415
 
-    project = await session.get(Project, project_id)
+    # Force a full SELECT rather than session.get(): a caller that left a
+    # partial Project (e.g. via ``load_only(Project.id)``) in the session
+    # identity map would otherwise return that cached partial here, and the
+    # ``project.design_doc`` access below would trigger a sync lazy-load in
+    # async context that poisons the connection. populate_existing=True
+    # repopulates any cached row with all columns.
+    project = (await session.execute(
+        select(Project).where(Project.id == project_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if project is None:
         return 0
 
