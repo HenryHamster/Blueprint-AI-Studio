@@ -697,6 +697,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
       </button>
 
       {expanded && (
+        // eslint-disable-next-line viewport/no-fixed-width -- dropdown drawer; max-w-[calc(100vw-1rem)] caps mobile width
         <div className="absolute top-full mt-2 right-0 w-96 max-w-[calc(100vw-1rem)] bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-4 z-50 max-h-[70vh] overflow-y-auto custom-scrollbar">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Autonomous Pipeline — Tactical · Strategic · Architecture</h3>

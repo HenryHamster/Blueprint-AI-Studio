@@ -15,9 +15,11 @@ tester.run('viewport/no-fixed-width', rule, {
     // Under threshold
     { code: '<div className="w-[374px]" />' },
     { code: '<div className="min-w-[300px]" />' },
+    { code: '<div className="w-80" />' },
     // max-w is intentionally excluded (it constrains, doesn't force overflow)
     { code: '<div className="max-w-[600px]" />' },
     { code: '<div className="max-w-[900px]" />' },
+    { code: '<div className="max-w-[calc(100vw-1rem)]" />' },
     // Non-px units
     { code: '<div className="w-full" />' },
     { code: '<div style={{ width: "50%" }} />' },
@@ -27,6 +29,7 @@ tester.run('viewport/no-fixed-width', rule, {
     // Inline style under threshold
     { code: '<div style={{ width: "300px" }} />' },
     { code: '<div style={{ minWidth: "374px" }} />' },
+    { code: '<div style={{ paddingLeft: "200px" }} />' },
     // Numeric style values (outside scope of this rule)
     { code: '<div style={{ width: 900 }} />' },
   ],
@@ -44,7 +47,27 @@ tester.run('viewport/no-fixed-width', rule, {
       errors: [{ messageId: 'tailwindWidth' }],
     },
     {
+      code: '<div className="w-96" />',
+      errors: [{ messageId: 'tailwindWidth' }],
+    },
+    {
+      code: '<div className="w-screen" />',
+      errors: [{ messageId: 'tailwindWidth' }],
+    },
+    {
       code: '<div className="flex min-w-[400px] overflow-auto" />',
+      errors: [{ messageId: 'tailwindWidth' }],
+    },
+    {
+      code: '<div className="px-[400px]" />',
+      errors: [{ messageId: 'tailwindWidth' }],
+    },
+    {
+      code: '<div className="gap-x-[375px]" />',
+      errors: [{ messageId: 'tailwindWidth' }],
+    },
+    {
+      code: '<div className="mx-[500px]" />',
       errors: [{ messageId: 'tailwindWidth' }],
     },
     // Template literal className
@@ -59,6 +82,10 @@ tester.run('viewport/no-fixed-width', rule, {
     },
     {
       code: '<div style={{ minWidth: "375px" }} />',
+      errors: [{ messageId: 'inlineWidth' }],
+    },
+    {
+      code: '<div style={{ padding: "375px" }} />',
       errors: [{ messageId: 'inlineWidth' }],
     },
   ],

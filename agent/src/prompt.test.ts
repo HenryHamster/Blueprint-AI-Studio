@@ -3445,14 +3445,15 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
 
     const checkScript = capturedScripts['/tmp/workspace/check'];
     expect(checkScript).toBeDefined();
+    expect(checkScript).toContain('run "admin-ui playwright chromium"');
     expect(checkScript).toContain('npm run test:viewport');
     expect(checkScript).toContain('Playwright Chromium');
-    // Should contain the smart install logic (cache check + fallback chain)
+    // Bootstrap step uses the smart install logic (cache check + fallback chain).
     expect(checkScript).toContain('$HOME/.cache/ms-playwright');
     expect(checkScript).toContain('npx playwright install chromium');
     expect(checkScript).toContain('npx playwright install --with-deps chromium');
     expect(checkScript).not.toContain('npm run test:run');
-    expect(checkScript.indexOf('admin-ui eslint')).toBeLessThan(checkScript.indexOf('admin-ui viewport'));
+    expect(checkScript.indexOf('admin-ui playwright chromium')).toBeLessThan(checkScript.indexOf('admin-ui viewport'));
     expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui build'));
   });
 

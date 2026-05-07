@@ -7,6 +7,11 @@
 mode + Playwright and asserts that the targeted component renders without
 horizontal overflow at narrow widths (375px primary target).
 
+On Blueprint agent VMs, `./check` bootstraps the Playwright Chromium
+binary automatically before the viewport suite runs. The baked VM image
+also includes the Chromium runtime libraries, so a fresh machine can run
+the gate without manual browser setup.
+
 The framework lives in `src/test/viewport.ts`; tests opt in by using the
 filename suffix `*.viewport.test.{ts,tsx}` so they don't run under the
 default jsdom suite (`npm run test:run`).
@@ -34,8 +39,9 @@ test('MyComponent renders without horizontal overflow at 375px', async () => {
 ```
 
 Save it as `MyComponent.viewport.test.tsx` next to the component. Run
-`npm run test:viewport` locally; CI will run it on PRs that touch
-`admin-ui/**` once the workflow snippet below is applied.
+`npm run test:viewport` locally if you already have Chromium installed;
+`./check` will do the bootstrap for you on agent VMs. CI will run it on
+PRs that touch `admin-ui/**` once the workflow snippet below is applied.
 
 ### Opting an element out
 

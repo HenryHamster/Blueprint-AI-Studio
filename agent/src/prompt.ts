@@ -582,6 +582,10 @@ CHANGED=$(printf '%s\\n%s\\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^
 
 touches() { printf '%s\\n' "$CHANGED" | grep -q "^$1"; }
 
+admin_ui_runtime_touched() {
+  printf '%s\\n' "$CHANGED" | grep -Eq '^(admin-ui/src/|admin-ui/(package\\.json|package-lock\\.json|vite\\.config\\.ts|vitest(\\.viewport)?\\.config\\.ts|eslint\\.config\\.js|eslint-rules/))'
+}
+
 FAILED=()
 
 run() {
@@ -595,7 +599,7 @@ run() {
   fi
 }
 
-if touches admin-ui/; then
+if admin_ui_runtime_touched; then
   ( cd admin-ui && [ -d node_modules ] || npm ci ) >/tmp/check_npm_ci.log 2>&1 || {
     echo "[check] admin-ui npm ci FAILED — see /tmp/check_npm_ci.log"
     tail -30 /tmp/check_npm_ci.log
@@ -650,6 +654,21 @@ if touches admin-ui/; then
   fi
   VIEWPORT_FILTER=$(sort -u /tmp/check_viewport_tests.txt 2>/dev/null | tr '\\n' ' ' | sed 's/ *$//')
   VIEWPORT_RUN=1
+  if [ "$FULL_SCOPE" = "0" ] && [ -z "$NON_COMPONENT" ] && [ -z "$VIEWPORT_FILTER" ]; then
+    echo "[check] no viewport test matches changed components, skipping viewport suite"
+    VIEWPORT_RUN=0
+  fi
+
+  if [ "$VIEWPORT_RUN" = "1" ]; then
+    # Bootstrap Playwright Chromium binary before the viewport gate.
+    # The baked agent VM already includes the system libs (libatk, libnss,
+    # etc.) — and may already have the browser cached, so we cache-check
+    # first and fall through to the bare install, with --with-deps as a
+    # last-resort fallback for fresh local machines.
+    # See admin-ui/CONTRIBUTING.md for developer-machine setup.
+    run "admin-ui playwright chromium" bash -c 'cd admin-ui && { [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1 || npx playwright install chromium || npx playwright install --with-deps chromium; } 2>&1'
+  fi
+
   if [ "$FULL_SCOPE" = "1" ]; then
     VIEWPORT_FILTER=""
     VIEWPORT_LABEL="admin-ui viewport (full, --full)"
@@ -657,20 +676,13 @@ if touches admin-ui/; then
     VIEWPORT_LABEL="admin-ui viewport (full)"
   elif [ -n "$VIEWPORT_FILTER" ]; then
     VIEWPORT_LABEL="admin-ui viewport (changed: $(echo "$VIEWPORT_FILTER" | wc -w | tr -d ' ') file(s))"
-  else
-    echo "[check] no viewport test matches changed components, skipping viewport suite"
-    VIEWPORT_RUN=0
   fi
 
   if [ "$VIEWPORT_RUN" = "1" ]; then
-    # Browser-mode vitest runs Playwright Chromium under the hood. The
-    # packer image pre-installs the system libs; the install line below
-    # is a no-op then. On a developer's local machine without Playwright,
-    # the install pulls Chromium + libs.
     echo "[check] $VIEWPORT_LABEL..."
     PR_VP_LOG=/tmp/check_viewport_pr.log
     export VIEWPORT_FILTER
-    if ( cd admin-ui && { [ -d "$HOME/.cache/ms-playwright" ] && ls "$HOME/.cache/ms-playwright"/chromium-* >/dev/null 2>&1 || npx playwright install chromium || npx playwright install --with-deps chromium; } >/tmp/check_pw_install.log 2>&1 && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$PR_VP_LOG" 2>&1; then
+    if ( cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$PR_VP_LOG" 2>&1; then
       tail -20 "$PR_VP_LOG"
       echo "[check] $VIEWPORT_LABEL OK"
     elif [ "$FULL_SCOPE" = "1" ]; then
