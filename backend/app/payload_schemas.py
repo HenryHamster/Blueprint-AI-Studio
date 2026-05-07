@@ -530,18 +530,24 @@ def validate_task_payload(raw: dict) -> dict:
 
 
 def validate_internal_payload(payload: dict, context: str) -> dict:
-    """Fail-open validation for internal callers.
+    """Validation for internal callers — fail-closed on schema bugs.
 
-    Schema violations log a WARNING and return the original dict so existing
-    in-flight tasks are never broken. PayloadTooLargeError always re-raises —
-    an oversized payload will stall the agent silently if queued, so the
-    spawn site must deal with it rather than quietly accepting the overflow.
+    Re-raises:
+      * PayloadTooLargeError — oversized payload would stall the agent silently.
+      * pydantic.ValidationError (wrapped as ValueError) — required-field or
+        constraint violations indicate caller bugs (missing fix_prompt, empty
+        prompt, malformed branch). Incident 2026-05-07 (task 8c1ab616): a
+        spawn site missed ``fix_prompt`` and the previous fail-open silently
+        accepted an empty ``prompt: ""`` payload, burning 3 retries on a
+        ``Fatal error: Fix task missing prompt`` agent crash.
+
+    Other exceptions still log a WARNING and return the original payload so a
+    truly unexpected error can't take down all spawns at once.
     """
     try:
         return validate_task_payload(payload)
-    except PayloadTooLargeError:
-        # Never swallow size overflows — the whole point of the check is to
-        # prevent oversized payloads from reaching the claim response.
+    except (PayloadTooLargeError, ValueError):
+        # Schema/size errors are caller bugs, not deployment skew.
         raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(

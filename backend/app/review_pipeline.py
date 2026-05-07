@@ -1448,15 +1448,14 @@ async def _spawn_pipeline_task(
                     direction_data = d
                     break
 
-    global_cap = _max_review_iterations(source_task, direction_data)
+    base_cap = _max_review_iterations(source_task, direction_data)
     # Rollup reviews accumulate iterations across retry attempts — always use the max cap
     # so transient review failures don't permanently block rollup merges. Detection uses
     # context flags set authoritatively by rollup_management when spawning review/fix tasks.
     is_rollup = (source_task.context or {}).get("_is_rollup_review") is True or (
         source_task.context or {}
     ).get("_rollup_retries") is not None
-    if is_rollup:
-        global_cap = MAX_REVIEW_FIX_ITERATIONS
+    global_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
     if pr_iterations >= global_cap:
         logger.warning(
             f"[PIPELINE] PR #{pr_number} hit global review-fix cap ({pr_iterations} iterations across all chains)"
@@ -1473,10 +1472,16 @@ async def _spawn_pipeline_task(
         session.add(source_task)
         return (None, False)
 
-    # Track review-fix iteration count to prevent infinite loops (per-chain)
+    # Track review-fix iteration count to prevent infinite loops (per-chain).
+    # Rollup PRs use the same elevated cap as the global check above — without
+    # this, a 12-iteration medium-scope cap fires on rollup chains even though
+    # the global path was bumped to MAX_REVIEW_FIX_ITERATIONS. Incident
+    # 2026-05-07 task 78de0fdb hit per-chain cap on rollup PR #4091 with simple
+    # fixable issues (duplicate vi.mock keys) because the per-chain cap had
+    # not been bumped in step with the global cap.
     source_loop = (source_task.context or {}).get("review_loop", {})
     iteration = source_loop.get("iteration", 0) + 1
-    per_chain_cap = _max_review_iterations(source_task, direction_data)
+    per_chain_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
 
     if iteration > per_chain_cap:
         logger.warning(

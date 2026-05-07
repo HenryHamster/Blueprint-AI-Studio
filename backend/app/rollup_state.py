@@ -48,9 +48,17 @@ def _is_rollup_parent_awaiting_merge(ctx: dict | None) -> bool:
     fix reuse) must NOT mark the parent COMPLETED — that terminates the
     parent before the PR is actually merged, leaving a "ghost success" and
     preventing ``ci_completion`` from promoting it via ``pr_merged=True``.
+
+    Child review/fix tasks spawned for the rollup PR carry ``rollup_pr_number``
+    AND ``review_loop.pr_number`` pointing at the same PR — those are NOT
+    rollup parents and must not be parked. Misidentifying them keeps the child
+    in EVALUATING after CI-fix takeover (incident 2026-05-07, task 12b4eb3b).
     """
     if not ctx:
         return False
     if ctx.get("_is_rollup_review") is True:
         return True
+    review_loop_pr = (ctx.get("review_loop") or {}).get("pr_number")
+    if review_loop_pr and review_loop_pr == ctx.get("rollup_pr_number"):
+        return False
     return bool(ctx.get("rollup_pr_number")) and not ctx.get("pr_merged")

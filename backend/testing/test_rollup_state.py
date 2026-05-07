@@ -89,6 +89,36 @@ class TestIsRollupParentAwaitingMerge:
             is True
         )
 
+    def test_child_review_with_rollup_pr_in_review_loop_returns_false(self):
+        # Regression guard for incident 2026-05-07 (task 12b4eb3b):
+        # A review task spawned for the rollup PR inherits rollup_pr_number into
+        # its own context AND has review_loop.pr_number == rollup_pr_number.
+        # Without this exclusion the fallback predicate falsely identifies it as
+        # a rollup parent and parks it in EVALUATING after the CI-fix takeover.
+        ctx = {
+            "rollup_pr_number": 4177,
+            "review_loop": {"pr_number": 4177, "iteration": 2},
+        }
+        assert _is_rollup_parent_awaiting_merge(ctx) is False
+
+    def test_child_fix_with_rollup_pr_in_review_loop_returns_false(self):
+        # Same exclusion applies to fix tasks spawned for the rollup PR
+        ctx = {
+            "rollup_pr_number": 4177,
+            "review_loop": {"pr_number": 4177, "iteration": 3, "fix_reason": "ci_failure"},
+        }
+        assert _is_rollup_parent_awaiting_merge(ctx) is False
+
+    def test_review_loop_with_different_pr_does_not_mask_parent(self):
+        # The child-task exclusion only fires when review_loop.pr_number matches
+        # rollup_pr_number — different PRs (shouldn't happen in practice but be
+        # safe) leave the rollup-parent fallback intact
+        ctx = {
+            "rollup_pr_number": 4177,
+            "review_loop": {"pr_number": 9999},
+        }
+        assert _is_rollup_parent_awaiting_merge(ctx) is True
+
 
 class TestBuildRollupPrBody:
     def _make_child(

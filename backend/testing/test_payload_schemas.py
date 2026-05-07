@@ -361,7 +361,7 @@ def test_fix_pipeline_pattern():
 
 
 # ---------------------------------------------------------------------------
-# validate_internal_payload — fail-open behaviour
+# validate_internal_payload — fail-closed on schema/required-field violations
 # ---------------------------------------------------------------------------
 
 
@@ -371,37 +371,37 @@ def test_internal_payload_passes_valid():
     assert result["prompt"] == "Do it"
 
 
-def test_internal_payload_returns_original_on_failure(caplog):
-    import logging
+def test_internal_payload_raises_on_missing_required_field():
+    """Caller bugs (missing required fields) must surface, not get silently
+    rewritten into an empty payload that crashes the agent. Regression guard
+    for incident 2026-05-07 task 8c1ab616 — a fix-spawn site forgot
+    ``fix_prompt``, the validator silently passed the empty ``prompt: ""``
+    through, and the agent died with ``Fatal error: Fix task missing prompt``
+    after burning 3 retries.
+    """
+    raw = {"type": "fix", "pr_number": 42, "branch": "blueprint/task-x"}  # missing prompt
+    with pytest.raises(ValueError, match="prompt"):
+        validate_internal_payload(raw, "my_context")
 
-    raw = {"type": "create"}  # missing prompt
-    with caplog.at_level(logging.WARNING):
-        result = validate_internal_payload(raw, "my_context")
-    assert result is raw  # original dict returned unchanged
-    assert "my_context" in caplog.text
+
+def test_internal_payload_raises_on_empty_required_string():
+    """min_length=1 violations also indicate caller bugs and must raise."""
+    raw = {"type": "fix", "pr_number": 42, "branch": "blueprint/task-x", "prompt": ""}
+    with pytest.raises(ValueError):
+        validate_internal_payload(raw, "ctx_empty_prompt")
 
 
-def test_internal_payload_logs_warning_on_failure(caplog):
-    import logging
-
+def test_internal_payload_raises_on_unknown_type():
     raw = {"type": "totally_unknown_type"}
-    with caplog.at_level(logging.WARNING):
-        result = validate_internal_payload(raw, "ctx_label")
-    assert result is raw
-    assert "ctx_label" in caplog.text
+    with pytest.raises(ValueError, match="Unknown task type"):
+        validate_internal_payload(raw, "ctx_label")
 
 
-def test_internal_payload_does_not_raise_on_bad_input():
-    """Must never raise, even with completely broken input."""
-    bad_inputs = [
-        {},
-        {"type": None},
-        {"type": "create"},  # missing prompt
-        {"type": "review", "pr_number": -1, "branch": "main"},
-    ]
-    for raw in bad_inputs:
-        result = validate_internal_payload(raw, "safety_check")
-        assert result is raw
+def test_internal_payload_raises_on_constraint_violation():
+    """gt=0 / pattern violations also surface as caller bugs."""
+    raw = {"type": "review", "pr_number": -1, "branch": "main"}
+    with pytest.raises(ValueError):
+        validate_internal_payload(raw, "neg_pr_number")
 
 
 # ---------------------------------------------------------------------------
@@ -707,12 +707,14 @@ def test_validate_internal_payload_reraises_size_errors():
         validate_internal_payload(raw, context="test")
 
 
-def test_validate_internal_payload_swallows_schema_errors():
-    """Schema errors should still fail open — existing behavior preserved."""
-    # Missing required 'prompt' for a create task. Should log + return raw.
+def test_validate_internal_payload_raises_on_schema_errors():
+    """Schema errors must surface — fail-closed prevents silent caller bugs
+    (incident 2026-05-07 task 8c1ab616: empty fix_prompt slipped past
+    fail-open validation, agent crashed after 3 retries)."""
+    # Missing required 'prompt' for a create task. Should raise.
     raw = {"type": "create"}
-    result = validate_internal_payload(raw, context="test")
-    assert result == raw  # returns original dict unchanged
+    with pytest.raises(ValueError):
+        validate_internal_payload(raw, context="test")
 
 
 # ---------------------------------------------------------------------------
