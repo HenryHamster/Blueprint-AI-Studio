@@ -273,6 +273,7 @@ function FeedRow({
 
               {event.type === 'TASK_COMPLETED' && event.commit_hash && (
                 event.repo_url && isSafeUrl(event.repo_url) ? (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <a
                     href={event.repo_url}
                     target="_blank"
@@ -459,6 +460,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
             );
           })()}
         </div>
+        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button
           onClick={onClose}
           className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-1.5 rounded text-xs transition-colors border border-neutral-700"

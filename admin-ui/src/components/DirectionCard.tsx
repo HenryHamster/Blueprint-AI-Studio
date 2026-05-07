@@ -254,6 +254,7 @@ function DirectionCardImpl({
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
             <div className="flex items-center gap-1 shrink-0">
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => approveProposal(d.id)}
                 title="Approve — activate this direction"
@@ -261,6 +262,7 @@ function DirectionCardImpl({
               >
                 Approve
               </button>
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => rejectProposal(d.id)}
                 title="Reject — remove this proposal"
@@ -301,6 +303,7 @@ function DirectionCardImpl({
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-400 flex-1">{d.text}</p>
             <div className="flex items-center gap-1 shrink-0">
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => reviveProposal(d.id)}
                 title="Revive — move back to proposed"
@@ -308,6 +311,7 @@ function DirectionCardImpl({
               >
                 Revive
               </button>
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => approveProposal(d.id)}
                 title="Approve — activate this direction"
@@ -447,6 +451,7 @@ function DirectionCardImpl({
                 const idx = activeItems.findIndex(x => x.id === d.id);
                 return (<>
                   {idx > 0 && (
+                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <button
                       onClick={() => {
                         const next = [...activeItems];
@@ -460,6 +465,7 @@ function DirectionCardImpl({
                     </button>
                   )}
                   {idx < activeItems.length - 1 && (
+                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <button
                       onClick={() => {
                         const next = [...activeItems];
@@ -479,6 +485,7 @@ function DirectionCardImpl({
                 const inCooldown = cooldownStatus === 'cooling';
                 return (
                   <div className="relative flex items-center gap-1">
+                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button
                       onClick={() => !inCooldown && triggerResearch(d.id)}
                       disabled={researchingIds[d.id] || inCooldown}
@@ -489,6 +496,7 @@ function DirectionCardImpl({
                     </button>
                     {inCooldown && (
                       <div className="relative">
+                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                         <button
                           onClick={() => setForceConfirmId(forceConfirmId === d.id ? null : d.id)}
                           disabled={researchingIds[d.id]}
@@ -505,12 +513,14 @@ function DirectionCardImpl({
                             <p className="text-[11px] text-amber-300 font-medium mb-1">Force research?</p>
                             <p className="text-[10px] text-neutral-400 mb-2 leading-relaxed">Bypasses the cooldown and queues a research task immediately.</p>
                             <div className="flex gap-2">
+                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
                                 onClick={() => triggerResearch(d.id, true)}
                                 className="flex-1 text-[10px] px-2 py-1 rounded border bg-amber-950/60 border-amber-900/50 text-amber-300 hover:bg-amber-900/50 font-medium transition-colors"
                               >
                                 Force
                               </button>
+                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
                                 onClick={() => setForceConfirmId(null)}
                                 className="flex-1 text-[10px] px-2 py-1 rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
@@ -525,9 +535,11 @@ function DirectionCardImpl({
                   </div>
                 );
               })()}
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
                 <Pencil className="w-3 h-3" />
               </button>
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button onClick={() => deleteDirection(d.id)} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
                 <Trash2 className="w-3 h-3" />
               </button>
@@ -573,6 +585,7 @@ function DirectionCardImpl({
                   </p>
                 )}
               </div>
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={(e) => { e.stopPropagation(); void unholdDirection(d.id); }}
                 className="text-[10px] px-2 py-0.5 rounded border border-red-700 text-red-200 hover:bg-red-900/40 shrink-0"
@@ -678,6 +691,7 @@ function DirectionCardImpl({
               {d.priority}
             </span>
             {d.status === 'active' || d.status === 'paused' ? (
+              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 onClick={() => quickToggleStatus(d.id, d.status as 'active' | 'paused')}
                 title={d.status === 'active' ? 'Click to pause' : 'Click to activate'}
@@ -805,6 +819,7 @@ function DirectionCardImpl({
             })()}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
+              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 onClick={() => reactivateDirection(d.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
@@ -814,6 +829,7 @@ function DirectionCardImpl({
             )}
             {/* Mark Complete button for possibly-complete directions */}
             {d.possibly_complete && key === 'active' && (
+              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 onClick={() => markDirectionComplete(d.id)}
                 className="text-[10px] px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
@@ -939,6 +955,7 @@ function DirectionCardImpl({
               return (
                 <div className="flex flex-wrap gap-1">
                   {tasks.map(t => (
+                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <button
                       key={t.id}
                       type="button"
@@ -1014,7 +1031,9 @@ function DirectionCardImpl({
                 <div className="text-neutral-500 italic mt-1">{d.pending_update.rationale}</div>
               )}
               <div className="flex gap-2 mt-2">
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
               </div>
             </div>

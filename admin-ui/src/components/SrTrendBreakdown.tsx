@@ -1057,6 +1057,7 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
       <div className="flex flex-wrap items-center gap-2 text-[10px]">
         <span className="text-neutral-500 uppercase tracking-wide">Time</span>
         {WINDOW_OPTIONS.map(w => (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             key={w.days}
             onClick={() => setWindowDays(w.days)}
@@ -1090,6 +1091,7 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
       ) : (
         <div className="flex flex-col gap-1">
           {visible.map(t => (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <div
               key={t.task_id}
               className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}

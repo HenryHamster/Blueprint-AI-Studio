@@ -524,6 +524,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
         {/* Spawn triggers */}
         <div className="px-5 py-2 border-b border-neutral-800 shrink-0 flex items-center gap-2">
           <div className="shrink-0 flex items-center gap-1">
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               type="button"
               onClick={() => triggerCycle('design_doc')}
@@ -532,6 +533,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             >
               <Zap className="w-3 h-3" /> Arch
             </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               type="button"
               onClick={() => triggerCycle('strategic_review')}
@@ -540,6 +542,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             >
               <Zap className="w-3 h-3" /> Strategic
             </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               type="button"
               onClick={() => triggerCycle('full')}
@@ -774,6 +777,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             if (modelEmpty) return null;
             return (
             <div className="mb-5">
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => setActiveTab('problem-model')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
@@ -815,6 +819,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           {/* Running Update quick-link */}
           {selectedProjectId && !loading && runningUpdate && runningUpdate.trim() && (
             <div className="mb-5">
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => setActiveTab('running-update')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
@@ -846,6 +851,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
             if (pages.length === 0) return null;
             return (
             <div className="mb-5">
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 onClick={() => setActiveTab('design-doc')}
                 className="flex items-center gap-2 w-full text-left group cursor-pointer hover:bg-neutral-800/50 rounded px-1.5 -mx-1.5 py-1.5 transition-colors"
@@ -880,6 +886,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
           {!loading && directions.length > 0 && (
             <div className="flex items-center gap-1 mb-3">
               {(['all', 'product', 'structural', 'mixed'] as const).map(cat => (
+                // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                 <button
                   key={cat}
                   onClick={() => setCategoryFilter(cat)}

@@ -103,6 +103,7 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
         ${total.toFixed(2)}
       </button>
       {open && hasBreakdown && (
+        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <div
           className="absolute z-20 top-full mt-1 left-0 w-56 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg text-[10px] text-neutral-300 space-y-1.5"
           onClick={e => e.stopPropagation()}
@@ -189,6 +190,7 @@ function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
     <div className="mt-1 text-[9px]">
       <button type="button" className={`${catchColor} hover:underline cursor-pointer`} title={`SR catch rate (n=${entry.sample_size})`} onClick={e => { e.stopPropagation(); setOpen(v => !v); }}>{label}</button>
       {open && (
+        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <div className="mt-0.5 flex flex-col gap-0.5 pl-2 border-l border-neutral-800" onClick={e => e.stopPropagation()}>
           {Object.entries(entry.categories).sort(([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0)).map(([cat, s]) => (
             <div key={cat} className="text-neutral-400">

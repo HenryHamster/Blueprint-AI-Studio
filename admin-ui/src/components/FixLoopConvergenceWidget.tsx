@@ -138,6 +138,7 @@ function LoopCard({ name, data, onChipClick }: { name: string; data: LoopAggrega
         {topReasons.map(([reason, count]) => {
           const cls = EXIT_REASON_COLORS[reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
           return (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               key={reason}
               onClick={() => onChipClick(name, reason)}
@@ -233,6 +234,7 @@ function DrillDownPanel({
           </span>
           {!loading && <span className="text-[10px] text-neutral-500">{total} task{total !== 1 ? 's' : ''}</span>}
         </div>
+        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
       </div>
       {isDivergenceFilter && DIVERGENCE_PATTERNS.some(p => (patternCounts[p] ?? 0) > 0) && (
@@ -243,6 +245,7 @@ function DrillDownPanel({
             const cls = EXIT_REASON_COLORS[p] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
             const isActive = activePattern === p;
             return (
+              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 key={p}
                 onClick={() => setActivePattern(prev => prev === p ? null : p)}
@@ -255,6 +258,7 @@ function DrillDownPanel({
             );
           })}
           {activePattern && (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button onClick={() => setActivePattern(null)} className="text-[10px] text-neutral-400 hover:text-neutral-200 px-1">
               show all
             </button>

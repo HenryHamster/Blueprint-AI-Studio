@@ -654,6 +654,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
         {!collapsed && (
           <div className="flex flex-wrap items-center gap-1 sm:ml-2">
             {windowLabels.map(({ key, label }) => (
+              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 key={key}
                 onClick={() => setActiveWindow(key)}
@@ -1148,6 +1149,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       <AlertTriangle className="w-3 h-3" />
                       <span className="flex-1">Needs attention ({countLabel})</span>
                       {onBulkApprove && visibleItems.filter(i => i.reason === 'approval_required').length >= 2 && (
+                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
                           className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
                           onClick={() => handleBulkApprove(visibleItems.filter(i => i.reason === 'approval_required').map(i => i.task_id))}
@@ -1157,6 +1159,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                         </button>
                       )}
                       {onBulkRetry && visibleItems.filter(i => i.reason === 'failed').length >= 2 && (
+                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
                           className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
                           onClick={() => handleBulkRetry(visibleItems.filter(i => i.reason === 'failed').map(i => i.task_id))}
@@ -1169,6 +1172,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     <div className="flex flex-col gap-1.5">
                       {visibleItems.map(item => (
                         <div key={item.task_id} className="flex flex-col gap-1">
+                          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                           <div
                             role="button"
                             tabIndex={0}
@@ -1229,6 +1233,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             )}
                             <WaitingBadge hours={item.waiting_hours} />
                             {item.reason === 'approval_required' && onApprove && (
+                              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                               <button
                                 className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20"
                                 onClick={e => { e.stopPropagation(); handleApprove(item.task_id); }}
@@ -1238,6 +1243,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               </button>
                             )}
                             {item.reason === 'failed' && onRetry && (
+                              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                               <button
                                 className="text-[9px] font-semibold px-1.5 py-0.5 rounded border flex items-center gap-0.5 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20"
                                 onClick={e => { e.stopPropagation(); handleRetry(item.task_id); }}
@@ -1248,6 +1254,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                             )}
                             {/* Dismiss/snooze button */}
                             <div className="relative shrink-0" onClick={e => e.stopPropagation()}>
+                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
                                 className="text-neutral-600 hover:text-neutral-400 transition-colors px-1 leading-none text-sm"
                                 title="Dismiss or snooze"
@@ -1335,6 +1342,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                                       {formatSnoozeRemaining((entry as { type: 'snooze'; until: number }).until)}
                                     </span>
                                   )}
+                                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                   <button
                                     className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
                                     aria-label="Restore this item"
@@ -1368,6 +1376,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                   {activeExpanded && (
                     <div className="flex flex-col gap-1.5">
                       {(digest.active_tasks ?? []).map(t => (
+                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <div
                           key={t.task_id}
                           role="button"
@@ -1476,6 +1485,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                       const isActive = activeTaxonomyFilter === cat;
                       const isDominant = ftd.dominant_category === cat;
                       return (
+                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
                           key={cat}
                           type="button"
@@ -1526,6 +1536,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                     const isActive = activeStageFilter === stage;
                     const isDominant = fsd.dominant_stage === stage;
                     return (
+                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         key={stage}
                         type="button"
@@ -1685,6 +1696,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                           .filter((s): s is string => !!s)
                           .map(s => s.length > 30 ? s.slice(0, 30) + '…' : s);
                         return (
+                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <div
                             key={cluster.fingerprint}
                             role="button"
@@ -2361,6 +2373,7 @@ export function CatchUpPanel({ selectedProjectId, lastVisitTimestamp: _lastVisit
                               <div className="flex flex-col gap-1 ml-5 max-w-full">
                                 {group.tasks.map(t => (
                                   <div key={t.task_id} className="flex flex-col gap-0.5">
+                                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                     <div
                                       role="button"
                                       tabIndex={0}

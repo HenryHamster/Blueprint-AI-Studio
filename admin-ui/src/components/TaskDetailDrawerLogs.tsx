@@ -263,6 +263,7 @@ export function LogsTab({
       <div className="px-3 py-2 border-b border-neutral-800 flex flex-col gap-1.5 shrink-0">
         <div className="flex items-center gap-1.5 flex-wrap">
           {levelButtons.map(({ level, label, count, activeClass }) => (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               key={level}
               onClick={() => setLogLevel(level)}
@@ -276,6 +277,7 @@ export function LogsTab({
             </button>
           ))}
           {hasPhases && !isFiltering && (
+            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               type="button"
               onClick={toggleAll}
@@ -319,6 +321,7 @@ export function LogsTab({
                 const isCollapsed = collapsedSections.has(sIdx);
                 return (
                   <div key={section.headerIdx} className="mb-1">
+                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button
                       type="button"
                       className="w-full bg-neutral-900/80 border border-neutral-700/50 rounded px-2 py-1 text-[11px] text-neutral-400 flex items-center gap-2 cursor-pointer sticky top-0 z-10 hover:bg-neutral-800/80 transition-colors"

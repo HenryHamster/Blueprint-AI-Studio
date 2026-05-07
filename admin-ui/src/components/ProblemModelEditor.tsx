@@ -199,6 +199,7 @@ export function ProblemModelEditor({
                     placeholder="e.g., Don't modify .github/workflows/"
                     className="flex-1 px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
                   />
+                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button
                     type="button"
                     onClick={() => removeConstraint(i)}
@@ -209,6 +210,7 @@ export function ProblemModelEditor({
                   </button>
                 </div>
               ))}
+              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 type="button"
                 onClick={addConstraint}

@@ -179,6 +179,7 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
                       </div>
                       {/* Actions */}
                       <div className="flex items-center gap-1 shrink-0 mt-0.5">
+                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                         <button
                           disabled={isPending}
                           onClick={() => doAction(entry.key, 'promote')}
@@ -187,6 +188,7 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
                         >
                           <ThumbsUp className="w-3.5 h-3.5" />
                         </button>
+                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                         <button
                           disabled={isPending}
                           onClick={() => doAction(entry.key, 'demote')}
@@ -195,6 +197,7 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
                         >
                           <ThumbsDown className="w-3.5 h-3.5" />
                         </button>
+                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                         <button
                           disabled={isPending}
                           onClick={() => doAction(entry.key, 'archive')}

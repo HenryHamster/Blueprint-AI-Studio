@@ -567,6 +567,7 @@ export function KanbanBoard({
                     {columnTasks.length}
                   </span>
                   {isArchivable && columnTasks.length > 0 && (
+                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <button
                       onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
                       title={`Archive all ${col.label} tasks`}

@@ -161,6 +161,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
 
                   {/* Remove button — owner can remove non-owners */}
                   {isOwner && !isRoleOwner ? (
+                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <button
                       onClick={() => handleRemove(m)}
                       disabled={loading === m.id}

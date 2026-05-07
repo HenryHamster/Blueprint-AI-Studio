@@ -72,9 +72,11 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
           <span className="font-semibold">Tracking ({ids.length})</span>
         </div>
         <div className="flex items-center gap-1">
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button onClick={() => onUntrackAll()} className="text-neutral-500 hover:text-red-400 p-0.5 transition-colors" title="Untrack all">
             <Trash2 className="w-3.5 h-3.5" />
           </button>
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button onClick={() => setCollapsed(c => !c)} className="text-neutral-500 hover:text-neutral-300 p-0.5 transition-colors" title={collapsed ? 'Expand' : 'Collapse'}>
             {collapsed ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
           </button>
@@ -91,6 +93,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
                 const title = t?.title || id.slice(0, 8);
                 const isActive = id === activeTab;
                 return (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button key={id} onClick={() => { setSelectedTab(id); setAutoScroll(true); }}
                     className={`flex items-center gap-1.5 px-2 py-1 rounded text-[10px] whitespace-nowrap shrink-0 transition-colors ${isActive ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900'}`}>
                     <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDotColor(t?.status)}`} />

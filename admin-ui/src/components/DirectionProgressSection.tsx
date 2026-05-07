@@ -147,6 +147,7 @@ export function DirectionProgressSection({ directions, medianCostPerMergedPr }: 
         const isExpanded = expandedDirections.has(dp.direction_id);
         return (
           <div key={dp.direction_id}>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/30 w-full text-left"
               onClick={() => toggleDirection(dp.direction_id)}

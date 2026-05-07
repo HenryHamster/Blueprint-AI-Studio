@@ -635,14 +635,14 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   />
                   <button
                     onClick={() => handleResolve(msg.id, resolveInput)}
-                    className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors"
+                    className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                     title="Confirm resolve"
                   >
                     <Check className="w-3 h-3" />
                   </button>
                   <button
                     onClick={() => setResolvingId(null)}
-                    className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors"
+                    className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                     title="Cancel"
                   >
                     <X className="w-3 h-3" />
@@ -691,7 +691,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           <button
             onClick={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
             title="Toggle sort order"
-            className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[36px]"
+            className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
           >
             {sortMode === 'importance' ? 'Importance' : 'Recent'}
           </button>
@@ -701,7 +701,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 if (selectMode) { setSelectMode(false); setSelectedIds(new Set()); }
                 else { setSelectMode(true); setSelectedIds(new Set(openFeedbackMessages.map(m => m.id))); }
               }}
-              className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors min-h-[36px] ${
+              className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
                 selectMode ? 'text-purple-400 bg-purple-500/10 border border-purple-500/30' : 'text-neutral-500 hover:text-neutral-300 border border-transparent'
               }`}
             >
@@ -712,7 +712,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <button
               onClick={() => setShowPrefsPanel(v => !v)}
               title="Event type visibility"
-              className={`p-2 rounded-lg transition-colors border min-h-[36px] min-w-[36px] flex items-center justify-center ${showPrefsPanel ? 'text-neutral-300 bg-neutral-800 border-neutral-700' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
+              className={`p-2 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center ${showPrefsPanel ? 'text-neutral-300 bg-neutral-800 border-neutral-700' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
             >
               <Settings className="w-4 h-4" />
             </button>
@@ -734,6 +734,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                       <div key={et} className="flex items-center gap-1.5">
                         <span className="text-[11px] text-neutral-400 truncate flex-1">{et.replace(/_/g, ' ')}</span>
                         {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
+                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button key={p} onClick={() => updatePref(et, p)}
                             title={p}
                             className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
@@ -747,7 +748,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               </>
             )}
           </div>
-          <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[36px] min-w-[36px] flex items-center justify-center">
+          <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -784,7 +785,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
               <div className="border border-neutral-800/50 rounded-xl overflow-hidden">
                 <button
                   onClick={() => setRoutineExpanded(e => !e)}
-                  className="w-full flex items-center gap-2 px-4 py-2.5 bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors text-left"
+                  className="w-full flex items-center gap-2 px-4 py-2.5 bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors text-left min-h-[44px]"
                 >
                   <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
                   <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
@@ -809,6 +810,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                               <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
                               <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}</span>
                             </button>
+                            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                             <button
                               onClick={() => handleResolveGroup(row.msgs)}
                               title="Resolve all"
@@ -836,6 +838,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             {/* Resolved toggle + clear */}
             {hiddenResolvedCount > 0 && (
               <div className="flex justify-center gap-3 pt-1">
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => setShowResolved(true)}
                   className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
@@ -846,12 +849,14 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             )}
             {showResolved && resolvedMessages.length > 0 && (
               <div className="flex justify-center gap-3 pt-1">
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => setShowResolved(false)}
                   className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
                 >
                   Hide older resolved
                 </button>
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={handleBulkDeleteResolved}
                   className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1"
@@ -865,6 +870,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
 
         {/* Scroll to bottom button */}
         {showScrollDown && (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={scrollToBottom}
             className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10"
@@ -881,7 +887,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           <button
             onClick={handleBatchCreateDirections}
             disabled={batchCreating}
-            className="text-xs bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded-lg disabled:opacity-40 transition-colors min-h-[36px]"
+            className="text-xs bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded-lg disabled:opacity-40 transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
           >
             {batchCreating ? 'Creating...' : 'Create Directions'}
           </button>
@@ -897,6 +903,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             <span className="text-xs text-neutral-400 truncate flex-1">
               Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
             </span>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button onClick={() => setReplyTo(null)} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0">
               <X className="w-3 h-3" />
             </button>

@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { MessagesPanel } from './MessagesPanel';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // Mock the api module so MessagesPanel doesn't try to fetch real data
 vi.mock('../api', () => ({
@@ -92,6 +92,21 @@ describe('MessagesPanel — viewport regression', () => {
       makeMsg({ id: 'r2', context: { event_type: 'cycle_summary' } }),
     ];
     await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, msgs);
+    });
+  });
+
+  test('action buttons meet 44px touch target at 375px', async () => {
+    const msgs = [
+      makeMsg({ id: 'msg-1', message_type: 'FEEDBACK', status: 'open' }),
+      makeMsg({ id: 'msg-2', message_type: 'NOTE', status: 'open' }),
+    ];
+    await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);

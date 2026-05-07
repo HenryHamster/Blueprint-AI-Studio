@@ -108,6 +108,7 @@ export function BulkActionBar({
           Archive {terminalTasks.length}
         </button>
       )}
+      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         onClick={toggleSelectionMode}
         title="Exit selection mode"

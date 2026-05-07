@@ -69,6 +69,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
           )}
         </button>
         {userRole === 'admin' && onNewProject && (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={onNewProject}
             className="flex items-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 rounded px-1.5 py-0.5 transition-colors"
@@ -140,6 +141,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   <span className="absolute top-2 right-2 text-[9px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/20 rounded px-1 py-0.5">setup</span>
                 )}
                 <div className="flex items-center justify-between mb-1.5">
+                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button
                     onClick={() => onSelectProject(isSelected ? null : project.id)}
                     className="text-xs font-semibold text-neutral-200 truncate pr-2 hover:text-white transition-colors text-left"
@@ -148,6 +150,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </button>
                   <div className="flex items-center gap-1.5 shrink-0">
                     {isSelected && onToggleMembers && (
+                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         onClick={(e) => { e.stopPropagation(); onToggleMembers(); }}
                         className={`p-1 rounded transition-colors ${
@@ -161,6 +164,7 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                       </button>
                     )}
                     {showSetupNudge && onOpenSetupGuide && (
+                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         onClick={(e) => { e.stopPropagation(); onOpenSetupGuide(project.id); }}
                         className="p-1 rounded text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors"

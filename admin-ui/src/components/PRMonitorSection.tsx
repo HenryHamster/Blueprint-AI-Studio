@@ -109,6 +109,7 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                             </div>
                           );
                           return fullTask ? (
+                            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                             <button
                               key={t.task_id}
                               onClick={() => onViewTask(fullTask)}

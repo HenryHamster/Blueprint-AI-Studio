@@ -359,6 +359,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
           </span>
         )}
         {overdueCount > 0 && (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             type="button"
             onClick={() => {
@@ -773,6 +774,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                         )}
                         <span className="font-mono text-[9px] text-neutral-600 truncate flex-1">{r.fingerprint}</span>
                         {canUnsuspend && (
+                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button
                             type="button"
                             onClick={() => handleUnsuspend(r)}
@@ -783,6 +785,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                           </button>
                         )}
                         {canIgnore && (
+                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <button
                             type="button"
                             onClick={() => handleIgnore(r)}

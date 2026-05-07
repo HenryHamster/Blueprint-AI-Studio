@@ -21,6 +21,7 @@ export function WaitingBadge({ hours }: { hours: number | undefined }) {
 export function CompletionRow({ c, onSelectTask }: { c: RecentCompletion; onSelectTask: (task: { id: string }) => void }) {
   const prNum = c.pr_url?.match(/\/(\d+)\/?$/)?.[1];
   return (
+    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
     <div
       role="button"
       tabIndex={0}

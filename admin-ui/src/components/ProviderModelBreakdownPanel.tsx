@@ -97,6 +97,7 @@ function QuarantineBadge({
       {qs.kind === 'regression' && (
         confirming ? (
           <span className="flex items-center gap-1">
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={doClear}
               disabled={clearing}
@@ -104,6 +105,7 @@ function QuarantineBadge({
             >
               {clearing ? 'Clearing…' : 'Confirm clear'}
             </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={() => setConfirming(false)}
               className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:bg-neutral-700 transition-colors"
@@ -112,6 +114,7 @@ function QuarantineBadge({
             </button>
           </span>
         ) : (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={() => setConfirming(true)}
             className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/50 text-neutral-400 hover:text-orange-300 hover:bg-orange-500/20 transition-colors"
@@ -173,6 +176,7 @@ export function ProviderModelBreakdownPanel({
         <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">
           Provider / Model Breakdown
         </h2>
+        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button
           onClick={() => setHideSingleAccount(v => !v)}
           className={`text-[9px] px-1.5 py-0.5 rounded border transition-colors ${

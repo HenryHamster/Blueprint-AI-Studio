@@ -151,17 +151,18 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
           {shouldCollapse && (
             <button
               onClick={() => setExpanded(e => !e)}
-              className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors flex items-center gap-1"
+              className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto px-2 md:px-0"
             >
               {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-              {expanded ? 'Collapse' : `Show all ${alerts.length} alerts`}
+              <span className="hidden md:inline">{expanded ? 'Collapse' : `Show all ${alerts.length} alerts`}</span>
             </button>
           )}
           <button
             onClick={onDismissAll}
-            className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors"
+            className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center px-2 md:px-0"
           >
-            Dismiss all
+            <span className="hidden md:inline">Dismiss all</span>
+            <span className="md:hidden">✕</span>
           </button>
         </div>
       )}
@@ -180,11 +181,11 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
               {srInfo && srInfo.categories.length > 0 && projectId && (
                 <button
                   onClick={() => void openDrilldown(alert)}
-                  className={`shrink-0 transition-opacity text-xs flex items-center gap-1 ${isOpen ? 'opacity-100' : 'opacity-60 hover:opacity-100'}`}
+                  className={`shrink-0 transition-opacity text-xs flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto px-2 md:px-0 ${isOpen ? 'opacity-100' : 'opacity-60 hover:opacity-100'}`}
                   title="Investigate contributing tasks"
                 >
                   <Search className="w-3.5 h-3.5" />
-                  <span>Why?</span>
+                  <span className="hidden md:inline">Why?</span>
                 </button>
               )}
               {alert.task_id && onViewTask && (() => {
@@ -192,7 +193,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
                 return (
                   <button
                     onClick={() => onViewTask(taskId)}
-                    className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center gap-1"
+                    className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto"
                     title="View task"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
@@ -222,7 +223,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
                       <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
                     </div>
                     {onViewTask && (
-                      <button onClick={() => onViewTask(row.task_id)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
+                      <button onClick={() => onViewTask(row.task_id)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center" title="View task SR panel">
                         <ExternalLink className="w-3 h-3" />
                       </button>
                     )}
@@ -234,6 +235,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
         );
       })}
       {hiddenCount > 0 && (
+        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <button
           onClick={() => setExpanded(true)}
           className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors text-center py-1"
@@ -288,7 +290,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
             {taskId && onViewTask && (
               <button
                 onClick={() => onViewTask(taskId)}
-                className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center gap-1"
+                className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto"
                 title={r.spawned_task_title ?? 'View investigation task'}
               >
                 <ExternalLink className="w-3.5 h-3.5" />

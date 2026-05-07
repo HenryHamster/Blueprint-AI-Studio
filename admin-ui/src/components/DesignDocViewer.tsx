@@ -171,6 +171,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
       <div className="w-[180px] shrink-0 border-r border-neutral-800 overflow-y-auto custom-scrollbar">
         <div className="p-2">
           {/* Overview link */}
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
             onClick={() => setSelectedPage(null)}
             className={`w-full text-left px-2 py-1.5 rounded text-xs transition-colors ${
@@ -188,6 +189,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
               {topLevel.map(key => {
                 const status = getPageStatus(designDoc[key]);
                 return (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={key}
                     onClick={() => setSelectedPage(key)}
@@ -211,6 +213,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
             const isCollapsed = collapsedGroups.has(prefix);
             return (
               <div key={prefix} className="mt-2">
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => toggleGroup(prefix)}
                   className="w-full text-left px-2 py-1 rounded text-[10px] font-semibold uppercase tracking-wider text-neutral-500 hover:text-neutral-300 flex items-center gap-1 transition-colors"
@@ -229,6 +232,7 @@ export default function DesignDocViewer({ designDoc }: DesignDocViewerProps) {
                       const fullKey = `${prefix}/${child}`;
                       const status = getPageStatus(designDoc[fullKey]);
                       return (
+                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
                           key={fullKey}
                           onClick={() => setSelectedPage(fullKey)}

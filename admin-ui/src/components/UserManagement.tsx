@@ -77,6 +77,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
     <div className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden">
       <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
         <h2 className="text-sm font-semibold text-neutral-100">User Management</h2>
+        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button onClick={onClose} className="p-1 hover:bg-neutral-800 rounded transition-colors">
           <X className="w-4 h-4 text-neutral-400" />
         </button>
@@ -147,6 +148,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
                       {isSelf && <span className="text-[10px] text-cyan-500 ml-1">(you)</span>}
                     </td>
                     <td className="px-4 py-2.5">
+                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => handleToggleRole(u)}
                         disabled={isSelf || loading === u.id}
@@ -171,6 +173,7 @@ export function UserManagement({ users, currentUserEmail, onAdd, onUpdateRole, o
                       {formatDate(u.last_login_at)}
                     </td>
                     <td className="px-4 py-2.5 text-right">
+                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => handleRemove(u)}
                         disabled={isSelf || loading === u.id}

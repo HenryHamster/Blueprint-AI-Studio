@@ -5,9 +5,10 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 import noFixedWidthOverflow from './eslint-rules/no-fixed-width-overflow.js'
+import minTouchTarget from './eslint-rules/min-touch-target.js'
 
 const viewportPlugin = {
-  rules: { 'no-fixed-width': noFixedWidthOverflow },
+  rules: { 'no-fixed-width': noFixedWidthOverflow, 'min-touch-target': minTouchTarget },
 }
 
 export default defineConfig([
@@ -29,6 +30,7 @@ export default defineConfig([
       '@typescript-eslint/no-non-null-assertion': 'warn',
       'no-console': ['warn', { allow: ['warn', 'error'] }],
       'viewport/no-fixed-width': 'error',
+      'viewport/min-touch-target': 'error',
     },
   },
 ])

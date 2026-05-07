@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { AlertsBanner } from './AlertsBanner';
 import type { Alert } from '../types/alert';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
 
 // AlertsBanner imports `apiFetch` from '../api', which transitively pulls in
 // firebase. We don't pass projectId in this test (so the fetch path never
@@ -70,6 +70,27 @@ describe('AlertsBanner — viewport regression', () => {
             onDismiss={() => {}}
             onDismissAll={() => {}}
             onViewTask={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('action buttons meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <AlertsBanner
+            alerts={sampleAlerts}
+            onDismiss={() => {}}
+            onDismissAll={() => {}}
+            onViewTask={() => {}}
+            projectId="project-canary"
           />,
         );
       });

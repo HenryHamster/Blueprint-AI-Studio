@@ -449,6 +449,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 ? `Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${Math.round(ratio * 100)}%). Click to view cost section.`
                 : `Daily cost: $${dailyCostUsd.toFixed(2)}. Click to view cost section.`;
               return (
+                // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                 <button
                   type="button"
                   className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''}`}

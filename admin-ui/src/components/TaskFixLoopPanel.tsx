@@ -161,6 +161,7 @@ function LoopSection({ name, attempts, summary }: { name: string; attempts: FixL
           {outcome}
         </div>
       )}
+      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         className="w-full flex items-center gap-2 py-1.5 text-left hover:bg-neutral-800/30 rounded px-1 -mx-1"
         onClick={() => setExpanded(e => !e)}

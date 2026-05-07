@@ -89,6 +89,7 @@ export default function ArchiveView({
             <Loader2 className="w-4 h-4 text-neutral-500 animate-spin" />
           )}
         </div>
+        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button
           onClick={() => setShowArchive(false)}
           className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
@@ -228,6 +229,7 @@ export default function ArchiveView({
 
                   {/* PR link */}
                   {task.pr_url && isSafeUrl(task.pr_url) && (
+                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <a
                       href={task.pr_url}
                       target="_blank"

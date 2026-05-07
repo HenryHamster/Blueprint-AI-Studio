@@ -63,6 +63,7 @@ export function ColumnsPicker({ prefs, onPrefsChange, columns }: {
                 />
                 <span className="flex-1 text-xs text-neutral-300">{col.label}</span>
                 <div className="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button
                     onClick={() => move(pref.id, -1)}
                     disabled={idx === 0}
@@ -70,6 +71,7 @@ export function ColumnsPicker({ prefs, onPrefsChange, columns }: {
                   >
                     <ChevronUp className="w-3 h-3" />
                   </button>
+                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button
                     onClick={() => move(pref.id, 1)}
                     disabled={idx === prefs.length - 1}

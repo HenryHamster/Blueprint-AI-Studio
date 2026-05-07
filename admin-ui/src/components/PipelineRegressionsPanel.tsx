@@ -197,10 +197,12 @@ export function ManualInterventionPanel({ projectId }: Props) {
         {cases.length > 0 && (
           <div className="flex items-center gap-1 text-[10px] text-neutral-500">
             <span>Sort:</span>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={() => setSortKey('last_seen_at')}
               className={`px-1.5 py-0.5 rounded ${sortKey === 'last_seen_at' ? 'text-white bg-neutral-700' : 'hover:text-neutral-300'}`}
             >recent</button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={() => setSortKey('mttd')}
               className={`px-1.5 py-0.5 rounded ${sortKey === 'mttd' ? 'text-white bg-neutral-700' : 'hover:text-neutral-300'}`}
@@ -293,6 +295,7 @@ export function ManualInterventionPanel({ projectId }: Props) {
                     </div>
                   </div>
                 </div>
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => handleClear(c.regression_class)}
                   disabled={clearing === c.regression_class}

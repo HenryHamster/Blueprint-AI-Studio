@@ -185,6 +185,7 @@ export function ProviderCategoriesPanel({
               placeholder="new category name"
               className="bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-xs text-neutral-100 w-40"
             />
+            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
             <button
               onClick={addCategory}
               className="inline-flex items-center gap-1 px-2 py-1 rounded border border-neutral-700 text-neutral-300 hover:bg-neutral-800 text-xs"
@@ -267,6 +268,7 @@ function ProviderChecklist({
       {providers.map(name => {
         const active = selected.includes(name);
         return (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             key={name}
             onClick={() => toggle(name)}
@@ -350,6 +352,7 @@ function CategoryCard({
           />
         )}
         {!isDefault && (
+          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={onDelete}
             className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-neutral-500 hover:text-red-400 hover:bg-red-950/30"
@@ -476,6 +479,7 @@ function TaskOverrideTable({
             <option value="">+ add override for…</option>
             {eligibleToAdd.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
             onClick={() => { if (newType) { onSet(newType, { providers: providerNames }); setNewType(''); } }}
             disabled={!newType}

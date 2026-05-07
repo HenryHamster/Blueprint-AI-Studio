@@ -569,6 +569,7 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
               <div className="flex gap-1 mb-1.5">
                 {REFRESH_PRESETS.map(p => (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={p.value}
                     onClick={() => { onUpdateRefreshInterval(p.value); setRefreshInputVal(''); }}
@@ -608,6 +609,7 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Tasks Per Page</label>
               <div className="flex gap-1 mb-1.5">
                 {PAGE_PRESETS.map(p => (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={p}
                     onClick={() => { onUpdatePageSize(p); setPageSizeInputVal(''); }}
@@ -616,6 +618,7 @@ export function SettingsDropdown({
                     {p}
                   </button>
                 ))}
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => { onUpdatePageSize(ALL_PAGE_SIZE); setPageSizeInputVal(''); }}
                   className={`flex-1 text-xs py-1.5 rounded-lg border transition-colors ${pageSize === ALL_PAGE_SIZE && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
@@ -1022,6 +1025,7 @@ export function SettingsDropdown({
                         />
                       )}
                     </div>
+                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                     <button
                       onClick={() => {
                         if (isCapExpanded) { setExpandedAccountCaps(null); return; }
@@ -1061,6 +1065,7 @@ export function SettingsDropdown({
                           </div>
                         );
                       })}
+                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button onClick={() => onResetRateLimits(a.id)}
                         className="mt-1.5 w-full text-[11px] text-amber-400/70 hover:text-amber-300 bg-amber-950/30 hover:bg-amber-950/50 rounded-lg px-2 py-1 transition-colors">
                         Clear rate limits
@@ -1503,6 +1508,7 @@ export function SettingsDropdown({
 
   return (
     <div className="relative" ref={settingsRef}>
+      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         onClick={onToggleSettings}
         className={`bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-2 rounded text-xs transition-colors border border-neutral-700${triggerClassName ? ` ${triggerClassName}` : ''}`}
@@ -1565,6 +1571,7 @@ export function SettingsDropdown({
                 <h3 className="text-sm font-semibold text-neutral-100">
                   {visibleSections.find(s => s.id === activeSection)?.label}
                 </h3>
+                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={onToggleSettings}
                   className="text-neutral-500 hover:text-neutral-300 transition-colors p-1 rounded hover:bg-neutral-800"
@@ -1660,6 +1667,7 @@ function AccountAvailabilityLine({
   return (
     <div className="text-[11px] font-mono flex items-center gap-1.5 mt-0.5">
       {body}
+      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         type="button"
         onClick={onRefresh}

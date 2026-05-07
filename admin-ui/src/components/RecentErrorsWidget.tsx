@@ -185,6 +185,7 @@ export function RecentErrorsWidget() {
               {buckets.length} unique{ackedCount > 0 ? ` · ${ackedCount} acked` : ''}
             </span>
           </button>
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); acknowledgeAll(); }}
@@ -193,6 +194,7 @@ export function RecentErrorsWidget() {
           >
             <EyeOff className="w-4 h-4" />
           </button>
+          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); copyAll(); }}

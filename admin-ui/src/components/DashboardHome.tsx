@@ -456,6 +456,7 @@ function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; spa
 
   return (
     <div ref={ref} className="relative">
+      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${colorClass} cursor-pointer`}
         onClick={() => setOpen(v => !v)}
@@ -1009,6 +1010,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
             <div>
               <div className="flex justify-end gap-0.5 mb-1">
                 {([7, 14, 30] as const).map(d => (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={d}
                     onClick={() => setFixLoopTrendDays(d)}
@@ -1555,6 +1557,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                       {dirs.length > 0 && (
                         <div className="flex flex-wrap items-center gap-1 text-[10px] text-neutral-500">
                           {dirs.slice(0, 4).map(d => (
+                            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                             <button
                               key={d.direction_id}
                               type="button"

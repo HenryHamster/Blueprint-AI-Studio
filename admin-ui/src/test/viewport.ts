@@ -92,3 +92,79 @@ export async function expectNoOverflowAt(
     );
   }
 }
+
+/**
+ * Options for `expectMinTouchTargetAt`.
+ *
+ * - `selector`: CSS selector to find buttons to check (default 'button').
+ * - `minSize`: minimum touch target size in px (default 44).
+ * - `height`: viewport height in px (default 800).
+ * - `waitMs`: extra milliseconds to pause after `render()` before asserting.
+ */
+export interface ExpectMinTouchTargetOptions {
+  selector?: string;
+  minSize?: number;
+  height?: number;
+  waitMs?: number;
+}
+
+/**
+ * Assert that all buttons have minimum touch target size at `width` px.
+ *
+ * Checks that every button (or element matching `selector`) visible at the
+ * given viewport width has a computed bounding box of at least `minSize` x
+ * `minSize` (default 44x44px, iOS guideline).
+ *
+ * Authors can opt a node out by adding `data-viewport-allow-small-target`
+ * to it (e.g. decorative icons that are not clickable).
+ */
+export async function expectMinTouchTargetAt(
+  width: number,
+  render: () => Promise<void> | void,
+  options?: ExpectMinTouchTargetOptions,
+): Promise<void> {
+  const selector = options?.selector ?? 'button';
+  const minSize = options?.minSize ?? 44;
+  const height = options?.height ?? 800;
+  const waitMs = options?.waitMs ?? 0;
+
+  await page.viewport(width, height);
+  await render();
+
+  // Let layout settle.
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+
+  if (waitMs > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  const undersized: { tag: string; width: number; height: number; html: string }[] = [];
+  const all = document.querySelectorAll<HTMLElement>(selector);
+  for (const el of all) {
+    if (el.closest('[data-viewport-allow-small-target]')) continue;
+    const rect = el.getBoundingClientRect();
+    // Skip hidden elements
+    if (rect.width === 0 && rect.height === 0) continue;
+    if (rect.width < minSize || rect.height < minSize) {
+      undersized.push({
+        tag: el.tagName.toLowerCase(),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        html: el.outerHTML.slice(0, 160),
+      });
+    }
+  }
+
+  if (undersized.length > 0) {
+    const lines = undersized
+      .slice(0, 5)
+      .map((e) => `  <${e.tag}> ${e.width}×${e.height}px (min ${minSize}×${minSize}px) — ${e.html}`)
+      .join('\n');
+    const more = undersized.length > 5 ? `\n  ... and ${undersized.length - 5} more` : '';
+    throw new Error(
+      `expectMinTouchTargetAt(${width}): ${undersized.length} element(s) below ${minSize}px touch target:\n${lines}${more}`,
+    );
+  }
+}

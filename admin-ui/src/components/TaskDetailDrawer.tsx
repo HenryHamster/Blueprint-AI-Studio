@@ -336,6 +336,7 @@ export function TaskDetailDrawer({
                       rows={3}
                     />
                     <div className="flex gap-2">
+                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => { onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
                         disabled={!changesFeedback.trim() || !!actionLoading}
@@ -343,6 +344,7 @@ export function TaskDetailDrawer({
                       >
                         {actionLoading === 'request-changes' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null} Send Fix
                       </button>
+                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => { onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
                         disabled={!!actionLoading}

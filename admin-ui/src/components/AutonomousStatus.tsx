@@ -732,6 +732,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                 {/* Header */}
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-medium text-neutral-200 truncate max-w-[200px]">{p.project_name}</span>
+                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button
                     onClick={() => toggleAutonomy(p.project_id, !p.autonomous_enabled)}
                     disabled={toggling === p.project_id}
@@ -752,6 +753,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                       <CircuitBreakerDetail cb={debug.circuit_breaker} />
                       {(debug.circuit_breaker.state === 'OPEN' || debug.circuit_breaker.state === 'HALF_OPEN') && (
                         <div className="flex justify-end">
+                          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                           <button
                             onClick={() => resetCircuitBreaker(p.project_id)}
                             disabled={resettingBreaker === p.project_id}

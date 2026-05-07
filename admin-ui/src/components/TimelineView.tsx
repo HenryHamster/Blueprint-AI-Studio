@@ -265,6 +265,7 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
                 const hasChildren = group && group.children.length > 0;
                 const isCollapsed = collapsedGroups.has(task.id);
                 return (
+                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <div
                     key={task.id}
                     className="flex items-center gap-1 border-b border-neutral-800/50 px-2 text-xs text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/30 cursor-pointer"

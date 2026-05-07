@@ -396,6 +396,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           </div>
           <div className="flex items-center gap-1 flex-wrap">
             {OUTCOME_FILTER_OPTIONS.map(opt => (
+              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 key={opt.value}
                 onClick={() => setOutcomeFilter(opt.value)}

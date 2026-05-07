@@ -404,6 +404,7 @@ function FieldRow({ label, schema, value, present, allowInherit, lockReason, dis
         )}
       </div>
       {allowInherit && !locked && (
+        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <button
           onClick={toggleOverride}
           className={`text-[10px] px-2 py-1 rounded border ${
