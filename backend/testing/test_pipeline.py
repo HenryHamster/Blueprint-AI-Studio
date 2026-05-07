@@ -5,6 +5,7 @@ Tests verdict parsing, failure classification, deployment monitoring,
 research findings parsing, and dependency validation — all pure functions
 that don't require a database.
 """
+
 import json
 import pytest
 import pytest_asyncio
@@ -22,12 +23,18 @@ from app.routers.agent_status import record_task_result
 from app.deploy_health import should_rollback
 from app.task_completion import _compute_first_attempt_succeeded
 from app.strategic_completion import _handle_strategic_completion
-from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS, STUCK_CYCLE_THRESHOLD_DEFAULT, STUCK_CYCLE_THRESHOLD_REFACTOR, _spawn_pipeline_task
+from app.review_pipeline import (
+    MAX_REVIEW_FIX_ITERATIONS,
+    STUCK_CYCLE_THRESHOLD_DEFAULT,
+    STUCK_CYCLE_THRESHOLD_REFACTOR,
+    _spawn_pipeline_task,
+)
 from app.rollup_management import _check_and_trigger_rollup
 from app.models import Project, Task, TaskStatus, DeploymentStatus
 
 
 # ── Verdict Parsing ─────────────────────────────────────────────────────────
+
 
 class TestVerdictParsing:
     """Tests for the inline verdict parsing logic in update_agent_status.
@@ -36,6 +43,7 @@ class TestVerdictParsing:
     def _parse_verdict(self, text: str) -> tuple:
         """Replicate the verdict parsing logic from main.py for testing."""
         import re
+
         verdict = "REQUEST_CHANGES"
         feedback = text
         verdict_parsed = False
@@ -45,13 +53,13 @@ class TestVerdictParsing:
                 start = m.start()
                 depth = 0
                 for i in range(start, len(text)):
-                    if text[i] == '{':
+                    if text[i] == "{":
                         depth += 1
-                    elif text[i] == '}':
+                    elif text[i] == "}":
                         depth -= 1
                         if depth == 0:
                             try:
-                                candidate = json.loads(text[start:i+1])
+                                candidate = json.loads(text[start : i + 1])
                                 if "verdict" in candidate:
                                     verdict = candidate["verdict"]
                                     feedback = candidate.get("feedback", text)
@@ -88,7 +96,9 @@ class TestVerdictParsing:
         assert parsed
 
     def test_verdict_with_surrounding_text(self):
-        text = 'Here is my review.\n\n{"verdict": "APPROVE", "feedback": "LGTM"}\n\nDone.'
+        text = (
+            'Here is my review.\n\n{"verdict": "APPROVE", "feedback": "LGTM"}\n\nDone.'
+        )
         verdict, feedback, parsed = self._parse_verdict(text)
         assert verdict == "APPROVE"
         assert parsed
@@ -149,6 +159,7 @@ class TestVerdictParsing:
 
 # ── Failure Classification ──────────────────────────────────────────────────
 
+
 class TestFailureClassification:
     def _make_task(self, status_msg: str = "") -> Task:
         task = MagicMock(spec=Task)
@@ -156,7 +167,9 @@ class TestFailureClassification:
         return task
 
     def test_provision_failure_by_quota(self):
-        task = self._make_task("VM provisioning failed: CPUS_ALL_REGIONS quota exceeded")
+        task = self._make_task(
+            "VM provisioning failed: CPUS_ALL_REGIONS quota exceeded"
+        )
         assert classify_failure(task) == "PROVISION_FAILURE"
 
     def test_provision_failure_by_address(self):
@@ -165,7 +178,10 @@ class TestFailureClassification:
 
     def test_external_api_github(self):
         task = self._make_task("")
-        assert classify_failure(task, "api.github.com returned 502 Bad Gateway") == "EXTERNAL_API"
+        assert (
+            classify_failure(task, "api.github.com returned 502 Bad Gateway")
+            == "EXTERNAL_API"
+        )
 
     def test_rate_limit(self):
         task = self._make_task("API Error: Rate limit reached")
@@ -295,7 +311,9 @@ class TestFailureClassification:
         assert classify_failure(task) == "PROVISION_FAILURE"
 
     def test_provision_failure_resource_not_found(self):
-        task = self._make_task("resource not found: projects/foo/zones/us-central1-a/instances/vm-123")
+        task = self._make_task(
+            "resource not found: projects/foo/zones/us-central1-a/instances/vm-123"
+        )
         assert classify_failure(task) == "PROVISION_FAILURE"
 
     def test_provision_failure_container_killed(self):
@@ -324,7 +342,9 @@ class TestFailureClassification:
         assert classify_failure(task) == "EXTERNAL_API"
 
     def test_external_api_rollup_pr_creation_failed(self):
-        task = self._make_task("rollup pr creation failed: could not open PR against main")
+        task = self._make_task(
+            "rollup pr creation failed: could not open PR against main"
+        )
         assert classify_failure(task) == "EXTERNAL_API"
 
     def test_external_api_staging_branch(self):
@@ -384,9 +404,11 @@ class TestFailureClassification:
 
 # ── Deployment Monitoring ───────────────────────────────────────────────────
 
+
 class TestDeploymentMonitoring:
     def test_record_task_result_success(self):
         import app.shared_state as ss
+
         ss.deploy_monitoring["task_results"] = []
         record_task_result(success=True)
         assert len(ss.deploy_monitoring["task_results"]) == 1
@@ -394,6 +416,7 @@ class TestDeploymentMonitoring:
 
     def test_record_task_result_failure(self):
         import app.shared_state as ss
+
         ss.deploy_monitoring["task_results"] = []
         record_task_result(success=False, failure_class="CODE_ERROR")
         assert len(ss.deploy_monitoring["task_results"]) == 1
@@ -404,6 +427,7 @@ class TestDeploymentMonitoring:
     def test_record_caps_at_100(self):
         from collections import deque
         import app.shared_state as ss
+
         # deque(maxlen=100) automatically caps — fill with 105 via extend, then add one more
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
         for _ in range(105):
@@ -422,20 +446,29 @@ class TestDeploymentMonitoring:
 
 # ── Research Findings Parsing ───────────────────────────────────────────────
 
+
 class TestResearchFindings:
     def test_valid_json_array(self):
-        text = json.dumps([
-            {"title": "Fix bug", "prompt": "Fix the null check", "scope": "small"},
-            {"title": "Add test", "prompt": "Write unit tests", "scope": "small"},
-        ])
+        text = json.dumps(
+            [
+                {"title": "Fix bug", "prompt": "Fix the null check", "scope": "small"},
+                {"title": "Add test", "prompt": "Write unit tests", "scope": "small"},
+            ]
+        )
         findings = _parse_research_findings(text)
         assert findings is not None
         assert len(findings) == 2
 
     def test_json_with_surrounding_text(self):
-        text = 'Here are my findings:\n' + json.dumps([
-            {"title": "T1", "prompt": "P1"},
-        ]) + '\n\nDone.'
+        text = (
+            "Here are my findings:\n"
+            + json.dumps(
+                [
+                    {"title": "T1", "prompt": "P1"},
+                ]
+            )
+            + "\n\nDone."
+        )
         findings = _parse_research_findings(text)
         assert findings is not None
         assert len(findings) == 1
@@ -467,15 +500,23 @@ class TestResearchFindings:
 
     def test_research_type_finding(self):
         """Research findings can include type=research for sub-research."""
-        text = json.dumps([
-            {"title": "Deep dive", "prompt": "Investigate auth flow", "type": "research", "scope": "medium"},
-        ])
+        text = json.dumps(
+            [
+                {
+                    "title": "Deep dive",
+                    "prompt": "Investigate auth flow",
+                    "type": "research",
+                    "scope": "medium",
+                },
+            ]
+        )
         findings = _parse_research_findings(text)
         assert findings is not None
         assert findings[0]["type"] == "research"
 
 
 # ── Dependency Validation ───────────────────────────────────────────────────
+
 
 class TestDependencyValidation:
     def test_no_dependencies(self):
@@ -508,9 +549,11 @@ class TestDependencyValidation:
 
 # ── Causation Analysis ──────────────────────────────────────────────────────
 
+
 class TestCausationAnalysis:
     def _setup_monitoring(self, results, pre_rate=0.0, failed_deps=None):
         import app.shared_state as ss
+
         ss.deploy_monitoring["task_results"] = results
         ss.deploy_monitoring["pre_deploy_failure_rate"] = pre_rate
         ss.external_health["failed_deps"] = failed_deps or []
@@ -569,9 +612,11 @@ class TestCausationAnalysis:
 
 # ── Circuit Breaker ─────────────────────────────────────────────────────────
 
+
 class TestCircuitBreaker:
     def _fresh(self, project_id: str):
         import app.shared_state as ss
+
         ss.circuit_breakers.pop(project_id, None)
         return ss.get_circuit_breaker(project_id)
 
@@ -584,6 +629,7 @@ class TestCircuitBreaker:
 
     def test_breaker_state_persistence(self):
         import app.shared_state as ss
+
         breaker = self._fresh("test-project-cb2")
         breaker["state"] = "OPEN"
         breaker["failure_count"] = 5
@@ -607,6 +653,7 @@ class TestCircuitBreaker:
 
 # ── Review-Fix Iteration Cap ───────────────────────────────────────────────
 
+
 class TestIterationCap:
     def test_max_iterations_value(self):
         """Tripwire: MAX_REVIEW_FIX_ITERATIONS must not be raised without review."""
@@ -619,36 +666,58 @@ class TestIterationCap:
 
     def test_iteration_cap_message_classified_as_agent_timeout(self):
         """'Review-fix cap reached' status messages must be AGENT_TIMEOUT not CODE_ERROR."""
-        assert classify_failure(self._make_task(
-            "Review-fix cap reached for PR #123 (12 total iterations)"
-        )) == "AGENT_TIMEOUT"
+        assert (
+            classify_failure(
+                self._make_task(
+                    "Review-fix cap reached for PR #123 (12 total iterations)"
+                )
+            )
+            == "AGENT_TIMEOUT"
+        )
 
     def test_iteration_cap_keyword_classified_as_agent_timeout(self):
         """'iteration cap' in status message must be AGENT_TIMEOUT."""
-        assert classify_failure(self._make_task(
-            "Rollup PR #100 created but review not spawned (iteration cap)"
-        )) == "AGENT_TIMEOUT"
+        assert (
+            classify_failure(
+                self._make_task(
+                    "Rollup PR #100 created but review not spawned (iteration cap)"
+                )
+            )
+            == "AGENT_TIMEOUT"
+        )
 
     def test_fix_not_spawned_classified_as_agent_timeout(self):
         """'fix not spawned' in status message must be AGENT_TIMEOUT."""
-        assert classify_failure(self._make_task(
-            "Rollup PR #200 merge blocked, fix not spawned (iteration cap)"
-        )) == "AGENT_TIMEOUT"
+        assert (
+            classify_failure(
+                self._make_task(
+                    "Rollup PR #200 merge blocked, fix not spawned (iteration cap)"
+                )
+            )
+            == "AGENT_TIMEOUT"
+        )
 
     def test_review_fix_cycle_limit_classified_as_agent_timeout(self):
         """'review-fix cycle limit' message must be AGENT_TIMEOUT not CODE_ERROR."""
-        assert classify_failure(self._make_task(
-            "Review-fix cycle limit reached for PR #55 after 16 iterations"
-        )) == "AGENT_TIMEOUT"
+        assert (
+            classify_failure(
+                self._make_task(
+                    "Review-fix cycle limit reached for PR #55 after 16 iterations"
+                )
+            )
+            == "AGENT_TIMEOUT"
+        )
 
 
 # ── Security Scan Coverage ─────────────────────────────────────────────────
+
 
 class TestSecurityScanDeletions:
     """Fix 2.3: Scanner must catch injection patterns in deleted lines too."""
 
     def test_deleted_line_detected(self):
         from app.security import scan_diff_text
+
         diff = """diff --git a/foo.py b/foo.py
 --- a/foo.py
 +++ b/foo.py
@@ -662,6 +731,7 @@ class TestSecurityScanDeletions:
 
     def test_added_line_still_detected(self):
         from app.security import scan_diff_text
+
         diff = """diff --git a/foo.py b/foo.py
 --- a/foo.py
 +++ b/foo.py
@@ -675,12 +745,14 @@ class TestSecurityScanDeletions:
 
 # ── Spawn Limits ───────────────────────────────────────────────────────────
 
+
 class TestSpawnLimits:
     """Fix 2.5: SpawnTaskRequest payloads limited to 20."""
 
     def test_spawn_payload_max_length(self):
         from app.schemas import SpawnTaskRequest
         import uuid
+
         # 20 payloads should work
         req = SpawnTaskRequest(task_id=uuid.uuid4(), payloads=[{"type": "create"}] * 20)
         assert len(req.payloads) == 20
@@ -689,11 +761,13 @@ class TestSpawnLimits:
         from app.schemas import SpawnTaskRequest
         from pydantic import ValidationError
         import uuid
+
         with pytest.raises(ValidationError):
             SpawnTaskRequest(task_id=uuid.uuid4(), payloads=[{"type": "create"}] * 21)
 
 
 # ── Task Result Dedup ──────────────────────────────────────────────────────
+
 
 class TestTaskResultDedup:
     """Fix 2.7: record_task_result deduplicates by task_id."""
@@ -721,11 +795,14 @@ class TestTaskResultDedup:
         initial_count = len(deploy_monitoring["task_results"])
 
         record_task_result(success=True, task_id="test-dedup-2")
-        record_task_result(success=False, failure_class="CODE_ERROR", task_id="test-dedup-3")
+        record_task_result(
+            success=False, failure_class="CODE_ERROR", task_id="test-dedup-3"
+        )
         assert len(deploy_monitoring["task_results"]) == initial_count + 2
 
 
 # ── Task Type Ring Buffer & Per-Type Failure Rate ─────────────────────────
+
 
 class TestTaskTypeRingBuffer:
     """task_type is stored as the 4th element in task_results entries."""
@@ -733,11 +810,13 @@ class TestTaskTypeRingBuffer:
     def setup_method(self):
         import app.shared_state as ss
         from collections import deque
+
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
 
     def test_record_includes_task_type(self):
         import app.shared_state as ss
         from app.routers.agent_status import record_task_result, _recorded_task_ids
+
         _recorded_task_ids.clear()
         record_task_result(success=True, task_id="type-test-1", task_type="create")
         entry = ss.deploy_monitoring["task_results"][0]
@@ -749,8 +828,14 @@ class TestTaskTypeRingBuffer:
     def test_record_failure_includes_task_type(self):
         import app.shared_state as ss
         from app.routers.agent_status import record_task_result, _recorded_task_ids
+
         _recorded_task_ids.clear()
-        record_task_result(success=False, failure_class="CODE_ERROR", task_id="type-test-2", task_type="fix")
+        record_task_result(
+            success=False,
+            failure_class="CODE_ERROR",
+            task_id="type-test-2",
+            task_type="fix",
+        )
         entry = ss.deploy_monitoring["task_results"][0]
         assert entry[1] == "failure"
         assert entry[2] == "CODE_ERROR"
@@ -759,6 +844,7 @@ class TestTaskTypeRingBuffer:
     def test_record_empty_task_type(self):
         import app.shared_state as ss
         from app.routers.agent_status import record_task_result, _recorded_task_ids
+
         _recorded_task_ids.clear()
         record_task_result(success=True, task_id="type-test-3")
         entry = ss.deploy_monitoring["task_results"][0]
@@ -772,18 +858,22 @@ class TestPerTypeFailureRate:
     def setup_method(self):
         import app.shared_state as ss
         from collections import deque
+
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
 
     def test_all_failures_for_type(self):
         from app.shared_state import get_task_type_failure_rate
         import app.shared_state as ss
         from app.time_utils import _utcnow
+
         ts = _utcnow().isoformat()
-        ss.deploy_monitoring["task_results"].extend([
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "failure", "CODE_ERROR", "create"),
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+            ]
+        )
         rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
         assert sample_size == 3
         assert rate == 1.0
@@ -793,15 +883,18 @@ class TestPerTypeFailureRate:
         from app.shared_state import get_task_type_failure_rate
         import app.shared_state as ss
         from app.time_utils import _utcnow
+
         ts = _utcnow().isoformat()
-        ss.deploy_monitoring["task_results"].extend([
-            (ts, "success", "", "create"),
-            (ts, "success", "", "create"),
-            (ts, "success", "", "create"),
-            (ts, "failure", "CODE_ERROR", "fix"),
-            (ts, "failure", "CODE_ERROR", "fix"),
-            (ts, "failure", "CODE_ERROR", "fix"),
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (ts, "success", "", "create"),
+                (ts, "success", "", "create"),
+                (ts, "success", "", "create"),
+                (ts, "failure", "CODE_ERROR", "fix"),
+                (ts, "failure", "CODE_ERROR", "fix"),
+                (ts, "failure", "CODE_ERROR", "fix"),
+            ]
+        )
         create_rate, create_n = get_task_type_failure_rate("create", window_minutes=15)
         fix_rate, fix_n = get_task_type_failure_rate("fix", window_minutes=15)
         # create has 0% failure among its typed entries (plus any untyped — none here)
@@ -815,18 +908,22 @@ class TestPerTypeFailureRate:
         from app.shared_state import get_task_type_failure_rate
         import app.shared_state as ss
         from app.time_utils import _utcnow
+
         ts = _utcnow().isoformat()
         # Old-format entries (no type field) — treated as matching any type
-        ss.deploy_monitoring["task_results"].extend([
-            (ts, "failure", "CODE_ERROR"),       # legacy 3-tuple
-            (ts, "failure", "CODE_ERROR", ""),   # 4-tuple but empty type
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (ts, "failure", "CODE_ERROR"),  # legacy 3-tuple
+                (ts, "failure", "CODE_ERROR", ""),  # 4-tuple but empty type
+            ]
+        )
         rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
         assert sample_size == 2
         assert rate == 1.0
 
     def test_empty_buffer_returns_zero(self):
         from app.shared_state import get_task_type_failure_rate
+
         rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
         assert rate == 0.0
         assert sample_size == 0
@@ -837,12 +934,15 @@ class TestPerTypeFailureRate:
         import app.shared_state as ss
         from app.time_utils import _utcnow
         from datetime import timedelta
+
         old_ts = (_utcnow() - timedelta(minutes=30)).isoformat()
         new_ts = _utcnow().isoformat()
-        ss.deploy_monitoring["task_results"].extend([
-            (old_ts, "failure", "CODE_ERROR", "create"),  # outside window
-            (new_ts, "success", "", "create"),             # inside window
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (old_ts, "failure", "CODE_ERROR", "create"),  # outside window
+                (new_ts, "success", "", "create"),  # inside window
+            ]
+        )
         rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
         assert sample_size == 1
         assert rate == 0.0
@@ -857,24 +957,30 @@ class TestPerTypeDispatchGate:
         import app.shared_state as ss
         from collections import deque
         from app.time_utils import _utcnow
+
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
         ts = _utcnow().isoformat()
         # 3 failures, 1 success → 75% failure rate for "create"
-        ss.deploy_monitoring["task_results"].extend([
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "success", "", "create"),
-            # "fix" type is healthy
-            (ts, "success", "", "fix"),
-            (ts, "success", "", "fix"),
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "success", "", "create"),
+                # "fix" type is healthy
+                (ts, "success", "", "fix"),
+                (ts, "success", "", "fix"),
+            ]
+        )
         create_rate, create_n = get_task_type_failure_rate("create", window_minutes=15)
         fix_rate, fix_n = get_task_type_failure_rate("fix", window_minutes=15)
 
         # Simulate the gate logic
         failing_types: set = set()
-        for ttype, (rate, n) in [("create", (create_rate, create_n)), ("fix", (fix_rate, fix_n))]:
+        for ttype, (rate, n) in [
+            ("create", (create_rate, create_n)),
+            ("fix", (fix_rate, fix_n)),
+        ]:
             if n >= 3 and rate >= 0.7:
                 failing_types.add(ttype)
 
@@ -887,15 +993,18 @@ class TestPerTypeDispatchGate:
         import app.shared_state as ss
         from collections import deque
         from app.time_utils import _utcnow
+
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
         ts = _utcnow().isoformat()
         # 2 failures, 2 successes → 50% failure rate
-        ss.deploy_monitoring["task_results"].extend([
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "success", "", "create"),
-            (ts, "success", "", "create"),
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "success", "", "create"),
+                (ts, "success", "", "create"),
+            ]
+        )
         rate, n = get_task_type_failure_rate("create", window_minutes=15)
         assert n >= 3
         assert rate < 0.7
@@ -906,13 +1015,16 @@ class TestPerTypeDispatchGate:
         import app.shared_state as ss
         from collections import deque
         from app.time_utils import _utcnow
+
         ss.deploy_monitoring["task_results"] = deque(maxlen=100)
         ts = _utcnow().isoformat()
         # 2 failures, no successes → 100% rate but only 2 samples
-        ss.deploy_monitoring["task_results"].extend([
-            (ts, "failure", "CODE_ERROR", "create"),
-            (ts, "failure", "CODE_ERROR", "create"),
-        ])
+        ss.deploy_monitoring["task_results"].extend(
+            [
+                (ts, "failure", "CODE_ERROR", "create"),
+                (ts, "failure", "CODE_ERROR", "create"),
+            ]
+        )
         rate, n = get_task_type_failure_rate("create", window_minutes=15)
         assert n == 2
         assert n < 3  # Gate requires minimum 3 samples
@@ -924,6 +1036,7 @@ class TestTypeUnthrottleBroadcast:
     def test_module_tracks_previously_failing_types(self):
         """The orchestrator module exposes state used to detect unthrottle transitions."""
         import app.orchestrator as orch
+
         assert hasattr(orch, "_previously_failing_types")
         assert hasattr(orch, "_last_type_unthrottle_broadcast")
         assert isinstance(orch._previously_failing_types, set)
@@ -945,16 +1058,18 @@ class TestTypeUnthrottleBroadcast:
 
 # ── Verdict JSON Field ────────────────────────────────────────────────────
 
+
 class TestVerdictJsonField:
     """Fix 2.8: AgentStatusPayload has verdict_json field."""
 
     def test_verdict_json_field_accepted(self):
         from app.schemas import AgentStatusPayload
         import uuid
+
         payload = AgentStatusPayload(
             task_id=uuid.uuid4(),
             status=TaskStatus.COMPLETED,
-            verdict_json='{"verdict": "APPROVE", "feedback": "LGTM"}'
+            verdict_json='{"verdict": "APPROVE", "feedback": "LGTM"}',
         )
         assert payload.verdict_json is not None
         parsed = json.loads(payload.verdict_json)
@@ -963,6 +1078,7 @@ class TestVerdictJsonField:
     def test_verdict_json_field_optional(self):
         from app.schemas import AgentStatusPayload
         import uuid
+
         payload = AgentStatusPayload(
             task_id=uuid.uuid4(),
             status=TaskStatus.COMPLETED,
@@ -971,6 +1087,7 @@ class TestVerdictJsonField:
 
 
 # ── Monitoring Window ─────────────────────────────────────────────────────
+
 
 class TestMonitoringWindowEdgeCases:
     """Fix 1.5: No rollback target should not promote to STABLE.
@@ -981,6 +1098,7 @@ class TestMonitoringWindowEdgeCases:
         should_rollback still returns the recommendation — the caller
         must check revision equality."""
         from app.shared_state import deploy_monitoring
+
         deploy_monitoring["task_results"] = [
             (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
             (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
@@ -997,12 +1115,14 @@ class TestMonitoringWindowEdgeCases:
 
 # ── GCP Health Check ──────────────────────────────────────────────────────
 
+
 class TestGCPHealthCheck:
     """Fix 1.4: all() on empty iterable should not mark GCP unhealthy."""
 
     def test_no_failures_means_healthy(self):
         """When all recent results are successes, GCP should be healthy."""
         from app.shared_state import deploy_monitoring
+
         # All successes
         deploy_monitoring["task_results"] = [
             (datetime.utcnow().isoformat(), "success", ""),
@@ -1010,21 +1130,26 @@ class TestGCPHealthCheck:
             (datetime.utcnow().isoformat(), "success", ""),
         ]
         # The health check looks at provision failures
-        recent_provisions = [r for r in deploy_monitoring["task_results"]
-                             if r[2] == "PROVISION_FAILURE"]
+        recent_provisions = [
+            r for r in deploy_monitoring["task_results"] if r[2] == "PROVISION_FAILURE"
+        ]
         # With 0 provision failures, GCP should stay healthy
         assert len(recent_provisions) < 3
 
 
 # ── Rollup Empty Children Guard ──────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def rollup_db(mocker):
     """Isolated in-memory DB for rollup tests."""
     # Ensure SQLite can handle PostgreSQL JSONB columns
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -1035,8 +1160,11 @@ async def rollup_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.main.AsyncSessionLocal", _Session)
 
@@ -1095,9 +1223,10 @@ async def test_rollup_only_review_fix_children_marks_completed(rollup_db, mocker
     assert parent.status == TaskStatus.COMPLETED, (
         f"Expected COMPLETED but got {parent.status}: {parent.latest_status_message}"
     )
-    assert "pipeline tasks" in (parent.latest_status_message or "").lower() or \
-           "review/fix" in (parent.latest_status_message or "").lower(), \
-        f"Unexpected status message: {parent.latest_status_message}"
+    assert (
+        "pipeline tasks" in (parent.latest_status_message or "").lower()
+        or "review/fix" in (parent.latest_status_message or "").lower()
+    ), f"Unexpected status message: {parent.latest_status_message}"
 
 
 @pytest.mark.asyncio
@@ -1106,7 +1235,9 @@ async def test_rollup_retries_failed_children_before_partial_rollup(rollup_db, m
     called (retry) instead of immediately proceeding to partial rollup, as long
     as the requeue limit hasn't been reached."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
 
     project = Project(name="Retry Before Partial Rollup Test", user_id="user1")
     rollup_db.add(project)
@@ -1156,7 +1287,9 @@ async def test_rollup_retries_all_failed_children(rollup_db, mocker):
     """When ALL children fail (none succeeded), _requeue_parent_task should still
     be called if the requeue limit hasn't been reached — don't fail the parent yet."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
 
     project = Project(name="All Failed Retry Test", user_id="user1")
     rollup_db.add(project)
@@ -1204,7 +1337,9 @@ async def test_rollup_not_blocked_by_stale_review_task(rollup_db, mocker):
     stale and not count as active — otherwise a silently-dead review task
     permanently blocks rollup."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
 
     project = Project(name="Stale Review Test", user_id="user1")
     rollup_db.add(project)
@@ -1254,7 +1389,9 @@ async def test_rollup_blocked_by_fresh_review_task(rollup_db, mocker):
     """A review task that recently heartbeated should still block rollup —
     the staleness guard must not cause false-positive non-blocking."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
 
     project = Project(name="Fresh Review Test", user_id="user1")
     rollup_db.add(project)
@@ -1304,7 +1441,9 @@ async def test_rollup_skips_requeue_for_cap_exhausted_children(rollup_db, mocker
     2026-04-17 fix, rollup_management's respawn loop re-entered the cap every
     10 min and the parent sat in EVALUATING indefinitely."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
 
     project = Project(name="Cap Exhausted Skip Requeue Test", user_id="user1")
@@ -1336,7 +1475,10 @@ async def test_rollup_skips_requeue_for_cap_exhausted_children(rollup_db, mocker
         status=TaskStatus.FAILED,
         requires_approval=True,
         latest_status_message="Review-fix cycle reached limit (10 iterations) — PR #42 auto-closed",
-        context={"failure_detail": "review_cap_exhausted", "failure_category": "CODE_ERROR"},
+        context={
+            "failure_detail": "review_cap_exhausted",
+            "failure_category": "CODE_ERROR",
+        },
     )
     rollup_db.add(succeeded)
     rollup_db.add(cap_exhausted)
@@ -1359,7 +1501,9 @@ async def test_rollup_partial_after_requeue_limit_exhausted(rollup_db, mocker):
     """When requeue limit is exhausted (_requeue_count == MAX_PARENT_REQUEUES),
     the rollup should skip retry and proceed with partial rollup of succeeded children."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
 
     project = Project(name="Partial Rollup After Limit Test", user_id="user1")
@@ -1415,7 +1559,9 @@ async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, 
     """When requeue limit is exhausted AND no children succeeded, the parent
     should be marked FAILED (not retry, not partial rollup)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mock_requeue = mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+    mock_requeue = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = Project(name="All Failed Limit Exhausted Test", user_id="user1")
@@ -1456,7 +1602,9 @@ async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, 
 # ── Rollup Approval Gate Alerts ──────────────────────────────────────────────
 
 
-async def _make_rollup_parent_with_completed_child(rollup_db, *, target_branch, child_risk=None):
+async def _make_rollup_parent_with_completed_child(
+    rollup_db, *, target_branch, child_risk=None
+):
     project = Project(name="Approval Gate Test", user_id="user1")
     rollup_db.add(project)
     await rollup_db.commit()
@@ -1494,20 +1642,36 @@ async def _make_rollup_parent_with_completed_child(rollup_db, *, target_branch, 
 
 def _patch_common_rollup_mocks(mocker):
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management.broadcast_to_project", new_callable=AsyncMock, create=True)
+    mocker.patch(
+        "app.rollup_management.broadcast_to_project",
+        new_callable=AsyncMock,
+        create=True,
+    )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
         return_value=("tok", "owner", "repo"),
     )
-    mocker.patch("app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[])
-    mocker.patch("app.github.get_branch_sha", new_callable=AsyncMock, return_value="deadbeef")
-    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock, return_value=None)
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    # Match callers' PR head_sha ("abc123") so the pre-merge tip-check is a
+    # no-op. Tests exercising the behind-state path override this mock.
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.create_pr_comment", new_callable=AsyncMock, return_value=None
+    )
     mocker.patch(
         "app.github.create_pull_request",
         new_callable=AsyncMock,
-        return_value={"number": 777, "html_url": "https://example.com/pr/777", "empty_diff": False},
+        return_value={
+            "number": 777,
+            "html_url": "https://example.com/pr/777",
+            "empty_diff": False,
+        },
     )
 
 
@@ -1533,7 +1697,9 @@ async def test_rollup_high_risk_gate_dispatches_approval_alert(rollup_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_rollup_security_scan_blocked_dispatches_approval_alert(rollup_db, mocker):
+async def test_rollup_security_scan_blocked_dispatches_approval_alert(
+    rollup_db, mocker
+):
     """Security scan blocked gate: parent.requires_approval=True → alert + notification."""
     _patch_common_rollup_mocks(mocker)
     mocker.patch(
@@ -1544,7 +1710,12 @@ async def test_rollup_security_scan_blocked_dispatches_approval_alert(rollup_db,
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
-        return_value={"blocked": True, "summary": "injection found", "findings": [], "report": ""},
+        return_value={
+            "blocked": True,
+            "summary": "injection found",
+            "findings": [],
+            "report": "",
+        },
     )
     mock_dispatch = mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
@@ -1564,7 +1735,9 @@ async def test_rollup_security_scan_blocked_dispatches_approval_alert(rollup_db,
 
 
 @pytest.mark.asyncio
-async def test_rollup_security_scan_failure_dispatches_approval_alert(rollup_db, mocker):
+async def test_rollup_security_scan_failure_dispatches_approval_alert(
+    rollup_db, mocker
+):
     """Security scan exception gate: parent.requires_approval=True → alert + notification."""
     _patch_common_rollup_mocks(mocker)
     mocker.patch(
@@ -1602,7 +1775,8 @@ async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
     from sqlmodel import select as _select
 
     mock_dispatch = mocker.patch(
-        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
     )
     mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
 
@@ -1620,13 +1794,21 @@ async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
     await rollup_db.commit()
     await rollup_db.refresh(parent)
 
-    await _dispatch_rollup_approval_alert(parent, rollup_db, "needs approval", pr_number=42)
+    await _dispatch_rollup_approval_alert(
+        parent, rollup_db, "needs approval", pr_number=42
+    )
     await rollup_db.commit()
 
-    alerts = (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id))).scalars().all()
+    alerts = (
+        (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
     assert len(alerts) == 1
     assert "needs approval" in (alerts[0].message or "")
-    approval_calls = [c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"]
+    approval_calls = [
+        c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
     assert len(approval_calls) == 1
     assert approval_calls[0].args[2]["pr_number"] == 42
 
@@ -1637,7 +1819,8 @@ async def test_dispatch_rollup_approval_alert_enriched_payload(rollup_db, mocker
     from app.rollup_management import _dispatch_rollup_approval_alert
 
     mock_dispatch = mocker.patch(
-        "app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
     )
     mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
 
@@ -1661,10 +1844,14 @@ async def test_dispatch_rollup_approval_alert_enriched_payload(rollup_db, mocker
     await rollup_db.commit()
     await rollup_db.refresh(parent)
 
-    await _dispatch_rollup_approval_alert(parent, rollup_db, "stuck cycle", pr_number=99)
+    await _dispatch_rollup_approval_alert(
+        parent, rollup_db, "stuck cycle", pr_number=99
+    )
     await rollup_db.commit()
 
-    payload = [c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"][0].args[2]
+    payload = [
+        c for c in mock_dispatch.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ][0].args[2]
     assert payload["approval_reason"] == "stuck cycle"
     assert payload["pr_url"] == "https://github.com/o/r/pull/99"
     assert payload["critical_files"] == ["backend/app/main.py", "backend/app/models.py"]
@@ -1686,7 +1873,9 @@ async def test_rollup_retry_exhaustion_creates_failure_alert(rollup_db, mocker):
         new_callable=AsyncMock,
         side_effect=ValueError("permanent rollup creation failure"),
     )
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="main"
@@ -1704,6 +1893,7 @@ async def test_rollup_retry_exhaustion_creates_failure_alert(rollup_db, mocker):
 
 # ── Rollup Merge Deferred Counter / Escalation ──────────────────────────────
 
+
 def _patch_deferred_counter_mocks(mocker, mergeable_state_holder):
     """Mock the GitHub + security plumbing so _check_and_trigger_rollup reaches
     the mergeable_state=blocked/unstable/unknown deferred-counter branch.
@@ -1719,13 +1909,17 @@ def _patch_deferred_counter_mocks(mocker, mergeable_state_holder):
         #   - state=open + merged=False keep the existing-PR resume path open
         #   - mergeable_state drives the deferred-counter branch
         return {
-            "additions": 5, "deletions": 5,
-            "state": "open", "merged": False,
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
             "mergeable_state": mergeable_state_holder["state"],
             "head": {"sha": "abc123"},
         }
 
-    mocker.patch("app.github.get_pull_request", new_callable=AsyncMock, side_effect=_pr_detail)
+    mocker.patch(
+        "app.github.get_pull_request", new_callable=AsyncMock, side_effect=_pr_detail
+    )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
@@ -1739,7 +1933,9 @@ def _patch_deferred_counter_mocks(mocker, mergeable_state_holder):
 
 
 @pytest.mark.asyncio
-async def test_rollup_merge_deferred_counter_increments_and_escalates(rollup_db, mocker):
+async def test_rollup_merge_deferred_counter_increments_and_escalates(
+    rollup_db, mocker
+):
     """Deferred-merge counter: consecutive same-state sweeps increment the
     counter, fire the stall alert exactly once at the alert threshold, and
     flip requires_approval at the approval threshold."""
@@ -1750,9 +1946,12 @@ async def test_rollup_merge_deferred_counter_increments_and_escalates(rollup_db,
     )
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mock_approval_dispatch = mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+        "app.rollup_management._dispatch_rollup_approval_alert",
+        new_callable=AsyncMock,
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -1808,7 +2007,9 @@ async def test_rollup_merge_deferred_counter_resets_on_state_change(rollup_db, m
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
@@ -1848,9 +2049,12 @@ async def test_rollup_merge_total_deferrals_catches_state_flapping(rollup_db, mo
     )
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mock_approval_dispatch = mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+        "app.rollup_management._dispatch_rollup_approval_alert",
+        new_callable=AsyncMock,
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -1879,7 +2083,9 @@ async def test_rollup_merge_total_deferrals_catches_state_flapping(rollup_db, mo
     await rollup_db.refresh(parent)
     ctx = parent.context or {}
     assert ctx.get("_merge_total_deferrals") == 10
-    assert mock_alert.await_count == 1, "total-count alert should fire at 2x per-state threshold"
+    assert mock_alert.await_count == 1, (
+        "total-count alert should fire at 2x per-state threshold"
+    )
     assert ctx.get("_merge_total_alerted") is True
     assert parent.requires_approval is False
 
@@ -1888,7 +2094,9 @@ async def test_rollup_merge_total_deferrals_catches_state_flapping(rollup_db, mo
         state["state"] = "unstable" if i % 2 == 0 else "blocked"
         await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
-    assert mock_alert.await_count == 1, "total alert must fire once, not on every subsequent sweep"
+    assert mock_alert.await_count == 1, (
+        "total alert must fire once, not on every subsequent sweep"
+    )
 
     # Sweep 20 — hits total approval threshold (2 * 10)
     state["state"] = "blocked"
@@ -1916,9 +2124,12 @@ async def test_rollup_merge_time_based_escalation(rollup_db, mocker):
     )
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mock_approval_dispatch = mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+        "app.rollup_management._dispatch_rollup_approval_alert",
+        new_callable=AsyncMock,
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -1935,26 +2146,35 @@ async def test_rollup_merge_time_based_escalation(rollup_db, mocker):
 
     # Back-date _merge_first_deferred_at to 31 minutes ago — next sweep should alert
     from app.time_utils import _utcnow
-    ctx = {**(parent.context or {}),
-           "_merge_first_deferred_at": (_utcnow() - timedelta(minutes=31)).isoformat()}
+
+    ctx = {
+        **(parent.context or {}),
+        "_merge_first_deferred_at": (_utcnow() - timedelta(minutes=31)).isoformat(),
+    }
     parent.context = ctx
     rollup_db.add(parent)
     await rollup_db.commit()
 
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
-    assert mock_alert.await_count == 1, "time-based alert should fire after 30 min elapsed"
+    assert mock_alert.await_count == 1, (
+        "time-based alert should fire after 30 min elapsed"
+    )
     assert (parent.context or {}).get("_merge_time_alerted") is True
     assert parent.requires_approval is False
 
     # Another sweep — time-alert must not re-fire
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
-    assert mock_alert.await_count == 1, "time alert must fire once, not on every subsequent sweep"
+    assert mock_alert.await_count == 1, (
+        "time alert must fire once, not on every subsequent sweep"
+    )
 
     # Back-date to 61 minutes ago — approval gate should engage
-    ctx = {**(parent.context or {}),
-           "_merge_first_deferred_at": (_utcnow() - timedelta(minutes=61)).isoformat()}
+    ctx = {
+        **(parent.context or {}),
+        "_merge_first_deferred_at": (_utcnow() - timedelta(minutes=61)).isoformat(),
+    }
     parent.context = ctx
     rollup_db.add(parent)
     await rollup_db.commit()
@@ -1980,11 +2200,16 @@ async def test_rollup_merge_unrecognized_state_escalates(rollup_db, mocker):
             "rollup_merge_deferred_approval": 5,
         },
     )
-    state = {"state": "has_hooks"}  # unrecognized — not in blocked/unstable/unknown/dirty
+    state = {
+        "state": "has_hooks"
+    }  # unrecognized — not in blocked/unstable/unknown/dirty
     _patch_deferred_counter_mocks(mocker, state)
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mock_approval_dispatch = mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock,
+        "app.rollup_management._dispatch_rollup_approval_alert",
+        new_callable=AsyncMock,
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -2019,7 +2244,9 @@ async def test_rollup_merge_unrecognized_state_escalates(rollup_db, mocker):
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
     assert (parent.context or {}).get("_merge_deferred_count") == 4
-    assert mock_alert.await_count == 1, "alert must fire only once for unrecognized state"
+    assert mock_alert.await_count == 1, (
+        "alert must fire only once for unrecognized state"
+    )
 
     # Sweep 5 — hits approval threshold, dispatch fires with PR number
     await _check_and_trigger_rollup(child, rollup_db)
@@ -2039,7 +2266,9 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
     mock_enable = mocker.patch(
         "app.github.enable_auto_merge",
         new_callable=AsyncMock,
@@ -2057,7 +2286,9 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     call_kwargs = mock_enable.await_args.kwargs
     call_args = mock_enable.await_args.args
     # Accept either positional or keyword call style — the important thing is PR #777
-    pr_number_arg = call_kwargs.get("pr_number") if "pr_number" in call_kwargs else call_args[3]
+    pr_number_arg = (
+        call_kwargs.get("pr_number") if "pr_number" in call_kwargs else call_args[3]
+    )
     assert pr_number_arg == 777
     # Deferral counter path still ran in parallel
     assert (parent.context or {}).get("_merge_deferred_count") == 1
@@ -2081,9 +2312,17 @@ async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker)
     )
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock)
-    mocker.patch("app.github.enable_auto_merge", new_callable=AsyncMock, return_value={"enabled": False})
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": False},
+    )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
@@ -2133,8 +2372,10 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         return_value={
-            "additions": 5, "deletions": 5,
-            "state": "open", "merged": False,
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
             "mergeable_state": "clean",
             "head": {"sha": "abc123"},
         },
@@ -2150,7 +2391,9 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
         return_value={"merged": True, "sha": "deadbeef"},
     )
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch("app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
@@ -2178,10 +2421,14 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
     assert (parent.context or {}).get("pr_merged") is True
     # All transient keys must be gone.
     for key in (
-        "_merge_deferred_count", "_merge_deferred_state",
-        "_merge_total_deferrals", "_merge_first_deferred_at",
-        "_merge_total_alerted", "_merge_time_alerted",
-        "_merge_alerted_states", "_rollup_retries",
+        "_merge_deferred_count",
+        "_merge_deferred_state",
+        "_merge_total_deferrals",
+        "_merge_first_deferred_at",
+        "_merge_total_alerted",
+        "_merge_time_alerted",
+        "_merge_alerted_states",
+        "_rollup_retries",
     ):
         assert key not in (parent.context or {}), (
             f"transient key {key!r} must be cleared on terminal success, "
@@ -2196,8 +2443,10 @@ def _patch_refetch_failure_mocks(mocker, *, merge_msg="merge_msg-from-failed-att
     Works across multiple rollup sweeps."""
     _patch_common_rollup_mocks(mocker)
     pr_size_detail = {
-        "additions": 5, "deletions": 5,
-        "state": "open", "merged": False,
+        "additions": 5,
+        "deletions": 5,
+        "state": "open",
+        "merged": False,
     }
     merge_attempted = {"v": False}
 
@@ -2240,7 +2489,9 @@ async def test_rollup_refetch_failure_defers_under_budget(rollup_db, mocker):
 
     assert parent.status == TaskStatus.EVALUATING
     assert (parent.context or {}).get("_refetch_failure_count") == 1
-    assert mock_spawn.await_count == 0, "fix task must not be spawned on first refetch failure"
+    assert mock_spawn.await_count == 0, (
+        "fix task must not be spawned on first refetch failure"
+    )
     assert "refetch failed" in (parent.latest_status_message or "").lower()
     assert "deferring" in (parent.latest_status_message or "").lower()
 
@@ -2273,7 +2524,9 @@ async def test_rollup_refetch_failure_exhausted_spawns_fix(rollup_db, mocker):
     # Sweep 2 — counter=2, meets budget, falls through to fix spawn
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
-    assert mock_spawn.await_count == 1, "fix task must spawn once refetch budget is exhausted"
+    assert mock_spawn.await_count == 1, (
+        "fix task must spawn once refetch budget is exhausted"
+    )
     fix_prompt = mock_spawn.await_args.kwargs.get("fix_prompt") or ""
     assert "merge_msg-from-failed-attempt" in fix_prompt
     # Counter cleared so a future refetch failure starts fresh.
@@ -2290,8 +2543,10 @@ async def test_rollup_refetch_success_clears_failure_counter(rollup_db, mocker):
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         return_value={
-            "additions": 5, "deletions": 5,
-            "state": "open", "merged": False,
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
             "mergeable_state": "dirty",
         },
     )
@@ -2330,6 +2585,7 @@ async def test_rollup_refetch_success_clears_failure_counter(rollup_db, mocker):
 
 # ── Rollup Behind-Branch Update Retry ───────────────────────────────────────
 
+
 def _patch_behind_branch_mocks(mocker, update_branch_result):
     """Mocks so the rollup flow reaches the mergeable_state='behind' branch and
     observes the supplied update_branch result.
@@ -2338,12 +2594,19 @@ def _patch_behind_branch_mocks(mocker, update_branch_result):
     or a callable producing one per call (for varying results across sweeps).
     """
     _patch_common_rollup_mocks(mocker)
+    # Override get_branch_sha so head_sha ("abc123") != target_tip ("deadbeef"):
+    # the pre-merge tip-check fires the update_branch path these tests exercise.
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="deadbeef"
+    )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         return_value={
-            "additions": 5, "deletions": 5,
-            "state": "open", "merged": False,
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
             "mergeable_state": "behind",
             "head": {"sha": "abc123"},
         },
@@ -2373,7 +2636,9 @@ def _patch_behind_branch_mocks(mocker, update_branch_result):
 
 
 @pytest.mark.asyncio
-async def test_rollup_behind_update_branch_failure_defers_without_fix_spawn(rollup_db, mocker):
+async def test_rollup_behind_update_branch_failure_defers_without_fix_spawn(
+    rollup_db, mocker
+):
     """When the PR is 'behind' and update_branch fails transiently, defer to the
     next sweep (track a retry counter) instead of falling through to fix spawn.
     A single transient API failure must not burn a review/fix cycle."""
@@ -2385,7 +2650,9 @@ async def test_rollup_behind_update_branch_failure_defers_without_fix_spawn(roll
         "app.rollup_management._spawn_pipeline_task",
         new=AsyncMock(return_value=(None, None)),
     )
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
@@ -2396,14 +2663,20 @@ async def test_rollup_behind_update_branch_failure_defers_without_fix_spawn(roll
 
     assert parent.status == TaskStatus.EVALUATING
     assert (parent.context or {}).get("_behind_update_retries") == 1
-    assert mock_spawn.await_count == 0, "fix task must not be spawned on first behind-update failure"
-    assert mock_alert.await_count == 0, "alert must not fire before retry budget is exhausted"
+    assert mock_spawn.await_count == 0, (
+        "fix task must not be spawned on first behind-update failure"
+    )
+    assert mock_alert.await_count == 0, (
+        "alert must not fire before retry budget is exhausted"
+    )
     assert "retrying" in (parent.latest_status_message or "").lower()
     assert "behind" in (parent.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio
-async def test_rollup_behind_update_branch_exhausted_spawns_fix_with_alert(rollup_db, mocker):
+async def test_rollup_behind_update_branch_exhausted_spawns_fix_with_alert(
+    rollup_db, mocker
+):
     """Once consecutive behind-update failures exhaust the retry budget,
     fall through to the fix-spawn path and fire an alert so operators know
     the update-branch path stalled out."""
@@ -2420,7 +2693,9 @@ async def test_rollup_behind_update_branch_exhausted_spawns_fix_with_alert(rollu
         "app.rollup_management._spawn_pipeline_task",
         new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
     )
-    mock_alert = mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -2444,7 +2719,9 @@ async def test_rollup_behind_update_branch_exhausted_spawns_fix_with_alert(rollu
 
 
 @pytest.mark.asyncio
-async def test_rollup_behind_update_branch_success_clears_retry_counter(rollup_db, mocker):
+async def test_rollup_behind_update_branch_success_clears_retry_counter(
+    rollup_db, mocker
+):
     """A prior transient update_branch failure leaves a counter in context; once
     update_branch succeeds on a later sweep, the counter must reset so a future
     behind-state starts from zero."""
@@ -2478,12 +2755,16 @@ async def test_rollup_behind_update_branch_success_clears_retry_counter(rollup_d
 
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def strategic_db(mocker):
     """Isolated in-memory DB for strategic completion handler tests."""
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -2494,8 +2775,11 @@ async def strategic_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.main.AsyncSessionLocal", _Session)
 
@@ -2511,8 +2795,13 @@ async def _make_strategic_task(session, project, context=None, vision_rev=0):
     """Helper: create a strategic_review task with the given context."""
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "run strategic review",
-                   "vision": {"revision": vision_rev}}],
+        payloads=[
+            {
+                "type": "strategic_review",
+                "prompt": "run strategic review",
+                "vision": {"revision": vision_rev},
+            }
+        ],
         context=context or {},
     )
     session.add(task)
@@ -2531,9 +2820,9 @@ async def test_strategic_completion_vision_set_flag_is_success(strategic_db, moc
     await strategic_db.commit()
     await strategic_db.refresh(project)
 
-    task = await _make_strategic_task(strategic_db, project,
-                                      context={"_strategic_vision_set": True},
-                                      vision_rev=1)
+    task = await _make_strategic_task(
+        strategic_db, project, context={"_strategic_vision_set": True}, vision_rev=1
+    )
 
     await _handle_strategic_completion(task, "", strategic_db)
 
@@ -2544,7 +2833,9 @@ async def test_strategic_completion_vision_set_flag_is_success(strategic_db, moc
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_api_path_records_directions_created(strategic_db, mocker):
+async def test_strategic_completion_api_path_records_directions_created(
+    strategic_db, mocker
+):
     """API path should record directions_created/retired on the cycle row from task context.
 
     Audit W2: cycle history is the StrategicCycle table now.
@@ -2552,27 +2843,33 @@ async def test_strategic_completion_api_path_records_directions_created(strategi
     from app import strategic_cycle as sc
     from app.models import StrategicCycle as _SC
     from app.time_utils import _utcnow as _ut
+
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     cycle_id = "cycle-test-001"
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
     )
     strategic_db.add(project)
     await strategic_db.commit()
     await strategic_db.refresh(project)
-    strategic_db.add(_SC(
-        id=cycle_id, project_id=project.id,
-        outcome=sc.OUTCOME_PHASE2_RUNNING,
-        phase1_started_at=_ut(),
-        phase1_completed_at=_ut(),
-        phase2_started_at=_ut(),
-    ))
+    strategic_db.add(
+        _SC(
+            id=cycle_id,
+            project_id=project.id,
+            outcome=sc.OUTCOME_PHASE2_RUNNING,
+            phase1_started_at=_ut(),
+            phase1_completed_at=_ut(),
+            phase2_started_at=_ut(),
+        )
+    )
     await strategic_db.commit()
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={
             "_strategic_vision_set": True,
             "_strategic_dirs_created": 2,
@@ -2597,9 +2894,13 @@ async def test_strategic_completion_api_path_records_directions_created(strategi
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_create_direction_only_is_not_success(strategic_db, mocker):
+async def test_strategic_completion_create_direction_only_is_not_success(
+    strategic_db, mocker
+):
     """A task that called create_direction but NOT set_vision should NOT be treated as success."""
-    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._create_strategic_alert", new_callable=AsyncMock
+    )
 
     project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 1})
     strategic_db.add(project)
@@ -2607,9 +2908,7 @@ async def test_strategic_completion_create_direction_only_is_not_success(strateg
     await strategic_db.refresh(project)
 
     # No _strategic_vision_set flag, vision_rev unchanged (1 == 1)
-    task = await _make_strategic_task(strategic_db, project,
-                                      context={},
-                                      vision_rev=1)
+    task = await _make_strategic_task(strategic_db, project, context={}, vision_rev=1)
 
     # Unparseable logs → should fall through to failure recording
     await _handle_strategic_completion(task, "not json", strategic_db)
@@ -2621,7 +2920,9 @@ async def test_strategic_completion_create_direction_only_is_not_success(strateg
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_vision_rev_increase_is_success(strategic_db, mocker):
+async def test_strategic_completion_vision_rev_increase_is_success(
+    strategic_db, mocker
+):
     """When vision_rev increased since task spawn, treat as success even without the flag."""
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
@@ -2631,9 +2932,7 @@ async def test_strategic_completion_vision_rev_increase_is_success(strategic_db,
     await strategic_db.commit()
     await strategic_db.refresh(project)
 
-    task = await _make_strategic_task(strategic_db, project,
-                                      context={},
-                                      vision_rev=1)
+    task = await _make_strategic_task(strategic_db, project, context={}, vision_rev=1)
 
     await _handle_strategic_completion(task, "", strategic_db)
 
@@ -2643,7 +2942,9 @@ async def test_strategic_completion_vision_rev_increase_is_success(strategic_db,
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db, mocker):
+async def test_strategic_completion_dirs_created_triggers_api_path(
+    strategic_db, mocker
+):
     """Strategic task with _strategic_dirs_created>0 but no _strategic_vision_set should use API path.
 
     Audit W2: cycle history is the StrategicCycle table.
@@ -2651,6 +2952,7 @@ async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db,
     from app import strategic_cycle as sc
     from app.models import StrategicCycle as _SC
     from app.time_utils import _utcnow as _ut
+
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     # Cycle ids must fit the column (String(36)). Use the same shape spawning uses.
@@ -2659,18 +2961,22 @@ async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db,
     strategic_db.add(project)
     await strategic_db.commit()
     await strategic_db.refresh(project)
-    strategic_db.add(_SC(
-        id=cycle_id, project_id=project.id,
-        outcome=sc.OUTCOME_PHASE2_RUNNING,
-        phase1_started_at=_ut(),
-        phase1_completed_at=_ut(),
-        phase2_started_at=_ut(),
-    ))
+    strategic_db.add(
+        _SC(
+            id=cycle_id,
+            project_id=project.id,
+            outcome=sc.OUTCOME_PHASE2_RUNNING,
+            phase1_started_at=_ut(),
+            phase1_completed_at=_ut(),
+            phase2_started_at=_ut(),
+        )
+    )
     await strategic_db.commit()
 
     # _strategic_dirs_created=2, but _strategic_vision_set is absent and vision_rev unchanged
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={
             "_strategic_dirs_created": 2,
             "strategic_cycle_id": cycle_id,
@@ -2691,12 +2997,19 @@ async def test_strategic_completion_dirs_created_triggers_api_path(strategic_db,
 
 
 @pytest.mark.asyncio
-async def test_strategic_completion_no_api_no_logs_increments_failures(strategic_db, mocker):
+async def test_strategic_completion_no_api_no_logs_increments_failures(
+    strategic_db, mocker
+):
     """No API calls and unparseable logs should increment _strategic_failures."""
-    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._create_strategic_alert", new_callable=AsyncMock
+    )
 
-    project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 0,
-                                                        "_strategic_failures": 2})
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 0, "_strategic_failures": 2},
+    )
     strategic_db.add(project)
     await strategic_db.commit()
     await strategic_db.refresh(project)
@@ -2720,7 +3033,8 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
 
     # Create project with internal tracking fields in vision
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={
             "purpose": "old purpose",
             "revision": 3,
@@ -2751,13 +3065,22 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
         yield strategic_db
 
     app.dependency_overrides[get_session] = _override_session
-    app.dependency_overrides[verify_agent_token] = lambda: {"sub": task_id, "task_type": "strategic_review"}
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
 
     try:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
             resp = await ac.post(
                 "/api/agent/strategic",
-                json={"op": "set_vision", "task_id": task_id, "data": {"purpose": "new purpose"}},
+                json={
+                    "op": "set_vision",
+                    "task_id": task_id,
+                    "data": {"purpose": "new purpose"},
+                },
             )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "ok"
@@ -2786,7 +3109,8 @@ async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker)
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
     )
@@ -2795,7 +3119,8 @@ async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker)
     await strategic_db.refresh(project)
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
         vision_rev=1,
     )
@@ -2808,13 +3133,18 @@ async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker)
 
 
 @pytest.mark.asyncio
-async def test_starvation_triggers_alert_and_override_after_two_cycles(strategic_db, mocker):
+async def test_starvation_triggers_alert_and_override_after_two_cycles(
+    strategic_db, mocker
+):
     """Two consecutive cycles with 0 dirs and active_count < 3 triggers alert and sets override."""
-    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._create_strategic_alert", new_callable=AsyncMock
+    )
 
     # Start with starvation_count=1 (simulating previous cycle)
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1, "_direction_starvation_count": 1},
         directions=[{"id": "d-aaa", "status": "active", "text": "Dir A"}],
     )
@@ -2823,7 +3153,8 @@ async def test_starvation_triggers_alert_and_override_after_two_cycles(strategic
     await strategic_db.refresh(project)
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
         vision_rev=1,
     )
@@ -2844,9 +3175,11 @@ async def test_starvation_counter_resets_on_direction_creation(strategic_db, moc
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={
-            "purpose": "test", "revision": 1,
+            "purpose": "test",
+            "revision": 1,
             "_direction_starvation_count": 2,
             "_strategic_frequency_override": 2,
         },
@@ -2857,7 +3190,8 @@ async def test_starvation_counter_resets_on_direction_creation(strategic_db, moc
     await strategic_db.refresh(project)
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={"_strategic_vision_set": True, "_strategic_dirs_created": 1},
         vision_rev=1,
     )
@@ -2874,7 +3208,8 @@ async def test_starvation_no_gap_no_increment(strategic_db, mocker):
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[
             {"id": "d-aaa", "status": "active", "text": "Dir A", "category": "product"},
@@ -2887,7 +3222,8 @@ async def test_starvation_no_gap_no_increment(strategic_db, mocker):
     await strategic_db.refresh(project)
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
         vision_rev=1,
     )
@@ -2899,15 +3235,21 @@ async def test_starvation_no_gap_no_increment(strategic_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_starvation_auto_creates_direction_after_five_cycles(strategic_db, mocker):
+async def test_starvation_auto_creates_direction_after_five_cycles(
+    strategic_db, mocker
+):
     """After 5 consecutive empty cycles with no product direction, auto-creates a product direction."""
-    alert_mock = mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    alert_mock = mocker.patch(
+        "app.main._create_strategic_alert", new_callable=AsyncMock
+    )
 
     # Start with starvation_count=4 (simulating 4 previous cycles)
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={
-            "purpose": "test", "revision": 1,
+            "purpose": "test",
+            "revision": 1,
             "_direction_starvation_count": 4,
             "_strategic_frequency_override": 2,
         },
@@ -2918,7 +3260,8 @@ async def test_starvation_auto_creates_direction_after_five_cycles(strategic_db,
     await strategic_db.refresh(project)
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
         vision_rev=1,
     )
@@ -2948,13 +3291,17 @@ async def test_starvation_auto_creates_direction_after_five_cycles(strategic_db,
 async def test_starvation_auto_create_respects_direction_cap(strategic_db, mocker):
     """Auto-creation does NOT exceed max_active_directions when cap is reached."""
     mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch("app.strategic_completion._runtime_config", {"max_active_directions": 2})
+    mocker.patch(
+        "app.strategic_completion._runtime_config", {"max_active_directions": 2}
+    )
 
     # Two active directions already at cap
     project = Project(
-        name="P", user_id="u1",
+        name="P",
+        user_id="u1",
         vision={
-            "purpose": "test", "revision": 1,
+            "purpose": "test",
+            "revision": 1,
             "_direction_starvation_count": 4,
         },
         directions=[
@@ -2967,7 +3314,8 @@ async def test_starvation_auto_create_respects_direction_cap(strategic_db, mocke
     await strategic_db.refresh(project)
 
     task = await _make_strategic_task(
-        strategic_db, project,
+        strategic_db,
+        project,
         context={"_strategic_vision_set": True, "_strategic_dirs_created": 0},
         vision_rev=1,
     )
@@ -2987,37 +3335,57 @@ class TestRefactorDeferralLogic:
     """Blocker 1: Refactor tasks should use the standard deferral threshold,
     not the 'any overlap' large-task rule that indefinitely deferred decomposition work."""
 
-    def _compute_should_defer(self, scope: str, task_type: str, overlap_count: int, candidate_file_count: int) -> bool:
+    def _compute_should_defer(
+        self, scope: str, task_type: str, overlap_count: int, candidate_file_count: int
+    ) -> bool:
         """Replicate the deferral decision from orchestrator.py lines 585-590."""
-        is_large = scope == "large" or task_type == "plan"  # refactors use standard threshold
-        should_defer = is_large or (overlap_count >= 2 and overlap_count >= candidate_file_count * 0.5)
+        is_large = (
+            scope == "large" or task_type == "plan"
+        )  # refactors use standard threshold
+        should_defer = is_large or (
+            overlap_count >= 2 and overlap_count >= candidate_file_count * 0.5
+        )
         return should_defer
 
     def test_refactor_single_file_overlap_not_deferred(self):
         """A refactor touching 1 file that overlaps must not be deferred — structural PRs
         are expected to touch their decomposition target."""
-        assert not self._compute_should_defer("small", "refactor", overlap_count=1, candidate_file_count=3)
+        assert not self._compute_should_defer(
+            "small", "refactor", overlap_count=1, candidate_file_count=3
+        )
 
     def test_refactor_small_overlap_not_deferred(self):
         """1-of-5 files overlapping is below both the count and ratio thresholds."""
-        assert not self._compute_should_defer("small", "refactor", overlap_count=1, candidate_file_count=5)
+        assert not self._compute_should_defer(
+            "small", "refactor", overlap_count=1, candidate_file_count=5
+        )
 
     def test_refactor_large_overlap_still_defers(self):
         """2+ files overlapping AND >= 50% of candidate files still defers — genuine conflict."""
-        assert self._compute_should_defer("small", "refactor", overlap_count=2, candidate_file_count=3)
+        assert self._compute_should_defer(
+            "small", "refactor", overlap_count=2, candidate_file_count=3
+        )
 
     def test_plan_always_defers_on_any_overlap(self):
         """Plan tasks retain the strict large-task deferral rule."""
-        assert self._compute_should_defer("small", "plan", overlap_count=1, candidate_file_count=5)
+        assert self._compute_should_defer(
+            "small", "plan", overlap_count=1, candidate_file_count=5
+        )
 
     def test_large_scope_refactor_still_defers(self):
         """A refactor explicitly marked scope=large still defers on any overlap."""
-        assert self._compute_should_defer("large", "refactor", overlap_count=1, candidate_file_count=5)
+        assert self._compute_should_defer(
+            "large", "refactor", overlap_count=1, candidate_file_count=5
+        )
 
     def test_create_task_standard_threshold(self):
         """Create tasks use the standard 2-file + 50% threshold (unchanged)."""
-        assert not self._compute_should_defer("small", "create", overlap_count=1, candidate_file_count=10)
-        assert self._compute_should_defer("small", "create", overlap_count=2, candidate_file_count=3)
+        assert not self._compute_should_defer(
+            "small", "create", overlap_count=1, candidate_file_count=10
+        )
+        assert self._compute_should_defer(
+            "small", "create", overlap_count=2, candidate_file_count=3
+        )
 
 
 class TestStuckCycleThreshold:
@@ -3027,7 +3395,11 @@ class TestStuckCycleThreshold:
 
     def _stuck_threshold(self, source_type: str) -> float:
         """Threshold logic from task_lifecycle.py stuck-cycle detection."""
-        return STUCK_CYCLE_THRESHOLD_REFACTOR if source_type == "refactor" else STUCK_CYCLE_THRESHOLD_DEFAULT
+        return (
+            STUCK_CYCLE_THRESHOLD_REFACTOR
+            if source_type == "refactor"
+            else STUCK_CYCLE_THRESHOLD_DEFAULT
+        )
 
     def test_refactor_threshold_is_75(self):
         assert self._stuck_threshold("refactor") == STUCK_CYCLE_THRESHOLD_REFACTOR
@@ -3076,7 +3448,9 @@ class TestHighRiskRollupGate:
             and (c.first_payload or {}).get("type") != "refactor"
         )
 
-    def _make_child(self, task_type: str, risk: str | None, status=TaskStatus.COMPLETED):
+    def _make_child(
+        self, task_type: str, risk: str | None, status=TaskStatus.COMPLETED
+    ):
         child = MagicMock()
         child.status = status
         child.context = {"risk": risk} if risk else {}
@@ -3100,17 +3474,21 @@ class TestHighRiskRollupGate:
 
     def test_refactor_high_and_create_medium_not_flagged(self):
         """Only refactor children — no behavioral-risk children → not flagged."""
-        assert not self._has_high_risk_child([
-            self._make_child("refactor", "high"),
-            self._make_child("create", "medium"),
-        ])
+        assert not self._has_high_risk_child(
+            [
+                self._make_child("refactor", "high"),
+                self._make_child("create", "medium"),
+            ]
+        )
 
     def test_refactor_high_and_create_high_flagged(self):
         """Mix of refactor (exempt) and create (high risk) — create triggers the gate."""
-        assert self._has_high_risk_child([
-            self._make_child("refactor", "high"),
-            self._make_child("create", "high"),
-        ])
+        assert self._has_high_risk_child(
+            [
+                self._make_child("refactor", "high"),
+                self._make_child("create", "high"),
+            ]
+        )
 
     def test_incomplete_refactor_not_counted(self):
         """Non-COMPLETED children are always excluded from the check."""
@@ -3148,8 +3526,11 @@ class TestFirstAttemptMetrics:
 async def metrics_db(mocker):
     """Isolated in-memory DB for first-attempt metrics tests."""
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -3160,8 +3541,11 @@ async def metrics_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
 
     async with _Session() as session:
@@ -3259,7 +3643,12 @@ async def test_first_attempt_by_review_category_populated(metrics_db):
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "test"}],
         status=TaskStatus.COMPLETED,
-        context={"_first_attempt_rejection_categories": {"test-coverage": 2, "style-conventions": 1}},
+        context={
+            "_first_attempt_rejection_categories": {
+                "test-coverage": 2,
+                "style-conventions": 1,
+            }
+        },
     )
     task_b = Task(
         project_id=project.id,
@@ -3291,12 +3680,16 @@ async def test_first_attempt_by_review_category_populated(metrics_db):
 
 # ── Priority Inheritance ──────────────────────────────────────────────────────
 
+
 @pytest_asyncio.fixture()
 async def spawn_db(mocker):
     """Isolated in-memory DB for _spawn_pipeline_task priority tests."""
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
-        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: self.visit_JSON(
+            type_, **kw
+        )
 
     _engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -3307,8 +3700,11 @@ async def spawn_db(mocker):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     _Session = sessionmaker(
-        bind=_engine, class_=AsyncSession,
-        autocommit=False, autoflush=False, expire_on_commit=False,
+        bind=_engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
     )
     mocker.patch("app.task_lifecycle.AsyncSessionLocal", _Session)
 
@@ -3320,7 +3716,9 @@ async def spawn_db(mocker):
     await _engine.dispose()
 
 
-async def _make_spawn_task(session, project_id, priority=50, task_type="create", context=None):
+async def _make_spawn_task(
+    session, project_id, priority=50, task_type="create", context=None
+):
     t = Task(
         project_id=project_id,
         title="Source task",
@@ -3381,10 +3779,15 @@ async def test_fix_task_inherits_priority_from_original(spawn_db, mocker):
         payloads=[{"type": "review", "pr_number": 42}],
         status=TaskStatus.COMPLETED,
         priority=100,
-        context={"review_loop": {"pr_number": 42, "branch": "feature",
-                                  "base_branch": "main",
-                                  "original_task_id": str(original.id),
-                                  "iteration": 1}},
+        context={
+            "review_loop": {
+                "pr_number": 42,
+                "branch": "feature",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            }
+        },
     )
     spawn_db.add(review)
     await spawn_db.commit()
@@ -3457,8 +3860,9 @@ async def test_dedup_blocks_same_chain_review(spawn_db, mocker):
     existing_review = Task(
         project_id=project.id,
         title="Review PR #7",
-        payloads=[{"type": "review", "pr_number": 7,
-                   "original_task_id": str(original.id)}],
+        payloads=[
+            {"type": "review", "pr_number": 7, "original_task_id": str(original.id)}
+        ],
         status=TaskStatus.IN_PROGRESS,
         priority=50,
     )
@@ -3505,8 +3909,9 @@ async def test_dedup_does_not_block_different_chain_on_same_pr(spawn_db, mocker)
     existing_review = Task(
         project_id=project.id,
         title="Review PR #99 (chain A)",
-        payloads=[{"type": "review", "pr_number": 99,
-                   "original_task_id": str(chain_a.id)}],
+        payloads=[
+            {"type": "review", "pr_number": 99, "original_task_id": str(chain_a.id)}
+        ],
         status=TaskStatus.IN_PROGRESS,
         priority=50,
     )
@@ -3542,16 +3947,22 @@ async def test_cap_reached_returns_none_false(spawn_db, mocker):
     await spawn_db.commit()
     await spawn_db.refresh(project)
 
-    source = await _make_spawn_task(spawn_db, project.id, priority=50,
-                                     context={"scope": "small"})
+    source = await _make_spawn_task(
+        spawn_db, project.id, priority=50, context={"scope": "small"}
+    )
 
     # Seed small-scope cap (10) with completed review/fix for this PR
     for i in range(10):
         t = Task(
             project_id=project.id,
             title=f"Prior {i}",
-            payloads=[{"type": "review" if i % 2 == 0 else "fix", "pr_number": 55,
-                       "original_task_id": str(source.id)}],
+            payloads=[
+                {
+                    "type": "review" if i % 2 == 0 else "fix",
+                    "pr_number": 55,
+                    "original_task_id": str(source.id),
+                }
+            ],
             status=TaskStatus.COMPLETED,
             priority=50,
         )
@@ -3574,11 +3985,13 @@ async def test_cap_reached_returns_none_false(spawn_db, mocker):
 
 # ── Error Message Fingerprinting ────────────────────────────────────────────
 
+
 class TestErrorMessageFingerprinting:
     """Tests for _normalize_error_message and _error_fingerprint in task_completion."""
 
     def setup_method(self):
         from app.anomaly_detection import _normalize_error_message, _error_fingerprint
+
         self._normalize = _normalize_error_message
         self._fp = _error_fingerprint
 
@@ -3633,7 +4046,9 @@ async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
         create=True,
     )
     # Patch classify_failure to return CODE_ERROR for all tasks
-    mocker.patch("app.failure_classification.classify_failure", return_value="CODE_ERROR")
+    mocker.patch(
+        "app.failure_classification.classify_failure", return_value="CODE_ERROR"
+    )
 
     project = Project(name="AnomalyTest", user_id="u1")
     spawn_db.add(project)
@@ -3641,7 +4056,10 @@ async def test_anomaly_detection_includes_top_patterns(spawn_db, mocker):
     await spawn_db.refresh(project)
 
     import datetime as _dt
-    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)  # naive UTC, matches DB
+
+    now = _dt.datetime.now(_dt.timezone.utc).replace(
+        tzinfo=None
+    )  # naive UTC, matches DB
     recent = now - _dt.timedelta(hours=12)
 
     # Create 4 failed tasks with 2 distinct error patterns
@@ -3696,9 +4114,15 @@ async def test_multi_iteration_cycle_maintains_priority(spawn_db, mocker):
         payloads=[{"type": "fix", "pr_number": 10}],
         status=TaskStatus.COMPLETED,
         priority=80,
-        context={"review_loop": {"pr_number": 10, "branch": "b", "base_branch": "main",
-                                  "original_task_id": str(original.id),
-                                  "iteration": 2}},
+        context={
+            "review_loop": {
+                "pr_number": 10,
+                "branch": "b",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 2,
+            }
+        },
     )
     spawn_db.add(fix2)
     await spawn_db.commit()
@@ -3720,6 +4144,7 @@ async def test_multi_iteration_cycle_maintains_priority(spawn_db, mocker):
 
 # ── _ensure_vm_deleted VM count decrement ────────────────────────────────────
 
+
 class TestEnsureVmDeletedCountDecrement:
     """_ensure_vm_deleted must decrement _last_gcp_vm_count on successful deletion."""
 
@@ -3728,9 +4153,12 @@ class TestEnsureVmDeletedCountDecrement:
         import app.main as main_module
 
         main_module._last_gcp_vm_count = 3
-        mocker.patch("app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True)
+        mocker.patch(
+            "app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True
+        )
 
         from app.main import _ensure_vm_deleted
+
         result = await _ensure_vm_deleted("vm-test-123", reason="test")
 
         assert result is True
@@ -3741,9 +4169,12 @@ class TestEnsureVmDeletedCountDecrement:
         import app.main as main_module
 
         main_module._last_gcp_vm_count = 0
-        mocker.patch("app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True)
+        mocker.patch(
+            "app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True
+        )
 
         from app.main import _ensure_vm_deleted
+
         result = await _ensure_vm_deleted("vm-test-456", reason="test")
 
         assert result is True
@@ -3754,9 +4185,12 @@ class TestEnsureVmDeletedCountDecrement:
         import app.main as main_module
 
         main_module._last_gcp_vm_count = 3
-        mocker.patch("app.main.delete_agent_vm", new_callable=AsyncMock, return_value=False)
+        mocker.patch(
+            "app.main.delete_agent_vm", new_callable=AsyncMock, return_value=False
+        )
 
         from app.main import _ensure_vm_deleted
+
         result = await _ensure_vm_deleted("vm-test-789", reason="test")
 
         assert result is False
@@ -3769,6 +4203,7 @@ class TestEnsureVmDeletedCountDecrement:
 # historic COMMENT "informational review" verdict created an orphaned-PR path
 # (#1710, #1683): a fix was expected but a pure review got spawned and exited
 # with an informational comment, leaving the conflict unresolved.
+
 
 class TestReviewVerdictBinaryOnly:
     def test_submit_pr_review_schema_rejects_comment(self):
@@ -3917,21 +4352,27 @@ class TestCalibrateFindingScope:
         """Score of 0.5 passes at baseline 0.45 but gets escalated when pipeline
         medium rate is 0.2 (tightened threshold ~0.55)."""
         from app.shared_state import runtime_config
+
         monkeypatch.setattr(
             "app.research_completion._composite_complexity_score",
             lambda files, direction, cochange: (0.5, {"sig": "borderline"}),
         )
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.2})
+        monkeypatch.setitem(
+            runtime_config, "pipeline_scope_merge_rates", {"medium": 0.2}
+        )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
         assert cal == "medium"
 
-    def test_adaptive_threshold_exceeds_0_6_when_pipeline_medium_very_low(self, monkeypatch):
+    def test_adaptive_threshold_exceeds_0_6_when_pipeline_medium_very_low(
+        self, monkeypatch
+    ):
         """When pipeline medium rate is below 0.10, the adaptive threshold
         should exceed the old 0.6 ceiling so catastrophic medium performance
         escalates more borderline findings."""
         from app.shared_state import runtime_config
+
         # Score 0.61 is above old ceiling (0.6) but below new adaptive
         # threshold (0.45 + (0.4-0.08)*0.5 = 0.61) — should escalate.
         # Use 0.08 (just above MEDIUM_EXPLORATION_FLOOR=0.05) so the
@@ -3940,7 +4381,9 @@ class TestCalibrateFindingScope:
             "app.research_completion._composite_complexity_score",
             lambda files, direction, cochange: (0.6, {"sig": "borderline"}),
         )
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.08})
+        monkeypatch.setitem(
+            runtime_config, "pipeline_scope_merge_rates", {"medium": 0.08}
+        )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "large"
@@ -3962,7 +4405,8 @@ class TestCalibrateFindingScope:
             return (0.99, {"sig": "healthy"})
 
         monkeypatch.setattr(
-            "app.research_completion._composite_complexity_score", _unexpected,
+            "app.research_completion._composite_complexity_score",
+            _unexpected,
         )
         monkeypatch.setitem(
             runtime_config,
@@ -3977,7 +4421,9 @@ class TestCalibrateFindingScope:
         assert _called["n"] == 0
         assert "_complexity_score" not in finding
 
-    def test_small_upgrade_to_medium_runs_complexity_and_escalates_to_large(self, monkeypatch):
+    def test_small_upgrade_to_medium_runs_complexity_and_escalates_to_large(
+        self, monkeypatch
+    ):
         """A small finding with 4+ related_files across cochange clusters should
         be upgraded to medium by file-count, then have composite complexity
         scored, and further escalated to large when score is below threshold."""
@@ -3992,7 +4438,9 @@ class TestCalibrateFindingScope:
         assert finding["_complexity_score"] == 0.2
         assert finding["_complexity_signals"] == {"sig": "low", "clusters": 2}
 
-    def test_small_upgrade_to_medium_stays_medium_when_complexity_healthy(self, monkeypatch):
+    def test_small_upgrade_to_medium_stays_medium_when_complexity_healthy(
+        self, monkeypatch
+    ):
         """Small finding upgraded to medium, with healthy complexity, should
         receive complexity signals but stay at medium."""
         monkeypatch.setattr(
@@ -4006,31 +4454,45 @@ class TestCalibrateFindingScope:
         assert finding["_complexity_score"] == 0.9
         assert finding["_complexity_signals"] == {"sig": "healthy"}
 
-    def test_adaptive_threshold_baseline_when_pipeline_medium_healthy(self, monkeypatch):
+    def test_adaptive_threshold_baseline_when_pipeline_medium_healthy(
+        self, monkeypatch
+    ):
         """Score of 0.5 passes through when pipeline medium rate is healthy."""
         from app.shared_state import runtime_config
+
         monkeypatch.setattr(
             "app.research_completion._composite_complexity_score",
             lambda files, direction, cochange: (0.5, {"sig": "borderline"}),
         )
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6})
+        monkeypatch.setitem(
+            runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6}
+        )
         finding = {"title": "t", "related_files": self._single_module_files(2)}
         scope, cal = _calibrate_finding_scope(finding, "medium", None, None)
         assert scope == "medium"
         assert cal is None
 
-    def test_outcome_threshold_midpoint_used_when_both_averages_present(self, monkeypatch):
+    def test_outcome_threshold_midpoint_used_when_both_averages_present(
+        self, monkeypatch
+    ):
         """Direction outcome data with avg_complexity_merged=0.65 and
         avg_complexity_failed=0.35 should shift the threshold to ~0.50: a score
         of 0.48 escalates, 0.52 does not (at baseline pipeline health)."""
         from app.shared_state import runtime_config
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6})
+
+        monkeypatch.setitem(
+            runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6}
+        )
         direction = {
             "research_history": [
-                {"scope_breakdown": {"medium": {
-                    "avg_complexity_merged": 0.65,
-                    "avg_complexity_failed": 0.35,
-                }}},
+                {
+                    "scope_breakdown": {
+                        "medium": {
+                            "avg_complexity_merged": 0.65,
+                            "avg_complexity_failed": 0.35,
+                        }
+                    }
+                },
             ],
         }
         monkeypatch.setattr(
@@ -4054,7 +4516,10 @@ class TestCalibrateFindingScope:
     def test_outcome_threshold_failed_only_used_as_threshold(self, monkeypatch):
         """When only avg_complexity_failed exists, use it directly as threshold."""
         from app.shared_state import runtime_config
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6})
+
+        monkeypatch.setitem(
+            runtime_config, "pipeline_scope_merge_rates", {"medium": 0.6}
+        )
         direction = {
             "research_history": [
                 {"scope_breakdown": {"medium": {"avg_complexity_failed": 0.55}}},
@@ -4073,15 +4538,22 @@ class TestCalibrateFindingScope:
     def test_outcome_threshold_plus_pipeline_tightening_layered(self, monkeypatch):
         """Pipeline adjustment applies on top of outcome-derived base threshold."""
         from app.shared_state import runtime_config
+
         # Base from outcomes = midpoint(0.6, 0.4) = 0.50
         # Pipeline 0.2 → delta = (0.4-0.2)*0.5 = 0.10 → threshold = 0.60
-        monkeypatch.setitem(runtime_config, "pipeline_scope_merge_rates", {"medium": 0.2})
+        monkeypatch.setitem(
+            runtime_config, "pipeline_scope_merge_rates", {"medium": 0.2}
+        )
         direction = {
             "research_history": [
-                {"scope_breakdown": {"medium": {
-                    "avg_complexity_merged": 0.60,
-                    "avg_complexity_failed": 0.40,
-                }}},
+                {
+                    "scope_breakdown": {
+                        "medium": {
+                            "avg_complexity_merged": 0.60,
+                            "avg_complexity_failed": 0.40,
+                        }
+                    }
+                },
             ],
         }
         monkeypatch.setattr(
@@ -4101,19 +4573,20 @@ class TestPredictSpawnSuccessExpansionRatio:
     def _direction(self, ratios: list[float], scope: str = "medium") -> dict:
         return {
             "research_history": [
-                {"scope_breakdown": {scope: {"avg_expansion_ratio": r}}}
-                for r in ratios
+                {"scope_breakdown": {scope: {"avg_expansion_ratio": r}}} for r in ratios
             ],
         }
 
     def test_high_ratio_penalizes_prediction(self):
         from app.spawn_calibration import predict_spawn_success
+
         p_bad = predict_spawn_success("medium", self._direction([1.6, 1.7]))
         p_good = predict_spawn_success("medium", self._direction([1.0, 1.0]))
         assert p_bad < p_good
 
     def test_moderate_ratio_applies_softer_penalty(self):
         from app.spawn_calibration import predict_spawn_success
+
         p_mod = predict_spawn_success("medium", self._direction([1.3, 1.35]))
         p_high = predict_spawn_success("medium", self._direction([1.6, 1.7]))
         # Moderate (0.45) > High (0.25), averaged with other signals.
@@ -4121,9 +4594,11 @@ class TestPredictSpawnSuccessExpansionRatio:
 
     def test_low_ratio_no_signal(self):
         from app.spawn_calibration import predict_spawn_success
+
         # avg_expansion_ratio < 1.3 → signal omitted. With no other signals
         # and no pipeline config → falls back to neutral 0.5.
         from app.shared_state import runtime_config
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         try:
@@ -4137,6 +4612,7 @@ class TestPredictSpawnSuccessExpansionRatio:
     def test_insufficient_data_no_signal(self):
         from app.spawn_calibration import predict_spawn_success
         from app.shared_state import runtime_config
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         try:
@@ -4151,6 +4627,7 @@ class TestPredictSpawnSuccessExpansionRatio:
     def test_graduated_threshold_boundary(self):
         from app.spawn_calibration import predict_spawn_success
         from app.shared_state import runtime_config
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         try:
@@ -4180,6 +4657,7 @@ class TestPredictSpawnSuccessFailureStageComposition:
     def _predict(self, direction: dict, scope: str = "small") -> float:
         from app.shared_state import runtime_config
         from app.spawn_calibration import predict_spawn_success
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         try:
@@ -4203,9 +4681,9 @@ class TestPredictSpawnSuccessFailureStageComposition:
     def test_infra_stages_excluded_from_denominator(self):
         # 2 merge / (2 merge + 1 test) = 66% → penalty applies.
         # Provision/clone excluded from the non-infra denominator.
-        p = self._predict(self._direction(
-            {"merge": 2, "test": 1, "provision": 10, "clone": 5}
-        ))
+        p = self._predict(
+            self._direction({"merge": 2, "test": 1, "provision": 10, "clone": 5})
+        )
         assert p == pytest.approx(0.25)
 
     def test_insufficient_non_infra_data_no_signal(self):
@@ -4215,9 +4693,9 @@ class TestPredictSpawnSuccessFailureStageComposition:
 
     def test_no_dominance_no_signal(self):
         # Evenly split across stages → no single stage >= 50%.
-        p = self._predict(self._direction(
-            {"merge": 2, "review": 2, "test": 2, "lint": 2}
-        ))
+        p = self._predict(
+            self._direction({"merge": 2, "review": 2, "test": 2, "lint": 2})
+        )
         assert p == 0.5
 
 
@@ -4239,6 +4717,7 @@ class TestPredictSpawnSuccessTaxonomyWeighting:
     def _predict(self, direction: dict) -> float:
         from app.shared_state import runtime_config
         from app.spawn_calibration import predict_spawn_success
+
         prev = runtime_config.get("pipeline_scope_merge_rates")
         runtime_config["pipeline_scope_merge_rates"] = {}
         try:
@@ -4303,10 +4782,16 @@ class TestRecoverPoisonedSession:
         """Healthy session: no rollback, no surprise side effects."""
         from app.routers.agent_status import _recover_poisoned_session
 
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
-        session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        session_factory = sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
         async with session_factory() as session:
             # No transaction at all → not poisoned.
             assert await _recover_poisoned_session(session, "task-123") is False
@@ -4326,10 +4811,16 @@ class TestRecoverPoisonedSession:
         (enforced at the DB layer) as the reliable trigger."""
         from app.routers.agent_status import _recover_poisoned_session
 
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
-        session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        session_factory = sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
         async with session_factory() as session:
             # Open a transaction with a clean insert so we have something to roll back.
             project = Project(name="poison-test", user_id="u")
@@ -4350,7 +4841,9 @@ class TestRecoverPoisonedSession:
                 _ = _swallowed
 
             assert session.in_transaction()
-            assert not session.is_active, "session should be in pending-rollback after swallowed flush failure"
+            assert not session.is_active, (
+                "session should be in pending-rollback after swallowed flush failure"
+            )
 
             recovered = await _recover_poisoned_session(session, "task-poison")
             assert recovered is True
@@ -4364,4 +4857,5 @@ def text_helper(s):
     """Small wrapper so the test can keep using sqlalchemy.text without
     importing it at module top."""
     from sqlalchemy import text
+
     return text(s)

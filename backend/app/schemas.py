@@ -1,4 +1,5 @@
 """Pydantic request/response schemas for Blueprint API endpoints."""
+
 import uuid
 from typing import List, Dict, Any
 
@@ -12,6 +13,7 @@ class DeployPayload(BaseModel):
     payloads: List[Dict[str, Any]]
     github_owner: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
     github_repo: str | None = Field(None, pattern="^[a-zA-Z0-9_.-]+$")
+
 
 class AgentStatusPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -70,10 +72,12 @@ class AgentStatusPayload(BaseModel):
     # (short-lived roles) still get a fingerprint persisted.
     prompt_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{12}$")
 
+
 class UploadUrlRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
     filename: str = Field(..., min_length=1)
+
 
 class HeartbeatMetrics(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -84,11 +88,13 @@ class HeartbeatMetrics(BaseModel):
     cgroup_mb: float | None = None
     cgroup_limit_mb: float | None = None
 
+
 class ToolTraceEntry(BaseModel):
     model_config = ConfigDict(extra="ignore")
     t: str
     tool: str
     input_preview: str
+
 
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -111,6 +117,15 @@ class HeartbeatRequest(BaseModel):
     # on the first heartbeat after the handler registers it. Used to correlate
     # behavioral regressions back to prompt edits cycle-over-cycle.
     prompt_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{12}$")
+    # GCP boot-disk image identity, read from the metadata service at agent
+    # startup. Lets the orchestrator detect VMs running stale Packer images
+    # (e.g. pre-Chromium-bake) that will fail declared pre-PR checks.
+    # Falls back to None when the metadata service is unreachable (local dev).
+    vm_image_name: str | None = Field(None, max_length=200)
+    # Unix timestamp (seconds) extracted from the image name suffix, e.g.
+    # "blueprint-agent-v2-1730000000" → 1730000000. None when unparseable.
+    vm_image_build_ts: int | None = None
+
 
 class SpawnTaskRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -119,6 +134,7 @@ class SpawnTaskRequest(BaseModel):
     requires_approval: bool = False
     context: Dict[str, Any] | None = None
     priority: int | None = Field(default=None, ge=0, le=100)
+
 
 class GitHubCommitStatusRequest(BaseModel):
     task_id: uuid.UUID
@@ -130,12 +146,14 @@ class GitHubCommitStatusRequest(BaseModel):
     context: str = "blueprint-agent"
     target_url: str = ""
 
+
 class GitHubPRCommentRequest(BaseModel):
     task_id: uuid.UUID
     owner: str = Field(..., min_length=1)
     repo: str = Field(..., min_length=1)
     pr_number: int
     body: str = Field(..., min_length=1)
+
 
 class GitHubPRReviewCommentRequest(BaseModel):
     task_id: uuid.UUID
@@ -147,6 +165,7 @@ class GitHubPRReviewCommentRequest(BaseModel):
     line: int
     body: str = Field(..., min_length=1)
 
+
 class GitHubSubmitPRReviewRequest(BaseModel):
     task_id: uuid.UUID
     owner: str = Field(..., min_length=1)
@@ -156,6 +175,7 @@ class GitHubSubmitPRReviewRequest(BaseModel):
     body: str = Field(..., min_length=1)
     comments: list[dict] = Field(default_factory=list)
 
+
 class GitHubCreateIssueRequest(BaseModel):
     task_id: uuid.UUID
     owner: str = Field(..., min_length=1)
@@ -164,11 +184,13 @@ class GitHubCreateIssueRequest(BaseModel):
     body: str = ""
     assignees: List[str] | None = None
 
+
 class GitHubGetIssuesRequest(BaseModel):
     task_id: uuid.UUID
     owner: str = Field(..., min_length=1)
     repo: str = Field(..., min_length=1)
     state: str = Field("open", pattern="^(open|closed|all)$")
+
 
 class GitHubCreateBranchRequest(BaseModel):
     task_id: uuid.UUID
@@ -186,6 +208,7 @@ class GitHubCreateBranchRequest(BaseModel):
             raise ValueError("Branch name cannot start with '/' or '-'")
         return v
 
+
 class GitHubCreatePRRequest(BaseModel):
     task_id: uuid.UUID
     owner: str = Field(..., min_length=1)
@@ -198,8 +221,10 @@ class GitHubCreatePRRequest(BaseModel):
 
 # --- Build Config & Onboarding ---
 
+
 class BuildConfigDirectoryEntry(BaseModel):
     """A single directory entry within a project's build configuration."""
+
     path: str = Field(..., min_length=1)
     type: str = Field(..., pattern="^(python|node|go|rust|other)$")
     lint_cmd: str | None = None
@@ -210,6 +235,7 @@ class BuildConfigDirectoryEntry(BaseModel):
 
 class BuildConfig(BaseModel):
     """Schema for project build configuration."""
+
     language: str | None = Field(None, pattern="^(python|typescript|go|rust|mixed)$")
     directories: List[BuildConfigDirectoryEntry] = Field(default_factory=list)
     env_vars: Dict[str, str] = Field(default_factory=dict)
@@ -221,6 +247,7 @@ class BuildConfig(BaseModel):
 
 class OnboardPayload(BaseModel):
     """Payload for the project onboarding endpoint."""
+
     github_owner: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
     github_repo: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
     name: str | None = None

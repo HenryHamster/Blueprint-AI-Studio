@@ -283,6 +283,39 @@ let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
 const VM_INSTANCE_ID = process.env.VM_INSTANCE_ID || 'local';
 export const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
 
+// Populated at startup by fetchVmImageIdentity(); stays null in local dev /
+// tests where the GCP metadata service is unreachable so vm-heartbeat sends
+// a null vm_image_name (rather than 'unknown', which would pollute
+// compute._vm_images and skew get_stale_image_vms accounting).
+let vmImageName: string | null = null;
+let vmImageTs: number | null = null;
+
+/** Fetch the GCP boot-disk image path from the instance metadata service.
+ *  Returns the short image name and extracted unix build timestamp, or
+ *  falls back to { image_name: null, image_ts: null } on any error so
+ *  callers can distinguish "unknown VM" from a real image. */
+export async function fetchVmImageIdentity(): Promise<{ image_name: string | null; image_ts: number | null }> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => { controller.abort(); }, 2000);
+    const res = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/image',
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: controller.signal },
+    );
+    clearTimeout(timer);
+    if (!res.ok) return { image_name: null, image_ts: null };
+    const path = (await res.text()).trim();
+    // path = "projects/<proj>/global/images/blueprint-agent-v2-1730000000"
+    const name = path.split('/').pop() ?? null;
+    if (!name) return { image_name: null, image_ts: null };
+    const tsMatch = /[-_](\d{9,})$/.exec(name);
+    const image_ts = tsMatch ? parseInt(tsMatch[1], 10) : null;
+    return { image_name: name, image_ts };
+  } catch {
+    return { image_name: null, image_ts: null };
+  }
+}
+
 /** Get the current agent token (may have been refreshed since startup). */
 export function getAgentToken(): string { return AGENT_TOKEN; }
 
@@ -784,7 +817,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ vm_instance_id: vmInstanceId }),
+          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs }),
         });
         if (res.status === 401 || res.status === 403) {
           log(`pollForNextRole vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -805,7 +838,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
       const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ vm_instance_id: vmInstanceId }),
+        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs }),
       });
       if (res.status === 401 || res.status === 403) {
         log(`pollForNextRole initial vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -1657,6 +1690,80 @@ export async function pushAndCreatePR(
   return prUrl;
 }
 
+function installPlaywrightChromium(cwd: string) {
+  const playwrightCacheDir = `${process.env.HOME}/.cache/ms-playwright`;
+  const chromiumPresent = fs.existsSync(playwrightCacheDir) &&
+    fs.readdirSync(playwrightCacheDir).some(d => d.startsWith('chromium-'));
+
+  if (chromiumPresent) {
+    return;
+  }
+
+  try {
+    execFileSync('npx', ['playwright', 'install', 'chromium'], {
+      cwd,
+      encoding: 'utf-8',
+      timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
+    });
+  } catch {
+    execFileSync('npx', ['playwright', 'install', '--with-deps', 'chromium'], {
+      cwd,
+      encoding: 'utf-8',
+      timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
+    });
+  }
+}
+
+// ── Viewport Bootstrap Fallback ─────────────────────────────────────────────
+
+// Missing-library / missing-install signatures. Deliberately excludes
+// 'browserType.launch:' and 'failed to launch browser' which are too broad
+// and would match sandbox crashes and OOMs.
+const VIEWPORT_BOOTSTRAP_PATTERNS = [
+  /libatk/,
+  /libnss/,
+  /libgbm/,
+  /libxkbcommon/,
+  /libxcomposite/,
+  /libasound/,
+  /cannot open shared object file/,
+  /host system is missing dependencies/,
+  /executable doesn't exist at/,
+];
+
+export function isViewportBootstrapFailure(msg: string): boolean {
+  return VIEWPORT_BOOTSTRAP_PATTERNS.some(re => re.test(msg));
+}
+
+/** Run `npm run test:viewport` locally; on a bootstrap failure retry inside the
+ *  Playwright Docker image where all native deps are baked in. Real assertion
+ *  failures (non-bootstrap errors) propagate immediately without Docker retry. */
+export function runViewportSuiteWithFallback(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeout: number,
+): void {
+  try {
+    execFileSync('npm', ['run', 'test:viewport'], { cwd, encoding: 'utf-8', timeout, env });
+    return;
+  } catch (localErr: unknown) {
+    const msg = localErr instanceof Error ? localErr.message : String(localErr);
+    if (!isViewportBootstrapFailure(msg)) {
+      throw localErr;
+    }
+  }
+  // Bootstrap failure — retry inside the Playwright image where deps are baked in
+  const envFlags = Object.entries(env)
+    .filter(([k]) => k.startsWith('VITE_'))
+    .flatMap(([k, v]) => ['--env', `${k}=${v ?? ''}`]);
+  execFileSync(
+    'docker',
+    ['run', '--rm', '-v', `${WORKSPACE}:/workspace`, '-w', '/workspace/admin-ui', ...envFlags,
+      'mcr.microsoft.com/playwright:v1.59.1-jammy', 'npm', 'run', 'test:viewport'],
+    { cwd, encoding: 'utf-8', timeout },
+  );
+}
+
 // ── Lint / Build Checks ─────────────────────────────────────────────────────
 /** Run lint/build checks on changed files. Throws with error details on failure.
  *  Each blocking execFileSync starves the event loop (and heartbeat setInterval),
@@ -1716,14 +1823,10 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
     sendHeartbeatSync(taskId, 'eslint (admin-ui)...');
     execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT });
     try {
-      sendHeartbeatSync(taskId, 'npx playwright install --with-deps chromium (admin-ui)...');
-      execFileSync('npx', ['playwright', 'install', '--with-deps', 'chromium'], {
-        cwd: `${WORKSPACE}/admin-ui`,
-        encoding: 'utf-8',
-        timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
-      });
+      sendHeartbeatSync(taskId, 'playwright chromium install (admin-ui)...');
+      installPlaywrightChromium(`${WORKSPACE}/admin-ui`);
       sendHeartbeatSync(taskId, 'npm run test:viewport (admin-ui)...');
-      execFileSync('npm', ['run', 'test:viewport'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });
+      runViewportSuiteWithFallback(`${WORKSPACE}/admin-ui`, adminUiEnv, FRONTEND_BUILD_TIMEOUT);
     } catch (err: unknown) {
       if (err instanceof Error) {
         err.message += viewportFailureGuidance;
@@ -3677,6 +3780,16 @@ async function main() {
   await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
   if (PRE_CLAIM_TASK_ID) {
     sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_AUTH_OK: provider validation complete');
+  }
+
+  // Read GCP boot-disk image identity once at startup so vm-heartbeats can
+  // report which Packer image this VM is running. Defensive: unreachable
+  // in local dev — vmImageName stays null and heartbeats omit it rather
+  // than blocking startup.
+  { const id = await fetchVmImageIdentity();
+    vmImageName = id.image_name;
+    vmImageTs = id.image_ts;
+    log(`VM image: ${vmImageName ?? '<unknown>'}${vmImageTs ? ` (ts=${vmImageTs})` : ''}`);
   }
 
   // Retry any stale result files from previous runs (network failure / VM kill mid-POST)

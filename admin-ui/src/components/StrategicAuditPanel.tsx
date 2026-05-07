@@ -82,7 +82,7 @@ function GradeDistributionRow({
   mergeRate?: number | null;
 }) {
   return (
-    <div className="flex items-center gap-2 text-[11px]">
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
       <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium w-14 text-center ${gradeColor(grade)}`}>
         {grade}
       </span>
@@ -229,7 +229,7 @@ export function StrategicAuditPanel({ projectId, calibrationFloor = 0.05 }: Stra
         const history = actionability.cycle_history ?? [];
         return (
           <div>
-            <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex items-center gap-2">
+            <h3 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex flex-wrap items-center gap-x-2 gap-y-1">
               <span>Research Actionability</span>
               <span
                 data-testid="calibration-badge"

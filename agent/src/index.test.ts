@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -397,7 +397,7 @@ describe('runProjectLintChecks', () => {
     expect(adminUiCalls).toEqual([
       'npm ci',
       'npx eslint .',
-      'npx playwright install --with-deps chromium',
+      'npx playwright install chromium',
       'npm run test:viewport',
       'npm run build',
     ]);
@@ -406,11 +406,67 @@ describe('runProjectLintChecks', () => {
   it('uses the Playwright install timeout for hardcoded admin-ui browser provisioning', () => {
     runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
     const installCall = vi.mocked(execFileSync).mock.calls.find(
-      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && args.join(' ') === 'playwright install --with-deps chromium',
+      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && args.join(' ') === 'playwright install chromium',
     );
     expect(defined(installCall)[2]).toEqual(expect.objectContaining({
       timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
     }));
+  });
+
+  it('skips Playwright install when Chromium is already cached', () => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockImplementation((path: unknown) => {
+      const pathStr = typeof path === 'string' ? path : '';
+      return pathStr.includes('.cache/ms-playwright');
+    });
+    (vi.mocked(fs.readdirSync) as ReturnType<typeof vi.fn>).mockReturnValue(['chromium-1234']);
+
+    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
+    const installCalls = vi.mocked(execFileSync).mock.calls.filter(
+      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && (args as string[])[0] === 'playwright',
+    );
+    expect(installCalls).toHaveLength(0);
+  });
+
+  it('falls back to --with-deps when plain Playwright install fails', () => {
+    vi.clearAllMocks();
+    // Mock that chromium is not cached
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      // First call to 'npx playwright install chromium' fails
+      if (cmd === 'npx' && Array.isArray(args) && args.join(' ') === 'playwright install chromium') {
+        if (callCount === 0) {
+          callCount++;
+          throw new Error('install failed');
+        }
+      }
+      return '';
+    });
+
+    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
+    // Should call both plain and --with-deps versions
+    const installCalls = vi.mocked(execFileSync).mock.calls.filter(
+      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && (args as string[])[0] === 'playwright',
+    );
+    expect(installCalls.length).toBeGreaterThanOrEqual(1);
+    // Should have tried the --with-deps fallback
+    const withDepsCall = installCalls.find(
+      ([, args]) => Array.isArray(args) && args.includes('--with-deps'),
+    );
+    expect(withDepsCall).toBeDefined();
+  });
+
+  it('runProjectLintChecks wires runViewportSuiteWithFallback into the admin-ui path', () => {
+    // Verify that the admin-ui branch uses runViewportSuiteWithFallback (calls npm run test:viewport)
+    // and that the call exists at all — this test will break loudly if a future merge removes it.
+    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
+    const viewportCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd, args]) => cmd === 'npm' && Array.isArray(args) && args.join(' ') === 'run test:viewport',
+    );
+    expect(viewportCall).toBeDefined();
   });
 
   it('falls back to hardcoded agent checks when buildConfig is undefined and agent/ touched', () => {
@@ -428,6 +484,68 @@ describe('runProjectLintChecks', () => {
     // Should use hardcoded ruff check (via execFileSync for the try/catch ruff path)
     // We just verify it doesn't throw and execFileSync was called for something
     expect(typeof runProjectLintChecks).toBe('function');
+  });
+});
+
+describe('isViewportBootstrapFailure', () => {
+  it('matches missing-library signatures', () => {
+    expect(isViewportBootstrapFailure('error: libatk-1.0.so.0: cannot open shared object file')).toBe(true);
+    expect(isViewportBootstrapFailure('error loading libnss3.so')).toBe(true);
+    expect(isViewportBootstrapFailure('libgbm.so.1 not found')).toBe(true);
+    expect(isViewportBootstrapFailure('cannot find libxkbcommon')).toBe(true);
+    expect(isViewportBootstrapFailure('libxcomposite.so missing')).toBe(true);
+    expect(isViewportBootstrapFailure('libasound.so.2 not present')).toBe(true);
+    expect(isViewportBootstrapFailure('cannot open shared object file: no such file')).toBe(true);
+    expect(isViewportBootstrapFailure('host system is missing dependencies')).toBe(true);
+    expect(isViewportBootstrapFailure("executable doesn't exist at /usr/bin/chromium")).toBe(true);
+  });
+
+  it('does not match generic launch failures or real test failures', () => {
+    expect(isViewportBootstrapFailure('browserType.launch: Target page, context or browser has been closed')).toBe(false);
+    expect(isViewportBootstrapFailure('failed to launch browser: error while loading')).toBe(false);
+    expect(isViewportBootstrapFailure('AssertionError: expected 375 to equal 1280')).toBe(false);
+    expect(isViewportBootstrapFailure('Error: expect(received).toBe(expected)')).toBe(false);
+  });
+});
+
+describe('runViewportSuiteWithFallback', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+  });
+
+  it('runs npm run test:viewport and returns on success', () => {
+    runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000);
+    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
+      'npm', ['run', 'test:viewport'], expect.objectContaining({ cwd: '/workspace/admin-ui' }),
+    );
+  });
+
+  it('rethrows non-bootstrap failures without Docker retry', () => {
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('AssertionError: expected true to be false');
+    });
+    expect(() => { runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000); }).toThrow('AssertionError');
+    const dockerCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'docker');
+    expect(dockerCall).toBeUndefined();
+  });
+
+  it('retries via Docker on bootstrap failure and passes VITE_ env vars', () => {
+    vi.mocked(execFileSync).mockImplementationOnce(() => {
+      throw new Error('libatk-1.0.so.0: cannot open shared object file');
+    });
+    vi.mocked(execFileSync).mockReturnValueOnce(Buffer.from(''));
+    const env = { VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_PROJECT_ID: 'ci', HOME: '/root' };
+    runViewportSuiteWithFallback('/workspace/admin-ui', env, 60000);
+    const dockerCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'docker');
+    expect(dockerCall).toBeDefined();
+    const dockerArgs = defined(dockerCall)[1] as string[];
+    expect(dockerArgs).toContain('mcr.microsoft.com/playwright:v1.59.1-jammy');
+    expect(dockerArgs).toContain('--env');
+    expect(dockerArgs).toContain('VITE_API_URL=http://localhost:8080');
+    // Non-VITE_ vars should not be passed
+    const homeEnvIdx = dockerArgs.findIndex(a => a.startsWith('HOME='));
+    expect(homeEnvIdx).toBe(-1);
   });
 });
 
@@ -3262,5 +3380,51 @@ describe('drainJsonChunks within-chunk yielding', () => {
 
     expect(result).toBeDefined();
     expect(result?.lastResultText).toBe('final-result-after-120-ticks');
+  });
+});
+
+describe('fetchVmImageIdentity', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('parses image name and timestamp from GCP metadata path', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve('projects/my-project/global/images/blueprint-agent-v2-1730000000'),
+    });
+    const result = await fetchVmImageIdentity();
+    expect(result.image_name).toBe('blueprint-agent-v2-1730000000');
+    expect(result.image_ts).toBe(1730000000);
+  });
+
+  it('returns null image_name when metadata service is unreachable', async () => {
+    // Null (rather than 'unknown') so vm-heartbeat omits vm_image_name
+    // and compute._vm_images doesn't get polluted with ('unknown', None)
+    // entries that would skew get_stale_image_vms accounting.
+    fetchMock.mockRejectedValue(new Error('network error'));
+    const result = await fetchVmImageIdentity();
+    expect(result.image_name).toBeNull();
+    expect(result.image_ts).toBeNull();
+  });
+
+  it('returns null image_name when metadata returns non-ok status', async () => {
+    fetchMock.mockResolvedValue({ ok: false, text: () => Promise.resolve('') });
+    const result = await fetchVmImageIdentity();
+    expect(result.image_name).toBeNull();
+    expect(result.image_ts).toBeNull();
+  });
+
+  it('returns null image_ts for image names without a numeric suffix', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve('projects/my-project/global/images/blueprint-agent-v2'),
+    });
+    const result = await fetchVmImageIdentity();
+    expect(result.image_name).toBe('blueprint-agent-v2');
+    expect(result.image_ts).toBeNull();
   });
 });

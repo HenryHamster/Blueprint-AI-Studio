@@ -120,4 +120,14 @@ build {
       "sudo systemctl daemon-reload"
     ]
   }
+
+  provisioner "shell" {
+    inline = [
+      "# Prefetch Playwright Chromium binary to the agent user's cache (idempotent).",
+      "# Failures are non-fatal so a transient download error doesn't sink the build,",
+      "# but emit a serial-output marker (PACKER_CHROMIUM_PREFETCH_FAILED) the orchestrator",
+      "# can grep for — silent || true masked broken images on prior runs.",
+      "sudo -u agent bash -c '/opt/agent/node_modules/.bin/playwright install chromium' || { echo 'PACKER_CHROMIUM_PREFETCH_FAILED: chromium prefetch failed; agent will fall back to runtime install'; true; }"
+    ]
+  }
 }

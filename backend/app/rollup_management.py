@@ -8,6 +8,8 @@ All deferred imports from ``app.main`` are intentional — they avoid circular
 imports (rollup_management is imported BY main indirectly via task_lifecycle)
 and preserve test-patchability.
 """
+
+# fmt: off
 import logging
 import time
 import uuid
@@ -1342,6 +1344,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     logger.warning(f"[ROLLUP] Failed to fetch PR #{rollup_pr_number} diff size for task {parent_id_local}: {e}")
                     lines_changed = 999  # assume large if we can't check
                     pr_detail = None
+                head_sha = (pr_detail.get("head") or {}).get("sha") if pr_detail else None
 
                 # Zero-diff guard: squash-merged commits can produce a PR with commits
                 # but no file changes. Close before spawning review/fix VMs.
@@ -1474,6 +1477,94 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
+                    if head_sha:
+                        try:
+                            target_tip_sha = await get_branch_sha(
+                                gh_token, owner, repo, target_branch, project_id=project_id_str,
+                            )
+                        except Exception as tip_err:
+                            logger.warning(f"[ROLLUP] Failed to fetch target tip for PR #{rollup_pr_number}: {tip_err}")
+                            return
+                        if target_tip_sha != head_sha:
+                            _upd = await update_branch_with_sha_retry(
+                                gh_token, owner, repo, rollup_pr_number,
+                                expected_head_sha=head_sha,
+                                project_id=project_id_str,
+                            )
+                            parent = await _relock_parent(
+                                session, parent_id_local, pre_actual_merge_snapshot,
+                                parent_in_session=parent,
+                            )
+                            if parent is None:
+                                return
+                            parent_ctx = parent.context or {}
+                            if _upd.get("updated"):
+                                _new_ctx = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                _new_ctx.pop("_behind_update_retries", None)
+                                parent.context = _new_ctx
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} was behind {target_branch} — updated branch, "
+                                    f"awaiting fresh CI; next rollup sweep will re-attempt merge"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped merge"
+                                )
+                                return
+                            _behind_retries = parent_ctx.get("_behind_update_retries", 0) + 1
+                            _behind_budget = _runtime_config.get("rollup_behind_update_retries", 3)
+                            _upd_msg = _upd.get("message") or "unknown"
+                            if _behind_retries < _behind_budget:
+                                parent.context = {
+                                    **parent_ctx,
+                                    "rollup_pr_url": rollup_pr_url,
+                                    "rollup_pr_number": rollup_pr_number,
+                                    "_behind_update_retries": _behind_retries,
+                                }
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                    f"({_upd_msg}); retrying next sweep ({_behind_retries}/{_behind_budget})"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                    f"(attempt {_behind_retries}/{_behind_budget}): {_upd_msg} — deferring merge"
+                                )
+                                return
+                            await _maybe_create_failure_alert(
+                                parent, session,
+                                f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
+                                f"{_behind_retries} consecutive sweeps ({_upd_msg}); spawning fix",
+                            )
+                            _ctx_cleared = {k: v for k, v in parent_ctx.items() if k != "_behind_update_retries"}
+                            parent.context = {
+                                **_ctx_cleared,
+                                "rollup_pr_url": rollup_pr_url,
+                                "rollup_pr_number": rollup_pr_number,
+                            }
+                            parent.latest_status_message = (
+                                f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch exhausted "
+                                f"after {_behind_retries} sweeps; spawning fix"
+                            )
+                            session.add(parent)
+                            await session.commit()
+                            _fix_prompt = (
+                                f"Rollup PR #{rollup_pr_number} merging {staging_branch} into {target_branch} "
+                                f"is behind the target branch and update_branch failed {_behind_retries} consecutive "
+                                f"sweeps ({_upd_msg}). Rebase manually onto origin/{target_branch} and force-push."
+                            )
+                            await _spawn_pipeline_task(
+                                parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
+                                fix_prompt=_fix_prompt,
+                                original_task_id=str(parent.id),
+                            )
+                            logger.warning(
+                                f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch exhausted "
+                                f"({_behind_retries} sweeps): {_upd_msg} — spawned fix"
+                            )
+                            return
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
                     parent = await _relock_parent(
                         session, parent_id_local, pre_actual_merge_snapshot,
@@ -2126,3 +2217,4 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": TaskStatus.FAILED})
         logger.error(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
+# fmt: on

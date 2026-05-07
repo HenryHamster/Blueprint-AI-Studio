@@ -27,6 +27,7 @@ backend/.testmondata
 /design-doc
 /strategic
 /suggest
+/blocked
 research-*.md
 
 # Local git worktrees spawned by Claude Code — never commit as gitlinks

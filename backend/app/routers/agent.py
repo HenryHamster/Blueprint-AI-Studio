@@ -1,4 +1,5 @@
 """Agent-facing API endpoints (lifecycle + GitHub proxy)."""
+
 import asyncio
 import json
 import logging
@@ -18,15 +19,30 @@ from sqlmodel import select
 from app.auth import verify_agent_jwt, create_agent_token
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
-    Project, Task, TaskStatus, TaskHistory, Artifact, ArtifactType,
-    UserIntegration, _on_task_terminal_callbacks, _on_task_revive_callbacks, _utcnow,
+    Project,
+    Task,
+    TaskStatus,
+    TaskHistory,
+    Artifact,
+    ArtifactType,
+    UserIntegration,
+    _on_task_terminal_callbacks,
+    _on_task_revive_callbacks,
+    _utcnow,
 )
 from app.time_utils import _to_naive_utc
 from app.schemas import (
-    UploadUrlRequest, HeartbeatRequest, SpawnTaskRequest,
-    GitHubCommitStatusRequest, GitHubPRCommentRequest,
-    GitHubPRReviewCommentRequest, GitHubSubmitPRReviewRequest, GitHubCreateIssueRequest,
-    GitHubGetIssuesRequest, GitHubCreateBranchRequest, GitHubCreatePRRequest,
+    UploadUrlRequest,
+    HeartbeatRequest,
+    SpawnTaskRequest,
+    GitHubCommitStatusRequest,
+    GitHubPRCommentRequest,
+    GitHubPRReviewCommentRequest,
+    GitHubSubmitPRReviewRequest,
+    GitHubCreateIssueRequest,
+    GitHubGetIssuesRequest,
+    GitHubCreateBranchRequest,
+    GitHubCreatePRRequest,
 )
 from pydantic import BaseModel, ConfigDict, Field
 from app.payload_schemas import validate_task_payload
@@ -72,18 +88,29 @@ async def _create_review_check_run_bg(
             pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             head_sha = pr_data.get("head", {}).get("sha", "")
             if not head_sha:
-                logger.warning(f"[CHECK RUN] No head_sha for PR #{pr_number} task {task_id}")
+                logger.warning(
+                    f"[CHECK RUN] No head_sha for PR #{pr_number} task {task_id}"
+                )
                 return
-            result = await create_check_run(gh_token, owner, repo, head_sha, name=check_run_name)
+            result = await create_check_run(
+                gh_token, owner, repo, head_sha, name=check_run_name
+            )
             if result and result.get("id"):
                 task = await session.get(Task, task_id)
                 if task:
-                    task.context = {**(task.context or {}), "check_run_id": result["id"]}
+                    task.context = {
+                        **(task.context or {}),
+                        "check_run_id": result["id"],
+                    }
                     session.add(task)
                     await session.commit()
-                    logger.info(f"[CHECK RUN] Created check run {result['id']} for review task {task_id} PR #{pr_number}")
+                    logger.info(
+                        f"[CHECK RUN] Created check run {result['id']} for review task {task_id} PR #{pr_number}"
+                    )
     except Exception as e:  # noqa: BLE001 — best-effort background task, never block claim response
-        logger.warning(f"[CHECK RUN] Failed to create check run for task {task_id}: {e}")
+        logger.warning(
+            f"[CHECK RUN] Failed to create check run for task {task_id}: {e}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +121,9 @@ async def _create_review_check_run_bg(
 # are evicted to prevent unbounded growth (JWTs expire after 8h).
 _terminated_task_ids: dict[str, float] = {}
 _TERMINATED_TTL = 9 * 3600  # 9h — slightly longer than 8h JWT max lifetime
-_on_task_terminal_callbacks.append(lambda tid: _terminated_task_ids.__setitem__(tid, time.time()))
+_on_task_terminal_callbacks.append(
+    lambda tid: _terminated_task_ids.__setitem__(tid, time.time())
+)
 # Production 2026-05-05: when a task is requeued (terminal → QUEUED, or any
 # in-flight set to a non-terminal status), drop the deny-list entry so the
 # next ``/api/agent/claim`` doesn't 401 with "Task is no longer active". The
@@ -131,18 +160,22 @@ _bg_tasks: set[asyncio.Task] = set()
 # call /api/agent/spawn with `req.context = {"warm_target_vm_id": "<victim>"}`
 # and the orchestrator's skip-provision branch would honor the pin, hijacking
 # another VM's warm chain. Phase 2c (warm-VM continuity) issue #3.
-_AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset({
-    "warm_target_vm_id",
-    "warm_target_pr",
-    "warm_handoff_deadline",
-    # Defense-in-depth — these are also orchestrator-internal:
-    "_timing",
-})
+_AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset(
+    {
+        "warm_target_vm_id",
+        "warm_target_pr",
+        "warm_handoff_deadline",
+        # Defense-in-depth — these are also orchestrator-internal:
+        "_timing",
+    }
+)
 
 
 async def verify_agent_token(
     request: Request,
-    x_agent_token: str = Header(..., description="Secret token for agent authentication"),
+    x_agent_token: str = Header(
+        ..., description="Secret token for agent authentication"
+    ),
 ):
     """
     Validates the short-lived JWT passed by the agent VM.
@@ -169,8 +202,10 @@ async def verify_agent_token(
     # them as idempotent paths so the verify-agent-token guard accepts the
     # terminal-task JWT, but still rejects a different VM trying to use it.
     is_idempotent_path = request.url.path in (
-        "/api/agent/status", "/api/agent/credentials/rotate",
-        "/api/agent/next-role", "/api/agent/vm-heartbeat",
+        "/api/agent/status",
+        "/api/agent/credentials/rotate",
+        "/api/agent/next-role",
+        "/api/agent/vm-heartbeat",
     )
     # Issue M3 freshness check (warm-VM rev): only the warm-VM idempotent
     # paths /next-role and /vm-heartbeat carry the replay risk for terminal
@@ -178,7 +213,8 @@ async def verify_agent_token(
     # guard via vm_instance_mismatch). Apply the freshness window only to
     # the warm-VM paths so the same-VM /status retry path stays intact.
     is_warm_idempotent_path = request.url.path in (
-        "/api/agent/next-role", "/api/agent/vm-heartbeat",
+        "/api/agent/next-role",
+        "/api/agent/vm-heartbeat",
     )
 
     def _enforce_terminal_freshness() -> None:
@@ -220,7 +256,11 @@ async def verify_agent_token(
 
     # Fast path: recently verified as active (TTL cache)
     cached_expiry = _agent_active_cache.get(task_id)
-    if cached_expiry and time.time() < cached_expiry and task_id not in _terminated_task_ids:
+    if (
+        cached_expiry
+        and time.time() < cached_expiry
+        and task_id not in _terminated_task_ids
+    ):
         return payload
 
     # Slow path: DB check (runs at most once per AGENT_CACHE_TTL per task)
@@ -241,18 +281,20 @@ async def verify_agent_token(
             # to a different VM (reaper requeue), the original agent's
             # token must NOT be allowed to mutate state for the new VM's
             # task. Same-VM retries are still allowed (idempotent path).
-            if (
-                token_vm
-                and task.vm_instance_id
-                and task.vm_instance_id != token_vm
-            ):
+            if token_vm and task.vm_instance_id and task.vm_instance_id != token_vm:
                 raise HTTPException(status_code=403, detail="vm_instance_mismatch")
-            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            if task.status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
                 _terminated_task_ids[task_id] = time.time()
                 # Same-VM idempotent retry on terminal task is OK; different
                 # VM (or any non-idempotent path) fails fast.
                 if not is_idempotent_path:
-                    raise HTTPException(status_code=401, detail="Task is no longer active")
+                    raise HTTPException(
+                        status_code=401, detail="Task is no longer active"
+                    )
                 # Issue M3: warm-VM idempotent paths additionally require a
                 # fresh JWT (iat within _TERMINAL_IDEMPOTENT_FRESHNESS_SECS)
                 # so a leaked terminal-task token can't be replayed hours
@@ -261,7 +303,9 @@ async def verify_agent_token(
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — fail open on DB errors so agents aren't blocked by transient DB issues
-        logger.warning(f"[AUTH] DB check failed for task {task_id}, allowing request: {e}")
+        logger.warning(
+            f"[AUTH] DB check failed for task {task_id}, allowing request: {e}"
+        )
 
     now = time.time()
     _agent_active_cache[task_id] = now + _AGENT_CACHE_TTL
@@ -283,8 +327,12 @@ async def verify_agent_token(
 # GitHub token cache (moved from main.py)
 # ---------------------------------------------------------------------------
 
-_github_token_cache: Dict[str, Dict] = {}  # project_id -> {"token", "owner", "repo", "fetched_at"}
-_github_token_cache_lock = asyncio.Lock()  # Prevent concurrent cache miss → duplicate token generation
+_github_token_cache: Dict[
+    str, Dict
+] = {}  # project_id -> {"token", "owner", "repo", "fetched_at"}
+_github_token_cache_lock = (
+    asyncio.Lock()
+)  # Prevent concurrent cache miss → duplicate token generation
 _GITHUB_TOKEN_TTL = 3000  # 50 minutes (installation tokens expire after 60min)
 
 
@@ -296,7 +344,9 @@ def invalidate_github_token_cache(project_id: str) -> None:
 
 
 async def get_github_token_for_task(
-    task_id: uuid.UUID, session: AsyncSession, force_refresh: bool = False,
+    task_id: uuid.UUID,
+    session: AsyncSession,
+    force_refresh: bool = False,
 ) -> tuple[str, str, str]:
     stmt = select(Task).where(Task.id == task_id)
     task = (await session.execute(stmt)).scalars().first()
@@ -309,7 +359,11 @@ async def get_github_token_for_task(
     if not force_refresh:
         async with _github_token_cache_lock:
             cached = _github_token_cache.get(project_id_str)
-            if cached and (_utcnow() - cached["fetched_at"]).total_seconds() < _GITHUB_TOKEN_TTL:
+            if (
+                cached
+                and (_utcnow() - cached["fetched_at"]).total_seconds()
+                < _GITHUB_TOKEN_TTL
+            ):
                 return cached["token"], cached["owner"], cached["repo"]
 
     project_stmt = select(Project).where(Project.id == task.project_id)
@@ -318,28 +372,39 @@ async def get_github_token_for_task(
         raise HTTPException(status_code=404, detail="Project or user not found")
 
     if not project.github_owner or not project.github_repo:
-        raise HTTPException(status_code=403, detail="Project does not have an authorized GitHub repository")
+        raise HTTPException(
+            status_code=403,
+            detail="Project does not have an authorized GitHub repository",
+        )
 
-    integration_stmt = select(UserIntegration).where(UserIntegration.user_id == project.user_id)
+    integration_stmt = select(UserIntegration).where(
+        UserIntegration.user_id == project.user_id
+    )
     integration = (await session.execute(integration_stmt)).scalars().first()
 
     # Prefer dynamic App-level discovery — always finds the correct installation
     # for this specific repo, even with multiple installations across orgs.
     token = None
     from app.github import get_repo_installation_token
+
     try:
-        token = await get_repo_installation_token(project.github_owner, project.github_repo)
+        token = await get_repo_installation_token(
+            project.github_owner, project.github_repo
+        )
     except Exception:  # noqa: BLE001 — fall through to stored-installation + PAT fallbacks
-        logger.debug(f"[GITHUB] App-level discovery failed for {project.github_owner}/{project.github_repo}, trying fallbacks")
+        logger.debug(
+            f"[GITHUB] App-level discovery failed for {project.github_owner}/{project.github_repo}, trying fallbacks"
+        )
 
     if not token and integration and integration.github_installation_id:
         try:
             token = await generate_installation_access_token(
-                integration.github_installation_id,
-                repositories=[project.github_repo]
+                integration.github_installation_id, repositories=[project.github_repo]
             )
         except Exception:  # noqa: BLE001 — fall through to PAT fallback
-            logger.debug(f"[GITHUB] Stored installation token failed for {project.github_owner}/{project.github_repo}")
+            logger.debug(
+                f"[GITHUB] Stored installation token failed for {project.github_owner}/{project.github_repo}"
+            )
 
     if not token and integration and integration.github_pat:
         token = await get_user_secret(integration.github_pat)
@@ -347,7 +412,7 @@ async def get_github_token_for_task(
     if not token:
         raise HTTPException(
             status_code=400,
-            detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat."
+            detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat.",
         )
 
     # Track successful GitHub API interaction for passive health checking
@@ -356,12 +421,16 @@ async def get_github_token_for_task(
     # Cache token to avoid re-generating for every API call within the same project
     async with _github_token_cache_lock:
         _github_token_cache[project_id_str] = {
-            "token": token, "owner": project.github_owner, "repo": project.github_repo,
-            "fetched_at": _utcnow()
+            "token": token,
+            "owner": project.github_owner,
+            "repo": project.github_repo,
+            "fetched_at": _utcnow(),
         }
         # Evict stale entries
         stale_cutoff = _utcnow() - timedelta(seconds=_GITHUB_TOKEN_TTL + 600)
-        for k in [k for k, v in _github_token_cache.items() if v["fetched_at"] < stale_cutoff]:
+        for k in [
+            k for k, v in _github_token_cache.items() if v["fetched_at"] < stale_cutoff
+        ]:
             _github_token_cache.pop(k, None)
 
     return token, project.github_owner, project.github_repo
@@ -371,10 +440,12 @@ async def get_github_token_for_task(
 # Helper: cycle detection for spawn dependency graphs
 # ---------------------------------------------------------------------------
 
+
 def _has_local_cycle(adj: Dict[str, list]) -> bool:
     """Check for cycles in a small adjacency list (dependency graph)."""
     WHITE, GRAY, BLACK = 0, 1, 2
     color = dict.fromkeys(adj, WHITE)
+
     def dfs(n):
         color[n] = GRAY
         for dep in adj.get(n, []):
@@ -386,6 +457,7 @@ def _has_local_cycle(adj: Dict[str, list]) -> bool:
                 return True
         color[n] = BLACK
         return False
+
     return any(color[n] == WHITE and dfs(n) for n in adj)
 
 
@@ -393,10 +465,16 @@ def _has_local_cycle(adj: Dict[str, list]) -> bool:
 # Helper: parse a Failed Approaches entry into {text, failure_type}
 # ---------------------------------------------------------------------------
 
-_KNOWN_FAILURE_CATEGORIES = frozenset({
-    "CODE_ERROR", "PROVISION_FAILURE", "AGENT_TIMEOUT", "EXTERNAL_API", "RATE_LIMIT",
-    "rejected in review",
-})
+_KNOWN_FAILURE_CATEGORIES = frozenset(
+    {
+        "CODE_ERROR",
+        "PROVISION_FAILURE",
+        "AGENT_TIMEOUT",
+        "EXTERNAL_API",
+        "RATE_LIMIT",
+        "rejected in review",
+    }
+)
 
 
 def _parse_failed_approach(line: str) -> dict:
@@ -418,10 +496,10 @@ def _parse_failed_approach(line: str) -> dict:
     if open_idx > 0:
         close_idx = line.find(")", open_idx)
         if close_idx > open_idx:
-            inner = line[open_idx + 1:close_idx].strip()
+            inner = line[open_idx + 1 : close_idx].strip()
             if inner in _KNOWN_FAILURE_CATEGORIES:
                 failure_type = inner
-                rest = line[close_idx + 1:]
+                rest = line[close_idx + 1 :]
                 # Look for a [at=... stage=...] metadata block that follows the
                 # category paren with only whitespace in between.
                 meta_start = -1
@@ -434,13 +512,13 @@ def _parse_failed_approach(line: str) -> dict:
                 if meta_start >= 0:
                     meta_end = rest.find("]", meta_start)
                     if meta_end > meta_start:
-                        meta = rest[meta_start + 1:meta_end]
+                        meta = rest[meta_start + 1 : meta_end]
                         for part in meta.split():
                             if part.startswith("at="):
-                                failed_at = part[len("at="):]
+                                failed_at = part[len("at=") :]
                             elif part.startswith("stage="):
-                                failure_stage = part[len("stage="):]
-                        rest = rest[:meta_start].rstrip() + rest[meta_end + 1:]
+                                failure_stage = part[len("stage=") :]
+                        rest = rest[:meta_start].rstrip() + rest[meta_end + 1 :]
                 stripped = (line[:open_idx].rstrip() + rest).strip()
                 text = stripped if stripped else line
     return {
@@ -454,6 +532,7 @@ def _parse_failed_approach(line: str) -> dict:
 # ---------------------------------------------------------------------------
 # Helper: failure stage pattern analysis
 # ---------------------------------------------------------------------------
+
 
 def _compute_failure_stage_pattern(history: list) -> "dict | None":
     """
@@ -513,6 +592,7 @@ def _compute_failure_stage_pattern(history: list) -> "dict | None":
 # Helper: compact strategic vision for the claim response
 # ---------------------------------------------------------------------------
 
+
 def _build_vision_summary(vision_raw: dict | None) -> "dict | None":
     """Return a size-bounded, agent-safe view of project.vision.
 
@@ -531,7 +611,9 @@ def _build_vision_summary(vision_raw: dict | None) -> "dict | None":
     if isinstance(success, str) and success.strip():
         summary["success_criteria"] = success.strip()[:600]
     elif isinstance(success, list):
-        compact = [str(s).strip()[:200] for s in success if isinstance(s, str) and s.strip()]
+        compact = [
+            str(s).strip()[:200] for s in success if isinstance(s, str) and s.strip()
+        ]
         if compact:
             summary["success_criteria"] = compact[:5]
     context_field = vision_raw.get("context")
@@ -583,6 +665,7 @@ def _build_vision_summary(vision_raw: dict | None) -> "dict | None":
 # Helper: direction narrative (what we know, what's open)
 # ---------------------------------------------------------------------------
 
+
 def _build_direction_narrative(direction: dict) -> "dict | None":
     """Extract a short "where we are" narrative from a direction.
 
@@ -595,10 +678,13 @@ def _build_direction_narrative(direction: dict) -> "dict | None":
     if not isinstance(direction, dict):
         return None
     from app.research_context import _parse_research_context
+
     rc_text = direction.get("research_context", "") or ""
     parsed = _parse_research_context(rc_text) if rc_text else {}
     established = parsed.get("established", []) if isinstance(parsed, dict) else []
-    open_questions = parsed.get("open_questions", []) if isinstance(parsed, dict) else []
+    open_questions = (
+        parsed.get("open_questions", []) if isinstance(parsed, dict) else []
+    )
 
     def _trim(items: list, limit: int, char_cap: int) -> list:
         return [
@@ -616,7 +702,9 @@ def _build_direction_narrative(direction: dict) -> "dict | None":
         narrative["open_questions"] = top_open
 
     history = direction.get("research_history") or []
-    productive = [h for h in history if isinstance(h, dict) and h.get("tasks_created", 0) > 0]
+    productive = [
+        h for h in history if isinstance(h, dict) and h.get("tasks_created", 0) > 0
+    ]
     if productive:
         last = productive[-1]
         merged = int(last.get("prs_merged", 0) or 0)
@@ -636,6 +724,7 @@ def _build_direction_narrative(direction: dict) -> "dict | None":
 # ---------------------------------------------------------------------------
 # Agent lifecycle endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.post("/refresh-token")
 @limiter.limit("120/minute")
@@ -660,7 +749,11 @@ async def agent_refresh_token(
         raise HTTPException(status_code=404, detail="task_not_found")
     if task.vm_instance_id != vm_id:
         raise HTTPException(status_code=409, detail="vm_instance_mismatch")
-    if task.status not in (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.QUEUED):
+    if task.status not in (
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.QUEUED,
+    ):
         raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
     task.last_token_refresh_at = _utcnow()
     await session.commit()
@@ -686,14 +779,20 @@ async def _stamp_reviewer_recovery_count(
     either spot depending on which path tagged it. No-op when nothing matched.
     """
     recovery_count = sum(
-        1 for t in high_iter_rows
+        1
+        for t in high_iter_rows
         if (
-            (t.context or {}).get("_self_review_outcome", {}).get("reviewer_recovery_origin")
+            (t.context or {})
+            .get("_self_review_outcome", {})
+            .get("reviewer_recovery_origin")
             == "reviewer_recovery_after_incomplete_sr"
-        ) or any(
-            isinstance(v, dict) and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
+        )
+        or any(
+            isinstance(v, dict)
+            and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
             for v in (
-                (t.context or {}).get("_self_review_outcome", {}).get("check_results") or {}
+                (t.context or {}).get("_self_review_outcome", {}).get("check_results")
+                or {}
             ).values()
         )
     )
@@ -716,7 +815,7 @@ async def _stamp_reviewer_recovery_count(
 async def claim_task(
     request: Request,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     vm_id = token.get("vm_instance_id")
     # Phase 2c Race A mitigation: a successful claim is a strong liveness
@@ -724,10 +823,14 @@ async def claim_task(
     # this widens the warm-VM continuity liveness window beyond just the
     # /vm-heartbeat and /next-role endpoints.
     _shared_state.record_vm_heartbeat(vm_id)
-    stmt = select(Task).where(
-        Task.vm_instance_id == vm_id,
-        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
-    ).with_for_update(skip_locked=True)
+    stmt = (
+        select(Task)
+        .where(
+            Task.vm_instance_id == vm_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
+        )
+        .with_for_update(skip_locked=True)
+    )
     result = await session.execute(stmt)
     task = result.scalars().first()
 
@@ -737,7 +840,7 @@ async def claim_task(
         check = await session.execute(
             select(Task.id).where(
                 Task.vm_instance_id == vm_id,
-                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING])
+                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
             )
         )
         if check.scalars().first():
@@ -766,17 +869,26 @@ async def claim_task(
         )
         task = (await session.execute(replay_stmt)).scalars().first()
         if not task:
-            raise HTTPException(status_code=404, detail="No queued task found for this VM instance.")
+            raise HTTPException(
+                status_code=404, detail="No queued task found for this VM instance."
+            )
         idempotent_replay = True
 
     if not idempotent_replay:
         task.status = TaskStatus.IN_PROGRESS
-        task.last_heartbeat = _utcnow()  # Immediate heartbeat — don't wait 30s for agent interval
+        task.last_heartbeat = (
+            _utcnow()
+        )  # Immediate heartbeat — don't wait 30s for agent interval
         # Record time-to-claim so we can measure the real distribution of VM cold-boot
         # + auth validation + claim and tighten the reaper's pre-claim threshold later.
         if task.vm_provisioned_at:
-            claim_latency = (task.last_heartbeat - task.vm_provisioned_at).total_seconds()
-            task.context = {**(task.context or {}), "claim_latency_secs": round(claim_latency, 1)}
+            claim_latency = (
+                task.last_heartbeat - task.vm_provisioned_at
+            ).total_seconds()
+            task.context = {
+                **(task.context or {}),
+                "claim_latency_secs": round(claim_latency, 1),
+            }
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -785,12 +897,13 @@ async def claim_task(
     await broadcast_to_project(
         str(task.project_id),
         "task_updated",
-        {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS}
+        {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
     )
 
     # Strip internal runtime-routing fields before returning task context to the agent.
     safe_context = {
-        k: v for k, v in (task.context or {}).items()
+        k: v
+        for k, v in (task.context or {}).items()
         if not k.startswith("max_plan_") and not k.startswith("llm_")
     }
     response = {
@@ -798,7 +911,7 @@ async def claim_task(
         "title": task.title,
         "description": task.description,
         "payloads": task.payloads,
-        "context": safe_context
+        "context": safe_context,
     }
 
     # Add project metadata so agents can adapt to different project structures
@@ -826,14 +939,20 @@ async def claim_task(
         # could pull 500 MB before truncating in Python.
         active_stmt = (
             select(Task)
-            .options(load_only(
-                Task.id, Task.title, Task.status, Task.payloads, Task.context,
-                Task.project_id,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.title,
+                    Task.status,
+                    Task.payloads,
+                    Task.context,
+                    Task.project_id,
+                )
+            )
             .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+                Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]),
             )
             .order_by(Task.created_at.desc())
             .limit(50)
@@ -842,28 +961,36 @@ async def claim_task(
         active_tasks = []
         for t in active_tasks_rows:
             p = t.first_payload
-            active_tasks.append({
-                "id": str(t.id),
-                "title": t.title,
-                "task_type": p.get("type", ""),
-                "status": t.status,
-                "prompt": p.get("prompt", p.get("description", "")),
-                "related_files": (t.context or {}).get("related_files", []),
-                "direction_id": (t.context or {}).get("direction_id"),
-            })
+            active_tasks.append(
+                {
+                    "id": str(t.id),
+                    "title": t.title,
+                    "task_type": p.get("type", ""),
+                    "status": t.status,
+                    "prompt": p.get("prompt", p.get("description", "")),
+                    "related_files": (t.context or {}).get("related_files", []),
+                    "direction_id": (t.context or {}).get("direction_id"),
+                }
+            )
 
         # Queued tasks in the same project. Same projection as active_stmt.
         # Audit R3-W2 (H6): cap fetch at 50 rows (same rationale as above).
         queued_stmt = (
             select(Task)
-            .options(load_only(
-                Task.id, Task.title, Task.status, Task.payloads, Task.context,
-                Task.project_id,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.title,
+                    Task.status,
+                    Task.payloads,
+                    Task.context,
+                    Task.project_id,
+                )
+            )
             .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.status == TaskStatus.QUEUED
+                Task.status == TaskStatus.QUEUED,
             )
             .order_by(Task.created_at.desc())
             .limit(50)
@@ -872,23 +999,34 @@ async def claim_task(
         queued_tasks = []
         for t in queued_tasks_rows:
             p = t.first_payload
-            queued_tasks.append({
-                "id": str(t.id),
-                "title": t.title,
-                "task_type": p.get("type", ""),
-                "prompt": p.get("prompt", p.get("description", "")),
-                "related_files": (t.context or {}).get("related_files", []),
-                "direction_id": (t.context or {}).get("direction_id"),
-            })
+            queued_tasks.append(
+                {
+                    "id": str(t.id),
+                    "title": t.title,
+                    "task_type": p.get("type", ""),
+                    "prompt": p.get("prompt", p.get("description", "")),
+                    "related_files": (t.context or {}).get("related_files", []),
+                    "direction_id": (t.context or {}).get("direction_id"),
+                }
+            )
 
         # Recently completed tasks (10 most recent): completed first, then failed/cancelled.
         # Phase B4 (H-P6): drop status_log/plan_output JSONB. Loop reads below
         # also call classify_failure(t) which touches latest_status_message,
         # context, payloads — all included.
         _completed_loadonly = load_only(
-            Task.id, Task.title, Task.status, Task.payloads, Task.context,
-            Task.project_id, Task.description, Task.created_at,
-            Task.latest_status_message, Task.account_id, Task.provider, Task.model,
+            Task.id,
+            Task.title,
+            Task.status,
+            Task.payloads,
+            Task.context,
+            Task.project_id,
+            Task.description,
+            Task.created_at,
+            Task.latest_status_message,
+            Task.account_id,
+            Task.provider,
+            Task.model,
         )
         completed_stmt = (
             select(Task)
@@ -896,10 +1034,14 @@ async def claim_task(
             .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.status == TaskStatus.COMPLETED
-            ).order_by(Task.created_at.desc()).limit(10)
+                Task.status == TaskStatus.COMPLETED,
+            )
+            .order_by(Task.created_at.desc())
+            .limit(10)
         )
-        completed_tasks_rows = list((await session.execute(completed_stmt)).scalars().all())
+        completed_tasks_rows = list(
+            (await session.execute(completed_stmt)).scalars().all()
+        )
 
         failed_cancelled_stmt = (
             select(Task)
@@ -907,10 +1049,14 @@ async def claim_task(
             .where(
                 Task.project_id == task.project_id,
                 Task.id != task.id,
-                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED])
-            ).order_by(Task.created_at.desc()).limit(max(0, 15 - len(completed_tasks_rows)))
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            )
+            .order_by(Task.created_at.desc())
+            .limit(max(0, 15 - len(completed_tasks_rows)))
         )
-        failed_cancelled_rows = (await session.execute(failed_cancelled_stmt)).scalars().all()
+        failed_cancelled_rows = (
+            (await session.execute(failed_cancelled_stmt)).scalars().all()
+        )
         completed_tasks_rows = completed_tasks_rows + list(failed_cancelled_rows)
 
         completed_task_ids = [t.id for t in completed_tasks_rows]
@@ -918,7 +1064,9 @@ async def claim_task(
         if completed_task_ids:
             art_stmt = select(Artifact).where(
                 Artifact.task_id.in_(completed_task_ids),
-                Artifact.artifact_type.in_([ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS])
+                Artifact.artifact_type.in_(
+                    [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
+                ),
             )
             completed_artifacts = (await session.execute(art_stmt)).scalars().all()
 
@@ -927,6 +1075,7 @@ async def claim_task(
             artifacts_by_completed_task.setdefault(a.task_id, []).append(a)
 
         from app.failure_classification import classify_failure
+
         recently_completed_tasks = []
         for t in completed_tasks_rows:
             p = t.first_payload
@@ -943,26 +1092,40 @@ async def claim_task(
                     research_findings_summary = a.logs[:8000]
                     break
             t_ctx = t.context or {}
-            t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[:300]
+            t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[
+                :300
+            ]
             t_related_files = (t_ctx.get("related_files") or [])[:10]
             t_direction_id = t_ctx.get("direction_id")
             is_failed = t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
             t_changed_files = (t_ctx.get("_pr_changed_files") or [])[:10] or None
-            recently_completed_tasks.append({
-                "id": str(t.id),
-                "title": t.title,
-                "task_type": p.get("type", ""),
-                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
-                "pr_url": pr_url,
-                "research_findings_summary": research_findings_summary,
-                "failure_reason": (t.latest_status_message or "")[:500] if is_failed and t.latest_status_message else None,
-                "failure_class": classify_failure(t) if is_failed and t.latest_status_message else None,
-                "review_iterations": (t_ctx.get("review_loop", {}) or {}).get("iteration", 0) if t_ctx.get("review_loop") else None,
-                "prompt": t_prompt or None,
-                "related_files": t_related_files,
-                "direction_id": t_direction_id,
-                "changed_files": t_changed_files,
-            })
+            recently_completed_tasks.append(
+                {
+                    "id": str(t.id),
+                    "title": t.title,
+                    "task_type": p.get("type", ""),
+                    "status": t.status.value
+                    if hasattr(t.status, "value")
+                    else str(t.status),
+                    "pr_url": pr_url,
+                    "research_findings_summary": research_findings_summary,
+                    "failure_reason": (t.latest_status_message or "")[:500]
+                    if is_failed and t.latest_status_message
+                    else None,
+                    "failure_class": classify_failure(t)
+                    if is_failed and t.latest_status_message
+                    else None,
+                    "review_iterations": (t_ctx.get("review_loop", {}) or {}).get(
+                        "iteration", 0
+                    )
+                    if t_ctx.get("review_loop")
+                    else None,
+                    "prompt": t_prompt or None,
+                    "related_files": t_related_files,
+                    "direction_id": t_direction_id,
+                    "changed_files": t_changed_files,
+                }
+            )
 
         # Build lessons from high-iteration tasks (3+ review cycles).
         # Phase B4 (H-P6): drop status_log/plan_output. Loop reads context,
@@ -970,11 +1133,21 @@ async def claim_task(
         lessons = []
         high_iter_stmt = (
             select(Task)
-            .options(load_only(
-                Task.id, Task.title, Task.status, Task.payloads, Task.context,
-                Task.latest_status_message, Task.created_at, Task.project_id,
-                Task.account_id, Task.provider, Task.model,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.title,
+                    Task.status,
+                    Task.payloads,
+                    Task.context,
+                    Task.latest_status_message,
+                    Task.created_at,
+                    Task.project_id,
+                    Task.account_id,
+                    Task.provider,
+                    Task.model,
+                )
+            )
             .where(
                 Task.project_id == task.project_id,
                 Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
@@ -1018,13 +1191,15 @@ async def claim_task(
                 if ht.status == TaskStatus.FAILED and ht.latest_status_message:
                     fc = classify_failure(ht)
                     if fc == "CODE_ERROR":
-                        lessons.append({
-                            "task_title": ht.title,
-                            "iterations": 0,
-                            "last_feedback": (ht.latest_status_message or "")[:500],
-                            "failure_class": "CODE_ERROR",
-                            "direction_id": (ht.context or {}).get("direction_id"),
-                        })
+                        lessons.append(
+                            {
+                                "task_title": ht.title,
+                                "iterations": 0,
+                                "last_feedback": (ht.latest_status_message or "")[:500],
+                                "failure_class": "CODE_ERROR",
+                                "direction_id": (ht.context or {}).get("direction_id"),
+                            }
+                        )
                 if len(lessons) >= 8:
                     break
 
@@ -1036,20 +1211,36 @@ async def claim_task(
             # set as completed_stmt — id/title/status/context/payloads/etc.
             dir_stmt = (
                 select(Task)
-                .options(load_only(
-                    Task.id, Task.title, Task.status, Task.payloads, Task.context,
-                    Task.project_id, Task.description, Task.created_at,
-                    Task.latest_status_message, Task.account_id, Task.provider, Task.model,
-                ))
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.title,
+                        Task.status,
+                        Task.payloads,
+                        Task.context,
+                        Task.project_id,
+                        Task.description,
+                        Task.created_at,
+                        Task.latest_status_message,
+                        Task.account_id,
+                        Task.provider,
+                        Task.model,
+                    )
+                )
                 .where(
                     Task.project_id == task.project_id,
                     Task.id != task.id,
-                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
-                ).order_by(Task.created_at.desc()).limit(50)
+                    Task.status.in_(
+                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                    ),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(50)
             )
             dir_rows = (await session.execute(dir_stmt)).scalars().all()
             dir_matches = [
-                t for t in dir_rows
+                t
+                for t in dir_rows
                 if (t.context or {}).get("direction_id") == current_direction_id
             ][:5]
             dir_match_ids = [t.id for t in dir_matches]
@@ -1057,7 +1248,9 @@ async def claim_task(
             if dir_match_ids:
                 dir_art_stmt = select(Artifact).where(
                     Artifact.task_id.in_(dir_match_ids),
-                    Artifact.artifact_type.in_([ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]),
+                    Artifact.artifact_type.in_(
+                        [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
+                    ),
                 )
                 for a in (await session.execute(dir_art_stmt)).scalars().all():
                     dir_artifacts_by_task.setdefault(a.task_id, []).append(a)
@@ -1077,23 +1270,38 @@ async def claim_task(
                         research_findings_summary = a.logs[:8000]
                         break
                 is_failed = t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
-                t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[:300]
-                direction_recent_tasks.append({
-                    "id": str(t.id),
-                    "title": t.title,
-                    "task_type": p.get("type", ""),
-                    "status": t.status.value if hasattr(t.status, "value") else str(t.status),
-                    "pr_url": pr_url,
-                    "research_findings_summary": research_findings_summary,
-                    "failure_reason": (t.latest_status_message or "")[:500] if is_failed and t.latest_status_message else None,
-                    "failure_class": classify_failure(t) if is_failed and t.latest_status_message else None,
-                    "review_iterations": (t_ctx.get("review_loop", {}) or {}).get("iteration", 0) if t_ctx.get("review_loop") else None,
-                    "prompt": t_prompt or None,
-                    "related_files": (t_ctx.get("related_files") or [])[:10],
-                    "direction_id": t_ctx.get("direction_id"),
-                    "scope": t_ctx.get("scope"),
-                    "changed_files": (t_ctx.get("_pr_changed_files") or [])[:10] or None,
-                })
+                t_prompt = (
+                    p.get("prompt") or p.get("description") or t.description or ""
+                )[:300]
+                direction_recent_tasks.append(
+                    {
+                        "id": str(t.id),
+                        "title": t.title,
+                        "task_type": p.get("type", ""),
+                        "status": t.status.value
+                        if hasattr(t.status, "value")
+                        else str(t.status),
+                        "pr_url": pr_url,
+                        "research_findings_summary": research_findings_summary,
+                        "failure_reason": (t.latest_status_message or "")[:500]
+                        if is_failed and t.latest_status_message
+                        else None,
+                        "failure_class": classify_failure(t)
+                        if is_failed and t.latest_status_message
+                        else None,
+                        "review_iterations": (t_ctx.get("review_loop", {}) or {}).get(
+                            "iteration", 0
+                        )
+                        if t_ctx.get("review_loop")
+                        else None,
+                        "prompt": t_prompt or None,
+                        "related_files": (t_ctx.get("related_files") or [])[:10],
+                        "direction_id": t_ctx.get("direction_id"),
+                        "scope": t_ctx.get("scope"),
+                        "changed_files": (t_ctx.get("_pr_changed_files") or [])[:10]
+                        or None,
+                    }
+                )
 
         # Open PRs: distinct pr_url from PULL_REQUEST artifacts for non-terminal tasks in project
         open_prs_stmt = (
@@ -1103,7 +1311,9 @@ async def claim_task(
                 Task.project_id == task.project_id,
                 Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                 Artifact.pr_url.isnot(None),
-                Task.status.not_in([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+                Task.status.not_in(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
             )
             .distinct()
             .limit(20)
@@ -1115,10 +1325,19 @@ async def claim_task(
             # Phase B4 (H-P6): drop status_log/plan_output. Reads: id/title/
             # status/context/payloads — all included.
             _sibling_loadonly = load_only(
-                Task.id, Task.title, Task.status, Task.payloads, Task.context,
-                Task.latest_status_message, Task.description, Task.created_at,
-                Task.parent_task_id, Task.project_id,
-                Task.account_id, Task.provider, Task.model,
+                Task.id,
+                Task.title,
+                Task.status,
+                Task.payloads,
+                Task.context,
+                Task.latest_status_message,
+                Task.description,
+                Task.created_at,
+                Task.parent_task_id,
+                Task.project_id,
+                Task.account_id,
+                Task.provider,
+                Task.model,
             )
             sibling_result = await session.execute(
                 select(Task)
@@ -1126,7 +1345,13 @@ async def claim_task(
                 .where(
                     Task.parent_task_id == task.parent_task_id,
                     Task.id != task.id,
-                    Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS])
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                        ]
+                    ),
                 )
             )
             sibling_tasks.extend(
@@ -1147,8 +1372,12 @@ async def claim_task(
                 .where(
                     Task.parent_task_id == task.parent_task_id,
                     Task.id != task.id,
-                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
-                ).order_by(Task.created_at.desc()).limit(5)
+                    Task.status.in_(
+                        [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                    ),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(5)
             )
             terminal_siblings = list(terminal_sibling_result.scalars().all())
             terminal_sibling_pr_urls: dict = {}
@@ -1161,8 +1390,14 @@ async def claim_task(
                 for art in (await session.execute(sib_art_stmt)).scalars().all():
                     terminal_sibling_pr_urls.setdefault(art.task_id, art.pr_url)
             for sib in terminal_siblings:
-                sib_status = sib.status.value if hasattr(sib.status, "value") else str(sib.status)
-                pr_url = (sib.context or {}).get("rollup_pr_url") or terminal_sibling_pr_urls.get(sib.id)
+                sib_status = (
+                    sib.status.value
+                    if hasattr(sib.status, "value")
+                    else str(sib.status)
+                )
+                pr_url = (sib.context or {}).get(
+                    "rollup_pr_url"
+                ) or terminal_sibling_pr_urls.get(sib.id)
                 entry = {
                     "id": str(sib.id),
                     "title": sib.title,
@@ -1184,9 +1419,14 @@ async def claim_task(
         pipeline_health = None
         try:
             from app.routers.admin_digest import compute_pipeline_health_summary
-            pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
+
+            pipeline_health = await compute_pipeline_health_summary(
+                session, task.project_id
+            )
         except Exception:
-            logger.exception("[AGENT] Failed to compute pipeline health summary (non-critical)")
+            logger.exception(
+                "[AGENT] Failed to compute pipeline health summary (non-critical)"
+            )
 
         # Aggregate review issue distribution for create/fix/refactor tasks (last 14 days)
         review_issue_distribution = None
@@ -1197,6 +1437,7 @@ async def claim_task(
         if task_type in ("create", "fix", "refactor"):
             try:
                 from app.playbook_learning import _categorize_review_issues
+
                 cutoff_14d = _utcnow() - timedelta(days=14)
                 combined_review_history = []
                 for ht in high_iter_rows:
@@ -1205,7 +1446,9 @@ async def claim_task(
                     if ht_created and ht_created < cutoff_14d:
                         continue
                     review_loop = (ht.context or {}).get("review_loop", {})
-                    rev_hist = review_loop.get("review_history", []) if review_loop else []
+                    rev_hist = (
+                        review_loop.get("review_history", []) if review_loop else []
+                    )
                     if rev_hist:
                         combined_review_history.extend(rev_hist)
                 if combined_review_history:
@@ -1219,63 +1462,96 @@ async def claim_task(
                             for cat, issues in top3
                         }
 
-                from app.playbook_learning import compute_recurring_first_review_descriptions
+                from app.playbook_learning import (
+                    compute_recurring_first_review_descriptions,
+                )
+
                 try:
-                    top_first_review_issues = compute_recurring_first_review_descriptions(
-                        high_iter_rows, cutoff_14d,
+                    top_first_review_issues = (
+                        compute_recurring_first_review_descriptions(
+                            high_iter_rows,
+                            cutoff_14d,
+                        )
                     )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute top_first_review_issues (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute top_first_review_issues (non-critical)"
+                    )
 
                 # Direction-scoped recurring issues: per-task presence within the current direction.
                 # Requires at least 3 direction-scoped tasks with review history to avoid noisy signals.
                 try:
                     if current_direction_id:
-                        direction_top_first_review_issues = compute_recurring_first_review_descriptions(
-                            high_iter_rows, cutoff_14d,
-                            task_filter=lambda ht: (ht.context or {}).get("direction_id") == current_direction_id,
-                            min_tasks=3,
-                            count_unique_tasks=True,
+                        direction_top_first_review_issues = (
+                            compute_recurring_first_review_descriptions(
+                                high_iter_rows,
+                                cutoff_14d,
+                                task_filter=lambda ht: (
+                                    (ht.context or {}).get("direction_id")
+                                    == current_direction_id
+                                ),
+                                min_tasks=3,
+                                count_unique_tasks=True,
+                            )
                         )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute direction_top_first_review_issues (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute direction_top_first_review_issues (non-critical)"
+                    )
 
                 try:
                     if current_task_scope:
-                        scope_specific_review_issues = compute_recurring_first_review_descriptions(
-                            high_iter_rows, cutoff_14d,
-                            task_filter=lambda ht: (ht.context or {}).get("scope") == current_task_scope,
-                            min_tasks=3,
-                            extra_fields={"scope": current_task_scope},
+                        scope_specific_review_issues = (
+                            compute_recurring_first_review_descriptions(
+                                high_iter_rows,
+                                cutoff_14d,
+                                task_filter=lambda ht: (
+                                    (ht.context or {}).get("scope")
+                                    == current_task_scope
+                                ),
+                                min_tasks=3,
+                                extra_fields={"scope": current_task_scope},
+                            )
                         )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute scope_specific_review_issues (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute scope_specific_review_issues (non-critical)"
+                    )
             except Exception:
-                logger.exception("[AGENT] Failed to compute review_issue_distribution (non-critical)")
+                logger.exception(
+                    "[AGENT] Failed to compute review_issue_distribution (non-critical)"
+                )
 
         # Compute review effectiveness trends (stores in project.design_doc as side effect)
         review_effectiveness = None
         if task_type in ("create", "fix", "refactor"):
             try:
                 from app.playbook_learning import compute_review_effectiveness
+
                 review_effectiveness = await compute_review_effectiveness(
                     project_id=task.project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
             except Exception:
-                logger.exception("[AGENT] Failed to compute review_effectiveness (non-critical)")
+                logger.exception(
+                    "[AGENT] Failed to compute review_effectiveness (non-critical)"
+                )
             try:
                 from app.playbook_learning import compute_sr_catch_rate_trends
+
                 await compute_sr_catch_rate_trends(
                     project_id=task.project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
             except Exception:
-                logger.exception("[AGENT] Failed to compute sr_catch_rate_trends (non-critical)")
+                logger.exception(
+                    "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
+                )
             try:
                 from app.playbook_learning import compute_edges_trend
+
                 await compute_edges_trend(
                     project_id=task.project_id,
                     session=session,
@@ -1284,18 +1560,25 @@ async def claim_task(
             except Exception:
                 logger.exception("[AGENT] Failed to compute edges_trend (non-critical)")
             try:
-                await _stamp_reviewer_recovery_count(session, task.project_id, high_iter_rows)
+                await _stamp_reviewer_recovery_count(
+                    session, task.project_id, high_iter_rows
+                )
             except Exception:
-                logger.exception("[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)")
+                logger.exception(
+                    "[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)"
+                )
             try:
                 from app.playbook_learning import compute_sr_reviewer_disagreements
+
                 await compute_sr_reviewer_disagreements(
                     project_id=task.project_id,
                     session=session,
                     all_tasks=list(high_iter_rows),
                 )
             except Exception:
-                logger.exception("[AGENT] Failed to compute sr_reviewer_disagreements (non-critical)")
+                logger.exception(
+                    "[AGENT] Failed to compute sr_reviewer_disagreements (non-critical)"
+                )
 
         direction_concurrent_files: list[str] = []
         if current_direction_id:
@@ -1303,7 +1586,7 @@ async def claim_task(
             for _at in active_tasks:
                 if _at.get("direction_id") != current_direction_id:
                     continue
-                for _f in (_at.get("related_files") or []):
+                for _f in _at.get("related_files") or []:
                     if isinstance(_f, str) and _f and _f not in _seen_files:
                         _seen_files.add(_f)
                         direction_concurrent_files.append(_f)
@@ -1313,7 +1596,9 @@ async def claim_task(
             "direction_concurrent_files": direction_concurrent_files,
             "queued_tasks": queued_tasks,
             "recently_completed_tasks": recently_completed_tasks,
-            "direction_recent_tasks": direction_recent_tasks if current_direction_id else [],
+            "direction_recent_tasks": direction_recent_tasks
+            if current_direction_id
+            else [],
             "open_prs": list(open_prs_rows),
             "sibling_tasks": sibling_tasks,
             "lessons": lessons,
@@ -1330,28 +1615,45 @@ async def claim_task(
             _ctx = dict(task.context or {})
             _ctx["_had_review_measurements"] = _had_measurements
             if _had_measurements:
-                _ctx["_top_review_issue_categories"] = list(review_issue_distribution.keys())
+                _ctx["_top_review_issue_categories"] = list(
+                    review_issue_distribution.keys()
+                )
             task.context = _ctx
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
         except Exception:
-            logger.exception("[AGENT] Failed to record review measurement attribution (non-critical)")
+            logger.exception(
+                "[AGENT] Failed to record review measurement attribution (non-critical)"
+            )
     else:
         # Lightweight pipeline health for all other task types
         try:
             from app.routers.admin_digest import compute_pipeline_health_summary
-            pipeline_health = await compute_pipeline_health_summary(session, task.project_id)
+
+            pipeline_health = await compute_pipeline_health_summary(
+                session, task.project_id
+            )
             if pipeline_health:
                 response["project_context"] = {"pipeline_health": pipeline_health}
         except Exception:
-            logger.exception("[AGENT] Failed to compute lightweight pipeline health (non-critical)")
+            logger.exception(
+                "[AGENT] Failed to compute lightweight pipeline health (non-critical)"
+            )
 
     # Task types that benefit from untagged operational playbook entries.
     # Types not in this set only receive entries with explicit applicable_types matching them.
     _PLAYBOOK_DEFAULT_TYPES = {
-        "create", "fix", "refactor", "review", "qa", "smoketest",
-        "deps", "migrate", "debug", "docs",
+        "create",
+        "fix",
+        "refactor",
+        "review",
+        "qa",
+        "smoketest",
+        "deps",
+        "migrate",
+        "debug",
+        "docs",
     }
 
     # Inject playbook for ALL task types (outside the project_context gate)
@@ -1362,10 +1664,16 @@ async def claim_task(
         _playbook_candidates = []
         _task_direction_id = str((task.context or {}).get("direction_id") or "")
         _task_related_files = {
-            str(f) for f in ((task.context or {}).get("related_files") or []) if isinstance(f, str) and f
+            str(f)
+            for f in ((task.context or {}).get("related_files") or [])
+            if isinstance(f, str) and f
         }
-        _file_to_system_raw = (project_for_playbook.design_doc or {}).get("_file_to_system") or {}
-        _file_to_system = _file_to_system_raw if isinstance(_file_to_system_raw, dict) else {}
+        _file_to_system_raw = (project_for_playbook.design_doc or {}).get(
+            "_file_to_system"
+        ) or {}
+        _file_to_system = (
+            _file_to_system_raw if isinstance(_file_to_system_raw, dict) else {}
+        )
         _task_systems = {
             str(_file_to_system.get(f))
             for f in _task_related_files
@@ -1389,7 +1697,7 @@ async def claim_task(
                         continue
                 elif task_type not in _PLAYBOOK_DEFAULT_TYPES:
                     continue
-                short_key = k[len("playbook/"):]
+                short_key = k[len("playbook/") :]
                 # Skip auto-archived (stale) entries
                 if v.get("stale"):
                     continue
@@ -1400,7 +1708,8 @@ async def claim_task(
                 if ineffective:
                     logger.info(
                         "Playbook entry '%s' demoted (reference_count=%d, confirmed_count=0)",
-                        short_key, referenced,
+                        short_key,
+                        referenced,
                     )
                 # Age penalty: deprioritise entries older than 30 days with < 3 confirmations
                 age_penalty = 0
@@ -1422,27 +1731,59 @@ async def claim_task(
                 if age_penalty or stale_penalty:
                     logger.debug(
                         "Playbook entry '%s' penalty: age=%d stale=%d",
-                        short_key, age_penalty, stale_penalty,
+                        short_key,
+                        age_penalty,
+                        stale_penalty,
                     )
                 # Effectiveness score: confirmed / referenced ratio (higher = better)
                 effectiveness_score = confirmed / max(referenced, 1)
-                entry_direction = str(v.get("learned_from_direction") or v.get("direction_key") or "")
+                entry_direction = str(
+                    v.get("learned_from_direction") or v.get("direction_key") or ""
+                )
                 raw_direction_successes = v.get("direction_successes")
-                direction_successes = raw_direction_successes if isinstance(raw_direction_successes, dict) else {}
-                direction_success_count = direction_successes.get(_task_direction_id, 0) if _task_direction_id else 0
-                direction_match = int(bool(
-                    _task_direction_id and (
-                        (entry_direction and entry_direction == _task_direction_id)
-                        or (isinstance(direction_success_count, (int, float)) and direction_success_count > 0)
+                direction_successes = (
+                    raw_direction_successes
+                    if isinstance(raw_direction_successes, dict)
+                    else {}
+                )
+                direction_success_count = (
+                    direction_successes.get(_task_direction_id, 0)
+                    if _task_direction_id
+                    else 0
+                )
+                direction_match = int(
+                    bool(
+                        _task_direction_id
+                        and (
+                            (entry_direction and entry_direction == _task_direction_id)
+                            or (
+                                isinstance(direction_success_count, (int, float))
+                                and direction_success_count > 0
+                            )
+                        )
                     )
-                ))
+                )
                 entry_systems = {
                     str(s)
-                    for s in ([v.get("learned_from_system")] if v.get("learned_from_system") else (v.get("systems") or []))
+                    for s in (
+                        [v.get("learned_from_system")]
+                        if v.get("learned_from_system")
+                        else (v.get("systems") or [])
+                    )
                     if isinstance(s, str) and s
                 }
-                system_match = int(bool(_task_systems and entry_systems and (_task_systems & entry_systems)))
-                entry_related = {str(f) for f in (v.get("related_files") or []) if isinstance(f, str) and f}
+                system_match = int(
+                    bool(
+                        _task_systems
+                        and entry_systems
+                        and (_task_systems & entry_systems)
+                    )
+                )
+                entry_related = {
+                    str(f)
+                    for f in (v.get("related_files") or [])
+                    if isinstance(f, str) and f
+                }
                 file_overlap_count = len(_task_related_files & entry_related)
                 relevance_reasons: list[str] = []
                 if direction_match:
@@ -1450,7 +1791,9 @@ async def claim_task(
                 if system_match:
                     relevance_reasons.append("same system")
                 if file_overlap_count > 0:
-                    relevance_reasons.append(f"{file_overlap_count} overlapping file(s)")
+                    relevance_reasons.append(
+                        f"{file_overlap_count} overlapping file(s)"
+                    )
                 # Age in days for metadata (0 if updated_at unavailable)
                 age_days = 0
                 if updated_at_str:
@@ -1463,23 +1806,25 @@ async def claim_task(
                         age_days = (_utcnow() - updated_dt2).days
                     except (ValueError, TypeError):
                         pass
-                _playbook_candidates.append((
-                    -direction_match,
-                    -system_match,
-                    -file_overlap_count,
-                    ineffective,
-                    stale_penalty,
-                    age_penalty,
-                    -confirmed,
-                    -effectiveness_score,
-                    short_key,
-                    v.get("content", ""),
-                    effectiveness_score,
-                    confirmed,
-                    age_days,
-                    bool(age_penalty or stale_penalty),
-                    relevance_reasons,
-                ))
+                _playbook_candidates.append(
+                    (
+                        -direction_match,
+                        -system_match,
+                        -file_overlap_count,
+                        ineffective,
+                        stale_penalty,
+                        age_penalty,
+                        -confirmed,
+                        -effectiveness_score,
+                        short_key,
+                        v.get("content", ""),
+                        effectiveness_score,
+                        confirmed,
+                        age_days,
+                        bool(age_penalty or stale_penalty),
+                        relevance_reasons,
+                    )
+                )
         _playbook_candidates.sort()
         # Cap shown entries: the sort already prioritizes direction match →
         # system match → file overlap → effectiveness, so the head of the
@@ -1489,13 +1834,33 @@ async def claim_task(
         # we can tune per task type without a redeploy. Defaults: fix/qa/
         # review get 8 (focused work, narrow scope); create/refactor get 12
         # (broader investigation, more priors useful); other types get 10.
-        _playbook_caps = (_shared_state.runtime_config.get("playbook_max_entries") or {}) \
-            if isinstance(_shared_state.runtime_config.get("playbook_max_entries"), dict) else {}
+        _playbook_caps = (
+            (_shared_state.runtime_config.get("playbook_max_entries") or {})
+            if isinstance(
+                _shared_state.runtime_config.get("playbook_max_entries"), dict
+            )
+            else {}
+        )
         _default_caps = {"fix": 8, "qa": 8, "review": 8, "create": 12, "refactor": 12}
         _cap = int(_playbook_caps.get(task_type, _default_caps.get(task_type, 10)))
-        _capped_candidates = _playbook_candidates[:max(_cap, 0)]
-        for (_, _, _, _, _, _, _, _, short_key, content,
-             eff_score, conf_count, age_days_val, is_stale, relevance_reasons) in _capped_candidates:
+        _capped_candidates = _playbook_candidates[: max(_cap, 0)]
+        for (
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            short_key,
+            content,
+            eff_score,
+            conf_count,
+            age_days_val,
+            is_stale,
+            relevance_reasons,
+        ) in _capped_candidates:
             playbook_entries[short_key] = {
                 "content": content,
                 "effectiveness_score": round(eff_score, 3),
@@ -1510,10 +1875,15 @@ async def claim_task(
         if len(_playbook_candidates) > len(_capped_candidates):
             logger.info(
                 "Playbook capped to %d/%d entries for task %s (type=%s)",
-                len(_capped_candidates), len(_playbook_candidates), task.id, task_type,
+                len(_capped_candidates),
+                len(_playbook_candidates),
+                task.id,
+                task_type,
             )
         total_playbook_count = sum(
-            1 for k in (project_for_playbook.design_doc or {}) if k.startswith("playbook/")
+            1
+            for k in (project_for_playbook.design_doc or {})
+            if k.startswith("playbook/")
         )
         response["first_task_on_repo"] = total_playbook_count == 0
         if playbook_entries:
@@ -1540,7 +1910,10 @@ async def claim_task(
                 # Check file-path references against the repo root (config-driven; skipped when unset)
                 try:
                     from app.playbook_learning import check_and_flag_stale_refs
-                    repo_root: str = _shared_state.runtime_config.get("playbook_repo_root", "") or ""
+
+                    repo_root: str = (
+                        _shared_state.runtime_config.get("playbook_repo_root", "") or ""
+                    )
                     if repo_root:
                         doc = check_and_flag_stale_refs(doc, repo_root)
                 except Exception:  # noqa: BLE001 — stale-ref check is best-effort, never block claim
@@ -1550,12 +1923,15 @@ async def claim_task(
                 # on the already-mutating doc/commit so no extra DB write.
                 try:
                     from app.playbook_learning import retire_idle_auto_entries
-                    idle_days = int(_shared_state.runtime_config.get(
-                        "playbook_idle_auto_days", 30
-                    ))
+
+                    idle_days = int(
+                        _shared_state.runtime_config.get("playbook_idle_auto_days", 30)
+                    )
                     retire_idle_auto_entries(doc, idle_days=idle_days)
                 except Exception:  # noqa: BLE001 — best-effort, never block claim
-                    logger.debug("[AGENT] Idle auto-entry retirement skipped (non-critical)")
+                    logger.debug(
+                        "[AGENT] Idle auto-entry retirement skipped (non-critical)"
+                    )
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)
@@ -1567,20 +1943,30 @@ async def claim_task(
                 session.add(task)
                 await session.commit()
             except Exception:
-                logger.exception("[AGENT] Failed to update playbook reference counts (non-critical)")
+                logger.exception(
+                    "[AGENT] Failed to update playbook reference counts (non-critical)"
+                )
 
     # Inject direction quality signal when total PRs >= 3 (reuse project already loaded above)
     direction_id = (task.context or {}).get("direction_id")
     if direction_id and project_for_playbook:
         direction = next(
-            (d for d in (project_for_playbook.directions or []) if d.get("id") == direction_id),
+            (
+                d
+                for d in (project_for_playbook.directions or [])
+                if d.get("id") == direction_id
+            ),
             None,
         )
         if direction:
             history = direction.get("research_history", [])
             agg = direction.get("history_aggregate", {})
-            total_merged = sum(e.get("prs_merged", 0) for e in history) + (agg.get("total_prs_merged") or 0)
-            total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (agg.get("total_prs_rejected") or 0)
+            total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+                agg.get("total_prs_merged") or 0
+            )
+            total_rejected = sum(e.get("prs_rejected", 0) for e in history) + (
+                agg.get("total_prs_rejected") or 0
+            )
             total_prs = total_merged + total_rejected
             if total_prs >= 3:
                 acceptance_rate = total_merged / total_prs
@@ -1589,7 +1975,11 @@ async def claim_task(
                     for h in history
                     if h.get("avg_time_to_merge_hours") is not None
                 ]
-                avg_ttm = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
+                avg_ttm = (
+                    round(sum(merge_time_values) / len(merge_time_values), 2)
+                    if merge_time_values
+                    else None
+                )
                 # Fetch last 3 tasks rejected by operator for this direction
                 rejected_stmt = (
                     select(Task)
@@ -1642,7 +2032,10 @@ async def claim_task(
                     _parse_failed_approach(a) for a in failed_approaches[:5]
                 ]
                 recent_outcomes = [
-                    {"tasks_created": h.get("tasks_created", 0), "prs_merged": h.get("prs_merged", 0)}
+                    {
+                        "tasks_created": h.get("tasks_created", 0),
+                        "prs_merged": h.get("prs_merged", 0),
+                    }
                     for h in history[-2:]
                     if h.get("tasks_created", 0) > 0
                 ]
@@ -1662,16 +2055,32 @@ async def claim_task(
                         if not isinstance(counts, dict):
                             continue
                         agg_entry = scope_success_rates.setdefault(
-                            scope_name, {"created": 0, "merged": 0, "failed": 0, "merged_cross_module": 0}
+                            scope_name,
+                            {
+                                "created": 0,
+                                "merged": 0,
+                                "failed": 0,
+                                "merged_cross_module": 0,
+                            },
                         )
                         agg_entry["created"] += int(counts.get("created", 0) or 0)
                         merged_this = int(counts.get("merged", 0) or 0)
                         agg_entry["merged"] += merged_this
                         agg_entry["failed"] += int(counts.get("failed", 0) or 0)
-                        agg_entry["merged_cross_module"] += int(counts.get("merged_cross_module", 0) or 0)
-                        ratio = counts.get("avg_expansion_ratio_merged") or counts.get("avg_expansion_ratio")
-                        if isinstance(ratio, (int, float)) and ratio > 0 and merged_this > 0:
-                            ew = expansion_weighted.setdefault(scope_name, {"sum": 0.0, "weight": 0.0})
+                        agg_entry["merged_cross_module"] += int(
+                            counts.get("merged_cross_module", 0) or 0
+                        )
+                        ratio = counts.get("avg_expansion_ratio_merged") or counts.get(
+                            "avg_expansion_ratio"
+                        )
+                        if (
+                            isinstance(ratio, (int, float))
+                            and ratio > 0
+                            and merged_this > 0
+                        ):
+                            ew = expansion_weighted.setdefault(
+                                scope_name, {"sum": 0.0, "weight": 0.0}
+                            )
                             ew["sum"] += float(ratio) * merged_this
                             ew["weight"] += merged_this
                 scope_success_rates = {
@@ -1684,8 +2093,13 @@ async def claim_task(
                         )
 
                 # Review-iteration trend: rolling median across last 3 cycles + last-cycle value
-                from app.direction_metrics import _compute_rolling_median_review_iterations
-                review_iteration_rolling_median = _compute_rolling_median_review_iterations(direction)
+                from app.direction_metrics import (
+                    _compute_rolling_median_review_iterations,
+                )
+
+                review_iteration_rolling_median = (
+                    _compute_rolling_median_review_iterations(direction)
+                )
                 review_iteration_last_cycle: float | None = None
                 if history:
                     last_val = history[-1].get("median_review_iterations")
@@ -1715,7 +2129,11 @@ async def claim_task(
                     test_failure_summary = pctx.get("_test_failure_summary")
                     status_message = (pt.latest_status_message or "").strip()
                     self_review_outcome = pctx.get("_self_review_outcome")
-                    if not analysis_plan and not test_failure_summary and not status_message:
+                    if (
+                        not analysis_plan
+                        and not test_failure_summary
+                        and not status_message
+                    ):
                         continue
                     entry = {
                         "title": pt.title,
@@ -1746,7 +2164,8 @@ async def claim_task(
                             failed_checks = [
                                 str(name)
                                 for name, result in check_results.items()
-                                if isinstance(result, dict) and result.get("passed") is False
+                                if isinstance(result, dict)
+                                and result.get("passed") is False
                             ]
                             if failed_checks:
                                 sro_compact["failed_checks"] = failed_checks[:10]
@@ -1798,10 +2217,15 @@ async def claim_task(
                                             sev = str(issue.get("severity", "")).lower()
                                             if sev != sev_filter:
                                                 continue
-                                            desc = str(issue.get("description", "")).strip()
+                                            desc = str(
+                                                issue.get("description", "")
+                                            ).strip()
                                             if not desc:
                                                 continue
-                                            item = {"severity": sev.upper(), "description": desc[:150]}
+                                            item = {
+                                                "severity": sev.upper(),
+                                                "description": desc[:150],
+                                            }
                                             file_path = issue.get("file")
                                             if file_path:
                                                 item["file"] = str(file_path)
@@ -1816,7 +2240,9 @@ async def claim_task(
                                 if compact_issues:
                                     entry["review_feedback"] = compact_issues
                                 else:
-                                    feedback_text = str(last_entry.get("feedback") or "").strip()
+                                    feedback_text = str(
+                                        last_entry.get("feedback") or ""
+                                    ).strip()
                                     if feedback_text:
                                         entry["review_feedback"] = feedback_text[:200]
                     entry_len = len(json.dumps(entry))
@@ -1845,7 +2271,9 @@ async def claim_task(
                     sctx = st.context or {}
                     analysis_plan = sctx.get("_analysis_plan")
                     changed_files = sctx.get("_pr_changed_files")
-                    has_changed_files = isinstance(changed_files, list) and changed_files
+                    has_changed_files = (
+                        isinstance(changed_files, list) and changed_files
+                    )
                     if not analysis_plan and not has_changed_files:
                         continue
                     s_entry = {
@@ -1857,7 +2285,9 @@ async def claim_task(
                     if scope:
                         s_entry["scope"] = str(scope)
                     if has_changed_files:
-                        s_entry["pr_changed_files"] = [str(f) for f in changed_files[:10]]
+                        s_entry["pr_changed_files"] = [
+                            str(f) for f in changed_files[:10]
+                        ]
                     review_loop = sctx.get("review_loop")
                     if isinstance(review_loop, dict):
                         iteration = review_loop.get("iteration", 0)
@@ -1877,15 +2307,20 @@ async def claim_task(
                     ) or {}
                     dfa_entry = dfa_all.get(str(direction_id)) or {}
                     dfa_cats = {
-                        k: v for k, v in dfa_entry.items()
-                        if k not in ("total", "last_updated") and isinstance(v, int) and v > 0
+                        k: v
+                        for k, v in dfa_entry.items()
+                        if k not in ("total", "last_updated")
+                        and isinstance(v, int)
+                        and v > 0
                     }
                     if dfa_cats:
                         direction_first_attempt_feedback = dict(
                             sorted(dfa_cats.items(), key=lambda kv: -kv[1])
                         )
                 except Exception:
-                    logger.exception("[AGENT] Failed to read direction_first_attempt_feedback (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to read direction_first_attempt_feedback (non-critical)"
+                    )
 
                 response["direction_context"] = {
                     "title": direction.get("title", ""),
@@ -1900,21 +2335,34 @@ async def claim_task(
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
                 if review_iteration_rolling_median is not None:
-                    response["direction_context"]["review_iteration_rolling_median"] = review_iteration_rolling_median
+                    response["direction_context"]["review_iteration_rolling_median"] = (
+                        review_iteration_rolling_median
+                    )
                 if review_iteration_last_cycle is not None:
-                    response["direction_context"]["review_iteration_last_cycle"] = review_iteration_last_cycle
+                    response["direction_context"]["review_iteration_last_cycle"] = (
+                        review_iteration_last_cycle
+                    )
                 from app.direction_outcomes import summarize_review_quality_feedback
-                review_quality_feedback = summarize_review_quality_feedback(history, dfa_entry)
+
+                review_quality_feedback = summarize_review_quality_feedback(
+                    history, dfa_entry
+                )
                 if review_quality_feedback:
-                    response["direction_context"]["review_quality_feedback"] = review_quality_feedback
+                    response["direction_context"]["review_quality_feedback"] = (
+                        review_quality_feedback
+                    )
 
             # Surface saturation / deadlock signals to research agents so they can
             # pivot to direction_update/direction_note findings on stuck directions.
             if task_type == "research":
                 from app.research_completion import _detect_dedup_deadlock
+
                 deadlocked, _ = _detect_dedup_deadlock(history)
                 research_recent_outcomes = [
-                    {"tasks_created": h.get("tasks_created", 0), "prs_merged": h.get("prs_merged", 0)}
+                    {
+                        "tasks_created": h.get("tasks_created", 0),
+                        "prs_merged": h.get("prs_merged", 0),
+                    }
                     for h in history[-2:]
                     if h.get("tasks_created", 0) > 0
                 ]
@@ -1928,66 +2376,103 @@ async def claim_task(
                         if not isinstance(counts, dict):
                             continue
                         agg = research_scope_rates.setdefault(
-                            scope_name, {"created": 0, "merged": 0, "failed": 0, "merged_cross_module": 0}
+                            scope_name,
+                            {
+                                "created": 0,
+                                "merged": 0,
+                                "failed": 0,
+                                "merged_cross_module": 0,
+                            },
                         )
                         agg["created"] += int(counts.get("created", 0) or 0)
                         agg["merged"] += int(counts.get("merged", 0) or 0)
                         agg["failed"] += int(counts.get("failed", 0) or 0)
-                        agg["merged_cross_module"] += int(counts.get("merged_cross_module", 0) or 0)
-                research_scope_rates = {k: v for k, v in research_scope_rates.items() if v["created"] >= 1}
+                        agg["merged_cross_module"] += int(
+                            counts.get("merged_cross_module", 0) or 0
+                        )
+                research_scope_rates = {
+                    k: v for k, v in research_scope_rates.items() if v["created"] >= 1
+                }
                 research_top_review_issues = None
                 try:
-                    from app.playbook_learning import compute_recurring_first_review_descriptions
+                    from app.playbook_learning import (
+                        compute_recurring_first_review_descriptions,
+                    )
+
                     if current_direction_id:
-                        research_top_review_issues = compute_recurring_first_review_descriptions(
-                            high_iter_rows, _utcnow() - timedelta(days=14),
-                            task_filter=lambda ht: (ht.context or {}).get("direction_id") == current_direction_id,
-                            min_tasks=3,
-                            count_unique_tasks=True,
+                        research_top_review_issues = (
+                            compute_recurring_first_review_descriptions(
+                                high_iter_rows,
+                                _utcnow() - timedelta(days=14),
+                                task_filter=lambda ht: (
+                                    (ht.context or {}).get("direction_id")
+                                    == current_direction_id
+                                ),
+                                min_tasks=3,
+                                count_unique_tasks=True,
+                            )
                         )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute research top_first_review_issues (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute research top_first_review_issues (non-critical)"
+                    )
                 research_review_effectiveness = None
                 try:
                     from app.playbook_learning import compute_review_effectiveness
+
                     research_review_effectiveness = await compute_review_effectiveness(
                         project_id=task.project_id,
                         session=session,
                         all_tasks=list(high_iter_rows),
                     )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute research review_effectiveness (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute research review_effectiveness (non-critical)"
+                    )
                 try:
                     from app.playbook_learning import compute_sr_catch_rate_trends
+
                     await compute_sr_catch_rate_trends(
                         project_id=task.project_id,
                         session=session,
                         all_tasks=list(high_iter_rows),
                     )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)"
+                    )
                 try:
                     from app.playbook_learning import compute_edges_trend
+
                     await compute_edges_trend(
                         project_id=task.project_id,
                         session=session,
                         all_tasks=list(high_iter_rows),
                     )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute research edges_trend (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute research edges_trend (non-critical)"
+                    )
                 try:
-                    await _stamp_reviewer_recovery_count(session, task.project_id, high_iter_rows)
+                    await _stamp_reviewer_recovery_count(
+                        session, task.project_id, high_iter_rows
+                    )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute research reviewer_recovery_after_incomplete_sr_count (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute research reviewer_recovery_after_incomplete_sr_count (non-critical)"
+                    )
                 try:
                     from app.playbook_learning import compute_sr_reviewer_disagreements
+
                     await compute_sr_reviewer_disagreements(
                         project_id=task.project_id,
                         session=session,
                         all_tasks=list(high_iter_rows),
                     )
                 except Exception:
-                    logger.exception("[AGENT] Failed to compute research sr_reviewer_disagreements (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to compute research sr_reviewer_disagreements (non-critical)"
+                    )
                 success_summary: list[str] = []
                 for scope_name, counts in research_scope_rates.items():
                     created = counts["created"]
@@ -2000,9 +2485,12 @@ async def claim_task(
                     summarize_review_quality_feedback,
                     synthesize_prompt_quality_patterns,
                 )
+
                 prompt_quality_patterns = synthesize_prompt_quality_patterns(history)
                 response["direction_context"] = {
-                    "possibly_saturated": bool(direction.get("possibly_saturated", False)),
+                    "possibly_saturated": bool(
+                        direction.get("possibly_saturated", False)
+                    ),
                     "deadlock_detected": bool(deadlocked),
                     "recent_outcomes": research_recent_outcomes,
                     "failure_stage_pattern": research_failure_stage_pattern,
@@ -2012,50 +2500,71 @@ async def claim_task(
                     "review_effectiveness": research_review_effectiveness,
                 }
                 if prompt_quality_patterns:
-                    response["direction_context"]["prompt_quality_patterns"] = prompt_quality_patterns
+                    response["direction_context"]["prompt_quality_patterns"] = (
+                        prompt_quality_patterns
+                    )
                 research_dfa_entry: dict = {}
                 try:
                     if project_for_playbook and current_direction_id:
                         research_dfa_entry = (
-                            (project_for_playbook.design_doc or {})
-                            .get("direction_first_attempt_feedback") or {}
+                            (project_for_playbook.design_doc or {}).get(
+                                "direction_first_attempt_feedback"
+                            )
+                            or {}
                         ).get(str(current_direction_id)) or {}
                 except Exception:
-                    logger.exception("[AGENT] Failed to read direction_first_attempt_feedback for research (non-critical)")
+                    logger.exception(
+                        "[AGENT] Failed to read direction_first_attempt_feedback for research (non-critical)"
+                    )
                 research_review_quality_feedback = summarize_review_quality_feedback(
                     history, research_dfa_entry
                 )
                 if research_review_quality_feedback:
-                    response["direction_context"]["review_quality_feedback"] = research_review_quality_feedback
+                    response["direction_context"]["review_quality_feedback"] = (
+                        research_review_quality_feedback
+                    )
 
                 from app.direction_outcomes import (
                     summarize_dedup_filter,
                     summarize_failure_hotspots,
                 )
-                failure_hotspots = summarize_failure_hotspots(direction, task.project_id)
+
+                failure_hotspots = summarize_failure_hotspots(
+                    direction, task.project_id
+                )
                 if failure_hotspots:
                     response["direction_context"]["failure_hotspots"] = failure_hotspots
                 dedup_summary = summarize_dedup_filter(history)
                 if dedup_summary:
-                    response["direction_context"]["dedup_filter_summary"] = dedup_summary
+                    response["direction_context"]["dedup_filter_summary"] = (
+                        dedup_summary
+                    )
 
     # Inject co-change affinity context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         related_files = (task.context or {}).get("related_files", [])
         if related_files:
-            cochange_index = (project_for_playbook.design_doc or {}).get("cochange_index")
+            cochange_index = (project_for_playbook.design_doc or {}).get(
+                "cochange_index"
+            )
             if cochange_index:
                 cochange_scores: dict[str, float] = {}
                 related_set = set(related_files)
                 for rf in related_files:
                     for co_file, score in (cochange_index.get(rf) or {}).items():
                         if co_file not in related_set:
-                            cochange_scores[co_file] = cochange_scores.get(co_file, 0.0) + score
+                            cochange_scores[co_file] = (
+                                cochange_scores.get(co_file, 0.0) + score
+                            )
                 if cochange_scores:
-                    top_cochange = sorted(cochange_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+                    top_cochange = sorted(
+                        cochange_scores.items(), key=lambda x: x[1], reverse=True
+                    )[:10]
                     if "project_context" not in response:
                         response["project_context"] = {}
-                    response["project_context"]["cochange_files"] = [f for f, _ in top_cochange]
+                    response["project_context"]["cochange_files"] = [
+                        f for f, _ in top_cochange
+                    ]
 
     # Inject within-set co-change affinity hints for plan tasks so the planner
     # can group high-affinity files into the same subtask and split low-affinity
@@ -2064,13 +2573,21 @@ async def claim_task(
     if task_type == "plan" and project_for_playbook:
         plan_related_files = (task.context or {}).get("related_files", [])
         if plan_related_files:
-            cochange_index = (project_for_playbook.design_doc or {}).get("cochange_index") or {}
+            cochange_index = (project_for_playbook.design_doc or {}).get(
+                "cochange_index"
+            ) or {}
             cochange_hints: dict[str, dict[str, float]] = {}
             related_set = set(plan_related_files)
             for rf in plan_related_files:
                 for co_file, score in (cochange_index.get(rf) or {}).items():
-                    if co_file in related_set and isinstance(score, (int, float)) and score >= 1.0:
-                        cochange_hints.setdefault(rf, {})[co_file] = round(float(score), 3)
+                    if (
+                        co_file in related_set
+                        and isinstance(score, (int, float))
+                        and score >= 1.0
+                    ):
+                        cochange_hints.setdefault(rf, {})[co_file] = round(
+                            float(score), 3
+                        )
             if cochange_hints:
                 if "direction_context" not in response:
                     response["direction_context"] = {}
@@ -2078,16 +2595,25 @@ async def claim_task(
 
     if task_type == "plan" and direction_id and project_for_playbook:
         direction_for_decomp = next(
-            (d for d in (project_for_playbook.directions or []) if d.get("id") == direction_id),
+            (
+                d
+                for d in (project_for_playbook.directions or [])
+                if d.get("id") == direction_id
+            ),
             None,
         )
         if direction_for_decomp:
             from app.playbook_learning import summarize_decomposition_outcomes
-            decomposition_outcomes = summarize_decomposition_outcomes(direction_for_decomp)
+
+            decomposition_outcomes = summarize_decomposition_outcomes(
+                direction_for_decomp
+            )
             if decomposition_outcomes:
                 if "direction_context" not in response:
                     response["direction_context"] = {}
-                response["direction_context"]["decomposition_outcomes"] = decomposition_outcomes
+                response["direction_context"]["decomposition_outcomes"] = (
+                    decomposition_outcomes
+                )
 
     # Inject per-module review feedback warnings for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
@@ -2102,7 +2628,11 @@ async def claim_task(
                 total = profile.get("total", 0)
                 if total < 3:
                     continue
-                cat_counts = {k: v for k, v in profile.items() if k not in ("total", "last_updated") and isinstance(v, int)}
+                cat_counts = {
+                    k: v
+                    for k, v in profile.items()
+                    if k not in ("total", "last_updated") and isinstance(v, int)
+                }
                 sorted_cats = sorted(cat_counts.items(), key=lambda x: -x[1])
                 top_cats = {
                     cat: round(count / total, 2)
@@ -2110,17 +2640,28 @@ async def claim_task(
                     if count / total >= 0.15
                 }
                 if top_cats:
-                    module_warnings.append({"file": file_path, "top_categories": top_cats, "sample_size": total})
+                    module_warnings.append(
+                        {
+                            "file": file_path,
+                            "top_categories": top_cats,
+                            "sample_size": total,
+                        }
+                    )
             if module_warnings:
                 if "project_context" not in response:
                     response["project_context"] = {}
-                response["project_context"]["module_feedback_warnings"] = module_warnings
+                response["project_context"]["module_feedback_warnings"] = (
+                    module_warnings
+                )
 
     # Inject SR catch-rate blind spots for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         try:
-            sr_trends = (project_for_playbook.design_doc or {}).get("sr_catch_rate_trends")
+            sr_trends = (project_for_playbook.design_doc or {}).get(
+                "sr_catch_rate_trends"
+            )
             if sr_trends and isinstance(sr_trends.get("categories"), dict):
+
                 def _cat_entry(data: dict) -> dict:
                     entry: dict = {"miss_rate": data["miss_rate"]}
                     if isinstance(data.get("weighted_miss_rate"), (int, float)):
@@ -2132,7 +2673,8 @@ async def claim_task(
                 cats = {
                     cat: _cat_entry(data)
                     for cat, data in sr_trends["categories"].items()
-                    if isinstance(data, dict) and isinstance(data.get("miss_rate"), (int, float))
+                    if isinstance(data, dict)
+                    and isinstance(data.get("miss_rate"), (int, float))
                 }
                 if cats:
                     catch_rate_payload: dict = {"categories": cats}
@@ -2143,11 +2685,16 @@ async def claim_task(
                             catch_rate_payload["for_task_type"] = {
                                 cat: _cat_entry(cdata)
                                 for cat, cdata in type_cats.items()
-                                if isinstance(cdata, dict) and isinstance(cdata.get("miss_rate"), (int, float))
+                                if isinstance(cdata, dict)
+                                and isinstance(cdata.get("miss_rate"), (int, float))
                             }
-                    response["project_context"]["self_review_catch_rate"] = catch_rate_payload
+                    response["project_context"]["self_review_catch_rate"] = (
+                        catch_rate_payload
+                    )
         except Exception:
-            logger.exception("[AGENT] Failed to inject self_review_catch_rate (non-critical)")
+            logger.exception(
+                "[AGENT] Failed to inject self_review_catch_rate (non-critical)"
+            )
 
     # Inject project-wide SR blind-spot themes (last 14 days, top 8). Surfaces
     # recurring areas where self-review has been most uncertain so the agent
@@ -2159,20 +2706,27 @@ async def claim_task(
     if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
         try:
             themes = await aggregate_sr_blind_spot_themes(
-                session, project_for_playbook.id, days=14, limit=8,
+                session,
+                project_for_playbook.id,
+                days=14,
+                limit=8,
             )
             if themes:
                 if "project_context" not in response:
                     response["project_context"] = {}
                 response["project_context"]["sr_blind_spot_themes"] = themes
         except Exception:
-            logger.exception("[AGENT] Failed to inject sr_blind_spot_themes (non-critical)")
+            logger.exception(
+                "[AGENT] Failed to inject sr_blind_spot_themes (non-critical)"
+            )
 
     # Inject scoped architecture context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         design_doc = project_for_playbook.design_doc or {}
         file_to_system_raw = design_doc.get("_file_to_system", {})
-        file_to_system = file_to_system_raw if isinstance(file_to_system_raw, dict) else {}
+        file_to_system = (
+            file_to_system_raw if isinstance(file_to_system_raw, dict) else {}
+        )
         if file_to_system:
             arch_related_files = (task.context or {}).get("related_files", [])
             seen_systems: dict[str, dict] = {}
@@ -2188,12 +2742,16 @@ async def claim_task(
                 arch_ctx = []
                 for sys_name, sys_data in seen_systems.items():
                     desc = sys_data.get("description", "")
-                    arch_ctx.append({
-                        "name": sys_data.get("name", sys_name),
-                        "status": str(sys_data.get("status", "")),
-                        "ready_for_features": bool(sys_data.get("ready_for_features", False)),
-                        "description": desc[:200] if isinstance(desc, str) else "",
-                    })
+                    arch_ctx.append(
+                        {
+                            "name": sys_data.get("name", sys_name),
+                            "status": str(sys_data.get("status", "")),
+                            "ready_for_features": bool(
+                                sys_data.get("ready_for_features", False)
+                            ),
+                            "description": desc[:200] if isinstance(desc, str) else "",
+                        }
+                    )
                 # Safety: drop trailing entries if total exceeds 1500 chars
                 while arch_ctx and len(json.dumps(arch_ctx)) > 1500:
                     arch_ctx.pop()
@@ -2205,13 +2763,17 @@ async def claim_task(
                     try:
                         _arch_task_ctx = dict(task.context or {})
                         _arch_task_ctx["_had_arch_context"] = True
-                        _arch_task_ctx["_shown_arch_system_names"] = list(seen_systems.keys())
+                        _arch_task_ctx["_shown_arch_system_names"] = list(
+                            seen_systems.keys()
+                        )
                         task.context = _arch_task_ctx
                         flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
                     except Exception:
-                        logger.exception("[AGENT] Failed to track arch context injection (non-critical)")
+                        logger.exception(
+                            "[AGENT] Failed to track arch context injection (non-critical)"
+                        )
 
     # Inject strategic vision so tactical agents understand the "why" behind
     # their work. Useful for every task type — the orchestrator's strategic
@@ -2224,11 +2786,24 @@ async def claim_task(
     # Inject direction narrative (established findings + open questions + last
     # cycle outcome) for task types that work inside a direction. Gives agents
     # a sense of trajectory rather than just a snapshot of recent tasks.
-    if direction_id and project_for_playbook and task_type in (
-        "create", "fix", "refactor", "research", "plan",
+    if (
+        direction_id
+        and project_for_playbook
+        and task_type
+        in (
+            "create",
+            "fix",
+            "refactor",
+            "research",
+            "plan",
+        )
     ):
         _narrative_direction = next(
-            (d for d in (project_for_playbook.directions or []) if d.get("id") == direction_id),
+            (
+                d
+                for d in (project_for_playbook.directions or [])
+                if d.get("id") == direction_id
+            ),
             None,
         )
         if _narrative_direction:
@@ -2260,13 +2835,14 @@ async def claim_task(
 
     return response
 
+
 @router.post("/artifacts/upload-url")
 @limiter.limit("300/minute")
 async def get_upload_url(
     request: Request,
     req: UploadUrlRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agents call this to get a temporary Signed URL to upload screenshots/logs directly to GCS.
@@ -2281,14 +2857,13 @@ async def get_upload_url(
         raise HTTPException(status_code=404, detail="Task not found")
 
     import os
+
     safe_filename = os.path.basename(req.filename)
     url = await generate_upload_signed_url(str(req.task_id), safe_filename)
     storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{req.task_id}/{safe_filename}"
 
-    return {
-        "upload_url": url,
-        "storage_uri": storage_uri
-    }
+    return {"upload_url": url, "storage_uri": storage_uri}
+
 
 @router.post("/heartbeat")
 @limiter.limit("600/minute")
@@ -2296,7 +2871,7 @@ async def agent_heartbeat(
     request: Request,
     req: HeartbeatRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Endpoint for agents to send a periodic heartbeat.
@@ -2319,10 +2894,13 @@ async def agent_heartbeat(
     # reaper to kill the task.
     # Skipping one heartbeat is safe — the reaper's threshold is 5 minutes,
     # and the next heartbeat (30s later) will succeed once the lock releases.
-    stmt = select(Task).where(
-        Task.id == req.task_id,
-        Task.vm_instance_id == token.get("vm_instance_id")
-    ).with_for_update(skip_locked=True)
+    stmt = (
+        select(Task)
+        .where(
+            Task.id == req.task_id, Task.vm_instance_id == token.get("vm_instance_id")
+        )
+        .with_for_update(skip_locked=True)
+    )
     task = (await session.execute(stmt)).scalars().first()
 
     if not task:
@@ -2357,13 +2935,23 @@ async def agent_heartbeat(
         # pre-claim death should then show up as a specific beacon landing
         # instead of a log void.
         msg = req.status_message
-        if any(msg.startswith(prefix) for prefix in (
-            "PROVISION_", "AGENT_BOOTED", "AGENT_AUTH_OK", "AGENT_CLAIMING",
-            "PRE_CLAIM_", "[FATAL", "STARTUP_FAILED",
-        )):
+        if any(
+            msg.startswith(prefix)
+            for prefix in (
+                "PROVISION_",
+                "AGENT_BOOTED",
+                "AGENT_AUTH_OK",
+                "AGENT_CLAIMING",
+                "PRE_CLAIM_",
+                "[FATAL",
+                "STARTUP_FAILED",
+            )
+        ):
             logger.info(
                 "[HEARTBEAT_BEACON] task=%s vm=%s msg=%s",
-                req.task_id, token.get("vm_instance_id"), msg[:300],
+                req.task_id,
+                token.get("vm_instance_id"),
+                msg[:300],
             )
     # Heartbeat counter (R4-W2 H1+H2+H3+M10): increment on EVERY heartbeat
     # (hoisted out of the metrics-conditional block — metrics-less heartbeats
@@ -2399,11 +2987,15 @@ async def agent_heartbeat(
         if req.tool_trace:
             try:
                 last_t = req.tool_trace[-1].t
-                latest_tool_use_at = datetime.fromisoformat(last_t.replace('Z', '+00:00'))
+                latest_tool_use_at = datetime.fromisoformat(
+                    last_t.replace("Z", "+00:00")
+                )
                 # Strip tz so the column (naive DateTime, matching the rest of
                 # the timestamp columns on Task) doesn't reject tz-aware values.
                 if latest_tool_use_at.tzinfo is not None:
-                    latest_tool_use_at = latest_tool_use_at.astimezone(timezone.utc).replace(tzinfo=None)
+                    latest_tool_use_at = latest_tool_use_at.astimezone(
+                        timezone.utc
+                    ).replace(tzinfo=None)
             except (ValueError, AttributeError, IndexError):
                 latest_tool_use_at = _utcnow()
 
@@ -2421,26 +3013,33 @@ async def agent_heartbeat(
         # The counter lives in a dedicated ``Task.heartbeat_count`` Integer
         # column (alembic 0066) and is bumped above (R4-W2) — the gate just
         # reads the in-memory value.
-        persist_audit_trail = (hb_count % 5 == 0)
+        persist_audit_trail = hb_count % 5 == 0
 
         if persist_audit_trail:
             ctx = dict(task.context or {})
             if metrics_dump is not None:
-                history = list(ctx.get('metrics_history', []))
-                entry: dict = {'t': _utcnow().isoformat()}
-                for k in ('rss_mb', 'heap_used_mb', 'disk_free_mb', 'disk_total_mb', 'cgroup_mb', 'cgroup_limit_mb'):
+                history = list(ctx.get("metrics_history", []))
+                entry: dict = {"t": _utcnow().isoformat()}
+                for k in (
+                    "rss_mb",
+                    "heap_used_mb",
+                    "disk_free_mb",
+                    "disk_total_mb",
+                    "cgroup_mb",
+                    "cgroup_limit_mb",
+                ):
                     if metrics_dump.get(k) is not None:
                         entry[k] = metrics_dump[k]
                 history.append(entry)
                 if len(history) > 30:
                     history = history[-30:]
-                ctx['metrics_history'] = history
+                ctx["metrics_history"] = history
             if req.tool_trace is not None:
                 # Overwrite — the agent's ring buffer already trims to the
                 # latest window, so each heartbeat carries the authoritative
                 # recent-tool-calls window. Last-successful value is the
                 # death trace after reap.
-                ctx['_tool_trace'] = [t.model_dump() for t in req.tool_trace]
+                ctx["_tool_trace"] = [t.model_dump() for t in req.tool_trace]
             # Only assign on the 5th-cycle write — assigning on every
             # heartbeat would re-serialize the whole JSONB blob and defeat
             # the column-counter optimisation we just made.
@@ -2452,12 +3051,17 @@ async def agent_heartbeat(
         # entries are dropped silently so a malformed event from a forward-rolled
         # agent doesn't 422 the whole heartbeat.
         from app.fix_loop_telemetry import FixLoopEventIn, apply_fix_loop_events
+
         validated: list[FixLoopEventIn] = []
         for raw in req.fix_loop_events:
             try:
                 validated.append(FixLoopEventIn(**raw))
             except Exception as exc:  # noqa: BLE001, PERF203
-                logger.info("[FIX_LOOP] dropping invalid event for task %s: %s", req.task_id, exc)
+                logger.info(
+                    "[FIX_LOOP] dropping invalid event for task %s: %s",
+                    req.task_id,
+                    exc,
+                )
         if validated:
             apply_fix_loop_events(task, validated)
 
@@ -2467,10 +3071,19 @@ async def agent_heartbeat(
     if req.prompt_fingerprint:
         if task.prompt_fingerprint != req.prompt_fingerprint:
             task.prompt_fingerprint = req.prompt_fingerprint
-        if (task.context or {}).get('prompt_fingerprint') != req.prompt_fingerprint:
+        if (task.context or {}).get("prompt_fingerprint") != req.prompt_fingerprint:
             ctx = dict(task.context or {})
-            ctx['prompt_fingerprint'] = req.prompt_fingerprint
+            ctx["prompt_fingerprint"] = req.prompt_fingerprint
             task.context = ctx
+
+    # Record VM image identity so the orchestrator can detect stale Packer images.
+    # Called on every heartbeat that carries image fields; no-ops when both are None.
+    if req.vm_image_name is not None or req.vm_image_build_ts is not None:
+        from app.compute import record_vm_image
+
+        record_vm_image(
+            token.get("vm_instance_id"), req.vm_image_name, req.vm_image_build_ts
+        )
 
     session.add(task)
     await session.commit()
@@ -2492,6 +3105,7 @@ class NextRoleRequest(BaseModel):
     VM identity (defence in depth — JWT + body cross-check) and the prior
     PR number so the orchestrator can scope the lookup.
     """
+
     model_config = ConfigDict(extra="ignore")
     vm_instance_id: str = Field(..., min_length=1)
     prior_task_id: uuid.UUID
@@ -2500,8 +3114,15 @@ class NextRoleRequest(BaseModel):
 
 class VmHeartbeatRequest(BaseModel):
     """Body for POST /api/agent/vm-heartbeat — VM-scoped liveness."""
+
     model_config = ConfigDict(extra="ignore")
     vm_instance_id: str = Field(..., min_length=1)
+    # Same field names as HeartbeatRequest (schemas.py) so agent can use
+    # one payload shape for both endpoints. Recorded into compute._vm_images
+    # so the orchestrator can detect stale Packer images on warm VMs that
+    # never run a task heartbeat.
+    vm_image_name: str | None = Field(None, max_length=200)
+    vm_image_build_ts: int | None = None
 
 
 @router.post("/vm-heartbeat", status_code=204)
@@ -2523,6 +3144,10 @@ async def vm_heartbeat(
     if req.vm_instance_id != token.get("vm_instance_id"):
         raise HTTPException(status_code=403, detail="vm_instance_mismatch")
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
+    if req.vm_image_name is not None or req.vm_image_build_ts is not None:
+        from app.compute import record_vm_image
+
+        record_vm_image(req.vm_instance_id, req.vm_image_name, req.vm_image_build_ts)
     return Response(status_code=204)
 
 
@@ -2565,6 +3190,7 @@ async def next_role(
     # on VM agent-vm-c44258...). The marker is recorded synchronously
     # before scheduling so it is always observable here.
     from app.main import is_orchestrator_initiated_delete
+
     _is_doomed, _delete_reason = is_orchestrator_initiated_delete(req.vm_instance_id)
     if _is_doomed:
         logger.info(
@@ -2599,6 +3225,7 @@ async def next_role(
 
     if task is not None:
         from app.compute import VM_PROVISIONING_MODEL
+
         task.vm_instance_id = req.vm_instance_id
         task.status = TaskStatus.IN_PROGRESS
         task.last_heartbeat = _utcnow()
@@ -2608,7 +3235,7 @@ async def next_role(
         task.vm_provisioned_at = _utcnow()
         # vm_spot mirrors orchestrator-mode for cost accounting; warm-start VMs
         # are spawned by orchestrator with the same provisioning model as cold.
-        task.vm_spot = (VM_PROVISIONING_MODEL == "SPOT")
+        task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
         if task.started_at is None:
             task.started_at = _utcnow()
         # Carry warm-start signal forward into context._timing so the
@@ -2707,7 +3334,7 @@ async def spawn_subtask(
     request: Request,
     req: SpawnTaskRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Endpoint for agents to request the creation of a new sub-task/VM.
@@ -2734,26 +3361,36 @@ async def spawn_subtask(
             depth += 1
         spawn_depth = depth
     if spawn_depth >= MAX_SPAWN_DEPTH:
-        raise HTTPException(status_code=400, detail=f"Spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")
+        raise HTTPException(
+            status_code=400, detail=f"Spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded"
+        )
 
     # Plan-spawned children are created by _handle_plan_completion AFTER branch creation,
     # so they get the correct base_branch. Don't pre-spawn them here.
     if (req.context or {}).get("agent_spawned"):
-        return {"message": "Plan children deferred to post-branch-creation", "task_ids": [], "requires_approval": False}
+        return {
+            "message": "Plan children deferred to post-branch-creation",
+            "task_ids": [],
+            "requires_approval": False,
+        }
 
     # Strip orchestrator-internal keys before merging into the new task's
     # context. An agent JWT-holder MUST NOT be able to forge a warm-VM pin
     # that hijacks another VM's chain. Log a warning when this happens so
     # we can spot the attack pattern in production.
     raw_context = req.context or {}
-    forbidden_present = [k for k in raw_context if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS]
+    forbidden_present = [
+        k for k in raw_context if k in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS
+    ]
     if forbidden_present:
         logger.warning(
             "[SPAWN] Stripped forbidden context keys from agent spawn: parent_task=%s keys=%s",
-            parent_task.id, forbidden_present,
+            parent_task.id,
+            forbidden_present,
         )
     sanitized_context = {
-        k: v for k, v in raw_context.items()
+        k: v
+        for k, v in raw_context.items()
         if k not in _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS
     }
 
@@ -2767,14 +3404,20 @@ async def spawn_subtask(
         parent_context = {
             "parent_task_id": str(parent_task.id),
             "parent_title": parent_task.title,
-            "parent_prompt": (parent_payload.get("prompt") or parent_payload.get("description") or "")[:500]
+            "parent_prompt": (
+                parent_payload.get("prompt") or parent_payload.get("description") or ""
+            )[:500],
         }
         new_task = Task(
             project_id=parent_task.project_id,
             title=payload.get("title", f"Subtask of {parent_task.title}"),
             description=payload.get("description", ""),
             payloads=[payload],
-            context={**sanitized_context, "spawn_depth": spawn_depth + 1, "parent_context": parent_context},
+            context={
+                **sanitized_context,
+                "spawn_depth": spawn_depth + 1,
+                "parent_context": parent_context,
+            },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             # Fixed value — parent linkage lives on parent_task_id, no need
@@ -2800,8 +3443,8 @@ async def spawn_subtask(
             details={
                 "spawned_by": f"AGENT_{parent_task.id}",
                 "requires_approval": req.requires_approval,
-                "context": req.context
-            }
+                "context": req.context,
+            },
         )
         session.add(history)
 
@@ -2810,7 +3453,7 @@ async def spawn_subtask(
     return {
         "message": f"Successfully spawned {len(new_tasks)} subtasks",
         "task_ids": [str(t.id) for t in new_tasks],
-        "requires_approval": req.requires_approval
+        "requires_approval": req.requires_approval,
     }
 
 
@@ -2818,13 +3461,14 @@ async def spawn_subtask(
 # GitHub proxy endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.get("/github/token")
 @limiter.limit("200/minute")
 async def agent_github_get_token(
     request: Request,
     task_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to retrieve the GitHub token for cloning repositories.
@@ -2835,12 +3479,9 @@ async def agent_github_get_token(
     gh_token, owner, repo = await get_github_token_for_task(task_id, session)
     return {
         "status": "success",
-        "data": {
-            "token": gh_token,
-            "owner": owner,
-            "repo": repo
-        }
+        "data": {"token": gh_token, "owner": owner, "repo": repo},
     }
+
 
 @router.post("/github/commit-status")
 @limiter.limit("500/minute")
@@ -2848,7 +3489,7 @@ async def agent_github_commit_status(
     request: Request,
     req: GitHubCommitStatusRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to update the commit status on GitHub.
@@ -2865,9 +3506,10 @@ async def agent_github_commit_status(
         state=req.state,
         description=req.description,
         context=req.context,
-        target_url=req.target_url
+        target_url=req.target_url,
     )
     return {"status": "success", "data": result}
+
 
 @router.post("/github/pr-comment")
 @limiter.limit("200/minute")
@@ -2875,7 +3517,7 @@ async def agent_github_pr_comment(
     request: Request,
     req: GitHubPRCommentRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to post a general comment to a PR.
@@ -2885,13 +3527,10 @@ async def agent_github_pr_comment(
 
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_pr_comment(
-        token=gh_token,
-        owner=owner,
-        repo=repo,
-        pr_number=req.pr_number,
-        body=req.body
+        token=gh_token, owner=owner, repo=repo, pr_number=req.pr_number, body=req.body
     )
     return {"status": "success", "data": result}
+
 
 @router.post("/github/pr-review-comment")
 @limiter.limit("200/minute")
@@ -2899,7 +3538,7 @@ async def agent_github_pr_review_comment(
     request: Request,
     req: GitHubPRReviewCommentRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to post an inline code review comment to a PR.
@@ -2916,9 +3555,10 @@ async def agent_github_pr_review_comment(
         commit_id=req.commit_id,
         path=req.path,
         line=req.line,
-        body=req.body
+        body=req.body,
     )
     return {"status": "success", "data": result}
+
 
 @router.post("/github/pr-review")
 @limiter.limit("150/minute")
@@ -2926,7 +3566,7 @@ async def agent_github_submit_pr_review(
     request: Request,
     req: GitHubSubmitPRReviewRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to submit a full PR review (APPROVE/REQUEST_CHANGES/COMMENT) via
@@ -2947,13 +3587,14 @@ async def agent_github_submit_pr_review(
     )
     return {"status": "success", "data": result}
 
+
 @router.post("/github/issues")
 @limiter.limit("100/minute")
 async def agent_github_create_issue(
     request: Request,
     req: GitHubCreateIssueRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to create a new issue.
@@ -2968,9 +3609,10 @@ async def agent_github_create_issue(
         repo=repo,
         title=req.title,
         body=req.body,
-        assignees=req.assignees
+        assignees=req.assignees,
     )
     return {"status": "success", "data": result}
+
 
 @router.get("/github/issues")
 @limiter.limit("150/minute")
@@ -2978,7 +3620,7 @@ async def agent_github_get_issues(
     request: Request,
     req: GitHubGetIssuesRequest = Depends(),
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to retrieve issues.
@@ -2987,13 +3629,9 @@ async def agent_github_get_issues(
         raise HTTPException(status_code=403, detail="Task ID mismatch")
 
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
-    result = await get_issues(
-        token=gh_token,
-        owner=owner,
-        repo=repo,
-        state=req.state
-    )
+    result = await get_issues(token=gh_token, owner=owner, repo=repo, state=req.state)
     return {"status": "success", "data": result}
+
 
 @router.post("/github/branches")
 @limiter.limit("100/minute")
@@ -3001,7 +3639,7 @@ async def agent_github_create_branch(
     request: Request,
     req: GitHubCreateBranchRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to create a new branch.
@@ -3011,13 +3649,10 @@ async def agent_github_create_branch(
 
     gh_token, owner, repo = await get_github_token_for_task(req.task_id, session)
     result = await create_branch(
-        token=gh_token,
-        owner=owner,
-        repo=repo,
-        branch_name=req.branch_name,
-        sha=req.sha
+        token=gh_token, owner=owner, repo=repo, branch_name=req.branch_name, sha=req.sha
     )
     return {"status": "success", "data": result}
+
 
 @router.post("/github/pull-requests")
 @limiter.limit("100/minute")
@@ -3025,7 +3660,7 @@ async def agent_github_create_pr(
     request: Request,
     req: GitHubCreatePRRequest,
     session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token)
+    token: dict = Depends(verify_agent_token),
 ):
     """
     Agent endpoint to create a pull request.
@@ -3039,19 +3674,30 @@ async def agent_github_create_pr(
     # open before returning it. If it was closed (e.g. branch deleted on requeue),
     # fall through and create a new PR — otherwise the agent reports COMPLETED on
     # a phantom PR and the rollup verifier later flips it to FAILED.
-    existing_artifact = (await session.execute(
-        select(Artifact).where(
-            Artifact.task_id == req.task_id,
-            Artifact.artifact_type == ArtifactType.PULL_REQUEST
+    existing_artifact = (
+        (
+            await session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == req.task_id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
         )
-    )).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing_artifact and existing_artifact.pr_url:
         try:
             pr_number = int(existing_artifact.pr_url.rstrip("/").split("/")[-1])
             pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("state") == "open":
-                logger.info(f"[PR] Task {req.task_id} already has open PR artifact: {existing_artifact.pr_url}")
-                return {"status": "success", "data": {"html_url": existing_artifact.pr_url}}
+                logger.info(
+                    f"[PR] Task {req.task_id} already has open PR artifact: {existing_artifact.pr_url}"
+                )
+                return {
+                    "status": "success",
+                    "data": {"html_url": existing_artifact.pr_url},
+                }
             logger.warning(
                 f"[PR] Task {req.task_id} cached PR #{pr_number} is {pr_data.get('state')} "
                 f"(merged={pr_data.get('merged')}) — recreating PR and replacing artifact"
@@ -3060,13 +3706,17 @@ async def agent_github_create_pr(
             await session.flush()
         except HTTPException as exc:
             if exc.status_code in (404, 410):
-                logger.warning(f"[PR] Task {req.task_id} cached PR no longer exists ({exc.status_code}) — recreating")
+                logger.warning(
+                    f"[PR] Task {req.task_id} cached PR no longer exists ({exc.status_code}) — recreating"
+                )
                 await session.delete(existing_artifact)
                 await session.flush()
             else:
                 raise
         except (ValueError, IndexError):
-            logger.warning(f"[PR] Could not parse PR number from cached URL {existing_artifact.pr_url} — recreating")
+            logger.warning(
+                f"[PR] Could not parse PR number from cached URL {existing_artifact.pr_url} — recreating"
+            )
             await session.delete(existing_artifact)
             await session.flush()
 
@@ -3077,7 +3727,7 @@ async def agent_github_create_pr(
         title=req.title,
         head=req.head,
         base=req.base,
-        body=req.body
+        body=req.body,
     )
 
     # Save artifact immediately so the PR is linked even if the agent is reaped
@@ -3085,7 +3735,9 @@ async def agent_github_create_pr(
     # find the PR and the pipeline stalls.
     pr_url = result.get("html_url", "")
     if pr_url:
-        artifact = Artifact(task_id=req.task_id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url)
+        artifact = Artifact(
+            task_id=req.task_id, artifact_type=ArtifactType.PULL_REQUEST, pr_url=pr_url
+        )
         session.add(artifact)
         await session.commit()
         logger.info(f"[PR] Saved PR artifact for task {req.task_id}: {pr_url}")
@@ -3182,7 +3834,11 @@ async def agent_fetch_playbook_entry(
         archive = design_doc.get("playbook_archive") or []
         if isinstance(archive, list):
             archived = next(
-                (e for e in archive if isinstance(e, dict) and e.get("key") == full_key),
+                (
+                    e
+                    for e in archive
+                    if isinstance(e, dict) and e.get("key") == full_key
+                ),
                 None,
             )
             if archived is not None:

@@ -220,7 +220,7 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
   return (
     <div className="flex flex-col h-full bg-neutral-900 text-neutral-300">
       {/* Time window selector */}
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-neutral-800">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-4 py-2 border-b border-neutral-800">
         <span className="text-xs text-neutral-500 mr-1">Window:</span>
         {WINDOW_OPTIONS.map((w) => (
           <button

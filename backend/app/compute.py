@@ -36,35 +36,45 @@ FALLBACK_ZONES: list[tuple[str, str]] = [
     ("us-central1-c", "agent-sandbox-subnet"),
     ("us-central1-b", "agent-sandbox-subnet"),
     ("us-central1-a", "agent-sandbox-subnet"),
-    ("us-east4-b",    "agent-sandbox-subnet-us-east4"),
-    ("us-east4-a",    "agent-sandbox-subnet-us-east4"),
-    ("us-east1-c",    "agent-sandbox-subnet-us-east1"),
-    ("us-east1-b",    "agent-sandbox-subnet-us-east1"),
-    ("us-west1-b",    "agent-sandbox-subnet-us-west1"),
-    ("us-west1-a",    "agent-sandbox-subnet-us-west1"),
+    ("us-east4-b", "agent-sandbox-subnet-us-east4"),
+    ("us-east4-a", "agent-sandbox-subnet-us-east4"),
+    ("us-east1-c", "agent-sandbox-subnet-us-east1"),
+    ("us-east1-b", "agent-sandbox-subnet-us-east1"),
+    ("us-west1-b", "agent-sandbox-subnet-us-west1"),
+    ("us-west1-a", "agent-sandbox-subnet-us-west1"),
 ]
 
 # Patterns indicating infrastructure-wide provision failure (not task-specific).
 # Used by orchestrator and reaper to avoid burning retry budgets for transient outages.
 INFRA_PROVISION_PATTERNS = [
-    "all zones in cooldown", "all zones exhausted",
+    "all zones in cooldown",
+    "all zones exhausted",
     "global provision capacity",
-    "zone_resource_pool_exhausted", "quota", "cpus_all_regions",
-    "does not have enough resources", "in_use_addresses",
+    "zone_resource_pool_exhausted",
+    "quota",
+    "cpus_all_regions",
+    "does not have enough resources",
+    "in_use_addresses",
     "503 service unavailable",
 ]
 
 # Track which zone each VM was created in (for delete/cleanup)
 _vm_zones: dict[str, str] = {}
 
+# Track per-VM image identity reported via heartbeats: vm_id -> (image_name, build_ts)
+_vm_images: dict[str, tuple[str | None, int | None]] = {}
+_IMAGE_STALENESS_THRESHOLD_HOURS = int(os.getenv("VM_IMAGE_STALENESS_HOURS", "24"))
+
 # Semaphores to cap concurrent GCP API calls — prevents thread pool starvation
 # and stays well under GCP's 20 QPS rate limit.
 # Separate limits for slow insert (up to 300s) vs fast ops (list/delete/get, ~10s)
 # so long-running provisions don't starve orphan cleanup.
 # Local semaphore still used as secondary guard even with Redis (prevents thread starvation).
-_MAX_GLOBAL_PROVISIONS = int(os.getenv('MAX_PROVISION_SLOTS', '10'))
-_gcp_provision_semaphore = asyncio.Semaphore(_MAX_GLOBAL_PROVISIONS)  # insert/create — long-running (up to 300s)
-_gcp_ops_semaphore = asyncio.Semaphore(8)         # list/delete/get — fast ops (~10s)
+_MAX_GLOBAL_PROVISIONS = int(os.getenv("MAX_PROVISION_SLOTS", "10"))
+_gcp_provision_semaphore = asyncio.Semaphore(
+    _MAX_GLOBAL_PROVISIONS
+)  # insert/create — long-running (up to 300s)
+_gcp_ops_semaphore = asyncio.Semaphore(8)  # list/delete/get — fast ops (~10s)
 
 # Distributed provision semaphore via Redis sorted set (falls back to local-only)
 _PROVISION_REDIS_KEY = "blueprint:active-provisions"
@@ -74,6 +84,7 @@ _PROVISION_SLOT_TTL = 600  # 10 min — auto-reclaim if process crashes
 async def _acquire_provision_slot(vm_id: str) -> bool:
     """Acquire a global provision slot via Redis. Falls back to local semaphore check."""
     from app.redis_client import get_redis
+
     r = await get_redis()
     if not r:
         return True  # No Redis — rely on local semaphore only
@@ -89,33 +100,46 @@ async def _acquire_provision_slot(vm_id: str) -> bool:
         await r.zadd(_PROVISION_REDIS_KEY, {vm_id: now + _PROVISION_SLOT_TTL})
         return True
     except Exception as e:
-        logger.warning(f"[REDIS] Provision slot acquire failed, using local semaphore: {e}")
+        logger.warning(
+            f"[REDIS] Provision slot acquire failed, using local semaphore: {e}"
+        )
         return True  # Degrade gracefully
 
 
 async def _release_provision_slot(vm_id: str):
     """Release a global provision slot."""
     from app.redis_client import get_redis
+
     r = await get_redis()
     if r:
         try:
             await r.zrem(_PROVISION_REDIS_KEY, vm_id)
         except Exception:
-            logger.exception(f"[COMPUTE] Failed to release provision slot for {vm_id} (TTL will reclaim)")
+            logger.exception(
+                f"[COMPUTE] Failed to release provision slot for {vm_id} (TTL will reclaim)"
+            )
+
 
 # Zone cooldown: skip zones that recently failed (avoid wasting time retrying exhausted zones)
 _zone_failures: dict[str, datetime] = {}
-ZONE_COOLDOWN_SECONDS = int(os.getenv('ZONE_COOLDOWN_BASE_SECONDS', '180'))  # 3 minutes — base for exponential backoff
-ZONE_RECOVERY_WAIT_CAP_SECONDS = int(os.getenv('ZONE_RECOVERY_WAIT_CAP_SECONDS', '300'))  # Max wait when all zones in cooldown
+ZONE_COOLDOWN_SECONDS = int(
+    os.getenv("ZONE_COOLDOWN_BASE_SECONDS", "180")
+)  # 3 minutes — base for exponential backoff
+ZONE_RECOVERY_WAIT_CAP_SECONDS = int(
+    os.getenv("ZONE_RECOVERY_WAIT_CAP_SECONDS", "300")
+)  # Max wait when all zones in cooldown
 
 
-ZONE_HISTORY_WINDOW = int(os.getenv('ZONE_HISTORY_WINDOW', '20'))  # Rolling window size for success rate
+ZONE_HISTORY_WINDOW = int(
+    os.getenv("ZONE_HISTORY_WINDOW", "20")
+)  # Rolling window size for success rate
 _ZONE_NEUTRAL_RATE = 0.5  # Default success rate for zones with no history
 
 
 def _zone_cooldown_seconds(consecutive_failures: int) -> int:
     """Exponential backoff: 3min → 6min → 12min → 24min → 30min cap."""
-    return min(ZONE_COOLDOWN_SECONDS * (2 ** consecutive_failures), 1800)
+    return min(ZONE_COOLDOWN_SECONDS * (2**consecutive_failures), 1800)
+
 
 # Zone health tracking: populated by provisioning attempts
 _zone_health: dict[str, dict] = {}
@@ -126,6 +150,7 @@ _zone_health: dict[str, dict] = {}
 #     "recent_outcomes": deque[bool],  # True=success, False=failure, maxlen=ZONE_HISTORY_WINDOW
 #   }
 # }
+
 
 def _zone_success_rate(zone: str) -> float:
     """Return the recent success rate for a zone (0.0–1.0).
@@ -228,7 +253,10 @@ VPC_NETWORK = os.getenv("VPC_NETWORK", "agent-sandbox-vpc")
 VPC_SUBNET = os.getenv("VPC_SUBNET", "agent-sandbox-subnet")
 
 # The base image for our agent
-AGENT_IMAGE_FAMILY = os.getenv("AGENT_IMAGE_FAMILY", f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent-v2")
+AGENT_IMAGE_FAMILY = os.getenv(
+    "AGENT_IMAGE_FAMILY",
+    f"projects/{GCP_PROJECT_ID}/global/images/family/blueprint-agent-v2",
+)
 
 # Scripts baked into the startup script as base64 blobs. Loaded at module
 # import time so a missing file fails fast instead of during VM provisioning.
@@ -248,25 +276,35 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # The "Naked" Service Account with minimal GCP permissions.
 AGENT_SERVICE_ACCOUNT_EMAIL = os.getenv(
     "AGENT_SERVICE_ACCOUNT_EMAIL",
-    "vpm-worker@your-gcp-project-id.iam.gserviceaccount.com"
+    "vpm-worker@your-gcp-project-id.iam.gserviceaccount.com",
 )
 
 # Agent source directory for local mode
-AGENT_DIR = os.getenv("AGENT_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "agent"))
+AGENT_DIR = os.getenv(
+    "AGENT_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "agent")
+)
+
 
 def _validate_env_config() -> None:
     """Fail fast if placeholder env vars are still set."""
     if GCP_PROJECT_ID == "your-gcp-project-id":
-        raise RuntimeError("GCP_PROJECT_ID is not configured (still set to placeholder)")
+        raise RuntimeError(
+            "GCP_PROJECT_ID is not configured (still set to placeholder)"
+        )
     if ORCHESTRATOR_URL == "http://localhost:8080" and not LOCAL_MODE:
-        raise RuntimeError("ORCHESTRATOR_URL is not configured (still set to localhost)")
+        raise RuntimeError(
+            "ORCHESTRATOR_URL is not configured (still set to localhost)"
+        )
     if "your-gcp-project-id" in AGENT_SERVICE_ACCOUNT_EMAIL and not LOCAL_MODE:
-        raise RuntimeError("AGENT_SERVICE_ACCOUNT_EMAIL is not configured (still contains placeholder)")
+        raise RuntimeError(
+            "AGENT_SERVICE_ACCOUNT_EMAIL is not configured (still contains placeholder)"
+        )
 
 
 def _validate_image_family() -> None:
     """Verify the agent VM image family exists in GCP. Prevents all-zone cascading failure."""
     from google.cloud import compute_v1
+
     try:
         client = compute_v1.ImagesClient()
         # get_from_family raises NotFound if family doesn't exist
@@ -276,16 +314,21 @@ def _validate_image_family() -> None:
             parts = AGENT_IMAGE_FAMILY.split("/")
             project = parts[1]
         client.get_from_family(project=project, family=family_name)
-        logger.info(f"[STARTUP] Image family '{family_name}' validated in project '{project}'")
+        logger.info(
+            f"[STARTUP] Image family '{family_name}' validated in project '{project}'"
+        )
     except Exception as e:
         logger.exception("[STARTUP] Image family validation failed")
         raise RuntimeError(f"AGENT_IMAGE_FAMILY '{AGENT_IMAGE_FAMILY}' not found: {e}")
+
 
 _image_family_valid: bool | None = None  # None = not yet checked, True/False = result
 _image_family_last_check: float = 0.0
 _IMAGE_FAMILY_RECHECK_INTERVAL: float = 300.0  # Retry validation every 5 min if failed
 
-if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run — skip in dev/test
+if not LOCAL_MODE and os.getenv(
+    "K_REVISION"
+):  # K_REVISION set by Cloud Run — skip in dev/test
     _validate_env_config()
     try:
         _validate_image_family()
@@ -294,12 +337,17 @@ if not LOCAL_MODE and os.getenv("K_REVISION"):  # K_REVISION set by Cloud Run �
     except Exception:
         _image_family_valid = False
         _image_family_last_check = time.time()
-        logger.exception(f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s")
+        logger.exception(
+            f"[STARTUP] Image family validation FAILED — will retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s"
+        )
 
 # Manifest builder + payload URI validator are imported at the top of this
 # module so they're re-exported for existing `from app.compute import ...`
 # callers (and tests that mock via `app.compute.X`).
-_REEXPORTS = (validate_payload_uri, build_agent_secret_manifest)  # keep referenced so linters don't strip the re-exports
+_REEXPORTS = (
+    validate_payload_uri,
+    build_agent_secret_manifest,
+)  # keep referenced so linters don't strip the re-exports
 
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
 
@@ -309,7 +357,8 @@ _local_processes: dict[str, subprocess.Popen] = {}
 
 
 async def prepare_and_store_agent_secret(
-    vm_instance_id: str, task_id: uuid.UUID,
+    vm_instance_id: str,
+    task_id: uuid.UUID,
     oauth_token: str | None = None,
     claude_config_json: str | None = None,
     task_type: str = "",
@@ -350,14 +399,22 @@ async def prepare_and_store_agent_secret(
     )
 
 
-async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
-                              oauth_token: str | None = None, claude_config_json: str | None = None,
-                              task_type: str = "", secret_version_name: str | None = None,
-                              provider: str | None = None, auth_mode: str | None = None,
-                              model: str | None = None, execution_mode: str | None = None,
-                              provider_metadata: dict | None = None,
-                              provider_settings: dict | None = None,
-                              provisioning_model: str | None = None):
+async def provision_agent_vm(
+    vm_instance_id: str,
+    task_id: uuid.UUID,
+    payload_uri: str | None = None,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    task_type: str = "",
+    secret_version_name: str | None = None,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
+    provisioning_model: str | None = None,
+):
     """
     Provisions an agent. In LOCAL_MODE, spawns a subprocess.
     In production, creates a GCP Compute Engine VM.
@@ -378,7 +435,9 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
                 _validate_image_family()
                 _image_family_valid = True
                 _image_family_last_check = now
-                logger.info("[COMPUTE] Image family re-validation succeeded — provisioning re-enabled")
+                logger.info(
+                    "[COMPUTE] Image family re-validation succeeded — provisioning re-enabled"
+                )
             except Exception:
                 _image_family_last_check = now
                 logger.exception("[COMPUTE] Image family re-validation still failing")
@@ -393,21 +452,40 @@ async def provision_agent_vm(vm_instance_id: str, task_id: uuid.UUID, payload_ur
             )
     if LOCAL_MODE:
         return await _provision_local(
-            vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
-            task_type=task_type, provider=provider, auth_mode=auth_mode, model=model,
-            execution_mode=execution_mode, provider_metadata=provider_metadata,
+            vm_instance_id,
+            task_id,
+            payload_uri,
+            oauth_token,
+            claude_config_json,
+            task_type=task_type,
+            provider=provider,
+            auth_mode=auth_mode,
+            model=model,
+            execution_mode=execution_mode,
+            provider_metadata=provider_metadata,
             provider_settings=provider_settings,
         )
-    return await _provision_gcp(vm_instance_id, task_id, payload_uri, oauth_token, claude_config_json,
-                                task_type=task_type, secret_version_name=secret_version_name,
-                                provider=provider, auth_mode=auth_mode, model=model,
-                                execution_mode=execution_mode, provider_metadata=provider_metadata,
-                                provider_settings=provider_settings,
-                                provisioning_model=provisioning_model)
+    return await _provision_gcp(
+        vm_instance_id,
+        task_id,
+        payload_uri,
+        oauth_token,
+        claude_config_json,
+        task_type=task_type,
+        secret_version_name=secret_version_name,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        execution_mode=execution_mode,
+        provider_metadata=provider_metadata,
+        provider_settings=provider_settings,
+        provisioning_model=provisioning_model,
+    )
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
 _PROVISION_ERROR_MAX = 500
+
 
 def get_provision_error(vm_instance_id: str) -> str:
     """Get and clear the last provisioning error for a VM."""
@@ -417,6 +495,49 @@ def get_provision_error(vm_instance_id: str) -> str:
 def get_vm_zone(vm_instance_id: str) -> str:
     """Get the zone a VM was provisioned in."""
     return _vm_zones.get(vm_instance_id, "unknown")
+
+
+def record_vm_image(
+    vm_instance_id: str, image_name: str | None, build_ts: int | None
+) -> None:
+    """Record the boot-disk image identity reported by a VM via heartbeat."""
+    if not vm_instance_id:
+        return
+    _vm_images[vm_instance_id] = (image_name, build_ts)
+    logger.debug(
+        f"[COMPUTE] VM {vm_instance_id} image={image_name} build_ts={build_ts}"
+    )
+
+
+def get_vm_image(vm_instance_id: str) -> tuple[str | None, int | None]:
+    """Return (image_name, build_ts) for a VM, or (None, None) if unknown."""
+    return _vm_images.get(vm_instance_id, (None, None))
+
+
+def get_stale_image_vms(threshold_hours: int | None = None) -> list[dict]:
+    """Return VMs whose image build_ts is older than threshold_hours.
+
+    Used by alerting to surface VMs running pre-Chromium-bake (or other
+    stale) images before they cause task-level failures.
+    """
+    cutoff_hours = (
+        threshold_hours
+        if threshold_hours is not None
+        else _IMAGE_STALENESS_THRESHOLD_HOURS
+    )
+    cutoff_ts = int(time.time()) - cutoff_hours * 3600
+    stale = []
+    for vm_id, (image_name, build_ts) in list(_vm_images.items()):
+        if build_ts is not None and build_ts < cutoff_ts:
+            stale.append(
+                {
+                    "vm_id": vm_id,
+                    "image_name": image_name,
+                    "build_ts": build_ts,
+                    "age_hours": round((time.time() - build_ts) / 3600, 1),
+                }
+            )
+    return stale
 
 
 async def delete_agent_vm(vm_instance_id: str):
@@ -438,7 +559,12 @@ async def cleanup_orphaned_vms(active_vm_ids: list[str]):
     return await _cleanup_gcp(active_vm_ids)
 
 
-async def cleanup_old_images(keep: int, family: str | None = None, project: str | None = None, dry_run: bool = False) -> dict:
+async def cleanup_old_images(
+    keep: int,
+    family: str | None = None,
+    project: str | None = None,
+    dry_run: bool = False,
+) -> dict:
     """Delete oldest custom images in `family`, retaining the `keep` most recent.
 
     GCP enforces a per-project image quota; without pruning, each Packer build leaves the
@@ -450,9 +576,18 @@ async def cleanup_old_images(keep: int, family: str | None = None, project: str 
     Returns a dict with: total (in family), deleted (count), kept, failed, dry_run.
     """
     if keep < 1:
-        raise ValueError("keep must be >= 1 (must retain at least one image for VM provisioning)")
+        raise ValueError(
+            "keep must be >= 1 (must retain at least one image for VM provisioning)"
+        )
     if LOCAL_MODE:
-        return {"total": 0, "deleted": 0, "kept": 0, "failed": [], "dry_run": dry_run, "skipped": "local_mode"}
+        return {
+            "total": 0,
+            "deleted": 0,
+            "kept": 0,
+            "failed": [],
+            "dry_run": dry_run,
+            "skipped": "local_mode",
+        }
 
     from google.cloud import compute_v1
 
@@ -475,14 +610,24 @@ async def cleanup_old_images(keep: int, family: str | None = None, project: str 
     images = await asyncio.to_thread(_list_and_sort)
     total = len(images)
     if total <= keep:
-        return {"total": total, "deleted": 0, "kept": total, "failed": [], "dry_run": dry_run}
+        return {
+            "total": total,
+            "deleted": 0,
+            "kept": total,
+            "failed": [],
+            "dry_run": dry_run,
+        }
 
     to_delete = images[keep:]
     failed: list[dict] = []
 
     if dry_run:
         return {
-            "total": total, "deleted": 0, "kept": keep, "failed": [], "dry_run": True,
+            "total": total,
+            "deleted": 0,
+            "kept": keep,
+            "failed": [],
+            "dry_run": True,
             "would_delete": [im.name for im in to_delete],
         }
 
@@ -504,10 +649,17 @@ async def cleanup_old_images(keep: int, family: str | None = None, project: str 
             deleted += 1
             logger.info(f"[IMAGE CLEANUP] Deleted {im.name}")
 
-    return {"total": total, "deleted": deleted, "kept": keep, "failed": failed, "dry_run": False}
+    return {
+        "total": total,
+        "deleted": deleted,
+        "kept": keep,
+        "failed": failed,
+        "dry_run": False,
+    }
 
 
 # ─── Local Mode Implementation ──────────────────────────────────────────────
+
 
 async def _provision_local(
     vm_instance_id: str,
@@ -523,7 +675,9 @@ async def _provision_local(
     provider_metadata: dict | None = None,
     provider_settings: dict | None = None,
 ):
-    logger.info(f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})")
+    logger.info(
+        f"[LOCAL] Spawning agent subprocess: {vm_instance_id} (Task: {task_id})"
+    )
     manifest = build_agent_secret_manifest(
         vm_instance_id=vm_instance_id,
         task_id=task_id,
@@ -562,7 +716,9 @@ async def _provision_local(
                 await asyncio.to_thread(proc.wait)
             finally:
                 _local_processes.pop(vm_instance_id, None)
-                logger.info(f"[LOCAL] Agent subprocess exited (PID: {proc.pid}, code: {proc.returncode})")
+                logger.info(
+                    f"[LOCAL] Agent subprocess exited (PID: {proc.pid}, code: {proc.returncode})"
+                )
 
         asyncio.create_task(_monitor())  # noqa: RUF006 — fire-and-forget monitor; lives for the subprocess lifetime
         return True
@@ -574,7 +730,9 @@ async def _provision_local(
 async def _delete_local(vm_instance_id: str):
     proc = _local_processes.pop(vm_instance_id, None)
     if proc and proc.poll() is None:
-        logger.info(f"[LOCAL] Killing agent subprocess: {vm_instance_id} (PID: {proc.pid})")
+        logger.info(
+            f"[LOCAL] Killing agent subprocess: {vm_instance_id} (PID: {proc.pid})"
+        )
         try:
             proc.send_signal(signal.SIGTERM)
             try:
@@ -588,6 +746,7 @@ async def _delete_local(vm_instance_id: str):
         local_root = _local_manifest_root(vm_instance_id)
         if local_root.exists():
             import shutil
+
             shutil.rmtree(local_root, ignore_errors=True)
     except Exception:
         logger.warning(f"[LOCAL] Failed to clean manifest files for {vm_instance_id}")
@@ -603,6 +762,7 @@ async def _cleanup_local(active_vm_ids: list[str]):
 
 
 # ─── GCP Mode Implementation ────────────────────────────────────────────────
+
 
 def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     """
@@ -626,14 +786,17 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
                 "secret_id": secret_id,
                 "secret": {
                     "replication": {"automatic": {}},
-                    "labels": {"managed-by": "blueprint", "vm-instance": vm_instance_id},
+                    "labels": {
+                        "managed-by": "blueprint",
+                        "vm-instance": vm_instance_id,
+                    },
                 },
             }
         )
     except Exception as e:
         if "AlreadyExists" in str(type(e).__name__) or "409" in str(e):
             logger.info(f"Secret {secret_id} already exists — reusing")
-            secret = type('Secret', (), {'name': secret_name})()
+            secret = type("Secret", (), {"name": secret_name})()
         else:
             raise
 
@@ -651,6 +814,7 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     # provisioning. Also short-circuits when the SA is already bound so reused
     # secrets don't accumulate duplicate bindings.
     from google.api_core.exceptions import Aborted
+
     agent_sa_member = f"serviceAccount:{AGENT_SERVICE_ACCOUNT_EMAIL}"
     max_retries = 5
     for attempt in range(max_retries):
@@ -674,13 +838,17 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
             if attempt == max_retries - 1:
                 logger.error(
                     "[COMPUTE] IAM policy ETag retry exhausted for %s after %d attempts",
-                    secret.name, max_retries,
+                    secret.name,
+                    max_retries,
                 )
                 raise
-            backoff_seconds = min(0.1 * (2 ** attempt), 2.0)
+            backoff_seconds = min(0.1 * (2**attempt), 2.0)
             logger.warning(
                 "[COMPUTE] IAM policy ETag conflict on %s (attempt %d/%d), retrying in %.2fs",
-                secret.name, attempt + 1, max_retries, backoff_seconds,
+                secret.name,
+                attempt + 1,
+                max_retries,
+                backoff_seconds,
             )
             time.sleep(backoff_seconds)
 
@@ -694,7 +862,9 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
         if verification.payload.data != secret_payload.encode("utf-8"):
             logger.error(
                 "[COMPUTE] Secret %s post-create payload mismatch (size=%d vs expected=%d)",
-                version.name, len(verification.payload.data), len(secret_payload),
+                version.name,
+                len(verification.payload.data),
+                len(secret_payload),
             )
             raise RuntimeError(
                 f"Secret {version.name} verification failed: payload mismatch"
@@ -702,7 +872,8 @@ def _store_agent_secret(vm_instance_id: str, secret_payload: str) -> str:
     except Exception as verify_err:
         logger.error(
             "[COMPUTE] Secret %s failed post-create verification: %s",
-            version.name, verify_err,
+            version.name,
+            verify_err,
         )
         raise
 
@@ -720,7 +891,11 @@ def _materialize_local_manifest(vm_instance_id: str, manifest: dict) -> dict[str
     root.mkdir(parents=True, exist_ok=True)
 
     path_map: dict[str, str] = {}
-    env = {str(key): str(value) for key, value in (manifest.get("env") or {}).items() if value is not None}
+    env = {
+        str(key): str(value)
+        for key, value in (manifest.get("env") or {}).items()
+        if value is not None
+    }
     for item in manifest.get("files", []) or []:
         original_path = str(item["path"])
         local_path = root / original_path.lstrip("/").replace("/", os.sep)
@@ -764,7 +939,9 @@ def _list_managed_secrets() -> list[tuple[str, str, datetime]]:
     client = secretmanager.SecretManagerServiceClient()
     parent = f"projects/{GCP_PROJECT_ID}"
     results: list[tuple[str, str, datetime]] = []
-    for secret in client.list_secrets(request={"parent": parent, "filter": "labels.managed-by=blueprint"}):
+    for secret in client.list_secrets(
+        request={"parent": parent, "filter": "labels.managed-by=blueprint"}
+    ):
         vm_id = secret.labels.get("vm-instance", "")
         if vm_id:
             results.append((secret.name, vm_id, secret.create_time))
@@ -780,13 +957,23 @@ async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
         secrets = await asyncio.to_thread(_list_managed_secrets)
 
     now = datetime.now(timezone.utc)
-    stats: dict[str, int] = {"listed": len(secrets), "deleted": 0, "skipped_young": 0, "skipped_active": 0, "failed": 0}
+    stats: dict[str, int] = {
+        "listed": len(secrets),
+        "deleted": 0,
+        "skipped_young": 0,
+        "skipped_active": 0,
+        "failed": 0,
+    }
     for _secret_name, vm_id, create_time in secrets:
         if vm_id in active_vm_ids:
             stats["skipped_active"] += 1
             continue
         # Ensure create_time is timezone-aware for comparison
-        ct = create_time if create_time.tzinfo else create_time.replace(tzinfo=timezone.utc)
+        ct = (
+            create_time
+            if create_time.tzinfo
+            else create_time.replace(tzinfo=timezone.utc)
+        )
         age_seconds = (now - ct).total_seconds()
         if age_seconds < 1800:  # < 30 min — could be mid-provision
             stats["skipped_young"] += 1
@@ -800,14 +987,22 @@ async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
     return stats
 
 
-async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: str | None = None,
-                         oauth_token: str | None = None, claude_config_json: str | None = None,
-                         task_type: str = "", secret_version_name: str | None = None,
-                         provider: str | None = None, auth_mode: str | None = None,
-                         model: str | None = None, execution_mode: str | None = None,
-                         provider_metadata: dict | None = None,
-                         provider_settings: dict | None = None,
-                         provisioning_model: str | None = None):
+async def _provision_gcp(
+    vm_instance_id: str,
+    task_id: uuid.UUID,
+    payload_uri: str | None = None,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    task_type: str = "",
+    secret_version_name: str | None = None,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
+    provisioning_model: str | None = None,
+):
     from google.cloud import compute_v1
 
     logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
@@ -817,17 +1012,28 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
         # (Callers that run upload_json_payload concurrently pass secret_version_name
         # from prepare_and_store_agent_secret to avoid this sequential fallback.)
         secret_version_name = await prepare_and_store_agent_secret(
-            vm_instance_id, task_id, oauth_token, claude_config_json, task_type,
-            provider=provider, auth_mode=auth_mode, model=model,
-            execution_mode=execution_mode, provider_metadata=provider_metadata,
+            vm_instance_id,
+            task_id,
+            oauth_token,
+            claude_config_json,
+            task_type,
+            provider=provider,
+            auth_mode=auth_mode,
+            model=model,
+            execution_mode=execution_mode,
+            provider_metadata=provider_metadata,
             provider_settings=provider_settings,
         )
 
     # payload_uri is validated upstream and safe to embed in the startup script
     import base64
-    payload_uri_b64 = base64.b64encode(payload_uri.encode()).decode() if payload_uri else ""
+
+    payload_uri_b64 = (
+        base64.b64encode(payload_uri.encode()).decode() if payload_uri else ""
+    )
 
     from app.compute_startup_script import build_agent_startup_script
+
     startup_script = build_agent_startup_script(
         task_id=str(task_id),
         secret_version_name=secret_version_name,
@@ -850,10 +1056,14 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     instance_config.disks = [disk]
 
     network_interface = compute_v1.NetworkInterface()
-    network_interface.network = f"projects/{GCP_PROJECT_ID}/global/networks/{VPC_NETWORK}"
+    network_interface.network = (
+        f"projects/{GCP_PROJECT_ID}/global/networks/{VPC_NETWORK}"
+    )
     # Default subnet — will be overridden per-zone in the fallback loop
     default_region = "-".join(GCP_ZONE.split("-")[:-1])
-    network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{default_region}/subnetworks/{VPC_SUBNET}"
+    network_interface.subnetwork = (
+        f"projects/{GCP_PROJECT_ID}/regions/{default_region}/subnetworks/{VPC_SUBNET}"
+    )
     instance_config.network_interfaces = [network_interface]
 
     metadata = compute_v1.Metadata()
@@ -888,7 +1098,9 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
     # is STANDARD; cloudbuild.yaml sets VM_PROVISIONING_MODEL=SPOT in prod.
     # provisioning_model overrides the process-wide default (e.g. to force
     # STANDARD after repeated preemptions on a specific task).
-    _effective_provisioning_model = (provisioning_model or VM_PROVISIONING_MODEL).upper()
+    _effective_provisioning_model = (
+        provisioning_model or VM_PROVISIONING_MODEL
+    ).upper()
     if _effective_provisioning_model == "SPOT":
         scheduling = compute_v1.Scheduling()
         scheduling.provisioning_model = "SPOT"
@@ -910,29 +1122,46 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
         # _active_fallback_zones() filters out admin-disabled regions (DISABLED_REGIONS env)
         # so spawn attempts skip regions with no subnet provisioned.
         active_zones = _active_fallback_zones()
-        healthy_zones = [(z, s) for z, s in active_zones if not (_zone_health.get(z, {}).get("cooldown_expires_at") and now_pre < _zone_health[z]["cooldown_expires_at"])]
+        healthy_zones = [
+            (z, s)
+            for z, s in active_zones
+            if not (
+                _zone_health.get(z, {}).get("cooldown_expires_at")
+                and now_pre < _zone_health[z]["cooldown_expires_at"]
+            )
+        ]
         cooled_zones = [(z, s) for z, s in active_zones if (z, s) not in healthy_zones]
         # Sort healthy zones by recent success rate (descending) so well-performing
         # zones are preferred. Zones with no history get neutral rate 0.5.
         # Use stable sort with a small random tiebreak to distribute load across
         # equal-rate zones (e.g. all-new zones with 0.5 default).
-        healthy_zones.sort(key=lambda zs: (_zone_success_rate(zs[0]), random.random()), reverse=True)
+        healthy_zones.sort(
+            key=lambda zs: (_zone_success_rate(zs[0]), random.random()), reverse=True
+        )
         zones_to_try = healthy_zones + cooled_zones
 
         for zone, subnet_name in zones_to_try:
             if _cancel_event.is_set():
-                logger.info(f"[PROVISION] {vm_instance_id} cancelled — skipping remaining zones")
+                logger.info(
+                    f"[PROVISION] {vm_instance_id} cancelled — skipping remaining zones"
+                )
                 return None
-            now = datetime.now(timezone.utc)  # Refresh each iteration — zone attempts can take up to 300s
+            now = datetime.now(
+                timezone.utc
+            )  # Refresh each iteration — zone attempts can take up to 300s
             # Skip zones in cooldown (recently failed) — use per-zone exponential backoff expiry
-            zone_cooldown_expires = _zone_health.get(zone, {}).get("cooldown_expires_at")
+            zone_cooldown_expires = _zone_health.get(zone, {}).get(
+                "cooldown_expires_at"
+            )
             if zone_cooldown_expires and now < zone_cooldown_expires:
                 skipped_cooldown.append(zone)
                 continue
 
             try:
                 # Update zone-dependent config for this attempt
-                instance_config.machine_type = f"zones/{zone}/machineTypes/{MACHINE_TYPE}"
+                instance_config.machine_type = (
+                    f"zones/{zone}/machineTypes/{MACHINE_TYPE}"
+                )
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
                 # Re-assign to ensure protobuf picks up the change
@@ -940,18 +1169,24 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
                 # Delete any existing VM with this name first (stale from retries)
                 try:
-                    instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
-                    logger.info(f"Deleting stale VM {vm_instance_id} in {zone} before re-provisioning")
-                    del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                    instance_client.get(
+                        project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                    )
+                    logger.info(
+                        f"Deleting stale VM {vm_instance_id} in {zone} before re-provisioning"
+                    )
+                    del_op = instance_client.delete(
+                        project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                    )
                     del_op.result(timeout=300)
                 except Exception as e:
                     if "was not found" not in str(e) and "404" not in str(e):
-                        logger.warning(f"Failed to clean stale VM {vm_instance_id} in {zone}: {e}")
+                        logger.warning(
+                            f"Failed to clean stale VM {vm_instance_id} in {zone}: {e}"
+                        )
 
                 operation = instance_client.insert(
-                    project=GCP_PROJECT_ID,
-                    zone=zone,
-                    instance_resource=instance_config
+                    project=GCP_PROJECT_ID, zone=zone, instance_resource=instance_config
                 )
                 # Inner wait is bounded below the outer 420s wait_for so we
                 # don't routinely burn the full budget on a single zone.
@@ -964,13 +1199,17 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                     prev_failures = health.get("consecutive_failures", 0)
                     health["consecutive_failures"] = 0
                     health.pop("cooldown_expires_at", None)
-                    outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                    outcomes = health.setdefault(
+                        "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
+                    )
                     outcomes.append(True)
                     was_in_cooldown = zone in _zone_failures
                     cooldown_since = _zone_failures.pop(zone, None)
 
                 if was_in_cooldown and prev_failures > 0:
-                    cooldown_duration = (datetime.now(timezone.utc) - cooldown_since).total_seconds()
+                    cooldown_duration = (
+                        datetime.now(timezone.utc) - cooldown_since
+                    ).total_seconds()
                     logger.warning(
                         f"Zone {zone} recovered from cooldown after {cooldown_duration:.0f}s "
                         f"(had {prev_failures} consecutive failure(s))"
@@ -987,7 +1226,9 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                 # insert in the same zone once.
                 if "409" in err_str and "already exists" in err_str.lower():
                     try:
-                        existing = instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                        existing = instance_client.get(
+                            project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                        )
                         existing_status = getattr(existing, "status", "") or ""
                         if existing_status in ("RUNNING", "STAGING", "PROVISIONING"):
                             logger.warning(
@@ -1000,7 +1241,10 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                                 health["last_success"] = datetime.now(timezone.utc)
                                 health["consecutive_failures"] = 0
                                 health.pop("cooldown_expires_at", None)
-                                outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                                outcomes = health.setdefault(
+                                    "recent_outcomes",
+                                    _deque(maxlen=ZONE_HISTORY_WINDOW),
+                                )
                                 outcomes.append(True)
                                 _zone_failures.pop(zone, None)
                             return f"adopted-{vm_instance_id}-in-{zone}"
@@ -1008,7 +1252,9 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                             f"[PROVISION] {vm_instance_id} exists in {zone} but status={existing_status} — "
                             f"deleting and retrying insert"
                         )
-                        del_op = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                        del_op = instance_client.delete(
+                            project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                        )
                         del_op.result(timeout=180)
                     except Exception as adopt_exc:
                         logger.warning(
@@ -1022,7 +1268,8 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                     "does not have enough resources" in err_str
                     or "ZONE_RESOURCE_POOL_EXHAUSTED" in err_str
                     or "QUOTA" in err_str
-                    or "subnetwork" in err_str.lower()  # Subnet not found (infra not provisioned)
+                    or "subnetwork"
+                    in err_str.lower()  # Subnet not found (infra not provisioned)
                     or "was not found" in err_str
                 )
                 if retryable:
@@ -1050,18 +1297,25 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                         # same failure event — update the timestamp but don't increment the counter.
                         within_debounce = (
                             last_fail_time is not None
-                            and (now_fail - last_fail_time).total_seconds() < ZONE_COOLDOWN_SECONDS
+                            and (now_fail - last_fail_time).total_seconds()
+                            < ZONE_COOLDOWN_SECONDS
                         )
                         if within_debounce:
-                            new_failure_count = old_cf  # Parallel failure of same event — no escalation
+                            new_failure_count = (
+                                old_cf  # Parallel failure of same event — no escalation
+                            )
                         else:
                             new_failure_count = old_cf + 1
                         health["last_failure"] = now_fail
                         health["consecutive_failures"] = new_failure_count
                         health["last_failure_reason"] = reason
                         cooldown_secs = _zone_cooldown_seconds(new_failure_count)
-                        health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
-                        outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                        health["cooldown_expires_at"] = now_fail + timedelta(
+                            seconds=cooldown_secs
+                        )
+                        outcomes = health.setdefault(
+                            "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
+                        )
                         outcomes.append(False)
 
                     if entering_cooldown:
@@ -1069,19 +1323,23 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                             f"Zone {zone} entering cooldown: {new_failure_count} consecutive failure(s), "
                             f"reason={reason}, cooldown={ZONE_COOLDOWN_SECONDS}s"
                         )
-                    logger.warning(f"Zone {zone} unavailable ({reason}) for {vm_instance_id}, trying next zone...")
+                    logger.warning(
+                        f"Zone {zone} unavailable ({reason}) for {vm_instance_id}, trying next zone..."
+                    )
                     continue
                 # Non-retryable error — don't retry
                 raise
 
         if skipped_cooldown:
-            logger.warning(f"Skipped {len(skipped_cooldown)} zones in cooldown: {skipped_cooldown}")
+            logger.warning(
+                f"Skipped {len(skipped_cooldown)} zones in cooldown: {skipped_cooldown}"
+            )
         if not last_error and len(skipped_cooldown) == len(active_zones):
             # All ACTIVE zones in cooldown — find the one expiring soonest and wait (up to 2 min).
             # Disabled zones are excluded; they have no subnet, so even waiting wouldn't help.
             now_check = datetime.now(timezone.utc)
             soonest_zone = None
-            soonest_wait = float('inf')
+            soonest_wait = float("inf")
             for z, sn in active_zones:
                 expires = _zone_health.get(z, {}).get("cooldown_expires_at")
                 if expires:
@@ -1095,13 +1353,22 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                     f"All zones in cooldown — waiting {soonest_wait:.0f}s for {wait_zone} to exit cooldown"
                 )
                 import time as _time
-                _time.sleep(max(0, soonest_wait) + 1)  # Safe to block — already in thread
+
+                _time.sleep(
+                    max(0, soonest_wait) + 1
+                )  # Safe to block — already in thread
                 # Retry the soonest zone
                 try:
-                    instance_config.machine_type = f"zones/{wait_zone}/machineTypes/{MACHINE_TYPE}"
+                    instance_config.machine_type = (
+                        f"zones/{wait_zone}/machineTypes/{MACHINE_TYPE}"
+                    )
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
-                    operation = instance_client.insert(project=GCP_PROJECT_ID, zone=wait_zone, instance_resource=instance_config)
+                    operation = instance_client.insert(
+                        project=GCP_PROJECT_ID,
+                        zone=wait_zone,
+                        instance_resource=instance_config,
+                    )
                     operation.result(timeout=240)
                     with _zone_lock:
                         _vm_zones[vm_instance_id] = wait_zone
@@ -1109,13 +1376,19 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
                         health["last_success"] = datetime.now(timezone.utc)
                         health["consecutive_failures"] = 0
                         health.pop("cooldown_expires_at", None)
-                        outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+                        outcomes = health.setdefault(
+                            "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
+                        )
                         outcomes.append(True)
                         _zone_failures.pop(wait_zone, None)
-                    logger.info(f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)")
+                    logger.info(
+                        f"Successfully provisioned VM {vm_instance_id} in {wait_zone} (after cooldown wait)"
+                    )
                     return operation.name
                 except Exception:
-                    logger.exception(f"Retry after cooldown wait failed for {wait_zone}")
+                    logger.exception(
+                        f"Retry after cooldown wait failed for {wait_zone}"
+                    )
                     raise
             else:
                 logger.critical(
@@ -1139,7 +1412,9 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
             # zone iteration, and secret setup. Previously 360s, which routinely
             # cancelled near-complete GCP operations (surfaced as
             # OPERATION_CANCELED_BY_USER 409 from the in-flight thread).
-            operation_name = await asyncio.wait_for(asyncio.to_thread(_insert_instance), timeout=420)
+            operation_name = await asyncio.wait_for(
+                asyncio.to_thread(_insert_instance), timeout=420
+            )
         logger.info(f"GCP Operation completed: {operation_name}")
         return True
     except (asyncio.TimeoutError, asyncio.CancelledError) as e:
@@ -1184,6 +1459,7 @@ async def _provision_gcp(vm_instance_id: str, task_id: uuid.UUID, payload_uri: s
 
 # ─── Shared VM Helpers (used by both delete and cleanup paths) ────────────
 
+
 def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
     """Best-effort serial capture. Returns tail or None.
 
@@ -1197,6 +1473,7 @@ def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
     fitting in JSONB without bloating the row.
     """
     from google.cloud import compute_v1
+
     if not zone or zone == "unknown":
         logger.warning(f"[COMPUTE] Serial capture skipped for {vm_name}: zone='{zone}'")
         return None
@@ -1211,7 +1488,10 @@ def _capture_serial_for_vm(vm_name: str, zone: str) -> str | None:
         # when it fails we must know why (VM already gone vs permission vs quota).
         logger.warning(
             "[COMPUTE] _capture_serial_for_vm failed for vm=%s zone=%s: %s: %s",
-            vm_name, zone, type(e).__name__, e,
+            vm_name,
+            zone,
+            type(e).__name__,
+            e,
         )
         return None
 
@@ -1225,11 +1505,14 @@ def get_vm_status(vm_name: str, zone: str) -> str | None:
     in asyncio.to_thread when called from the reaper.
     """
     from google.cloud import compute_v1
+
     if not zone or zone == "unknown":
         return None
     try:
         client = compute_v1.InstancesClient()
-        instance = client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_name, timeout=10)
+        instance = client.get(
+            project=GCP_PROJECT_ID, zone=zone, instance=vm_name, timeout=10
+        )
         return getattr(instance, "status", None) or None
     except Exception as e:
         if "was not found" in str(e) or "404" in str(e):
@@ -1237,13 +1520,16 @@ def get_vm_status(vm_name: str, zone: str) -> str | None:
             # instances are deleted, not just stopped. Return a synthetic
             # "DELETED" so callers can distinguish "vanished" from "API errored".
             return "DELETED"
-        logger.debug(f"[COMPUTE] get_vm_status failed for vm={vm_name} zone={zone}: {e}")
+        logger.debug(
+            f"[COMPUTE] get_vm_status failed for vm={vm_name} zone={zone}: {e}"
+        )
         return None
 
 
 def _delete_single_vm(vm_name: str, zone: str) -> bool:
     """Delete a single VM. No serial capture. Returns True on success."""
     from google.cloud import compute_v1
+
     try:
         client = compute_v1.InstancesClient()
         operation = client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_name)
@@ -1259,6 +1545,7 @@ def _delete_single_vm(vm_name: str, zone: str) -> bool:
 def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
     """List all agent-vm-* instances in a single zone. Returns [(name, zone, status)]."""
     from google.cloud import compute_v1
+
     results = []
     try:
         client = compute_v1.InstancesClient()
@@ -1281,23 +1568,28 @@ def _list_vms_in_zone(zone: str) -> list[tuple[str, str, str]]:
 
 # ─── Individual VM Deletion ───────────────────────────────────────────────
 
+
 async def _delete_gcp(vm_instance_id: str):
     """Delete a single VM. Captures serial BEFORE deletion for reliable forensics."""
     logger.info(f"Issuing external kill command for VM: {vm_instance_id}")
 
     def _find_capture_and_delete():
         from google.cloud import compute_v1
+
         instance_client = compute_v1.InstancesClient()
         zones_to_try = []
         with _zone_lock:
             known_zone = _vm_zones.pop(vm_instance_id, None)
+        _vm_images.pop(vm_instance_id, None)
         if known_zone:
             zones_to_try.append(known_zone)
         zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
 
         for zone in zones_to_try:
             try:
-                instance = instance_client.get(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                instance = instance_client.get(
+                    project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                )
                 # Serial capture only makes sense while the agent was running — for already
                 # TERMINATED/STOPPING VMs the buffer is just shutdown output, and the 10s call
                 # eats into the delete budget for no forensic gain.
@@ -1306,7 +1598,9 @@ async def _delete_gcp(vm_instance_id: str):
                     serial_tail = None
                 else:
                     serial_tail = _capture_serial_for_vm(vm_instance_id, zone)
-                operation = instance_client.delete(project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id)
+                operation = instance_client.delete(
+                    project=GCP_PROJECT_ID, zone=zone, instance=vm_instance_id
+                )
                 operation.result(timeout=180)
                 logger.info(f"Successfully terminated VM {vm_instance_id} in {zone}")
                 return zone, serial_tail
@@ -1322,8 +1616,7 @@ async def _delete_gcp(vm_instance_id: str):
             # Budget: up to ~10s zone probes + up to 10s serial + up to 180s delete op.
             # The prior 60s cap left ops that actually reached GCP stranded mid-delete.
             _deleted_zone, serial_tail = await asyncio.wait_for(
-                asyncio.to_thread(_find_capture_and_delete),
-                timeout=240
+                asyncio.to_thread(_find_capture_and_delete), timeout=240
             )
 
         if serial_tail:
@@ -1343,8 +1636,10 @@ async def _delete_gcp(vm_instance_id: str):
 
 # ─── Bulk Orphan Cleanup ──────────────────────────────────────────────────
 
+
 class CleanupResult:
     """Structured result from orphan cleanup."""
+
     __slots__ = ("deleted", "failed", "orphan_count", "total_gcp_vms")
 
     def __init__(self):
@@ -1367,7 +1662,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
 
     # Phase 1: Parallel zone listing (semaphore-bounded)
     unique_zones = list({z for z, _ in FALLBACK_ZONES})
-    logger.info(f"[GCP CLEANUP] Cycle starting — scanning {len(unique_zones)} zones, DB active: {len(active_vm_ids)}")
+    logger.info(
+        f"[GCP CLEANUP] Cycle starting — scanning {len(unique_zones)} zones, DB active: {len(active_vm_ids)}"
+    )
 
     async def _list_zone_bounded(zone: str):
         async with _gcp_ops_semaphore:
@@ -1385,7 +1682,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
         all_vms.extend(zr)
 
     result.total_gcp_vms = len(all_vms)
-    orphans = [(name, zone, status) for name, zone, status in all_vms if name not in active_set]
+    orphans = [
+        (name, zone, status) for name, zone, status in all_vms if name not in active_set
+    ]
     result.orphan_count = len(orphans)
 
     logger.info(
@@ -1401,7 +1700,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
     # preemption)" so operators distinguish capacity-driven kills from
     # agent crashes when scanning logs.
     async def _delete_orphan(name: str, zone: str, status: str):
-        logger.warning(f"[GCP CLEANUP] Deleting orphan {name} ({zone}, {_format_orphan_status(status)})")
+        logger.warning(
+            f"[GCP CLEANUP] Deleting orphan {name} ({zone}, {_format_orphan_status(status)})"
+        )
         try:
             async with _gcp_ops_semaphore:
                 success = await asyncio.to_thread(_delete_single_vm, name, zone)
@@ -1412,7 +1713,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
                     async with _gcp_ops_semaphore:
                         await asyncio.to_thread(_delete_agent_secret, name)
                 except Exception:
-                    logger.exception(f"[GCP CLEANUP] Failed to clean up secret for orphan {name}")
+                    logger.exception(
+                        f"[GCP CLEANUP] Failed to clean up secret for orphan {name}"
+                    )
             else:
                 result.failed.append(name)
         except asyncio.TimeoutError:
@@ -1422,7 +1725,9 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
             result.failed.append(name)
             logger.exception(f"[GCP CLEANUP] Exception deleting orphan {name}")
 
-    delete_tasks = [_delete_orphan(name, zone, status) for name, zone, status in orphans]
+    delete_tasks = [
+        _delete_orphan(name, zone, status) for name, zone, status in orphans
+    ]
     await asyncio.gather(*delete_tasks, return_exceptions=True)
 
     if result.deleted or result.failed:
@@ -1435,6 +1740,7 @@ async def _cleanup_gcp(active_vm_ids: list[str]) -> CleanupResult:
 
 
 # ─── Zone Health API ───────────────────────────────────────────────────────
+
 
 def get_zone_health() -> dict:
     """Return zone health data for admin API consumption."""
@@ -1459,16 +1765,24 @@ def get_zone_health() -> dict:
 
             outcomes = data.get("recent_outcomes")
             provision_count = len(outcomes) if outcomes else 0
-            success_rate = (sum(outcomes) / provision_count) if provision_count else None
+            success_rate = (
+                (sum(outcomes) / provision_count) if provision_count else None
+            )
 
             result[zone] = {
                 "status": status,
-                "last_success": data["last_success"].isoformat() if data.get("last_success") else None,
-                "last_failure": data["last_failure"].isoformat() if data.get("last_failure") else None,
+                "last_success": data["last_success"].isoformat()
+                if data.get("last_success")
+                else None,
+                "last_failure": data["last_failure"].isoformat()
+                if data.get("last_failure")
+                else None,
                 "last_failure_reason": data.get("last_failure_reason"),
                 "consecutive_failures": consecutive,
                 "cooldown_active": cooldown_active,
-                "cooldown_expires_at": cooldown_expires.isoformat() if cooldown_active and cooldown_expires else None,
+                "cooldown_expires_at": cooldown_expires.isoformat()
+                if cooldown_active and cooldown_expires
+                else None,
                 "success_rate": success_rate,
                 "provision_count": provision_count,
             }
@@ -1481,9 +1795,7 @@ def get_zone_health_summary() -> dict:
     exhausted = [z for z, d in health.items() if d["status"] == "exhausted"]
     disabled = [z for z, d in health.items() if d["status"] == "disabled"]
     zone_success_rates = {
-        z: d["success_rate"]
-        for z, d in health.items()
-        if d["success_rate"] is not None
+        z: d["success_rate"] for z, d in health.items() if d["success_rate"] is not None
     }
     active_total = len(FALLBACK_ZONES) - len(disabled)
     return {
@@ -1513,7 +1825,7 @@ def any_zone_available() -> bool:
             health = _zone_health.get(zone)
             if health is None:
                 return True  # Unknown = available
-            cooldown = health.get('cooldown_expires_at')
+            cooldown = health.get("cooldown_expires_at")
             if cooldown is None or now >= cooldown:
                 return True
     return False
@@ -1547,7 +1859,9 @@ def record_zone_failure(zone: str, reason: str = "HEARTBEAT_STARVATION") -> None
         health["last_failure_reason"] = reason
         cooldown_secs = _zone_cooldown_seconds(new_failure_count)
         health["cooldown_expires_at"] = now_fail + timedelta(seconds=cooldown_secs)
-        outcomes = health.setdefault("recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW))
+        outcomes = health.setdefault(
+            "recent_outcomes", _deque(maxlen=ZONE_HISTORY_WINDOW)
+        )
         outcomes.append(False)
 
     if entering_cooldown:
@@ -1570,7 +1884,7 @@ def soonest_zone_recovery() -> datetime | None:
             health = _zone_health.get(zone)
             if health is None:
                 return None  # Unknown = available now
-            cooldown = health.get('cooldown_expires_at')
+            cooldown = health.get("cooldown_expires_at")
             if cooldown is None or now >= cooldown:
                 return None  # Available now
             if soonest is None or cooldown < soonest:
