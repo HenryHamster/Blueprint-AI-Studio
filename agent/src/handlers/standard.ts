@@ -358,6 +358,15 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
   const checkResults = (sr.check_results as Record<string, Record<string, unknown>> | undefined) ?? {};
   const checkResultsLookup = checkResults as Record<string, Record<string, unknown> | undefined>;
+
+  // Backfill origin='sr' on existing agent self-review entries that lack an origin field.
+  for (const [, entry] of Object.entries(checkResultsLookup)) {
+    if (entry && !('origin' in entry)) {
+      entry.origin = 'sr';
+    }
+  }
+
+  // Merge fresh-reviewer findings, tagging each with origin='reviewer'.
   for (const f of groundedFindings) {
     const existing = checkResultsLookup[f.category];
     if (!existing || existing.passed === true) {

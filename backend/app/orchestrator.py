@@ -623,6 +623,11 @@ def _serialize_anomaly_snapshot() -> dict:
     for proj_id, proj_anomalies in _shared_state.persistent_anomalies.items():
         serializable_anomalies[proj_id] = {}
         for k, v in proj_anomalies.items():
+            if not isinstance(v, dict):
+                serializable_anomalies[proj_id][k] = (
+                    v.isoformat() if isinstance(v, datetime) else v
+                )
+                continue
             serializable_anomalies[proj_id][k] = {
                 fk: fv.isoformat() if isinstance(fv, datetime) else fv
                 for fk, fv in v.items()

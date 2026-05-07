@@ -9781,6 +9781,7 @@ async def test_digest_sr_trends_fp_fields_passthrough(client: AsyncClient, db_se
     project.design_doc = {
         "sr_catch_rate_trends": {
             "computed_at": "2026-05-01T00:00:00",
+            "signal_last_computed_at": "2026-05-01T00:00:00",
             "categories": {
                 "correctness": {
                     "current_hit_rate": 0.7,
@@ -9807,6 +9808,46 @@ async def test_digest_sr_trends_fp_fields_passthrough(client: AsyncClient, db_se
     assert correctness["fp_count"] == 2
     assert correctness["tp_count"] == 3
     assert correctness["false_positive_rate"] == 0.4
+    assert trends["signal_last_computed_at"] == "2026-05-01T00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_regressions_surface_signal_staleness(
+    client: AsyncClient, db_session
+):
+    """Stale signal timestamps are surfaced as warning regressions."""
+    from app.pipeline_regression_dispatcher import run_once
+
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": (
+                    datetime.utcnow() - timedelta(days=3)
+                ).isoformat(),
+            },
+            "fix_loop_divergence_signal_last_computed_at": (
+                datetime.utcnow() - timedelta(days=8)
+            ).isoformat(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await run_once(db_session, project.id)
+
+    response = await client.get(
+        f"/api/admin/pipeline-regressions?project_id={project.id}"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    stale = {
+        r["regression_class"]: r
+        for r in body["regressions"]
+        if r["regression_class"].startswith("signal_staleness:")
+    }
+    assert "signal_staleness:sr_catch_rate" in stale
+    assert "signal_staleness:fix_loop_divergence" in stale
+    assert "last computed" in stale["signal_staleness:sr_catch_rate"]["details"]
 
 
 # ---------------------------------------------------------------------------
@@ -11292,6 +11333,154 @@ async def test_regression_dispatcher_health_with_cycle_and_case(
     cls = data["per_class"][0]
     assert cls["regression_class"] == "sr_catch_rate:correctness"
     assert cls["status"] == RegressionCaseStatus.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/anomaly-tracker/snapshot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_anomaly_tracker_snapshot_empty(client: AsyncClient):
+    """Empty persistent_anomalies returns empty projects list and null run_at."""
+    import app.shared_state as _ss
+
+    saved_dict = dict(_ss.persistent_anomalies)
+    saved_run_at = _ss.last_anomaly_detection_run_at
+    _ss.persistent_anomalies.clear()
+    _ss.last_anomaly_detection_run_at = None
+    try:
+        response = await client.get("/api/admin/anomaly-tracker/snapshot")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["last_detection_run_at"] is None
+        assert data["freshness_window_hours"] == 24
+        assert data["total"] == 0
+        assert data["projects"] == []
+    finally:
+        _ss.persistent_anomalies.clear()
+        _ss.persistent_anomalies.update(saved_dict)
+        _ss.last_anomaly_detection_run_at = saved_run_at
+
+
+@pytest.mark.asyncio
+async def test_anomaly_tracker_snapshot_fresh_and_stale(
+    client: AsyncClient, db_session
+):
+    """Returns sorted entries, marks stuck=true for stale last_seen, echoes run_at."""
+    import app.shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    now = _utcnow()
+    fresh_last = (now - timedelta(hours=2)).isoformat()
+    stale_last = (now - timedelta(hours=72)).isoformat()
+    first_seen = (now - timedelta(hours=96)).isoformat()
+    run_at = now - timedelta(minutes=3)
+
+    saved_dict = dict(_ss.persistent_anomalies)
+    saved_run_at = _ss.last_anomaly_detection_run_at
+    _ss.persistent_anomalies.clear()
+    _ss.persistent_anomalies[proj_key] = {
+        "FailureRateMomentum": {
+            "first_seen": first_seen,
+            "last_seen": fresh_last,
+            "occurrence_count": 4,
+            "severity": "high",
+            "latest_details": "fresh anomaly",
+            "affected_directions": ["dir-1"],
+        },
+        "CrossDirectionFingerprint_abc": {
+            "first_seen": first_seen,
+            "last_seen": stale_last,
+            "occurrence_count": 2,
+            "severity": "medium",
+            "latest_details": "stale anomaly",
+            "fingerprint": "abc",
+        },
+    }
+    _ss.last_anomaly_detection_run_at = run_at
+    try:
+        response = await client.get(
+            "/api/admin/anomaly-tracker/snapshot",
+            params={"project_id": str(project.id), "freshness_hours": 48},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["last_detection_run_at"] == run_at.isoformat()
+        assert data["freshness_window_hours"] == 48
+        assert data["total"] == 2
+        assert len(data["projects"]) == 1
+        bucket = data["projects"][0]
+        assert bucket["project_id"] == proj_key
+        entries = bucket["anomalies"]
+        # Sorted by last_seen desc — fresh first.
+        assert entries[0]["key"] == "FailureRateMomentum"
+        assert entries[0]["stuck"] is False
+        assert entries[0]["affected_directions"] == ["dir-1"]
+        assert entries[0]["last_dispatch_attempt_at"] is None
+        assert entries[1]["key"] == "CrossDirectionFingerprint_abc"
+        assert entries[1]["stuck"] is True
+        assert entries[1]["fingerprint"] == "abc"
+    finally:
+        _ss.persistent_anomalies.clear()
+        _ss.persistent_anomalies.update(saved_dict)
+        _ss.last_anomaly_detection_run_at = saved_run_at
+
+
+@pytest.mark.asyncio
+async def test_anomaly_tracker_snapshot_dispatch_lookup(
+    client: AsyncClient, db_session
+):
+    """When a RegressionRemediationCase exists for (project, anomaly_key), its
+    last_seen_at is echoed as last_dispatch_attempt_at."""
+    import app.shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case_seen = _utcnow() - timedelta(minutes=10)
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        # Dispatcher prefixes anomaly cases with 'anomaly:' (pipeline_regression_dispatcher.py:1748);
+        # the snapshot endpoint strips that prefix when keying case_index.
+        regression_class="anomaly:FailureRateMomentum",
+        status=RegressionCaseStatus.ACTIVE,
+        last_seen_at=case_seen,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    proj_key = str(project.id)
+    saved_dict = dict(_ss.persistent_anomalies)
+    _ss.persistent_anomalies.clear()
+    _ss.persistent_anomalies[proj_key] = {
+        "FailureRateMomentum": {
+            "first_seen": _utcnow().isoformat(),
+            "last_seen": _utcnow().isoformat(),
+            "occurrence_count": 3,
+            "severity": "high",
+            "latest_details": "x",
+        },
+    }
+    try:
+        response = await client.get(
+            "/api/admin/anomaly-tracker/snapshot",
+            params={"project_id": str(project.id)},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        entry = data["projects"][0]["anomalies"][0]
+        assert entry["last_dispatch_attempt_at"] == case_seen.isoformat()
+    finally:
+        _ss.persistent_anomalies.clear()
+        _ss.persistent_anomalies.update(saved_dict)
 
 
 # ---------------------------------------------------------------------------

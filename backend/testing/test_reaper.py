@@ -36,6 +36,7 @@ from app.reaper import (
     _copy_analysis_artifacts_to_previous,
     _reaper_skip_counts,
     _heartbeat_stale_cutoff,
+    _progress_stale_cutoff,
 )
 from app.shared_state import runtime_config as _runtime_config
 
@@ -141,6 +142,87 @@ def test_heartbeat_stale_cutoff_unknown_effort_uses_scope_threshold():
 
     now = datetime(2026, 1, 1, 12, 0, 0)
     assert _heartbeat_stale_cutoff(_T(), now) == now - timedelta(seconds=300)
+
+
+# ── _progress_stale_cutoff ────────────────────────────────────────────────────
+
+
+def test_progress_stale_cutoff_small_scope_default_is_480s():
+    """Small-scope default progress-stale threshold is 480s (8 minutes)."""
+
+    class _T:
+        context = {"scope": "small"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=480)
+
+
+def test_progress_stale_cutoff_medium_scope_default_is_720s():
+    """Medium-scope default progress-stale threshold is 720s (12 minutes)."""
+
+    class _T:
+        context = {"scope": "medium"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=720)
+
+
+def test_progress_stale_cutoff_large_scope_default_is_1080s():
+    """Large-scope default progress-stale threshold is 1080s (18 minutes)."""
+
+    class _T:
+        context = {"scope": "large"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1080)
+
+
+def test_progress_stale_cutoff_respects_runtime_config_override():
+    """_progress_stale_cutoff reads per-scope thresholds from runtime_config."""
+    original = _runtime_config.get("progress_stale_seconds_by_scope")
+    try:
+        _runtime_config["progress_stale_seconds_by_scope"] = {
+            "small": 300,
+            "medium": 600,
+            "large": 900,
+        }
+
+        class _T:
+            context = {"scope": "medium"}
+            first_payload = None
+
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=600)
+    finally:
+        if original is None:
+            _runtime_config.pop("progress_stale_seconds_by_scope", None)
+        else:
+            _runtime_config["progress_stale_seconds_by_scope"] = original
+
+
+def test_progress_stale_cutoff_unknown_scope_falls_back_to_small():
+    """Unknown scope string falls back to the small-scope threshold (480s)."""
+
+    class _T:
+        context = {"scope": "unknown_scope_xyz"}
+        first_payload = None
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=480)
+
+
+def test_progress_stale_cutoff_reads_scope_from_payload():
+    """Scope falls back to first_payload when context has no scope key."""
+
+    class _T:
+        context = {}
+        first_payload = {"scope": "large"}
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1080)
 
 
 class _StopLoop(Exception):

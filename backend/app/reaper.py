@@ -204,6 +204,31 @@ _PRECLAIM_STALE_DEFAULTS = {
     "large": 600,
 }
 
+# Progress-staleness thresholds: how long a fresh-heartbeating task may go
+# without any tool/LLM event before being classified as agent_stalled.
+# Longer than heartbeat-stale to avoid false positives on normal LLM think time.
+_PROGRESS_STALE_DEFAULTS = {
+    "small": 480,  # 8 min
+    "medium": 720,  # 12 min
+    "large": 1080,  # 18 min
+}
+
+
+def _progress_stale_cutoff(task, now: datetime) -> datetime:
+    """Return cutoff time for meaningful-progress (last_tool_use_at) staleness.
+
+    Only fires when last_heartbeat IS fresh (agent alive but wedged). Uses
+    longer thresholds than heartbeat-stale to tolerate normal LLM latency.
+    """
+    ctx = task.context or {}
+    payload = task.first_payload or {}
+    scope = ctx.get("scope") or payload.get("scope")
+    thresholds = _runtime_config.get(
+        "progress_stale_seconds_by_scope", _PROGRESS_STALE_DEFAULTS
+    )
+    seconds = thresholds.get(scope, thresholds.get("small", 480))
+    return now - timedelta(seconds=seconds)
+
 
 def _extract_tool_trace_tail(task) -> str:
     """Extract and format the tail of _tool_trace from task.context.
@@ -729,6 +754,18 @@ async def reaper_service():
                             # that's been alive for >10 min — data corruption or a path that
                             # forgot to set started_at. Reap as a catch-all.
                             orphaned_ids.append(task.id)
+                        elif (
+                            task.last_heartbeat
+                            and task.last_heartbeat >= hb_cutoff
+                            and task.last_tool_use_at is not None
+                            and task.last_tool_use_at
+                            < _progress_stale_cutoff(task, now)
+                        ):
+                            # Stalled-but-heartbeating: agent process is alive (fresh
+                            # heartbeat) but has made no tool/LLM calls for longer than
+                            # the scope-aware progress threshold. Indicates a hung LLM
+                            # call, a spinning retry loop, or a wedged tool invocation.
+                            orphaned_ids.append(task.id)
                     elif task.created_at < ten_minutes_ago:
                         orphaned_ids.append(task.id)
 
@@ -860,6 +897,13 @@ async def reaper_service():
                                 and t.created_at < ten_minutes_ago
                             ):
                                 verified.append(t)
+                            elif (
+                                t.last_heartbeat
+                                and t.last_heartbeat >= hb_cutoff
+                                and t.last_tool_use_at is not None
+                                and t.last_tool_use_at < _progress_stale_cutoff(t, now)
+                            ):
+                                verified.append(t)
                         elif t.created_at < ten_minutes_ago:
                             verified.append(t)
                     orphaned_tasks = verified
@@ -943,6 +987,21 @@ async def reaper_service():
                         age = int((now - clock).total_seconds()) if clock else 0
                         reap_reason = f"Silent pre-claim death — {age}s since VM provisioned, no heartbeat"
                         reap_reason_code = "provision_timeout_pre_claim"
+                    elif (
+                        fresh_task.last_heartbeat
+                        and fresh_task.last_tool_use_at is not None
+                        and fresh_task.last_tool_use_at
+                        < _progress_stale_cutoff(fresh_task, now)
+                        and fresh_task.last_heartbeat
+                        >= _heartbeat_stale_cutoff(fresh_task, now)
+                    ):
+                        # Stalled-but-heartbeating: process alive, no tool progress.
+                        age = int((now - fresh_task.last_tool_use_at).total_seconds())
+                        reap_reason = (
+                            f"Agent stalled — heartbeat fresh but no tool calls for {age}s "
+                            f"(last_tool_use_at={fresh_task.last_tool_use_at.isoformat()})"
+                        )
+                        reap_reason_code = "agent_stalled"
                     elif fresh_task.last_heartbeat:
                         age = int((now - fresh_task.last_heartbeat).total_seconds())
                         reap_reason = f"No heartbeat for {age}s (last: {fresh_task.last_heartbeat.isoformat()})"
@@ -1939,6 +1998,8 @@ async def reaper_service():
                             task, logs=extra_logs or None
                         )
                         failure_class = classification.failure_class
+                        if reap_reason_code == "agent_stalled":
+                            failure_class = "agent_stalled"
                         persist_failure_category(
                             task,
                             failure_class,

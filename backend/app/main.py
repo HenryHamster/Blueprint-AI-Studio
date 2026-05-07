@@ -576,6 +576,9 @@ async def _init_deployment_state():
                 for proj_id, proj_anomalies in raw_anomalies.items():
                     restored_proj: dict = {}
                     for k, v in proj_anomalies.items():
+                        if not isinstance(v, dict):
+                            restored_proj[k] = v
+                            continue
                         entry: dict = {}
                         for fk, fv in v.items():
                             # first_seen/last_seen are ISO strings everywhere they're

@@ -30,6 +30,20 @@ _SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing 
 _TASK_SCAN_CAP = 2000
 
 
+def stamp_sr_blind_spot_computed_at(
+    doc: dict,
+    now: datetime | None = None,
+) -> None:
+    """Write the current UTC timestamp into *doc* under the sr_blind_spot
+    signal_last_computed_at key consumed by the pipeline staleness watchdog.
+
+    Centralising the write here keeps the design-doc key name canonical and
+    lets callers avoid hardcoding it.  Pass *now* in tests to fix the clock.
+    """
+    ts = (now or datetime.utcnow()).isoformat()
+    doc["sr_blind_spot_signal_last_computed_at"] = ts
+
+
 def is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
     """A self-review outcome is a 'skip' when the agent emitted the
     bash ./done fallback envelope: verdict=='unknown' with empty

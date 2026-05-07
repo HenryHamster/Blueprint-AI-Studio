@@ -698,6 +698,12 @@ last_idle_check: Optional[datetime] = None
 # project_id -> { anomaly_key -> {first_seen, last_seen, occurrence_count, severity, latest_details} }
 persistent_anomalies: Dict[str, Dict[str, Dict]] = {}
 
+# Last time _compute_research_anomalies completed successfully for ANY project.
+# Used by /api/admin/anomaly-tracker/snapshot so operators can detect a silent
+# writer failure (corrupted shared_state, swallowed exception). Ephemeral —
+# not persisted across pod restarts.
+last_anomaly_detection_run_at: Optional[datetime] = None
+
 # Key used inside Project.design_doc for anomaly fingerprint persistence.
 _ANOMALY_FINGERPRINTS_KEY = "_anomaly_fingerprints"
 
@@ -752,7 +758,9 @@ async def persist_anomaly_snapshot(
     if project is None:
         return
     doc = dict(project.design_doc or {})
-    doc[_ANOMALY_FINGERPRINTS_KEY] = {k: dict(v) for k, v in proj_anomalies.items()}
+    doc[_ANOMALY_FINGERPRINTS_KEY] = {
+        k: dict(v) if isinstance(v, dict) else v for k, v in proj_anomalies.items()
+    }
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)

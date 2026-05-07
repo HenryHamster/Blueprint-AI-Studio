@@ -21,7 +21,7 @@
     "research_completion.py": 2350,
     "strategic_completion.py": 1800,
     "rollup_management.py": 2950,
-    "reaper.py": 2950,
+    "reaper.py": 3050,
     "review_pipeline.py": 2350,
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 250
@@ -38,7 +38,7 @@
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1650,
     "components/PipelineView.tsx": 1200,
-    "components/DashboardHome.tsx": 2150,
+    "components/DashboardHome.tsx": 2250,
     "components/MessagesPanel.tsx": 1500,
     "components/MetricsDashboard.tsx": 1500,
     "components/ProjectDashboard.tsx": 1500,

@@ -211,6 +211,8 @@ def _expire_stale_project_anomalies(
         if key in seen_keys:
             continue
         entry = proj_anomalies.get(key) or {}
+        if not isinstance(entry, dict):
+            continue
         current_last_seen = _as_iso(entry.get("last_seen"))
         if current_last_seen != initial_last_seen.get(key, current_last_seen):
             continue
@@ -664,6 +666,11 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         initial_last_seen=initial_last_seen,
     )
 
+    # Record when this signal was last freshly computed so the staleness watchdog
+    # in pipeline_regression_dispatcher._run_signal_staleness_watchdog can detect
+    # if _compute_research_anomalies stops being called (e.g. aggregator loop dies).
+    proj_anomalies["signal_last_computed_at"] = now_iso
+
     # Persist so occurrence counts survive pod restarts (writes to Project.design_doc;
     # caller owns the commit).
     try:
@@ -672,6 +679,16 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
         logger.warning(
             "[ANOMALY_PERSIST] Failed to persist anomaly snapshot for %s",
             proj_key,
+            exc_info=True,
+        )
+
+    # Record successful run for the silent-writer watchdog. Wrapped so a
+    # tracking failure can never break detection.
+    try:
+        _shared_state.last_anomaly_detection_run_at = now
+    except Exception:
+        logger.warning(
+            "[ANOMALY_TRACKER] Failed to record last_anomaly_detection_run_at",
             exc_info=True,
         )
 
@@ -1211,7 +1228,10 @@ def _expire_stale_anomalies() -> int:
     expired = 0
     for proj_key, proj_anomalies in list(_shared_state.persistent_anomalies.items()):
         for key in list(proj_anomalies):
-            last_seen = _as_iso(proj_anomalies[key].get("last_seen"))
+            entry = proj_anomalies[key]
+            if not isinstance(entry, dict):
+                continue
+            last_seen = _as_iso(entry.get("last_seen"))
             if last_seen and last_seen < stale_cutoff:
                 del proj_anomalies[key]
                 expired += 1
@@ -1670,11 +1690,11 @@ async def _check_anomaly_proposals(project, session):
 
     now_iso = _utcnow().isoformat()
     for anomaly_key, info in sorted(
-        proj_anomalies.items(),
+        ((k, v) for k, v in proj_anomalies.items() if isinstance(v, dict)),
         key=lambda x: x[1].get("occurrence_count", 0),
         reverse=True,
     ):
-        if info["occurrence_count"] < 3:
+        if info.get("occurrence_count", 0) < 3:
             continue
 
         # Build proposal text based on the anomaly key pattern

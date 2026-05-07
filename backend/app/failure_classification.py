@@ -128,6 +128,15 @@ MIGRATION_ERROR = "MIGRATION_ERROR"
 # 79a4a5ec each consumed a retry slot on a missing-on-main dispatcher file
 # that was waiting on an upstream rollup PR (#3768) to land.
 BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
+# Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
+# for longer than the scope-aware threshold (8 min small / 12 min medium /
+# 18 min large). Detected by the reaper's progress-staleness sweep, which
+# checks last_tool_use_at against _progress_stale_cutoff() while verifying
+# last_heartbeat is fresh. Distinct from AGENT_TIMEOUT (process dead / reaped
+# for heartbeat absence) so the dispatcher can track wedged-agent regressions
+# separately from crash/OOM regressions. Lowercase to match the literal string
+# the reaper writes into failure_category context.
+AGENT_STALLED = "agent_stalled"
 
 
 # Substrings that uniquely identify migration-related failures. Kept narrow so
@@ -177,6 +186,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         EXTERNAL_API,
         SCOPE_OVERFLOW,
         BLOCKED_PRECONDITION,
+        AGENT_STALLED,
     }
 )
 
@@ -188,6 +198,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     PROVISION_FAILURE,
     MIGRATION_ERROR,
     AGENT_TIMEOUT,
+    AGENT_STALLED,
     SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
 )
@@ -394,6 +405,10 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # (which is for non-zero exit) so analytics can separate "Claude bailed
     # silently" from "Claude crashed."
     "incomplete": CODE_ERROR,
+    # ``agent_stalled`` — reaper-emitted when heartbeat is fresh but no tool/LLM
+    # progress for longer than the scope-aware threshold. Written as lowercase by
+    # the reaper; fast-path maps it to the canonical AGENT_STALLED constant.
+    "agent_stalled": AGENT_STALLED,
 }
 
 
@@ -481,6 +496,7 @@ _SEVERITY: dict[str, int] = {
     MIGRATION_ERROR: 3,
     CODE_ERROR: 3,
     AGENT_TIMEOUT: 2,
+    AGENT_STALLED: 2,
     PROVISION_FAILURE: 1,
     EXTERNAL_API: 1,
     RATE_LIMIT: 1,

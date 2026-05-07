@@ -1232,6 +1232,7 @@ class TestFailureClassificationInvariants:
 
     def test_infra_classes_membership_exact(self):
         from app.failure_classification import (
+            AGENT_STALLED,
             AGENT_TIMEOUT,
             BLOCKED_PRECONDITION,
             EXTERNAL_API,
@@ -1246,6 +1247,7 @@ class TestFailureClassificationInvariants:
                 PROVISION_FAILURE,
                 RATE_LIMIT,
                 AGENT_TIMEOUT,
+                AGENT_STALLED,
                 EXTERNAL_API,
                 SCOPE_OVERFLOW,
                 BLOCKED_PRECONDITION,

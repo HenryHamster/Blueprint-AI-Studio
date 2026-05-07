@@ -354,6 +354,34 @@ export interface SrFixIterationBucket {
 
 export type SrFixIterationBreakdown = Record<string, SrFixIterationBucket>;
 
+export interface RegressionClassKpiRow {
+  regression_class: string;
+  cases_opened: number;
+  cases_closed: number;
+  dispatch_attempt_count: number;
+  remediation_success_rate: number | null;
+  mean_time_to_detect_seconds: number | null;
+  mean_time_to_remediate_seconds: number | null;
+}
+
+export interface RegressionClassKpisResponse {
+  project_id: string;
+  window_hours: number;
+  class_count: number;
+  classes: RegressionClassKpiRow[];
+}
+
+export async function fetchRegressionClassKpis(
+  projectId: string,
+  windowHours = 168,
+): Promise<RegressionClassKpisResponse> {
+  const res = await apiFetch(
+    `/api/admin/regression-class-kpis?project_id=${encodeURIComponent(projectId)}&window_hours=${windowHours}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch regression class KPIs: ${res.status}`);
+  return res.json();
+}
+
 export async function onboardProject(
   owner: string,
   repo: string,

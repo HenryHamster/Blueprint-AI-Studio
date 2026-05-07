@@ -44,6 +44,7 @@ from app.models import (
     TaskStatus,
 )
 from app.payload_schemas import validate_internal_payload
+import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -147,6 +148,15 @@ _signal_first_tripped: dict[tuple[str, str], datetime] = {}
 # from a prior case lifecycle cannot let a re-opened case bypass the window.
 _signal_healthy_since: dict[tuple[str, str], datetime] = {}
 
+_SIGNAL_STALENESS_WINDOWS = {
+    "sr_catch_rate": timedelta(hours=48),
+    "fix_loop_divergence": timedelta(days=7),
+    "sr_blind_spot": timedelta(days=7),
+    "persistent_anomaly": timedelta(hours=48),
+    "deploy_health": timedelta(hours=6),
+    "ci_completion": timedelta(hours=6),
+}
+
 # Per-project last cycle timestamp (monotonic). Updated in run_once finally
 # block even when run_once raises. Used by the staleness watchdog alarm.
 # An absent entry means no cycle has ever completed for this process boot.
@@ -158,6 +168,91 @@ _cycle_signals_tripped_var: contextvars.ContextVar[list] = contextvars.ContextVa
     "_cycle_signals_tripped",
     default=None,
 )
+
+
+def _parse_iso_timestamp(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+async def _run_signal_staleness_watchdog(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict[str, Any] | None,
+) -> int:
+    """Emit warning Alerts when a known signal source has stopped updating."""
+    doc = project_design_doc or {}
+    now = _utcnow()
+    specs: list[tuple[str, Any, timedelta]] = [
+        (
+            "sr_catch_rate",
+            (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at")
+            or (doc.get("sr_catch_rate_trends") or {}).get("computed_at"),
+            _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"],
+        ),
+        (
+            "fix_loop_divergence",
+            doc.get("fix_loop_divergence_signal_last_computed_at")
+            or doc.get("fix_loop_divergence_detected_at"),
+            _SIGNAL_STALENESS_WINDOWS["fix_loop_divergence"],
+        ),
+        (
+            "persistent_anomaly",
+            (
+                (_shared_state.persistent_anomalies.get(str(project_id)) or {}).get(
+                    "signal_last_computed_at"
+                )
+            ),
+            _SIGNAL_STALENESS_WINDOWS["persistent_anomaly"],
+        ),
+        (
+            "deploy_health",
+            _shared_state.deploy_monitoring.get("signal_last_computed_at"),
+            _SIGNAL_STALENESS_WINDOWS["deploy_health"],
+        ),
+    ]
+    created = 0
+    for signal_name, raw_ts, threshold in specs:
+        computed_at = _parse_iso_timestamp(raw_ts)
+        if computed_at is None or (now - computed_at) <= threshold:
+            continue
+        age = now - computed_at
+        title = f"Signal staleness: {signal_name}"
+        message = (
+            f"{signal_name} last computed {round(age.total_seconds() / 3600, 1)}h "
+            f"ago; freshness window is {round(threshold.total_seconds() / 3600, 1)}h."
+        )
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is None:
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=title,
+                    message=message,
+                )
+            )
+            created += 1
+    return created
 
 
 def get_dispatcher_cycle_records(
@@ -2650,6 +2745,10 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         if project is None:
             return 0
 
+        stale_alerts_created = await _run_signal_staleness_watchdog(
+            session, project_id, project.design_doc
+        )
+
         # Deploy-monitoring guard: if a fresh deploy is in its observation window,
         # defer spawns to avoid chasing deploy-induced signal noise.  PAUSED/HALTED
         # are operator-controlled states the dispatcher already skips via other
@@ -2676,6 +2775,8 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
                     deploy_state,
                     "pipeline_regression_dispatcher",
                 )
+                await session.commit()
+            elif stale_alerts_created:
                 await session.commit()
             return 0
 
@@ -2734,7 +2835,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             spawn_budget - _spawned,
         )
 
-        if _spawned:
+        if _spawned or stale_alerts_created:
             await session.commit()
         return _spawned
     finally:

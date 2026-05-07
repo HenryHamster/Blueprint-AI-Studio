@@ -3297,6 +3297,7 @@ async def compute_sr_catch_rate_trends(
     edges_stats = _compute_edges_stats(all_tasks)
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
+        "signal_last_computed_at": now.isoformat(),
         "bucket_mode": "cycle" if use_cycle_mode else "calendar",
         "current_cycle_id": current_cycle_id,
         "previous_cycle_id": previous_cycle_id,
@@ -3763,6 +3764,11 @@ async def check_fix_loop_divergence_regression(
         return None
     doc = dict(project.design_doc or {})
     if doc.get("fix_loop_divergence_alerted_window") == window_key:
+        doc["fix_loop_divergence_signal_last_computed_at"] = now.isoformat()
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+        await session.commit()
         return None
 
     tasks = (
@@ -3842,6 +3848,7 @@ async def check_fix_loop_divergence_regression(
     doc["fix_loop_divergence_alerted_window"] = window_key
     doc["fix_loop_divergence_regressions"] = regressions
     doc["fix_loop_divergence_detected_at"] = now.isoformat()
+    doc["fix_loop_divergence_signal_last_computed_at"] = now.isoformat()
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)

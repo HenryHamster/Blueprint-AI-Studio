@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, CheckCircle, RotateCcw, Activity } from 'lucide-react';
+import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
-import { timeAgo } from '../utils/time';
+import { timeAgo, parseTimestamp } from '../utils/time';
 
 interface DispatcherCycleClass {
   regression_class: string;
@@ -79,6 +79,77 @@ export function DispatcherHealthPanel({ projectId }: Props) {
   );
 }
 
+export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props) {
+  const [data, setData] = useState<{ window_hours: number; class_count: number; classes: ClassKpiRow[] } | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [windowHours, setWindowHours] = useState(168);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-class-kpis?project_id=${encodeURIComponent(projectId)}&window_hours=${windowHours}`)
+      .then(async (res) => { if (!cancelled && res.ok) setData(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId, windowHours]);
+
+  if (!loaded || !data || data.class_count === 0) return null;
+
+  return (
+    <section data-testid="class-kpis-panel" className="mb-4">
+      <div className="flex items-center justify-between mb-2">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Per-Class KPIs</h2>
+        <select
+          value={windowHours}
+          onChange={(e) => setWindowHours(Number(e.target.value))}
+          className="text-[10px] bg-neutral-800 border border-neutral-700 rounded px-1.5 py-0.5 text-neutral-400"
+        >
+          <option value={24}>24h</option>
+          <option value={168}>7d</option>
+          <option value={720}>30d</option>
+        </select>
+      </div>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        <table className="w-full text-[10px]">
+          <thead>
+            <tr className="border-b border-neutral-800/50 text-neutral-500">
+              <th className="text-left px-3 py-1.5 font-medium">Class</th>
+              <th className="text-right px-2 py-1.5 font-medium">Opened</th>
+              <th className="text-right px-2 py-1.5 font-medium">Closed</th>
+              <th className="text-right px-2 py-1.5 font-medium">MTTD</th>
+              <th className="text-right px-2 py-1.5 font-medium">MTTR</th>
+              <th className="text-right px-3 py-1.5 font-medium">Success</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {data.classes.map((row) => {
+              const active = filterClass === row.regression_class;
+              return (
+                <tr
+                  key={row.regression_class}
+                  onClick={() => onClassSelect?.(active ? null : row.regression_class)}
+                  className={`transition-colors ${onClassSelect ? 'cursor-pointer' : ''} ${active ? 'bg-blue-950/30' : onClassSelect ? 'hover:bg-neutral-800/30' : ''}`}
+                >
+                  <td className="px-3 py-1.5 font-mono text-neutral-300 max-w-[160px] truncate">{row.regression_class}</td>
+                  <td className="px-2 py-1.5 text-right text-white">{row.cases_opened}</td>
+                  <td className="px-2 py-1.5 text-right text-emerald-400">{row.cases_closed}</td>
+                  <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_detect_seconds)}</td>
+                  <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_remediate_seconds)}</td>
+                  <td className="px-3 py-1.5 text-right">
+                    {row.remediation_success_rate !== null
+                      ? <span className={row.remediation_success_rate >= 0.5 ? 'text-emerald-400' : 'text-amber-400'}>{Math.round(row.remediation_success_rate * 100)}%</span>
+                      : <span className="text-neutral-600">—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 interface FixLogEntry {
   fix_pr_number?: number;
   merged_at?: string;
@@ -113,8 +184,20 @@ const ESCALATION_REASON_LABELS: Record<string, string> = {
   recovered_unattended: 'Auto-recovered (24h healthy)',
 };
 
+interface ClassKpiRow {
+  regression_class: string;
+  cases_opened: number;
+  cases_closed: number;
+  dispatch_attempt_count: number;
+  remediation_success_rate: number | null;
+  mean_time_to_detect_seconds: number | null;
+  mean_time_to_remediate_seconds: number | null;
+}
+
 interface Props {
   projectId: string;
+  filterClass?: string | null;
+  onClassSelect?: (cls: string | null) => void;
 }
 
 function formatMttd(sec: number | null | undefined): string {
@@ -134,7 +217,7 @@ function snapshotSummary(snap: Record<string, unknown> | null): string {
   return entries.length ? entries.join(', ') : '—';
 }
 
-export function ManualInterventionPanel({ projectId }: Props) {
+export function ManualInterventionPanel({ projectId, filterClass }: Props) {
   const [cases, setCases] = useState<ManualInterventionCase[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [clearing, setClearing] = useState<string | null>(null);
@@ -178,10 +261,12 @@ export function ManualInterventionPanel({ projectId }: Props) {
 
   if (!loaded) return null;
 
-  const sorted = [...cases].sort((a, b) => {
-    if (sortKey === 'mttd') return (b.time_to_detect_sec ?? -1) - (a.time_to_detect_sec ?? -1);
-    return (b.last_seen_at ?? '').localeCompare(a.last_seen_at ?? '');
-  });
+  const sorted = [...cases]
+    .filter(c => !filterClass || c.regression_class === filterClass)
+    .sort((a, b) => {
+      if (sortKey === 'mttd') return (b.time_to_detect_sec ?? -1) - (a.time_to_detect_sec ?? -1);
+      return (b.last_seen_at ?? '').localeCompare(a.last_seen_at ?? '');
+    });
 
   return (
     <section data-testid="manual-intervention-panel">
@@ -308,6 +393,129 @@ export function ManualInterventionPanel({ projectId }: Props) {
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface AnomalyEntry {
+  key: string;
+  first_seen: string;
+  last_seen: string;
+  occurrence_count: number;
+  severity: string;
+  latest_details: string;
+  fingerprint: string | null;
+  affected_directions: string[] | null;
+  last_dispatch_attempt_at: string | null;
+  stuck: boolean;
+}
+
+interface AnomalyTrackerSnapshot {
+  last_detection_run_at: string | null;
+  freshness_window_hours: number;
+  total: number;
+  projects: { project_id: string; anomalies: AnomalyEntry[] }[];
+}
+
+// Detection sweep cadence is sub-minute; flagging amber after 30 min keeps the
+// signal noticeable while staying well clear of normal jitter.
+const DETECTION_STALE_MS = 30 * 60 * 1000;
+
+export function AnomalyTrackerPanel({ projectId }: Props) {
+  const [snap, setSnap] = useState<AnomalyTrackerSnapshot | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/anomaly-tracker/snapshot?project_id=${encodeURIComponent(projectId)}&freshness_hours=24`)
+      .then(async (res) => { if (!cancelled && res.ok) setSnap(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!loaded) return null;
+
+  const lastRun = snap?.last_detection_run_at ?? null;
+  const stale = !lastRun || (nowMs - parseTimestamp(lastRun).getTime()) > DETECTION_STALE_MS;
+  const lastUpdateText = lastRun ? timeAgo(lastRun) : 'never';
+  const project = snap?.projects.find(p => p.project_id === projectId);
+  const anomalies = project?.anomalies ?? [];
+
+  return (
+    <section data-testid="anomaly-tracker-panel" className="mt-4">
+      <button
+        type="button"
+        onClick={() => setExpanded(v => !v)}
+        className="w-full flex items-center gap-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 text-left hover:bg-neutral-900/80 transition-colors min-h-[44px]"
+        aria-expanded={expanded}
+      >
+        {expanded ? <ChevronDown className="w-3.5 h-3.5 text-neutral-500 shrink-0" /> : <ChevronRight className="w-3.5 h-3.5 text-neutral-500 shrink-0" />}
+        <Activity className="w-3 h-3 text-neutral-400 shrink-0" />
+        <span className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Anomaly Tracker</span>
+        {anomalies.length > 0 && (
+          <span className="bg-neutral-700/40 text-neutral-300 text-[10px] font-semibold px-1.5 py-0.5 rounded-full normal-case tracking-normal">
+            {anomalies.length}
+          </span>
+        )}
+        <span className="ml-auto text-[10px] text-neutral-500 truncate" title={lastRun ?? 'no detection run recorded'}>
+          last-update:{' '}
+          <span className={stale ? 'text-amber-400 font-medium' : 'text-neutral-300'}>
+            {lastUpdateText}
+          </span>
+        </span>
+      </button>
+      {expanded && (
+        <div className="mt-2">
+          {anomalies.length === 0 ? (
+            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-neutral-500 text-xs">
+              No tracked anomalies
+            </div>
+          ) : (
+            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg divide-y divide-neutral-800/50 overflow-hidden">
+              {anomalies.map(a => (
+                <div key={a.key} className="px-3 py-2 space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[10px] font-mono text-neutral-300 break-all min-w-0">{a.key}</span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-700/40 text-neutral-300 border border-neutral-700/40 capitalize">
+                      {a.severity}
+                    </span>
+                    <span className="text-[10px] text-neutral-400">
+                      ×{a.occurrence_count}
+                    </span>
+                    {a.stuck && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20" title="Last seen older than the freshness window (default 24h)">
+                        stuck
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3 text-[10px] text-neutral-500 flex-wrap">
+                    <span>first {timeAgo(a.first_seen)}</span>
+                    <span>last {timeAgo(a.last_seen)}</span>
+                    <span>dispatch {a.last_dispatch_attempt_at ? timeAgo(a.last_dispatch_attempt_at) : '—'}</span>
+                  </div>
+                  {(a.fingerprint || (a.affected_directions && a.affected_directions.length > 0)) && (
+                    <div className="text-[9px] text-neutral-600 font-mono break-all min-w-0">
+                      {a.fingerprint && <span>fp: {a.fingerprint}</span>}
+                      {a.fingerprint && a.affected_directions && a.affected_directions.length > 0 && <span> · </span>}
+                      {a.affected_directions && a.affected_directions.length > 0 && (
+                        <span>directions: {a.affected_directions.join(', ')}</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </section>

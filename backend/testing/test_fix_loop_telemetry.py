@@ -16,10 +16,12 @@ from httpx import AsyncClient
 from app.auth import create_agent_token
 from app.fix_loop_telemetry import (
     DIVERGENCE_EXIT_REASONS,
+    FIX_LOOP_DIVERGENCE_STALENESS_WINDOW_DAYS,
     FixLoopEventIn,
     MAX_ATTEMPTS_PER_LOOP,
     apply_fix_loop_events,
     has_terminal_divergence,
+    stamp_fix_loop_divergence_computed_at,
     summarize_fix_loop_history,
 )
 from app.models import Project, ProjectMember, Task, TaskStatus
@@ -860,3 +862,40 @@ async def test_diverged_tasks_endpoint_filter_by_exit_reason(
     assert body["total"] == 1
     assert body["tasks"][0]["title"] == "Osc task"
     assert body["tasks"][0]["exit_reason"] == "divergence_oscillation"
+
+
+# --- stamp_fix_loop_divergence_computed_at + staleness constants --------------
+
+
+def test_fix_loop_divergence_staleness_window_days_is_positive_int():
+    assert isinstance(FIX_LOOP_DIVERGENCE_STALENESS_WINDOW_DAYS, int)
+    assert FIX_LOOP_DIVERGENCE_STALENESS_WINDOW_DAYS > 0
+
+
+def test_stamp_fix_loop_divergence_computed_at_writes_key():
+    from datetime import datetime
+
+    doc: dict = {}
+    fixed_now = datetime(2026, 5, 7, 12, 0, 0)
+    stamp_fix_loop_divergence_computed_at(doc, now=fixed_now)
+    assert doc["fix_loop_divergence_signal_last_computed_at"] == "2026-05-07T12:00:00"
+
+
+def test_stamp_fix_loop_divergence_computed_at_overwrites_existing():
+    doc: dict = {"fix_loop_divergence_signal_last_computed_at": "2020-01-01T00:00:00"}
+    from datetime import datetime
+
+    stamp_fix_loop_divergence_computed_at(doc, now=datetime(2026, 5, 7, 0, 0, 0))
+    assert doc["fix_loop_divergence_signal_last_computed_at"] == "2026-05-07T00:00:00"
+
+
+def test_stamp_fix_loop_divergence_computed_at_defaults_to_utcnow():
+    from datetime import datetime
+
+    doc: dict = {}
+    before = datetime.utcnow()
+    stamp_fix_loop_divergence_computed_at(doc)
+    after = datetime.utcnow()
+    ts_str = doc.get("fix_loop_divergence_signal_last_computed_at", "")
+    ts = datetime.fromisoformat(ts_str)
+    assert before <= ts <= after

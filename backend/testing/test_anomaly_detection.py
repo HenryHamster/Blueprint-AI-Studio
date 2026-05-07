@@ -1205,3 +1205,28 @@ async def test_compute_research_anomalies_persists_snapshot():
 
     assert captured.get("proj_key") == str(project_id)
     assert captured.get("sess") is session
+
+
+@pytest.mark.asyncio
+async def test_compute_research_anomalies_records_last_run_timestamp():
+    """A successful detection cycle stamps shared_state.last_anomaly_detection_run_at."""
+    from unittest.mock import patch
+    import app.shared_state as _shared_state
+
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+    session = _make_session(tasks=[], project=project)
+
+    saved = _shared_state.last_anomaly_detection_run_at
+    _shared_state.last_anomaly_detection_run_at = None
+    try:
+        before = _utcnow()
+        with patch("app.shared_state.persist_anomaly_snapshot", new=AsyncMock()):
+            await _compute_research_anomalies(project_id, session)
+        after = _utcnow()
+        recorded = _shared_state.last_anomaly_detection_run_at
+        assert recorded is not None
+        # The function uses _utcnow() at the top; bound it within the test window.
+        assert before - timedelta(seconds=1) <= recorded <= after + timedelta(seconds=1)
+    finally:
+        _shared_state.last_anomaly_detection_run_at = saved

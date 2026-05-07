@@ -72,6 +72,7 @@ _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retireme
 _REGRESSION_STALL_THRESHOLD_HOURS = (
     4  # ACTIVE case without PR older than this → stalled
 )
+_SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
 
 
 def _stash_projected_task_fields(
@@ -117,6 +118,8 @@ def _task_prompt_fingerprint(task: Task) -> str:
 def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "computed_at": sr_trends.get("computed_at"),
+        "signal_last_computed_at": sr_trends.get("signal_last_computed_at")
+        or sr_trends.get("computed_at"),
         "categories": sr_trends.get("categories") or {},
         "by_task_type": sr_trends.get("by_task_type") or {},
         "by_fix_iteration": sr_trends.get("by_fix_iteration") or {},
@@ -2439,6 +2442,89 @@ async def list_recently_closed_regression_cases(
     return {
         "count": len(cases),
         "cases": cases,
+    }
+
+
+@router.get("/regression-class-kpis")
+async def get_regression_class_kpis(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    window_hours: int = Query(168, ge=1, le=720, description="Rolling window in hours"),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Per-class KPI snapshot from RegressionRemediationCase records.
+
+    Returns cases_opened, cases_closed, dispatch_attempt_count,
+    remediation_success_rate, mean_time_to_detect_seconds, and
+    mean_time_to_remediate_seconds grouped by regression_class.
+    cases_opened/closed are scoped to the window; timing stats use all
+    available rows for the class (more data = better mean estimate).
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    by_class: Dict[str, Any] = {}
+    for case in rows:
+        cls = case.regression_class
+        b = by_class.setdefault(
+            cls, {"opened": 0, "closed": 0, "attempts": 0, "mttd": [], "mttr": []}
+        )
+        first = case.first_seen_at and _to_naive_utc(case.first_seen_at)
+        if first and first >= cutoff:
+            b["opened"] += 1
+        if case.status in (RegressionCaseStatus.CLOSED, RegressionCaseStatus.MERGED):
+            last = case.last_seen_at and _to_naive_utc(case.last_seen_at)
+            if last and last >= cutoff:
+                b["closed"] += 1
+        b["attempts"] += case.attempts or 0
+        if case.time_to_detect_sec is not None:
+            b["mttd"].append(case.time_to_detect_sec)
+        if case.fingerprint_to_fix_log and first:
+            for entry in case.fingerprint_to_fix_log:
+                if entry.get("merged_at"):
+                    try:
+                        merged = _to_naive_utc(
+                            datetime.fromisoformat(
+                                str(entry["merged_at"]).replace("Z", "+00:00")
+                            )
+                        )
+                        b["mttr"].append((merged - first).total_seconds())
+                    except (ValueError, TypeError):
+                        pass
+
+    classes = [
+        {
+            "regression_class": cls,
+            "cases_opened": b["opened"],
+            "cases_closed": b["closed"],
+            "dispatch_attempt_count": b["attempts"],
+            "remediation_success_rate": round(b["closed"] / b["attempts"], 3)
+            if b["attempts"]
+            else None,
+            "mean_time_to_detect_seconds": round(statistics.mean(b["mttd"]), 1)
+            if b["mttd"]
+            else None,
+            "mean_time_to_remediate_seconds": round(statistics.mean(b["mttr"]), 1)
+            if b["mttr"]
+            else None,
+        }
+        for cls, b in sorted(by_class.items())
+    ]
+    return {
+        "project_id": str(project_id),
+        "window_hours": window_hours,
+        "class_count": len(classes),
+        "classes": classes,
     }
 
 
@@ -5423,6 +5509,8 @@ async def _compute_digest(
     }
     for _proj_anoms in _anoms_map.values():
         for _key, _info in _proj_anoms.items():
+            if not isinstance(_info, dict):
+                continue
             if _info.get("occurrence_count", 0) < 2:
                 continue
             if _key.startswith("FailureRateMomentum"):
@@ -6623,6 +6711,42 @@ async def get_pipeline_regressions(
             }
         )
 
+    staleness_rows = (
+        (
+            await session.execute(
+                select(Alert)
+                .where(
+                    Alert.project_id == project_id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.created_at >= now - timedelta(days=14),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like(f"{_SIGNAL_STALENESS_TITLE_PREFIX}%"),
+                )
+                .order_by(Alert.created_at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for alert in staleness_rows:
+        signal_name = alert.title[len(_SIGNAL_STALENESS_TITLE_PREFIX) :].strip()
+        regressions.append(
+            {
+                "signal_name": alert.title,
+                "regression_class": f"signal_staleness:{signal_name or 'unknown'}",
+                "detected_at": alert.created_at.isoformat()
+                if alert.created_at
+                else None,
+                "severity": "warning",
+                "current_rate": None,
+                "prior_rate": None,
+                "resolved": False,
+                "resolved_at": None,
+                "details": alert.message,
+            }
+        )
+
     # Enrich each regression with the status of any spawned investigation task.
     # Includes both pipeline_regression_dispatcher tasks (SR/fix-loop classes) and
     # crash_investigation tasks spawned by lifecycle._spawn_crash_investigations.
@@ -7259,4 +7383,114 @@ async def get_regression_dispatcher_health(
         },
         "spawns_sparkline": sparkline,
         "per_class": per_class,
+    }
+
+
+@router.get("/anomaly-tracker/snapshot")
+async def get_anomaly_tracker_snapshot(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    freshness_hours: int = Query(default=24, ge=1, le=720),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Read-only snapshot of shared_state.persistent_anomalies.
+
+    Surfaces which fingerprints the detection pipeline is currently tracking,
+    how aged they are, and when the detection sweep last ran (so a silent
+    writer failure is visible). Pure passthrough of stored entries — no
+    normalization, no garbage collection.
+    """
+    # Lazy import: shared_state mutates at runtime (in-memory cache), so we
+    # always read the live module attribute rather than a cached binding.
+    from app.shared_state import (  # noqa: PLC0415
+        persistent_anomalies as _persistent_anomalies,
+        last_anomaly_detection_run_at as _last_run,
+    )
+
+    pid_filter = str(project_id) if project_id else None
+    now = _utcnow()
+    stale_cutoff_iso = (now - timedelta(hours=freshness_hours)).isoformat()
+
+    # Collect (project_id, RegressionRemediationCase) for last_dispatch_attempt_at.
+    # Best-effort lookup: an active case whose regression_class is the dispatcher's
+    # f"anomaly:{anomaly_key}" form gets its last_seen_at echoed; missing rows
+    # return null. Filter to ACTIVE so this scales with backlog rather than
+    # whole-table size on a hot endpoint.
+    case_where = [RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE]
+    if project_id is not None:
+        case_where.append(RegressionRemediationCase.project_id == project_id)
+    cases = (
+        (await session.execute(select(RegressionRemediationCase).where(*case_where)))
+        .scalars()
+        .all()
+    )
+    # (project_id, anomaly_key) -> latest last_seen_at across rows. The
+    # dispatcher writes regression_class = f"anomaly:{anomaly_key}"
+    # (pipeline_regression_dispatcher.py:1748) — strip that prefix here so the
+    # index keys match the persistent_anomalies anomaly_key directly.
+    case_index: Dict[tuple, datetime] = {}
+    _ANOMALY_PREFIX = "anomaly:"
+    for c in cases:
+        if not c.last_seen_at:
+            continue
+        rclass = c.regression_class or ""
+        if not rclass.startswith(_ANOMALY_PREFIX):
+            continue
+        anomaly_key = rclass[len(_ANOMALY_PREFIX) :]
+        key = (str(c.project_id), anomaly_key)
+        prior = case_index.get(key)
+        if prior is None or c.last_seen_at > prior:
+            case_index[key] = c.last_seen_at
+
+    projects_payload: List[Dict[str, Any]] = []
+    total = 0
+    for proj_key, proj_anomalies in _persistent_anomalies.items():
+        if pid_filter and proj_key != pid_filter:
+            continue
+        if not proj_anomalies:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for anomaly_key, entry in proj_anomalies.items():
+            if not isinstance(entry, dict):
+                continue
+            first_seen = entry.get("first_seen")
+            last_seen = entry.get("last_seen")
+            first_seen_iso = (
+                first_seen.isoformat()
+                if isinstance(first_seen, datetime)
+                else (first_seen or None)
+            )
+            last_seen_iso = (
+                last_seen.isoformat()
+                if isinstance(last_seen, datetime)
+                else (last_seen or None)
+            )
+            stuck = bool(last_seen_iso and last_seen_iso < stale_cutoff_iso)
+            dispatch_at = case_index.get((proj_key, anomaly_key))
+            entries.append(
+                {
+                    "key": anomaly_key,
+                    "first_seen": first_seen_iso,
+                    "last_seen": last_seen_iso,
+                    "occurrence_count": entry.get("occurrence_count", 0),
+                    "severity": entry.get("severity"),
+                    "latest_details": entry.get("latest_details"),
+                    "fingerprint": entry.get("fingerprint"),
+                    "affected_directions": entry.get("affected_directions"),
+                    "last_dispatch_attempt_at": dispatch_at.isoformat()
+                    if dispatch_at
+                    else None,
+                    "stuck": stuck,
+                }
+            )
+        # Sort by last_seen desc; entries with missing last_seen sink to the bottom.
+        entries.sort(key=lambda e: e.get("last_seen") or "", reverse=True)
+        total += len(entries)
+        projects_payload.append({"project_id": proj_key, "anomalies": entries})
+
+    return {
+        "last_detection_run_at": _last_run.isoformat() if _last_run else None,
+        "freshness_window_hours": freshness_hours,
+        "total": total,
+        "projects": projects_payload,
     }

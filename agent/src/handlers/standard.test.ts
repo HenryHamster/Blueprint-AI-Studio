@@ -2000,8 +2000,10 @@ describe('runFreshReviewerPass reviewer_edges_considered', () => {
 // Tests that fresh-reviewer findings mentioning non-existent files are filtered
 // before merging into check_results, but kept in reviewer_findings for transparency.
 describe('runFreshReviewerPass phantom file ref filtering', () => {
-  const BIG_DIFF = 'diff --git a/src/app.ts b/src/app.ts\n+export function foo() {}\n'
-    + 'diff --git a/src/utils.ts b/src/utils.ts\n+export function bar() {}\n';
+  const BIG_DIFF = 'diff --git a/src/app.ts b/src/app.ts\n'
+    + Array.from({ length: 15 }, (_, i) => `+export const appLine${i} = ${i};`).join('\n') + '\n'
+    + 'diff --git a/src/utils.ts b/src/utils.ts\n'
+    + Array.from({ length: 15 }, (_, i) => `+export const utilLine${i} = ${i};`).join('\n') + '\n';
   let fsModule: typeof import('fs');
 
   beforeEach(async () => {
@@ -2487,6 +2489,130 @@ describe('runFreshReviewerPass origin stamp for incompleteSrRecovery', () => {
     expect(checkResults.correctness).toBeDefined();
     expect(checkResults.correctness.origin).toBe('reviewer');
     expect(capturedRx2.reviewer_recovery_origin).toBeUndefined();
+  });
+});
+
+// ── origin field tagging (agent self-review + fresh-reviewer) ───────────────────
+describe('runFreshReviewerPass origin field tagging', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = await import('fs');
+    vi.mocked(fsModule.writeFileSync).mockClear();
+    vi.mocked(fsModule.readFileSync).mockClear();
+  });
+
+  it('backfills origin=sr on agent self-review entries that lack origin', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {
+        correctness: { passed: true, issue: '' },
+        'type-safety': { passed: false, issue: 'missing null guard' },
+      },
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[]}',
+    });
+
+    await runFreshReviewerPass('origin-1', 'Title', 'Desc', [], null, { value: '' });
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness.origin).toBe('sr');
+    expect(checkResults['type-safety'].origin).toBe('sr');
+  });
+
+  it('adds origin=reviewer to fresh-reviewer entries (normal path)', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: { 'type-safety': { passed: true, issue: '' } },
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Logic bug"}]}',
+    });
+
+    await runFreshReviewerPass('origin-2', 'Title', 'Desc', [], null, { value: '' });
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness.origin).toBe('reviewer');
+    expect((checkResults.correctness.issue as string)).toContain('[reviewer]');
+  });
+
+  it('preserves origin=reviewer_recovery_after_incomplete_sr for incompleteSrRecovery path', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {},
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Caught during recovery"}]}',
+    });
+
+    await runFreshReviewerPass('origin-3', 'Title', 'Desc', [], null, { value: '' }, undefined, undefined, true);
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    expect(checkResults.correctness.origin).toBe('reviewer_recovery_after_incomplete_sr');
+  });
+
+  it('applies origin tags uniformly: agent entries get sr, reviewer entries get reviewer', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.readFileSync).mockReturnValue(JSON.stringify({
+      verdict: 'pass',
+      check_results: {
+        'type-safety': { passed: true, issue: 'agent self-review found nothing' },
+        correctness: { passed: true, issue: '' },
+      },
+    }));
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '{"reviewer_findings":[{"category":"correctness","severity":"HIGH","description":"Off-by-one error"}]}',
+    });
+
+    await runFreshReviewerPass('origin-4', 'Title', 'Desc', [], null, { value: '' });
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, Record<string, unknown>>;
+    // Agent entries without origin get backfilled with 'sr'
+    expect(checkResults['type-safety'].origin).toBe('sr');
+    // Reviewer entries get 'reviewer'
+    expect(checkResults.correctness.origin).toBe('reviewer');
   });
 });
 
