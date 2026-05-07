@@ -1629,8 +1629,23 @@ async def _delete_gcp(vm_instance_id: str):
     except asyncio.TimeoutError:
         logger.warning(f"Timeout deleting VM {vm_instance_id} (>240s)")
         return False
-    except Exception:
-        logger.warning(f"Failed to terminate VM {vm_instance_id}", exc_info=True)
+    except Exception as e:
+        # GCE delete-op polling can exhaust retries on transient backend errors
+        # (zone-operations.get returning 5xx, gRPC unavailable, etc.). The
+        # delete request was already issued; the next reaper cycle re-detects
+        # and retries if the VM is still alive. Demote these to a one-line
+        # warning — the full traceback is noise in the dashboard.
+        from google.api_core.exceptions import (  # noqa: PLC0415
+            GoogleAPICallError,
+            RetryError,
+        )
+        if isinstance(e, (RetryError, GoogleAPICallError)):
+            logger.warning(
+                f"Failed to terminate VM {vm_instance_id}: "
+                f"GCE API transient: {type(e).__name__}: {e}"
+            )
+        else:
+            logger.warning(f"Failed to terminate VM {vm_instance_id}", exc_info=True)
         return False
 
 

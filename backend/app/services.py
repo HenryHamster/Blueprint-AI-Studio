@@ -679,7 +679,24 @@ async def stale_branch_cleanup_service():
             logger.info("[BRANCH CLEANUP] Service shutting down.")
             break
         except Exception as e:
-            logger.error(f"[BRANCH CLEANUP] Error: {e}", exc_info=True)
+            # Cloud Run instance shutdowns mid-cycle close the connection while
+            # the long-lived AsyncSessionLocal context is still open; the
+            # __aexit__ rollback then raises InterfaceError("connection is
+            # closed"). Branches were already deleted before the rollback
+            # fired — this is shutdown collateral, not a cleanup failure.
+            # Demote to a one-line warning so the dashboard doesn't flag it.
+            msg = str(e)
+            is_close_collateral = (
+                "connection is closed" in msg
+                or "InterfaceError" in type(e).__name__
+            )
+            if is_close_collateral:
+                logger.warning(
+                    f"[BRANCH CLEANUP] Session closed mid-cycle "
+                    f"(instance shutdown collateral): {type(e).__name__}: {e}"
+                )
+            else:
+                logger.error(f"[BRANCH CLEANUP] Error: {e}", exc_info=True)
 
         interval_minutes = _shared_state.runtime_config.get(
             "branch_cleanup_interval_minutes", 360
