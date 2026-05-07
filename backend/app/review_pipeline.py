@@ -1428,7 +1428,14 @@ async def _spawn_pipeline_task(
                     return (None, False)
 
     def _counts_toward_cap(t: Task) -> bool:
-        if t.status == TaskStatus.FAILED:
+        # Exempt both FAILED and CANCELLED tasks with infra failure categories.
+        # Without CANCELLED here, supersede-cancels (review_pipeline.py:1170,
+        # 1204) — which stamp failure_category=AGENT_TIMEOUT — burn cap slots
+        # without doing useful work. Incident 2026-05-07 task 78de0fdb hit
+        # the global cap at PR #4091 because ~13 of 25 tasks on the chain
+        # were supersede-cancels (review-snapshot-stale, no-heartbeat-for-15min)
+        # that each consumed an iteration slot.
+        if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
             fc = (t.context or {}).get("failure_category")
             if fc in INFRA_CLASSES:
                 return False

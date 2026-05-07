@@ -813,6 +813,72 @@ async def test_infra_failed_tasks_dont_count_toward_global_cap(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_supersede_cancelled_tasks_dont_count_toward_global_cap(
+    db_session, mocker
+):
+    """CANCELLED tasks with infra failure_category (set by supersede paths in
+    review_pipeline.py:1170 and :1204) never ran a real review, so they must
+    not consume iteration budget. Regression guard for incident 2026-05-07
+    task 78de0fdb: ~13 of 25 tasks on PR #4091's chain were supersede-cancels
+    (snapshot-stale, no-heartbeat-15min) that each burned a cap slot, hitting
+    the global cap on churn alone with zero useful review-fix progress."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 105,
+                "branch": "feat/x",
+                "base_branch": "main",
+            }
+        ],
+        context={"scope": "small", "review_loop": {"iteration": 0}},
+    )
+    db_session.add(source_task)
+
+    # 20 CANCELLED review/fix tasks with AGENT_TIMEOUT (the supersede stamp).
+    # Cap is 10 for small scope — would block spawn if counted.
+    for i in range(20):
+        ttype = "fix" if i % 2 else "review"
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            payloads=[
+                {
+                    "type": ttype,
+                    "pr_number": 105,
+                    "branch": "feat/x",
+                    "base_branch": "main",
+                }
+            ],
+            context={"failure_category": "AGENT_TIMEOUT"},
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=105,
+        branch="feat/x",
+        base_branch="main",
+        fix_prompt="Fix",
+    )
+    assert result is not None, (
+        "Supersede-cancelled tasks must not count toward the cap"
+    )
+    assert result.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_archived_tasks_dont_count_toward_global_cap(db_session, mocker):
     """Archived tasks must not count — this is how reset-iteration-cap works."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
@@ -4932,7 +4998,7 @@ class TestDetectIssueChurn:
 
     def test_short_history_no_churn(self):
         hist = [self._entry([_issue("a")])]
-        is_churn, counts = _detect_issue_churn(hist)
+        is_churn, counts = _detect_issue_churn(hist)  # noqa: RUF059
         assert is_churn is False
 
     def test_non_decreasing_distinct_issues_is_churn(self):
