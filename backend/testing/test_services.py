@@ -1259,3 +1259,99 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
 
     # Both retried.
     assert mock_process.call_count == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _sweep_post_commit_pending — bump-failure isolation (regression 2026-05-07)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mocker):
+    """When the attempt-bump fails on one task (e.g. row-lock contention →
+    Postgres LockNotAvailableError on the bump UPDATE), the sweep must
+    continue and bump the OTHER tasks in the batch instead of aborting.
+    Regression for 2026-05-07 incident: a single stuck task's bump failure
+    propagated to the outer try/except, leaving subsequent pending tasks
+    unprocessed AND letting the same bad task burn ~30s of orchestrator
+    cycle time per sweep (lock_timeout) → /health 503 → instance kill loop.
+    """
+    import uuid as _uuid
+    project = await _make_project(svc_db)
+    bad_id = _uuid.uuid4()
+    good_id = _uuid.uuid4()
+    bad_task = Task(
+        id=bad_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "bad"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={"_post_commit_pending_meta": {
+            "at": _naive_utcnow().isoformat(),
+            "reason": "post_commit_error",
+            "payload": {"task_id": str(bad_id), "status": "COMPLETED", "logs": "{}"},
+            "attempts": 4,
+        }},
+    )
+    good_task = Task(
+        id=good_id,
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "good"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={"_post_commit_pending_meta": {
+            "at": _naive_utcnow().isoformat(),
+            "reason": "post_commit_error",
+            "payload": {"task_id": str(good_id), "status": "COMPLETED", "logs": "{}"},
+            "attempts": 1,
+        }},
+    )
+    svc_db.add_all([bad_task, good_task])
+    await svc_db.commit()
+
+    # _process_post_commit raises for BOTH tasks → bump path runs for both.
+    # This isolates the test from sweep iteration order: the regression is
+    # about whether one task's bump failure blocks the others' bumps.
+    call_log: list[str] = []
+
+    async def fake_process(task_id, _payload):
+        call_log.append(str(task_id))
+        raise RuntimeError("simulated _process_post_commit retry exhaustion")
+
+    mocker.patch("app.routers.agent_status._process_post_commit", side_effect=fake_process)
+
+    # Make ONLY the bad task's bump raise. flag_modified is called inside
+    # the bump block before commit; raising there mimics the production
+    # LockNotAvailableError on bump_session.commit() (single-point injection
+    # since patching commit() across multiple async sessions is awkward).
+    from sqlalchemy.orm import attributes as _sa_attrs
+    real_flag_modified = _sa_attrs.flag_modified
+
+    def fake_flag_modified(obj, key):
+        if isinstance(obj, Task) and str(obj.id) == str(bad_id) and key == "context":
+            raise RuntimeError("simulated bump lock_timeout")
+        return real_flag_modified(obj, key)
+
+    mocker.patch("sqlalchemy.orm.attributes.flag_modified", fake_flag_modified)
+
+    await _sweep_post_commit_pending()
+
+    # Both tasks reached _process_post_commit (the regression was that the
+    # outer except aborted the loop after the first failure).
+    assert str(bad_id) in call_log
+    assert str(good_id) in call_log
+
+    # Good task: bump succeeded → attempts advanced 1 → 2.
+    await svc_db.refresh(good_task)
+    good_attempts = (good_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    assert good_attempts == 2, (
+        f"good task's bump should have advanced attempts to 2, got {good_attempts}. "
+        f"This means the bad task's bump failure poisoned the batch — the regression is back."
+    )
+
+    # Bad task: bump failed → attempts stays at 4. The sweep must NOT have
+    # raised (otherwise the good task wouldn't have been processed).
+    await svc_db.refresh(bad_task)
+    bad_attempts = (bad_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    assert bad_attempts == 4, f"bad task attempts should stay at 4, got {bad_attempts}"

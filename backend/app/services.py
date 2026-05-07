@@ -1837,19 +1837,44 @@ async def _sweep_post_commit_pending():
                     logger.warning(
                         f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} retry failed: {e}"
                     )
-                    async with AsyncSessionLocal() as bump_session:
-                        refreshed = await bump_session.get(Task, task.id)
-                        if refreshed:
-                            new_ctx = dict(refreshed.context or {})
-                            new_pending = dict(new_ctx.get("_post_commit_pending_meta") or pending_meta)
-                            new_pending["attempts"] = int(new_pending.get("attempts", attempts)) + 1
-                            new_pending["last_retry_at"] = _utcnow().isoformat()
-                            new_ctx["_post_commit_pending_meta"] = new_pending
-                            refreshed.context = new_ctx
-                            from sqlalchemy.orm.attributes import flag_modified
-                            flag_modified(refreshed, "context")
-                            bump_session.add(refreshed)
-                            await bump_session.commit()
+                    # Bump in its own try/except so a bump failure on one task
+                    # doesn't poison the entire sweep batch (which would let
+                    # the outer except at the bottom abort the loop, leaving
+                    # all subsequent pending tasks unprocessed). Short
+                    # lock_timeout (5s) so we fail fast on row contention
+                    # instead of burning 30s of orchestrator-cycle time per
+                    # task — the next sweep will try again.
+                    try:
+                        async with AsyncSessionLocal() as bump_session:
+                            # Postgres-only fast-fail on row contention; on
+                            # SQLite (test DB) SET LOCAL is a no-op syntax
+                            # error, so dialect-gate it.
+                            if bump_session.bind and bump_session.bind.dialect.name == "postgresql":
+                                await bump_session.execute(
+                                    text("SET LOCAL lock_timeout = '5s'")
+                                )
+                            refreshed = await bump_session.get(Task, task.id)
+                            if refreshed:
+                                new_ctx = dict(refreshed.context or {})
+                                new_pending = dict(new_ctx.get("_post_commit_pending_meta") or pending_meta)
+                                new_pending["attempts"] = int(new_pending.get("attempts", attempts)) + 1
+                                new_pending["last_retry_at"] = _utcnow().isoformat()
+                                new_ctx["_post_commit_pending_meta"] = new_pending
+                                refreshed.context = new_ctx
+                                from sqlalchemy.orm.attributes import flag_modified
+                                flag_modified(refreshed, "context")
+                                bump_session.add(refreshed)
+                                await bump_session.commit()
+                    except Exception as bump_exc:
+                        logger.warning(
+                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} "
+                            f"attempt-bump failed (likely row-lock contention): "
+                            f"{type(bump_exc).__name__}: {bump_exc}"
+                        )
+                        # Continue to next task — attempts stays where it
+                        # was, but the sweep proceeds. If contention persists
+                        # the operator must clear post_commit_pending via the
+                        # admin PATCH (admin.py modify_task).
     except Exception as e:
         logger.error(f"[POST_COMMIT SWEEP] Sweep failed: {e}", exc_info=True)
 

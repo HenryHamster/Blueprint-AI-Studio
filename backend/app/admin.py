@@ -1369,7 +1369,6 @@ async def modify_task(
             if new_status == TaskStatus.CANCELLED and task.context and task.context.get("finding_hash"):
                 task_priority = task.priority if task.priority is not None else 50
                 if task_priority == 0:  # low priority tasks map to 0 in TASK_PRIORITY_MAP
-                    from app.models import _utcnow
                     suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
                     task.context = {**task.context, "suppress_until": suppress_until}
                     flag_modified(task, "context")
@@ -1612,6 +1611,39 @@ async def modify_task(
             raise HTTPException(status_code=400, detail="Merged context exceeds 100KB limit")
         task.context = merged
         changes["context"] = "updated"
+
+    # Operator escape hatch for tasks stuck in the post_commit_pending sweep
+    # loop. The sweep retries `_process_post_commit` for terminal tasks whose
+    # earlier handler chain failed; if `_process_post_commit` can never lock
+    # the row (peer holds it across slow ops) AND the bump-attempts session
+    # also can't, the sweep gets stuck on this task indefinitely (cycle stall
+    # → /health 503 → instance kill cascade). Setting `post_commit_pending:
+    # false` here drops the task out of the sweep filter; we also strip the
+    # `_post_commit_pending_meta` retry log from context so the row is clean.
+    # `post_commit_failed` is set so observers can distinguish "operator-cleared"
+    # from "naturally completed".
+    if (
+        "post_commit_pending" in payload
+        and payload["post_commit_pending"] is False
+        and task.post_commit_pending
+    ):
+        task.post_commit_pending = False
+        task.post_commit_failed = True
+        new_ctx = dict(task.context or {})
+        stripped_meta = new_ctx.pop("_post_commit_pending_meta", None)
+        new_ctx["_post_commit_abandoned"] = {
+            "at": _utcnow().isoformat(),
+            "by": "ADMIN_PATCH",
+            "prior_attempts": (stripped_meta or {}).get("attempts"),
+            "prior_reason": (stripped_meta or {}).get("reason"),
+        }
+        task.context = new_ctx
+        flag_modified(task, "context")
+        changes["post_commit_pending"] = False
+        logger.info(
+            f"[ADMIN] Cleared post_commit_pending on task {task.id} via PATCH "
+            f"(prior_attempts={(stripped_meta or {}).get('attempts')})"
+        )
 
     if "depends_on" in payload:
         new_deps = payload["depends_on"] if isinstance(payload["depends_on"], list) else []

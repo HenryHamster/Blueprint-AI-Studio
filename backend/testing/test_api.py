@@ -620,3 +620,90 @@ async def test_bulk_action_cancel_skips_terminal_tasks(client: AsyncClient, db_s
     assert data["success_count"] == 0
     assert data["error_count"] == 1
     assert "terminal" in data["results"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_patch_clears_post_commit_pending(client: AsyncClient, db_session):
+    """PATCH /api/admin/tasks/{id} with {"post_commit_pending": false} clears
+    the column AND strips _post_commit_pending_meta from context, leaving an
+    _post_commit_abandoned breadcrumb. Operator escape hatch for tasks the
+    sweep can't recover from (row-lock contention preventing the bump).
+    """
+    project = await _make_project_with_member(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Stuck task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        post_commit_pending=True,
+        post_commit_failed=False,
+        context={
+            "_post_commit_pending_meta": {
+                "at": "2026-05-07T08:00:00",
+                "reason": "post_commit_error",
+                "attempts": 4,
+                "payload": {"task_id": "x", "status": "COMPLETED", "logs": "{}"},
+            },
+            "pr_merged": True,  # unrelated context survives
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.patch(
+        f"/api/admin/tasks/{task.id}",
+        json={"post_commit_pending": False},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Verify directly via db_session refresh — the GET admin endpoint
+    # doesn't expose post_commit_pending/post_commit_failed in its response,
+    # so we read the columns via the session.
+    await db_session.refresh(task)
+    assert task.post_commit_pending is False
+    assert task.post_commit_failed is True
+    ctx = task.context or {}
+    assert "_post_commit_pending_meta" not in ctx, "pending meta should be stripped"
+    abandoned = ctx.get("_post_commit_abandoned")
+    assert abandoned is not None
+    assert abandoned["by"] == "ADMIN_PATCH"
+    assert abandoned["prior_attempts"] == 4
+    assert abandoned["prior_reason"] == "post_commit_error"
+    # Unrelated context survives
+    assert ctx.get("pr_merged") is True
+    # Status unchanged
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_patch_post_commit_pending_false_is_noop_when_already_false(
+    client: AsyncClient, db_session
+):
+    """PATCHing post_commit_pending=False on a task where the column is
+    already False is a no-op (no _post_commit_abandoned breadcrumb added)."""
+    project = await _make_project_with_member(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Already clean task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        post_commit_pending=False,
+        context={"some_key": "some_val"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.patch(
+        f"/api/admin/tasks/{task.id}",
+        json={"post_commit_pending": False},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert "_post_commit_abandoned" not in ctx, (
+        "abandoned breadcrumb should NOT be added when column was already False"
+    )
+    assert ctx.get("some_key") == "some_val"
