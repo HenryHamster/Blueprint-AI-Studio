@@ -1741,11 +1741,29 @@ async def _process_post_commit(
                             logger.info(f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)")
                         else:
                             logger.error(f"[PIPELINE] Auto-merge failed for PR #{pr_number}: {merge_result.get('message')}")
-                            # Defensive layer: if the PR is blocked on checks (not a
-                            # real conflict), ask GitHub to auto-merge once the gates
-                            # clear. This does nothing for DIRTY/BEHIND states (real
-                            # conflict or out-of-date branch — the review/fix pipeline
-                            # is the only thing that can resolve those).
+                            # Probe GitHub for the PR's mergeable_state so we can
+                            # route the recovery correctly:
+                            #   blocked / unstable → CI gating; queue GitHub auto-merge
+                            #     and let it fire when checks clear.
+                            #   dirty → real merge conflict (sibling cluster touched
+                            #     overlapping files between PR creation and the merge
+                            #     attempt). Spawn a `fix` task — fix is the rebase-
+                            #     and-resolve primitive; review is the assess-and-
+                            #     give-feedback primitive, the wrong tool here.
+                            #     Without this, cluster sub-PRs orphan: tasks COMPLETE,
+                            #     the dep chain stays QUEUED on PR_MERGED, and the
+                            #     research rollup stalls (see PR#4070, PR#4044 incident
+                            #     on 2026-05-06).
+                            #   default → fall back to review-spawn (preserves
+                            #     existing behavior for unknown states).
+                            #
+                            # Reviews still fire downstream: when the fix task
+                            # COMPLETES, the fix-completion handler at line ~2899
+                            # spawns a review task before merging. So a DIRTY-routed
+                            # cluster sub-PR gets: create → conflict → fix (rebase)
+                            # → review → auto-merge. This change does not bypass
+                            # review for tasks that need it.
+                            recovery_type = "review"
                             try:
                                 from app.github import enable_auto_merge
                                 pr_detail = await get_pull_request(gh_token, owner, repo, pr_number, project_id=str(task.project_id))
@@ -1756,22 +1774,35 @@ async def _process_post_commit(
                                         logger.info(f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})")
                                     else:
                                         logger.info(f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}")
+                                elif ms == "dirty":
+                                    recovery_type = "fix"
                             except Exception as _am_exc:
-                                logger.warning(f"[PIPELINE] Auto-merge enablement attempt failed for PR #{pr_number}: {_am_exc}")
-                            # Fall through to review pipeline for conflict resolution.
-                            # Branch on was_created: a fresh review handles the work,
-                            # a dedup hit means an existing same-chain task is handling it,
-                            # and (None, False) means nothing is handling it → park.
-                            review_task, was_created = await _spawn_pipeline_task(
-                                task, "review", session, pr_number, branch, base_branch,
-                                original_prompt=original_prompt, original_task_id=str(task.id)
+                                logger.warning(f"[PIPELINE] Mergeable-state probe failed for PR #{pr_number}: {_am_exc}")
+                            # Spawn the recovery task. For DIRTY conflicts on cluster
+                            # sub-PRs we use `fix` (rebase + resolve); otherwise
+                            # `review` (the existing default).
+                            #
+                            # Pass fix_reason="merge_conflict" so the fix-completion
+                            # handler can route straight to security-scan + auto-merge
+                            # WITHOUT a re-review. Rationale (per the small/medium
+                            # intermediate path): the original task was scope-gated
+                            # to skip review entirely; once the conflict is resolved
+                            # there's no review-worthy logic change to re-assess —
+                            # rebase output is mechanical. This keeps the cost model
+                            # symmetric with the no-conflict happy path.
+                            spawn_kwargs = {"original_prompt": original_prompt, "original_task_id": str(task.id)}
+                            if recovery_type == "fix":
+                                spawn_kwargs["fix_reason"] = "merge_conflict"
+                            recovery_task, was_created = await _spawn_pipeline_task(
+                                task, recovery_type, session, pr_number, branch, base_branch,
+                                **spawn_kwargs,
                             )
                             if was_created:
-                                logger.info(f"[PIPELINE] Spawned review task {review_task.id} for PR #{pr_number} after auto-merge failure")
-                            elif review_task is not None:
-                                logger.info(f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {review_task.first_payload.get('type')} task {review_task.id} ({review_task.status}) already handling it")
+                                logger.info(f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure")
+                            elif recovery_task is not None:
+                                logger.info(f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it")
                             else:
-                                logger.warning(f"[PIPELINE] Auto-merge failed and no review spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait")
+                                logger.warning(f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait")
                                 task.status = TaskStatus.EVALUATING
                                 task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
                                 task.context = {**(task.context or {}), "review_loop": {
@@ -2950,12 +2981,16 @@ async def _process_post_commit(
                     await session.commit()
 
                 fix_reason = review_loop.get("fix_reason", "code_review")
-                if not scan_blocked and fix_reason == "ci_failure":
-                    # CI-only fix: skip re-review, go straight to CI check + merge.
-                    # The original review already approved the code logic, so the
-                    # review-side gate is open. Set review_approved explicitly even
-                    # though the inherited review_loop should already carry it from
-                    # the prior approval write.
+                # Skip re-review for fixes whose origin doesn't add review-worthy
+                # logic on top of an already-decided merge gate:
+                #   - ci_failure  → original review already approved code; CI is
+                #                   the only gate. Wait for CI then merge.
+                #   - merge_conflict → cluster sub-PR rebase. The original task
+                #                   was scope-gated to skip review (small/medium
+                #                   intermediate); rebase output is mechanical;
+                #                   re-reviewing would be inconsistent with the
+                #                   no-conflict happy path. Wait for CI then merge.
+                if not scan_blocked and fix_reason in ("ci_failure", "merge_conflict"):
                     from app import pause_clock
                     ci_loop = review_loop.copy()
                     ci_loop["ci_waiting"] = True
@@ -2965,10 +3000,11 @@ async def _process_post_commit(
                     ci_loop["ci_poll_interval"] = 10
                     task.status = TaskStatus.EVALUATING
                     task.context = {**(task.context or {}), "review_loop": ci_loop}
-                    task.latest_status_message = f"CI-only fix applied for PR #{pr_number} — waiting for CI (review already approved)"
+                    label = "CI-only fix" if fix_reason == "ci_failure" else "merge-conflict fix"
+                    task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {fix_reason})"
                     session.add(task)
                     await session.commit()
-                    logger.info(f"[REVIEW PIPELINE] CI-only fix for PR #{pr_number} — skipping re-review, waiting for CI")
+                    logger.info(f"[REVIEW PIPELINE] {label} for PR #{pr_number} (fix_reason={fix_reason}) — skipping re-review, waiting for CI")
                 elif not scan_blocked:
                     review_task, _ = await _spawn_pipeline_task(
                         task, "review", session, pr_number, branch, base_branch,

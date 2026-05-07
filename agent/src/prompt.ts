@@ -1131,6 +1131,76 @@ fi
 
 # 6. Persist PR URL for ./done + wrapper detection
 echo "$PR_URL" > /tmp/pr_url_${cfg.taskId}
+
+# 7. Post-create mergeable check.
+#
+# GitHub computes mergeable status asynchronously (a few seconds after
+# the head commit lands). Poll briefly, then if the PR is in a real
+# conflict state (mergeable=false + state=dirty) tell the agent so
+# they can rebase and resolve while the workspace is still warm. This
+# is dramatically cheaper than letting the orchestrator spawn a fresh
+# fix-task from a cold VM that has to re-derive the change intent.
+#
+# State semantics (from GitHub):
+#   clean / has_hooks  → mergeable, will merge / fast-forward fine
+#   blocked / unstable → CI gating; auto-merge handles it
+#   behind             → out-of-date with base; GitHub or auto-rebase fixes
+#   dirty              → real merge conflict; needs rebase + manual resolve
+#   draft              → marked draft; no action
+#
+# Only \`dirty\` triggers the warning + exit 4. Everything else exits 0.
+PR_NUMBER=$(printf '%s' "$PR_URL" | grep -oE '[0-9]+$' || true)
+if [ -n "$PR_NUMBER" ]; then
+  TOKEN_RESP=$(curl -f -sS --max-time 30 \\
+    -H "X-Agent-Token: $TOKEN" \\
+    "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || TOKEN_RESP=""
+  GH_TOKEN_PR=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty' 2>/dev/null || true)
+  if [ -n "$GH_TOKEN_PR" ]; then
+    PR_MERGEABLE="null"
+    PR_STATE="unknown"
+    for pr_attempt in 1 2 3 4 5; do
+      _PR_DETAIL=$(curl -sS --max-time 20 \\
+        -H "Authorization: token $GH_TOKEN_PR" \\
+        -H "Accept: application/vnd.github+json" \\
+        "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/$PR_NUMBER" 2>/dev/null || echo "")
+      PR_MERGEABLE=$(printf '%s' "$_PR_DETAIL" | jq -r '.mergeable // "null"' 2>/dev/null || echo "null")
+      PR_STATE=$(printf '%s' "$_PR_DETAIL" | jq -r '.mergeable_state // "unknown"' 2>/dev/null || echo "unknown")
+      [ "$PR_MERGEABLE" != "null" ] && break
+      sleep 3
+    done
+    unset GH_TOKEN_PR
+    if [ "$PR_MERGEABLE" = "false" ] && [ "$PR_STATE" = "dirty" ]; then
+      echo ""
+      echo "[pr] WARNING: PR #$PR_NUMBER has merge conflicts with origin/${cfg.baseBranch}"
+      echo "[pr]   mergeable=false, mergeable_state=dirty"
+      echo "[pr]"
+      echo "[pr] You're still in the workspace — resolve here, much cheaper than"
+      echo "[pr] spawning a fix-task from a fresh VM that has to re-derive intent."
+      echo "[pr]"
+      echo "[pr] Resolution flow:"
+      echo "[pr]   git fetch origin ${cfg.baseBranch}"
+      echo "[pr]   git rebase origin/${cfg.baseBranch}"
+      echo "[pr]   # Resolve conflicts in the listed files (use the Edit tool)."
+      echo "[pr]   # If a conflict is in a file YOUR PR did not intend to touch,"
+      echo "[pr]   # the right move is usually \\\`git checkout --theirs <file>\\\` to"
+      echo "[pr]   # take the base branch's version, then re-apply your edits to"
+      echo "[pr]   # the files you OWN. Don't accidentally revert sibling work."
+      echo "[pr]   git rebase --continue"
+      echo "[pr]   ./check       # re-verify before pushing"
+      echo "[pr]   ./pr open --title \\"...\\" --body \\"...\\"   # re-push (force-with-lease)"
+      echo "[pr]"
+      echo "[pr] Limit: ~2 attempts. If you can't resolve cleanly (the conflict is"
+      echo "[pr] structural, not just a textual overlap, or it's in code your task"
+      echo "[pr] should not be modifying), call \\\`./blocked \\"<reason>\\"\\\` instead."
+      echo "[pr] The orchestrator will spawn a fix-task as backstop."
+      exit 4
+    fi
+    if [ "$PR_STATE" = "behind" ]; then
+      echo "[pr] note: PR #$PR_NUMBER is behind origin/${cfg.baseBranch}; auto-merge will rebase when CI clears"
+    fi
+  fi
+fi
+
 echo ""
 echo "[pr] OK — $PR_URL"
 echo "[pr] Next: ./done   (or call ./pr again if you push more commits)"
@@ -1753,6 +1823,16 @@ the workspace, executable):
   /tmp/pr_url_<task_id> with the URL. Pass \`--with-tests\` to run
   \`./check test\` instead of just \`./check\` as the gate. Exits non-zero
   with a clear message on failure — fix and call again.
+  - **Exit 4 = PR created but conflicts with base.** \`./pr\` polls GitHub
+    for mergeable status post-create; if the result is \`mergeable=false\`
+    + \`mergeable_state=dirty\` (real conflict), exit 4 is returned with
+    explicit resolution steps. You're still in the workspace — rebase
+    onto origin/<base>, resolve the conflicts (typically via Edit or
+    \`git checkout --theirs <file>\` for files outside your task's scope),
+    re-run \`./check\`, then \`./pr open\` again to push the rebase. Cap
+    yourself at ~2 conflict-resolution attempts; if it's not converging
+    call \`./blocked\` and the orchestrator will spawn a fix-task from a
+    fresh VM. Resolving locally is much cheaper than that fallback.
 - \`./done\` — marks the task COMPLETED with the PR URL. Requires
   \`./pr open\` to have run first. Idempotent (safe to re-run).
   - \`./done --warn-out-of-scope "<reason>"\` — judgment-call escape hatch.
