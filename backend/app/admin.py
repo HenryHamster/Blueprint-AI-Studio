@@ -1883,18 +1883,42 @@ async def trigger_rollup(
         else:
             # _spawn_pipeline_task sets source_task.latest_status_message to a
             # specific reason (already merged / iteration cap / deferred behind
-            # in-flight task / stuck cycle) and we want to preserve that.
-            # Only fall back to the generic message if nothing was set.
-            spawn_reason = task.latest_status_message
-            task.status = TaskStatus.FAILED
-            task.latest_status_message = (
-                f"Rollup PR #{rollup_pr_number} created but review not spawned — {spawn_reason}"
-                if spawn_reason
-                else f"Rollup PR #{rollup_pr_number} created but review not spawned (unknown reason)"
+            # in-flight task / stuck cycle) and writes a SPAWN_REASON code into
+            # context so callers can distinguish recoverable from terminal cases.
+            from app.review_pipeline import (  # noqa: PLC0415
+                SPAWN_REASON_KEY,
+                SPAWN_REASON_DEFERRED,
+                SPAWN_REASON_DEDUP,
+                SPAWN_REASON_ALREADY_MERGED,
             )
-            from app.failure_classification import persist_failure_category  # noqa: PLC0415
-            persist_failure_category(task, "AGENT_TIMEOUT")
-            _record_failure_result(task, "AGENT_TIMEOUT")
+            spawn_reason_code = (task.context or {}).get(SPAWN_REASON_KEY)
+            spawn_reason_msg = task.latest_status_message
+            if spawn_reason_code == SPAWN_REASON_ALREADY_MERGED:
+                # PR was already merged before review could spawn — terminal success.
+                task.status = TaskStatus.COMPLETED
+                task.context = {**(task.context or {}), "pr_merged": True}
+                task.latest_status_message = (
+                    f"Rollup PR #{rollup_pr_number} already merged"
+                )
+            elif spawn_reason_code in (SPAWN_REASON_DEFERRED, SPAWN_REASON_DEDUP):
+                # Recoverable: a sibling task is in-flight on the same PR. Keep
+                # the parent EVALUATING so the orchestrator retries review-spawn
+                # once the in-flight task completes.
+                task.latest_status_message = (
+                    f"Rollup PR #{rollup_pr_number} created — review deferred ({spawn_reason_msg})"
+                )
+            else:
+                # Terminal failure (iteration cap, stuck cycle, blocked repeat,
+                # or unknown). Operator must intervene.
+                task.status = TaskStatus.FAILED
+                task.latest_status_message = (
+                    f"Rollup PR #{rollup_pr_number} created but review not spawned — {spawn_reason_msg}"
+                    if spawn_reason_msg
+                    else f"Rollup PR #{rollup_pr_number} created but review not spawned (unknown reason)"
+                )
+                from app.failure_classification import persist_failure_category  # noqa: PLC0415
+                persist_failure_category(task, "AGENT_TIMEOUT")
+                _record_failure_result(task, "AGENT_TIMEOUT")
 
     session.add(task)
     await session.commit()

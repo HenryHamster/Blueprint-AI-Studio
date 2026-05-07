@@ -26,7 +26,7 @@ Usage:
 """
 import json
 import sys
-from blueprint_api import list_tasks, all_tasks_by_status, patch_task, fmt_task
+from blueprint_api import list_tasks, all_tasks_by_status, patch_task, fmt_task, api
 
 
 def _resolve_task(query):
@@ -421,14 +421,16 @@ def cmd_trigger_rollup(args):
             if failed:
                 print(f"  No unmerged children, but {len(failed)} failed. Use: tasks.py requeue {pid[:8]}")
                 continue
-            # All merged but parent still EVALUATING -- force rollup by re-completing a child
+            # All merged but parent still EVALUATING -- force rollup PR creation via admin endpoint
             any_merged = next((c for c in work_children
                                if c["status"] == "COMPLETED" and (c.get("context") or {}).get("pr_merged")), None)
             if any_merged:
-                print(f"  All children merged but rollup didn't fire. Re-triggering...")
+                print(f"  All children merged but rollup didn't fire. Forcing rollup PR via admin endpoint...")
                 try:
-                    patch_task(any_merged["id"], {"status": "COMPLETED"})
-                    print(f"    Re-completed {any_merged['id'][:8]} to trigger rollup")
+                    result = api("POST", f"/api/admin/tasks/{pid}/rollup")
+                    pr_num = result.get("rollup_pr_number") or result.get("pr_number")
+                    pr_url = result.get("rollup_pr_url") or result.get("pr_url") or ""
+                    print(f"    Rollup PR created: #{pr_num} {pr_url}")
                 except Exception as e:
                     print(f"    FAILED: {e}")
             else:
