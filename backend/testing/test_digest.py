@@ -17,7 +17,10 @@ from app.models import (
     RegressionCaseStatus,
 )
 from app.routers.admin_analytics import _derive_completed_at
-from app.routers.admin_digest import _stash_projected_task_fields
+from app.routers.admin_digest import (
+    _stash_projected_task_fields,
+    _summarize_symptoms_by_layer,
+)
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
 
@@ -10623,6 +10626,7 @@ async def test_list_regression_cases_response_shape(client: AsyncClient, db_sess
     assert c["last_remediation_result"] == "merged"
     assert c["signal_snapshot_at_spawn"] == {"value": 0.45, "threshold": 0.6}
     assert c["signal_snapshot_at_merge"] == {"value": 0.62, "threshold": 0.6}
+    assert c["recurrence_count"] == 1
     assert c["fingerprint_to_fix_log"] == [
         {"fingerprint": "abc", "fix_pr_number": 1234}
     ]
@@ -10957,6 +10961,7 @@ async def test_list_regression_manual_intervention_response_shape(
     assert c["attempts"] == 3
     assert c["signal_snapshot_at_spawn"] == {"value": 0.3, "threshold": 0.6}
     assert c["signal_snapshot_at_merge"] == {}
+    assert c["recurrence_count"] == 0
     assert c["needs_manual_intervention_at"] is not None
     assert "last_seen_at" in c
     assert "last_remediation_pr_number" in c
@@ -11084,11 +11089,76 @@ async def test_list_recently_closed_extracts_fix_pr_and_recovered_at_and_time_to
     # Latest entry's fix_pr_number wins (the loop overwrites earlier values).
     assert c["fix_pr_number"] == 2222
     assert c["recovered_at"] == recovered_at_str
+    assert c["recurrence_count"] == 2
     # 90 minutes = 5400 seconds.
     assert c["time_to_recover_sec"] == 5400
     assert c["regression_class"] == "sr_catch_rate:correctness"
     assert "id" in c
     assert "first_seen_at" in c
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_happy_path_recurrence_count_is_one_cycle(
+    client: AsyncClient, db_session
+):
+    """A fix entry + a separate recovery entry collapses to one cycle (not two)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[
+            {"fingerprint": "abc", "fix_pr_number": 555},
+            {"fingerprint": "abc", "recovered_at": "2026-05-05T13:30:00+00:00"},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["recurrence_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_two_cycles_when_re_armed(
+    client: AsyncClient, db_session
+):
+    """Two fix→recovery cycles count as 2 recurrences."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        fingerprint_to_fix_log=[
+            {"fingerprint": "abc", "fix_pr_number": 100},
+            {"fingerprint": "abc", "recovered_at": "2026-05-05T11:00:00+00:00"},
+            {"fingerprint": "abc", "fix_pr_number": 200},
+            {"fingerprint": "abc", "recovered_at": "2026-05-05T13:00:00+00:00"},
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    c = response.json()["cases"][0]
+    assert c["recurrence_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -11586,3 +11656,316 @@ async def test_digest_self_review_effectiveness_below_threshold_is_none(
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
     assert response.json()["self_review_effectiveness"] is None
+
+
+# ── _summarize_symptoms_by_layer + layer_summary integration ──────────────────
+
+
+def _layer_entry(fingerprint: str, observed_at: datetime, sample: str = "") -> dict:
+    return {
+        "fingerprint": fingerprint,
+        "observed_at": observed_at.isoformat(),
+        "sample": sample,
+    }
+
+
+def test_summarize_symptoms_by_layer_cross_layer_two_populated_layers():
+    """Two layers with recent entries → cross_layer=true, both layers reported."""
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    symptoms = {
+        "CI_WORKFLOW": [
+            _layer_entry("fp1", now - timedelta(hours=1), "ci sample"),
+            _layer_entry("fp1", now - timedelta(minutes=30), "ci sample updated"),
+            _layer_entry("fp2", now - timedelta(minutes=10), "newer ci sample"),
+        ],
+        "AGENT_VM": [
+            _layer_entry("fp3", now - timedelta(hours=2), "vm sample"),
+        ],
+    }
+    summary = _summarize_symptoms_by_layer(symptoms, now=now)
+    assert summary["cross_layer"] is True
+    assert summary["layers_affected"] == ["AGENT_VM", "CI_WORKFLOW"]
+    assert summary["window_hours"] == 48
+    by_layer = {entry["layer"]: entry for entry in summary["layers"]}
+    assert by_layer["CI_WORKFLOW"]["count"] == 3
+    assert by_layer["CI_WORKFLOW"]["distinct_fingerprints"] == 2
+    assert by_layer["CI_WORKFLOW"]["sample"] == "newer ci sample"
+    assert by_layer["AGENT_VM"]["count"] == 1
+    assert by_layer["AGENT_VM"]["distinct_fingerprints"] == 1
+    # Layers ordered by last_observed_at descending → CI_WORKFLOW first.
+    assert summary["layers"][0]["layer"] == "CI_WORKFLOW"
+
+
+def test_summarize_symptoms_by_layer_single_layer_not_cross_layer():
+    """One layer populated → cross_layer=false."""
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    symptoms = {
+        "BASELINE_GATE": [
+            _layer_entry("fp1", now - timedelta(hours=1), "lint baseline"),
+        ],
+    }
+    summary = _summarize_symptoms_by_layer(symptoms, now=now)
+    assert summary["cross_layer"] is False
+    assert summary["layers_affected"] == ["BASELINE_GATE"]
+    assert len(summary["layers"]) == 1
+
+
+def test_summarize_symptoms_by_layer_excludes_entries_older_than_window():
+    """Entries older than 48h are dropped; layer with only stale entries is omitted."""
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    symptoms = {
+        "CI_WORKFLOW": [
+            _layer_entry("fp_old", now - timedelta(hours=72), "stale"),
+            _layer_entry("fp_new", now - timedelta(hours=1), "fresh"),
+        ],
+        "AGENT_VM": [
+            _layer_entry("fp_old", now - timedelta(hours=72), "stale only"),
+        ],
+    }
+    summary = _summarize_symptoms_by_layer(symptoms, now=now)
+    assert summary["layers_affected"] == ["CI_WORKFLOW"]
+    assert summary["cross_layer"] is False
+    ci = summary["layers"][0]
+    assert ci["count"] == 1  # only the fresh entry counted
+    assert ci["sample"] == "fresh"
+
+
+def test_summarize_symptoms_by_layer_empty_and_malformed_safe():
+    """None, empty, and malformed payloads return an empty summary without raising."""
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    empty_shape = {
+        "layers": [],
+        "layers_affected": [],
+        "cross_layer": False,
+        "window_hours": 48,
+    }
+    assert _summarize_symptoms_by_layer(None, now=now) == empty_shape
+    assert _summarize_symptoms_by_layer({}, now=now) == empty_shape
+    # Non-list entries / bad observed_at / non-dict items are skipped.
+    bad = {
+        "CI_WORKFLOW": "not-a-list",
+        "AGENT_VM": [
+            "not-a-dict",
+            {"fingerprint": "fp", "observed_at": "totally-bogus", "sample": "x"},
+            {"fingerprint": "fp2", "observed_at": None, "sample": "y"},
+        ],
+    }
+    assert _summarize_symptoms_by_layer(bad, now=now) == empty_shape
+
+
+def test_summarize_symptoms_by_layer_truncates_long_sample():
+    """Sample is truncated to 200 chars."""
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    long_sample = "x" * 500
+    symptoms = {
+        "CI_WORKFLOW": [
+            _layer_entry("fp1", now - timedelta(minutes=5), long_sample),
+        ],
+    }
+    summary = _summarize_symptoms_by_layer(symptoms, now=now)
+    assert len(summary["layers"][0]["sample"]) == 200
+
+
+def test_summarize_symptoms_by_layer_handles_zulu_timestamp():
+    """observed_at written as ...Z is parsed correctly."""
+    now = datetime(2026, 5, 7, 12, 0, 0)
+    symptoms = {
+        "CI_WORKFLOW": [
+            {
+                "fingerprint": "fp1",
+                "observed_at": "2026-05-07T11:30:00Z",
+                "sample": "z",
+            }
+        ],
+    }
+    summary = _summarize_symptoms_by_layer(symptoms, now=now)
+    assert summary["layers_affected"] == ["CI_WORKFLOW"]
+    assert summary["layers"][0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_includes_layer_summary(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases returns layer_summary on each case."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.ACTIVE,
+        symptoms_by_layer={
+            "CI_WORKFLOW": [
+                _layer_entry("fp1", now - timedelta(hours=1), "ci sample"),
+            ],
+            "AGENT_VM": [
+                _layer_entry("fp2", now - timedelta(hours=2), "vm sample"),
+            ],
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    layer_summary = data["cases"][0]["layer_summary"]
+    assert layer_summary["cross_layer"] is True
+    assert sorted(layer_summary["layers_affected"]) == ["AGENT_VM", "CI_WORKFLOW"]
+    assert layer_summary["window_hours"] == 48
+    layer_names = {entry["layer"] for entry in layer_summary["layers"]}
+    assert layer_names == {"CI_WORKFLOW", "AGENT_VM"}
+
+
+@pytest.mark.asyncio
+async def test_list_regression_manual_intervention_includes_layer_summary(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases/manual-intervention returns layer_summary on each case."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:architecture",
+        status=RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+        attempts=3,
+        needs_manual_intervention_at=now,
+        symptoms_by_layer={
+            "REVIEWER_PASS": [
+                _layer_entry("fp1", now - timedelta(hours=3), "reviewer sample"),
+            ],
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/manual-intervention",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    layer_summary = data["cases"][0]["layer_summary"]
+    assert layer_summary["cross_layer"] is False
+    assert layer_summary["layers_affected"] == ["REVIEWER_PASS"]
+
+
+@pytest.mark.asyncio
+async def test_list_recently_closed_includes_layer_summary(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases/recently-closed returns layer_summary on each case."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        symptoms_by_layer={
+            "AGENT_VERB": [
+                _layer_entry("fp1", now - timedelta(hours=4), "verb sample"),
+            ],
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/recently-closed",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    layer_summary = data["cases"][0]["layer_summary"]
+    assert layer_summary["layers_affected"] == ["AGENT_VERB"]
+    assert layer_summary["cross_layer"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_auto_recovered_includes_layer_summary(
+    client: AsyncClient, db_session
+):
+    """GET /regression-cases/auto-recovered returns layer_summary on each case."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:scope-drift",
+        status=RegressionCaseStatus.CLOSED,
+        last_remediation_result="recovered_unattended",
+        symptoms_by_layer={
+            "DISPATCHER": [
+                _layer_entry("fp1", now - timedelta(hours=2), "dispatcher sample"),
+            ],
+            "AGENT_VM": [
+                _layer_entry("fp2", now - timedelta(hours=1), "vm sample"),
+            ],
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/auto-recovered",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    layer_summary = data["cases"][0]["layer_summary"]
+    assert layer_summary["cross_layer"] is True
+    assert sorted(layer_summary["layers_affected"]) == ["AGENT_VM", "DISPATCHER"]
+
+
+@pytest.mark.asyncio
+async def test_list_regression_cases_layer_summary_empty_for_default_case(
+    client: AsyncClient, db_session
+):
+    """When symptoms_by_layer defaults to empty, layer_summary is the empty shape."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="fix_loop_divergence",
+        status=RegressionCaseStatus.ACTIVE,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    layer_summary = response.json()["cases"][0]["layer_summary"]
+    assert layer_summary == {
+        "layers": [],
+        "layers_affected": [],
+        "cross_layer": False,
+        "window_hours": 48,
+    }

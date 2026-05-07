@@ -66,6 +66,7 @@ _PIPELINE_SUCCESS_MIN_SAMPLE = 10
 
 # Give merged signals time to settle before the recovery scan re-evaluates them.
 _REGRESSION_RECOVERY_COOLDOWN = timedelta(minutes=15)
+_RECURRENCE_LOOKBACK = timedelta(days=30)
 
 # Watchdog staleness thresholds.  An ACTIVE case that hasn't been updated in
 # 24h has silently stalled (investigation finished with low confidence and no
@@ -112,6 +113,14 @@ _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.PROVISIONING,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
+)
+
+_CANONICAL_RECURRENCE_LAYERS = (
+    "CI_WORKFLOW",
+    "AGENT_VM",
+    "AGENT_VERB",
+    "BASELINE_GATE",
+    "REVIEWER_PASS",
 )
 
 # Bounded ring buffer of the last 1000 dispatcher cycle records (all projects).
@@ -429,6 +438,141 @@ def _format_prior_attempt_context(case: RegressionRemediationCase) -> str:
         "Approach from a different angle — look for a deeper root cause or a "
         "different contributing factor that the prior fix missed."
     )
+    return "\n".join(lines)
+
+
+def _parse_dispatcher_dt(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+def _format_dispatcher_duration(delta: timedelta | None) -> str:
+    if delta is None:
+        return "unknown"
+    seconds = max(int(delta.total_seconds()), 0)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, rem = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{rem}s"
+
+
+def _extract_recurrence_cycles(
+    case: RegressionRemediationCase,
+) -> list[dict[str, Any]]:
+    log_entries = case.fingerprint_to_fix_log or []
+    snapshot = case.signal_snapshot_at_merge or {}
+    merged_fallback = _parse_dispatcher_dt(snapshot.get("captured_at"))
+    cycles: list[dict[str, Any]] = []
+    for entry in log_entries:
+        if not isinstance(entry, dict):
+            continue
+        has_fix = entry.get("fix_pr_number") is not None
+        has_recovery = entry.get("recovered_at") is not None
+        if has_fix:
+            cycles.append(
+                {
+                    "fix_pr_number": entry.get("fix_pr_number"),
+                    "merged_at": _parse_dispatcher_dt(entry.get("merged_at"))
+                    or merged_fallback
+                    or _parse_dispatcher_dt(entry.get("recovered_at"))
+                    or case.updated_at
+                    or case.created_at,
+                    "recovered_at": None,
+                }
+            )
+            continue
+        if has_recovery:
+            recovered_at = _parse_dispatcher_dt(entry.get("recovered_at"))
+            if cycles and cycles[-1].get("recovered_at") is None:
+                cycles[-1]["recovered_at"] = recovered_at
+                continue
+            cycles.append(
+                {
+                    "fix_pr_number": None,
+                    "merged_at": merged_fallback or recovered_at or case.updated_at,
+                    "recovered_at": recovered_at,
+                }
+            )
+    if not cycles and (
+        case.last_remediation_pr_number is not None
+        or merged_fallback is not None
+        or snapshot.get("captured_at") is not None
+    ):
+        cycles.append(
+            {
+                "fix_pr_number": case.last_remediation_pr_number,
+                "merged_at": merged_fallback or case.updated_at or case.created_at,
+                "recovered_at": None,
+            }
+        )
+    return cycles
+
+
+def _format_recurrence_meta_prompt(
+    case: RegressionRemediationCase,
+    base_lines: str,
+) -> str:
+    attempts = getattr(case, "_recurrence_attempts", []) or []
+    recurrence_count = getattr(case, "_recurrence_count", len(attempts)) or len(
+        attempts
+    )
+    held_text = getattr(case, "_recurrence_held_text", "unknown")
+    lines = [
+        "RECURRENCE META-INVESTIGATION",
+        (
+            f"This regression class has recurred {recurrence_count} time(s) after "
+            "prior remediation."
+        ),
+        f"Most recent prior fix held for {held_text} before the signal re-tripped.",
+        "Prior remediation attempts:",
+    ]
+    if attempts:
+        for idx, attempt in enumerate(attempts, start=1):
+            task_id = attempt.get("task_id") or "unknown"
+            pr_number = attempt.get("pr_number")
+            merged_at = attempt.get("merged_at") or "unknown"
+            recovered_at = attempt.get("recovered_at")
+            held_for = attempt.get("held_for") or "unknown"
+            parts = [
+                f"- Attempt {idx}: task {task_id}",
+                f"PR #{pr_number}" if pr_number is not None else "PR unknown",
+                f"merged {merged_at}",
+                f"held {held_for} before re-trip",
+            ]
+            if recovered_at is not None:
+                parts.insert(3, f"recovered {recovered_at}")
+            lines.append(" | ".join(parts))
+    else:
+        lines.append("- No prior remediation task metadata was found.")
+    lines.extend(
+        [
+            "",
+            "Enumerate ALL FIVE canonical layers explicitly:",
+            ", ".join(_CANONICAL_RECURRENCE_LAYERS),
+            (
+                "For each layer answer: is it involved? if yes, what defense "
+                "should we add? if no, why is it ruled out?"
+            ),
+        ]
+    )
+    lines.append("")
+    lines.append(base_lines)
     return "\n".join(lines)
 
 
@@ -1132,6 +1276,101 @@ async def _get_remediation_case(
     )
 
 
+async def _load_recurrence_prompt_context(
+    session: AsyncSession,
+    case: RegressionRemediationCase,
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Return recurrence metadata when a case clearly re-tripped."""
+    cycles = _extract_recurrence_cycles(case)
+
+    recent_closed = False
+    if case.status == RegressionCaseStatus.CLOSED:
+        closed_anchor = case.updated_at or case.last_seen_at or case.created_at
+        recent_closed = now - closed_anchor <= _RECURRENCE_LOOKBACK
+
+    rearmed_after_merge = (
+        case.status == RegressionCaseStatus.ACTIVE
+        and (case.attempts or 0) >= 1
+        and case.last_remediation_result == "failed"
+    )
+
+    recurrence_from_history = bool(
+        case.fingerprint_to_fix_log
+        and any(
+            isinstance(entry, dict)
+            and (
+                entry.get("fix_pr_number") is not None
+                or entry.get("recovered_at") is not None
+            )
+            for entry in case.fingerprint_to_fix_log
+        )
+    )
+
+    if not (recent_closed or rearmed_after_merge or recurrence_from_history):
+        return None
+
+    if not cycles:
+        snapshot = case.signal_snapshot_at_merge or {}
+        merged_anchor = _parse_dispatcher_dt(snapshot.get("captured_at"))
+        cycles = [
+            {
+                "fix_pr_number": case.last_remediation_pr_number,
+                "merged_at": merged_anchor or case.updated_at or case.created_at,
+                "recovered_at": None,
+            }
+        ]
+
+    task_rows = (
+        await session.execute(
+            select(Task.id, TaskHistory.timestamp)
+            .join(TaskHistory, TaskHistory.task_id == Task.id)
+            .where(
+                Task.project_id == case.project_id,
+                Task.context["spawned_by"].as_string()
+                == "pipeline_regression_dispatcher",
+                Task.context["regression_class"].as_string() == case.regression_class,
+                TaskHistory.action == "SPAWNED",
+            )
+            .order_by(TaskHistory.timestamp.asc())
+        )
+    ).all()
+
+    attempts: list[dict[str, Any]] = []
+    for idx, row in enumerate(task_rows):
+        task_id, _spawned_at = row
+        cycle = cycles[idx] if idx < len(cycles) else {}
+        merged_at = cycle.get("merged_at")
+        recovered_at = cycle.get("recovered_at")
+        if recovered_at is not None:
+            held_for = now - recovered_at
+        elif merged_at is not None:
+            held_for = now - merged_at
+        else:
+            held_for = None
+        attempts.append(
+            {
+                "task_id": str(task_id),
+                "pr_number": cycle.get("fix_pr_number")
+                or case.last_remediation_pr_number,
+                "merged_at": merged_at.isoformat() if merged_at is not None else None,
+                "recovered_at": (
+                    recovered_at.isoformat() if recovered_at is not None else None
+                ),
+                "held_for": _format_dispatcher_duration(held_for),
+            }
+        )
+
+    recurrence_count = len(cycles)
+    held_text = attempts[-1]["held_for"] if attempts else "unknown"
+    return {
+        "recurrence_count": recurrence_count,
+        "attempts": attempts,
+        "held_text": held_text,
+    }
+
+
 async def _maybe_spawn(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1305,7 +1544,36 @@ async def _maybe_spawn(
         prompt = base_prompt
         layers_evidence = []
 
-    if existing_case is not None and (existing_case.attempts or 0) >= 2:
+    recurrence_context = None
+    if not is_cross_layer and existing_case is not None:
+        recurrence_context = await _load_recurrence_prompt_context(
+            session,
+            existing_case,
+            now=now,
+        )
+        if recurrence_context is not None:
+            object.__setattr__(
+                existing_case,
+                "_recurrence_attempts",
+                recurrence_context["attempts"],
+            )
+            object.__setattr__(
+                existing_case,
+                "_recurrence_count",
+                recurrence_context["recurrence_count"],
+            )
+            object.__setattr__(
+                existing_case,
+                "_recurrence_held_text",
+                recurrence_context["held_text"],
+            )
+            prompt = _format_recurrence_meta_prompt(existing_case, base_prompt)
+
+    if (
+        recurrence_context is None
+        and existing_case is not None
+        and (existing_case.attempts or 0) >= 2
+    ):
         prompt += _format_prior_attempt_context(existing_case)
     payload_dict: dict[str, Any] = {
         "type": "investigate",
@@ -1341,6 +1609,8 @@ async def _maybe_spawn(
             "escalation": "cross_layer",
         }
         context["cross_layer_layers"] = list(distinct_layers)
+    if recurrence_context is not None:
+        context["recurrence_count"] = recurrence_context["recurrence_count"]
     if extra_context_fields:
         context.update(extra_context_fields)
     new_task = Task(

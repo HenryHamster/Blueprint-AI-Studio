@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
+import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 
 interface RecentlyClosedCase {
   id: string;
@@ -11,6 +12,8 @@ interface RecentlyClosedCase {
   first_seen_at: string | null;
   signal_first_crossed_at?: string | null;
   time_to_recover_sec: number | null;
+  recurrence_count?: number;
+  layer_summary?: LayerSummary | null;
 }
 
 interface Props {
@@ -83,6 +86,12 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                         PR #{c.fix_pr_number}
                       </span>
                     )}
+                    {(c.recurrence_count ?? 0) > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20">
+                        recurred {c.recurrence_count}x
+                      </span>
+                    )}
+                    <LayersAffectedBadges summary={c.layer_summary} />
                   </div>
                   <div className="mt-1.5 flex items-center gap-3 text-[10px] text-neutral-500">
                     {c.time_to_recover_sec != null && (

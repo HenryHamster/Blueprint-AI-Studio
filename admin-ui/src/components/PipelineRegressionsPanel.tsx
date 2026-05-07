@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, CheckCircle, RotateCcw, Activity, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo, parseTimestamp } from '../utils/time';
+import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 
 interface DispatcherCycleClass {
   regression_class: string;
@@ -174,6 +175,8 @@ interface ManualInterventionCase {
   signal_first_seen_at: string | null;
   time_to_detect_sec: number | null;
   escalation_reason: string | null;
+  recurrence_count?: number;
+  layer_summary?: LayerSummary | null;
 }
 
 const ESCALATION_REASON_LABELS: Record<string, string> = {
@@ -215,6 +218,14 @@ function snapshotSummary(snap: Record<string, unknown> | null): string {
     .slice(0, 3)
     .map(([k, v]) => `${k.replace(/_/g, ' ')}: ${typeof v === 'number' ? Math.round(Number(v) * 100) / 100 : v}`);
   return entries.length ? entries.join(', ') : '—';
+}
+
+function recurrenceBadge(count: number | undefined) {
+  return count && count > 0 ? (
+    <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400 border border-neutral-500/20">
+      recurred {count}x
+    </span>
+  ) : null;
 }
 
 export function ManualInterventionPanel({ projectId, filterClass }: Props) {
@@ -320,6 +331,7 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
                       {c.attempts} attempt{c.attempts !== 1 ? 's' : ''}
                     </span>
+                    {recurrenceBadge(c.recurrence_count)}
                     {c.escalation_reason && ESCALATION_REASON_LABELS[c.escalation_reason] && (
                       <span
                         className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20"
@@ -328,6 +340,7 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                         {ESCALATION_REASON_LABELS[c.escalation_reason]}
                       </span>
                     )}
+                    <LayersAffectedBadges summary={c.layer_summary} />
                   </div>
                   <div className="mt-1.5 space-y-0.5">
                     <div className="text-[10px] text-neutral-500">
@@ -581,6 +594,7 @@ export function AutoRecoveredPanel({ projectId }: Props) {
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                     {c.attempts} attempt{c.attempts !== 1 ? 's' : ''}
                   </span>
+                  {recurrenceBadge(c.recurrence_count)}
                   {c.escalation_reason && ESCALATION_REASON_LABELS[c.escalation_reason] && (
                     <span
                       className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20"
@@ -589,6 +603,7 @@ export function AutoRecoveredPanel({ projectId }: Props) {
                       {ESCALATION_REASON_LABELS[c.escalation_reason]}
                     </span>
                   )}
+                  <LayersAffectedBadges summary={c.layer_summary} />
                 </div>
                 <div className="mt-1.5 space-y-0.5">
                   <div className="text-[10px] text-neutral-500">

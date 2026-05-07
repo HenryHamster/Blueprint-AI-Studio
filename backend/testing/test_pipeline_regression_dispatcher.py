@@ -31,7 +31,7 @@ from app.pipeline_regression_dispatcher import (
 )
 from app.time_utils import _utcnow
 
-from testing.factories import make_project, make_task
+from testing.factories import make_project, make_task, make_task_history
 
 
 def _design_doc_with_sr_regression(
@@ -173,7 +173,13 @@ async def test_cooldown_blocks_after_terminal(db_session):
     # Mark the spawned task COMPLETED — no longer in-flight, but cooldown
     # window has not elapsed yet, so the next call MUST still skip.
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
         .scalars()
         .first()
     )
@@ -2565,6 +2571,43 @@ async def test_two_sr_categories_coalesce_into_one_task(db_session):
 # ---------------------------------------------------------------------------
 
 
+async def _seed_dispatcher_spawn_history(
+    db_session,
+    project_id,
+    *,
+    regression_class: str,
+    created_at,
+    pr_number: int,
+) -> Task:
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        created_at=created_at,
+        context={
+            "spawned_by": "pipeline_regression_dispatcher",
+            "regression_class": regression_class,
+        },
+        payloads=[{"type": "investigate", "prompt": "old", "base_branch": "main"}],
+    )
+    db_session.add(task)
+    db_session.add(
+        make_task_history(
+            task.id,
+            action="SPAWNED",
+            timestamp=created_at,
+            details={
+                "spawned_by": "PIPELINE_REGRESSION_DISPATCHER",
+                "regression_class": regression_class,
+                "signal_name": "sr_catch_rate",
+                "last_remediation_pr_number": pr_number,
+            },
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
 @pytest.mark.asyncio
 async def test_second_attempt_prompt_unchanged(db_session):
     """attempts==1: prompt has no prior-attempt context (existing behavior preserved)."""
@@ -2598,6 +2641,174 @@ async def test_second_attempt_prompt_unchanged(db_session):
         .first()
     )
     prompt = (task.first_payload or {}).get("prompt", "")
+    assert "PRIOR ATTEMPT CONTEXT" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_fresh_spawn_prompt_has_no_recurrence_or_cross_layer_headers(db_session):
+    """Fresh class with no history keeps the plain signal prompt."""
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert prompt.startswith(
+        "Pipeline regression detected (sr_catch_rate / class=sr_catch_rate:correctness)."
+    )
+    assert "CROSS-LAYER REGRESSION DETECTED" not in prompt
+    assert "RECURRENCE META-INVESTIGATION" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_re_arm_spawn_uses_recurrence_meta_prompt(db_session):
+    """Re-armed cases after MERGED transition get the recurrence meta prompt."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(hours=3)).isoformat()
+    prior_task = await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class="sr_catch_rate",
+        created_at=_utcnow() - timedelta(hours=7),
+        pr_number=4321,
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        hit_count=1,
+        attempts=0,
+        last_remediation_task_id=prior_task.id,
+        last_remediation_pr_number=4321,
+        last_remediation_result="merged",
+        signal_snapshot_at_spawn={
+            "prior_rate": 0.80,
+            "current_rate": 0.50,
+            "signal_name": "sr_catch_rate",
+            "captured_at": merged_at,
+        },
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 4321,
+                "merged_at": merged_at,
+            }
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    await run_recovery_once(db_session, project.id)
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.attempts == 1
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRENCE META-INVESTIGATION" in prompt
+    assert "#4321" in prompt
+    assert "PRIOR ATTEMPT CONTEXT" not in prompt
+    for layer in (
+        "CI_WORKFLOW",
+        "AGENT_VM",
+        "AGENT_VERB",
+        "BASELINE_GATE",
+        "REVIEWER_PASS",
+    ):
+        assert layer in prompt
+
+
+@pytest.mark.asyncio
+async def test_closed_case_with_recent_history_uses_recurrence_prompt(db_session):
+    """A CLOSED case from the last 30 days re-spawns with recurrence guidance."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    merged_at = (_utcnow() - timedelta(days=1)).isoformat()
+    await _seed_dispatcher_spawn_history(
+        db_session,
+        project.id,
+        regression_class="sr_catch_rate",
+        created_at=_utcnow() - timedelta(days=1, minutes=5),
+        pr_number=5678,
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.CLOSED,
+        hit_count=1,
+        last_remediation_pr_number=5678,
+        signal_snapshot_at_merge={"captured_at": merged_at},
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate",
+                "fix_pr_number": 5678,
+                "merged_at": merged_at,
+            },
+            {
+                "fingerprint": "sr_catch_rate",
+                "recovered_at": (_utcnow() - timedelta(hours=12)).isoformat(),
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+    prompt = (task.first_payload or {}).get("prompt", "")
+    assert "RECURRENCE META-INVESTIGATION" in prompt
+    assert "#5678" in prompt
     assert "PRIOR ATTEMPT CONTEXT" not in prompt
 
 
@@ -4390,6 +4601,7 @@ async def test_cross_layer_two_layers_escalates(db_session):
         payload = task.first_payload or {}
         prompt = payload.get("prompt") or ""
         assert "CROSS-LAYER REGRESSION DETECTED" in prompt
+        assert "RECURRENCE META-INVESTIGATION" not in prompt
         assert LAYER_AGENT_VM in prompt
         assert LAYER_CI_WORKFLOW in prompt
 

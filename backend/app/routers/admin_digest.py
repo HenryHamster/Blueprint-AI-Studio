@@ -681,6 +681,69 @@ def _compute_first_attempt_breakdowns(
     }
 
 
+_LAYER_SUMMARY_WINDOW = timedelta(hours=48)
+
+
+def _summarize_symptoms_by_layer(
+    symptoms_by_layer: Dict[str, Any] | None,
+    *,
+    now: datetime,
+    window: timedelta = _LAYER_SUMMARY_WINDOW,
+) -> Dict[str, Any]:
+    """Compact per-layer summary of recent regression-case symptom observations.
+
+    Reads the JSONB shape ``{layer: [{fingerprint, observed_at, sample}, ...]}``
+    populated by the pipeline regression dispatcher. Returns layers with at
+    least one observation inside ``window`` (default 48h), sorted by
+    most-recent ``last_observed_at`` first; cross_layer is true when >=2
+    layers have non-empty entries within the window.
+    """
+    cutoff = now - window
+    layers_out: list[dict[str, Any]] = []
+    if isinstance(symptoms_by_layer, dict):
+        for layer, entries in symptoms_by_layer.items():
+            if not isinstance(entries, list):
+                continue
+            recent: list[tuple[datetime, dict[str, Any]]] = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    obs_dt = datetime.fromisoformat(
+                        str(entry.get("observed_at")).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if obs_dt.tzinfo is not None:
+                    obs_dt = obs_dt.replace(tzinfo=None)
+                if obs_dt >= cutoff:
+                    recent.append((obs_dt, entry))
+            if not recent:
+                continue
+            recent.sort(key=lambda p: p[0])
+            latest_dt, latest_entry = recent[-1]
+            distinct_fps = {
+                e.get("fingerprint") for _, e in recent if e.get("fingerprint")
+            }
+            layers_out.append(
+                {
+                    "layer": layer,
+                    "count": len(recent),
+                    "distinct_fingerprints": len(distinct_fps),
+                    "last_observed_at": latest_dt.isoformat(),
+                    "sample": str(latest_entry.get("sample") or "")[:200],
+                }
+            )
+    layers_out.sort(key=lambda d: d["last_observed_at"], reverse=True)
+    affected = sorted(d["layer"] for d in layers_out)
+    return {
+        "layers": layers_out,
+        "layers_affected": affected,
+        "cross_layer": len(affected) >= 2,
+        "window_hours": int(window.total_seconds() // 3600),
+    }
+
+
 def _compute_regression_case_summary(
     rows: List[RegressionRemediationCase],
 ) -> Dict[str, Any]:
@@ -740,6 +803,30 @@ def _compute_regression_case_summary(
             for regression_class, bucket in sorted(by_class.items())
         ]
     }
+
+
+def _regression_case_recurrence_count(case: RegressionRemediationCase) -> int:
+    """Count fix→recovery cycles in the log; mirrors the dispatcher's pairing.
+
+    A normal happy-path closure writes two entries (one fix, one recovery),
+    which collapse into a single cycle. Counting raw entries would double-count.
+    """
+    cycles = 0
+    last_unpaired_fix = False
+    for entry in case.fingerprint_to_fix_log or []:
+        if not isinstance(entry, dict):
+            continue
+        has_fix = entry.get("fix_pr_number") is not None
+        has_recovery = entry.get("recovered_at") is not None
+        if has_fix:
+            cycles += 1
+            last_unpaired_fix = not has_recovery
+        elif has_recovery:
+            if last_unpaired_fix:
+                last_unpaired_fix = False
+            else:
+                cycles += 1
+    return cycles
 
 
 _REVIEW_ELIGIBLE_TYPES = {"create", "refactor"}
@@ -2114,6 +2201,7 @@ async def list_regression_cases(
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "recurrence_count": _regression_case_recurrence_count(c),
                 "signal_first_seen_at": c.signal_first_seen_at.isoformat()
                 if c.signal_first_seen_at
                 else None,
@@ -2127,6 +2215,9 @@ async def list_regression_cases(
                 "stalled": c.status == RegressionCaseStatus.ACTIVE
                 and c.last_remediation_pr_number is None
                 and c.first_seen_at < stall_threshold,
+                "layer_summary": _summarize_symptoms_by_layer(
+                    c.symptoms_by_layer, now=now
+                ),
             }
             for c in rows
         ],
@@ -2193,6 +2284,7 @@ async def list_regression_manual_intervention_cases(
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ):
     """List regression cases escalated to manual intervention."""
+    now = _utcnow()
     rows = (
         (
             await session.execute(
@@ -2223,6 +2315,7 @@ async def list_regression_manual_intervention_cases(
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
+                "recurrence_count": _regression_case_recurrence_count(c),
                 "signal_first_seen_at": c.signal_first_seen_at.isoformat()
                 if c.signal_first_seen_at
                 else None,
@@ -2239,6 +2332,9 @@ async def list_regression_manual_intervention_cases(
                 if c.signal_first_crossed_at
                 else None,
                 "escalation_reason": c.escalation_reason,
+                "layer_summary": _summarize_symptoms_by_layer(
+                    c.symptoms_by_layer, now=now
+                ),
             }
             for c in rows
         ],
@@ -2259,6 +2355,7 @@ async def list_regression_auto_recovered_cases(
     Adds a ``recovered_at`` field pulled from the latest ``recovered_unattended``
     log entry and an ``updated_at`` field so operators can sort by close time.
     """
+    now = _utcnow()
     rows = (
         (
             await session.execute(
@@ -2300,6 +2397,7 @@ async def list_regression_auto_recovered_cases(
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
+                "recurrence_count": _regression_case_recurrence_count(c),
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat()
                 if c.needs_manual_intervention_at
@@ -2311,6 +2409,9 @@ async def list_regression_auto_recovered_cases(
                 "escalation_reason": c.escalation_reason,
                 "recovered_at": recovered_at,
                 "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                "layer_summary": _summarize_symptoms_by_layer(
+                    c.symptoms_by_layer, now=now
+                ),
             }
         )
     return {"count": len(cases), "cases": cases}
@@ -2376,6 +2477,7 @@ async def list_recently_closed_regression_cases(
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ):
     """List recently closed regression cases (autonomous wins)."""
+    now = _utcnow()
     rows = (
         (
             await session.execute(
@@ -2425,6 +2527,7 @@ async def list_recently_closed_regression_cases(
                 "regression_class": c.regression_class,
                 "fix_pr_number": fix_pr_number,
                 "recovered_at": recovered_at,
+                "recurrence_count": _regression_case_recurrence_count(c),
                 "first_seen_at": c.first_seen_at.isoformat()
                 if c.first_seen_at
                 else None,
@@ -2436,6 +2539,9 @@ async def list_recently_closed_regression_cases(
                 else None,
                 "time_to_detect_sec": c.time_to_detect_sec,
                 "time_to_recover_sec": time_to_recover_sec,
+                "layer_summary": _summarize_symptoms_by_layer(
+                    c.symptoms_by_layer, now=now
+                ),
             }
         )
 
