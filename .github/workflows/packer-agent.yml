@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'agent/**'
+      - 'infra/packer/**'
   workflow_dispatch: {}
 
 env:
