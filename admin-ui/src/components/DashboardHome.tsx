@@ -8,6 +8,7 @@ import {
   ExternalLink,
   GitMerge,
   Minus,
+  Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch } from '../api';
@@ -234,7 +235,7 @@ interface DigestData {
     false_alarm_rate?: number | null;
     sample_size?: number | null;
   } | null;
-  self_review_prediction_accuracy_trends?: SrTrendData | null;
+  self_review_prediction_accuracy_trends?: SrTrendWithFixIterations | null;
   sr_regression_risk_test_signal_trends?: {
     computed_at?: string | null;
     bucket_mode?: string | null;
@@ -278,6 +279,9 @@ interface DigestData {
   } | null;
   tasks_truncated?: boolean;
 }
+
+interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
+type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; };
 
 // Per-direction SR catch-rate breakdown types (endpoint: GET /projects/{id}/direction-sr-breakdown)
 interface DirectionSrCategoryStats {
@@ -334,6 +338,43 @@ const REVIEW_CAT_COLORS: Record<string, string> = {
   architecture: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
   other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
 };
+
+const FIX_ITERATION_BUCKETS = ['1', '2', '3+'] as const;
+
+function FixIterationBreakdown({ trends }: { trends: SrTrendWithFixIterations | null | undefined }) {
+  const breakdown = trends?.by_fix_iteration ?? trends?.fix_iteration_breakdown ?? trends?.iteration_breakdown ?? null;
+  if (!breakdown) return null;
+  return (
+    <section>
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">SR by Fix Iteration</p>
+      <div className="flex flex-wrap gap-1.5">
+        {FIX_ITERATION_BUCKETS.map(bucket => {
+          const stats = breakdown[bucket] ?? breakdown[`fix-${bucket}`] ?? breakdown[`fix_${bucket}`] ?? breakdown[bucket.replace('+', 'plus')] ?? null;
+          const sampleCount = stats?.sample_count ?? 0;
+          const enoughSignal = sampleCount >= 5 && stats?.hit_rate != null && stats?.miss_rate != null;
+          return (
+            <span
+              key={bucket}
+              className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-neutral-500/10 text-neutral-300 border-neutral-700/40"
+              title={enoughSignal ? `n=${sampleCount}` : 'insufficient signal (<5 qualifying tasks)'}
+            >
+              fix-{bucket}
+              {enoughSignal ? (
+                <>
+                  <span className="font-bold text-emerald-400">{Math.round((stats.hit_rate ?? 0) * 100)}%</span>
+                  <span className="opacity-70">miss {Math.round((stats.miss_rate ?? 0) * 100)}%</span>
+                  <span className="text-neutral-500 font-normal">n={sampleCount}</span>
+                </>
+              ) : (
+                <span className="text-neutral-500 font-normal">insufficient signal</span>
+              )}
+            </span>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
 
 interface BlindSpotTheme {
   theme: string;
@@ -615,6 +656,9 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
+  const [srTrendDrilldownOpen, setSrTrendDrilldownOpen] = useState(false);
+  const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
+  const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
@@ -773,6 +817,19 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
       : !digestOk;
     setLastFetchError(allFailed);
   }, [selectedProjectId, windowHours]);
+
+  const fetchSrTrendDrilldown = useCallback(async (categories: string[]) => {
+    if (!selectedProjectId || categories.length === 0) return;
+    setSrTrendDrilldownLoading(true);
+    try {
+      const params = new URLSearchParams({ alert_type: 'trends' });
+      categories.forEach(c => params.append('categories', c));
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-alert-drilldown?${params}`);
+      if (res.ok) setSrTrendDrilldownRows(((await res.json()) as { items: { task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[] }).items ?? []);
+    } finally {
+      setSrTrendDrilldownLoading(false);
+    }
+  }, [selectedProjectId]);
 
   // Initial + polling
   useEffect(() => {
@@ -1108,6 +1165,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   variant="card"
                   onCategoryClick={onCategoryClick}
                 />
+                <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />
                 {digest?.fresh_reviewer_effectiveness != null && (() => {
                   const fre = digest.fresh_reviewer_effectiveness;
@@ -1135,6 +1193,47 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                   );
                 })()}
               </div>
+              {selectedProjectId && (() => {
+                const cats = Object.entries(
+                  digest?.self_review_prediction_accuracy_trends?.categories ?? {}
+                ).filter(([, c]) => c.trend === 'decreasing').map(([k]) => k);
+                if (cats.length === 0) return null;
+                return (
+                  <div className="mt-2">
+                    <button
+                      onClick={() => {
+                        if (srTrendDrilldownOpen) { setSrTrendDrilldownOpen(false); return; }
+                        setSrTrendDrilldownOpen(true);
+                        void fetchSrTrendDrilldown(cats);
+                      }}
+                      className="text-[10px] flex items-center gap-1 text-amber-400/70 hover:text-amber-400 transition-colors mb-1"
+                    >
+                      <Search className="w-3 h-3" />
+                      <span>{srTrendDrilldownOpen ? 'Hide' : 'Investigate'} regression ({cats.join(', ')})</span>
+                    </button>
+                    {srTrendDrilldownOpen && (
+                      <div className="bg-neutral-900/60 border border-neutral-700/40 rounded-lg px-3 py-2 text-xs text-neutral-300 flex flex-col gap-1.5">
+                        {srTrendDrilldownLoading && <span className="text-neutral-500">Loading…</span>}
+                        {!srTrendDrilldownLoading && srTrendDrilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found.</span>}
+                        {!srTrendDrilldownLoading && srTrendDrilldownRows.map(row => (
+                          <div key={row.task_id} className="flex items-start gap-2">
+                            <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
+                              SR {row.sr_verdict ?? '?'}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <span className="text-neutral-200 truncate block">{row.title}</span>
+                              <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
+                            </div>
+                            <button onClick={() => { const t = tasks.find(t => t.id === row.task_id); if (t) onViewTask(t); }} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
+                              <ExternalLink className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </section>
           )}
 

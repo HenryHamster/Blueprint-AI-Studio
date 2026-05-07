@@ -3149,6 +3149,10 @@ async def compute_sr_catch_rate_trends(
         result["sr_skip_rate"] = sr_skip_rate
         result["sr_skip_reason_distribution"] = sr_skip_dist
 
+    by_direction = compute_sr_catch_rate_by_direction(all_tasks)
+    if by_direction:
+        result["by_direction"] = by_direction
+
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
     flag_modified(project, "design_doc")
@@ -3561,6 +3565,8 @@ async def compute_sr_catch_rate_trends(
         logger.exception(
             "[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing"
         )
+
+    await session.flush()
 
     return result
 
@@ -4420,3 +4426,81 @@ async def compute_sr_regression_risk_test_signal_trends(
     )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# SR alert drilldown helper
+# ---------------------------------------------------------------------------
+
+
+def get_sr_alert_drilldown_tasks(
+    all_tasks: list,
+    design_doc: dict,
+    categories: list[str],
+    *,
+    alert_type: str = "trends",
+    page_size: int = 50,
+) -> list[dict[str, Any]]:
+    """Return tasks from the current SR alert window where SR missed the given categories.
+
+    Finds tasks where the human reviewer flagged at least one category from
+    ``categories`` but SR did not (category absent from ``check_results`` or
+    ``passed`` is True).  Window is derived from the stored alert state:
+    - cycle_id present -> filter by ``strategic_cycle_id``
+    - no cycle_id -> last 14 calendar days (calendar fallback)
+
+    PR URLs are not fetched here; the calling endpoint should batch-query
+    Artifact rows by the returned task_id list.
+    """
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    alert_key = (
+        "sr_catch_rate_trends_alert"
+        if alert_type == "trends"
+        else "sr_catch_rate_floor_alert"
+    )
+    alert_state: dict = dict(design_doc.get(alert_key) or {})
+    cycle_id: Optional[str] = alert_state.get("cycle_id")
+    target_cats = set(categories)
+
+    if cycle_id:
+        window_tasks = [
+            t for t in all_tasks if getattr(t, "strategic_cycle_id", None) == cycle_id
+        ]
+    else:
+        cutoff = _naive(now - timedelta(days=14))
+        window_tasks = [
+            t for t in all_tasks if t.created_at and _naive(t.created_at) >= cutoff
+        ]
+
+    results: list[dict[str, Any]] = []
+    for t in window_tasks:
+        ctx = t.context or {}
+        if "_self_review_outcome" not in ctx:
+            continue
+        check_results = ctx["_self_review_outcome"].get("check_results") or {}
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
+        missed_in_target = (human_cats & target_cats) - sr_failed
+        if not missed_in_target:
+            continue
+        caught_in_target = human_cats & target_cats & sr_failed
+        payload = t.first_payload or {}
+        results.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or "",
+                "task_type": payload.get("type", ""),
+                "scope": ctx.get("scope"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "missed_categories": sorted(missed_in_target),
+                "caught_categories": sorted(caught_in_target),
+                "sr_verdict": ctx["_self_review_outcome"].get("verdict"),
+            }
+        )
+
+    results.sort(key=lambda x: x["created_at"] or "", reverse=True)
+    return results[:page_size]

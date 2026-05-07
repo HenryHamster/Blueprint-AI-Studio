@@ -6,10 +6,18 @@ from datetime import datetime, timedelta
 from httpx import AsyncClient
 from sqlalchemy import select
 from app.models import (
-    Artifact, ArtifactType, LLMAuthMode, LLMProviderName, MaxPlanAccount,
-    Project, ProjectStatus, Task, TaskStatus,
+    Artifact,
+    ArtifactType,
+    LLMAuthMode,
+    LLMProviderName,
+    MaxPlanAccount,
+    Project,
+    ProjectStatus,
+    Task,
+    TaskStatus,
 )
 from app.auth import create_agent_token
+
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
@@ -22,7 +30,9 @@ async def test_agent_claim_success(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="agent-vm-999")
+    task = Task(
+        project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="agent-vm-999"
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -41,24 +51,31 @@ async def test_agent_claim_success(client: AsyncClient, db_session):
     await db_session.refresh(task)
     assert task.status == TaskStatus.IN_PROGRESS
 
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_agent_claim_unauthorized(client: AsyncClient):
     """
     Tests that missing or invalid token returns 401.
     """
-    resp = await client.post("/api/agent/claim", headers={"x-agent-token": "wrong-token"})
+    resp = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": "wrong-token"}
+    )
     assert resp.status_code == 401
+
 
 @pytest.mark.asyncio
 async def test_agent_claim_not_found(client: AsyncClient):
     """
     Tests that claiming a task with an invalid VM ID returns 404.
     """
-    token = create_agent_token("00000000-0000-0000-0000-000000000000", "non-existent-vm")
+    token = create_agent_token(
+        "00000000-0000-0000-0000-000000000000", "non-existent-vm"
+    )
     headers = {"x-agent-token": token}
     resp = await client.post("/api/agent/claim", headers=headers)
     assert resp.status_code == 404
+
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
@@ -74,7 +91,12 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"cmd": "ls"}], vm_instance_id="agent-vm-888", status=TaskStatus.IN_PROGRESS)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-888",
+        status=TaskStatus.IN_PROGRESS,
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -85,7 +107,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
         "task_id": str(task.id),
         "status": "COMPLETED",
         "artifact_type": "ERROR_LOG",
-        "logs": "build success"
+        "logs": "build success",
     }
     resp = await client.post("/api/agent/status", json=payload, headers=headers)
     assert resp.status_code == 200
@@ -100,7 +122,9 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_agent_status_update_persists_runtime_identity(client: AsyncClient, db_session, mocker):
+async def test_agent_status_update_persists_runtime_identity(
+    client: AsyncClient, db_session, mocker
+):
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     now = datetime.utcnow()
 
@@ -147,8 +171,10 @@ async def test_agent_status_update_persists_runtime_identity(client: AsyncClient
     assert task.estimated_cost_usd is not None
 
     provider_tasks = (
-        await db_session.execute(select(Task).where(Task.provider == "openai"))
-    ).scalars().all()
+        (await db_session.execute(select(Task).where(Task.provider == "openai")))
+        .scalars()
+        .all()
+    )
     assert any(t.id == task.id for t in provider_tasks)
 
 
@@ -166,7 +192,11 @@ async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"cmd": "run"}], vm_instance_id="agent-vm-concurrent")
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-concurrent",
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -254,7 +284,9 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_agent_heartbeat_persists_valid_prompt_fingerprint(client: AsyncClient, db_session):
+async def test_agent_heartbeat_persists_valid_prompt_fingerprint(
+    client: AsyncClient, db_session
+):
     """Heartbeat accepts the persisted 12-char lowercase-hex fingerprint contract."""
     project = Project(name="Heartbeat Prompt Fingerprint", user_id="test-user-123")
     db_session.add(project)
@@ -288,9 +320,13 @@ async def test_agent_heartbeat_persists_valid_prompt_fingerprint(client: AsyncCl
 
 
 @pytest.mark.asyncio
-async def test_agent_heartbeat_rejects_invalid_prompt_fingerprint_shape(client: AsyncClient, db_session):
+async def test_agent_heartbeat_rejects_invalid_prompt_fingerprint_shape(
+    client: AsyncClient, db_session
+):
     """Heartbeat rejects prompt fingerprints that do not match the 12-hex contract."""
-    project = Project(name="Heartbeat Invalid Prompt Fingerprint", user_id="test-user-123")
+    project = Project(
+        name="Heartbeat Invalid Prompt Fingerprint", user_id="test-user-123"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -322,7 +358,9 @@ async def test_agent_heartbeat_rejects_invalid_prompt_fingerprint_shape(client: 
 
 
 @pytest.mark.asyncio
-async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(client: AsyncClient, db_session):
+async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(
+    client: AsyncClient, db_session
+):
     """
     Tests that the heartbeat endpoint accepts a heartbeat from an agent whose task
     is still in PROVISIONING state. This is the pre-claim failure reporting path:
@@ -358,12 +396,16 @@ async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(client: Async
     assert resp.status_code == 200
     await db_session.refresh(task)
     assert task.status == TaskStatus.PROVISIONING, "heartbeat must not mutate status"
-    assert task.latest_status_message == "PRE_CLAIM_FAILED: token validation rate-limited"
+    assert (
+        task.latest_status_message == "PRE_CLAIM_FAILED: token validation rate-limited"
+    )
     assert task.last_heartbeat is not None
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_count_increments_per_heartbeat(client: AsyncClient, db_session):
+async def test_heartbeat_count_increments_per_heartbeat(
+    client: AsyncClient, db_session
+):
     """R4-W2 (H1+H2+H3+M10): the dedicated ``Task.heartbeat_count`` column
     advances by exactly one on every heartbeat, regardless of whether the
     request carries metrics/tool_trace.
@@ -500,7 +542,9 @@ async def test_heartbeat_audit_gate_fires_every_5th(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_agent_status_complete_with_artifacts_creates_artifact_record(client: AsyncClient, db_session, mocker):
+async def test_agent_status_complete_with_artifacts_creates_artifact_record(
+    client: AsyncClient, db_session, mocker
+):
     """
     Tests that completing a task with artifact information creates an Artifact record
     in the database and transitions the task status to COMPLETED.
@@ -574,13 +618,20 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
         user_id="test-user-123",
         github_owner="acme",
         github_repo="myapp",
-        build_config={"directories": [{"path": "frontend", "type": "node"}], "test_command": "pytest"},
+        build_config={
+            "directories": [{"path": "frontend", "type": "node"}],
+            "test_command": "pytest",
+        },
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"type": "create", "prompt": "do something"}], vm_instance_id="agent-vm-meta-1")
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-meta-1",
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -602,7 +653,9 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_project_metadata_empty_build_config(client: AsyncClient, db_session):
+async def test_agent_claim_project_metadata_empty_build_config(
+    client: AsyncClient, db_session
+):
     """
     Tests that agents get an empty build_config dict (not an error) when the project
     has no build_config configured.
@@ -612,7 +665,11 @@ async def test_agent_claim_project_metadata_empty_build_config(client: AsyncClie
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = Task(project_id=project.id, payloads=[{"type": "create", "prompt": "do something"}], vm_instance_id="agent-vm-meta-2")
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-meta-2",
+    )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -628,7 +685,9 @@ async def test_agent_claim_project_metadata_empty_build_config(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_agent_status_already_completed_returns_200_idempotent(client: AsyncClient, db_session, mocker):
+async def test_agent_status_already_completed_returns_200_idempotent(
+    client: AsyncClient, db_session, mocker
+):
     """
     Tests that completing a task that is already in a terminal state (COMPLETED)
     returns 200 rather than 409, demonstrating idempotent behavior for agent retries.
@@ -666,7 +725,9 @@ async def test_agent_status_already_completed_returns_200_idempotent(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_agent_token_rejected_for_terminated_task(client: AsyncClient, db_session):
+async def test_agent_token_rejected_for_terminated_task(
+    client: AsyncClient, db_session
+):
     """
     Tests that an agent cannot use a JWT for a task that has been terminated.
     The _terminated_task_ids set (populated by SQLAlchemy event on status transition)
@@ -697,9 +758,11 @@ async def test_agent_token_rejected_for_terminated_task(client: AsyncClient, db_
     _terminated_task_ids[task_id_str] = 9999999999.0  # far-future timestamp
 
     # Heartbeat should now be rejected
-    resp = await client.post("/api/agent/heartbeat",
+    resp = await client.post(
+        "/api/agent/heartbeat",
         json={"task_id": task_id_str, "status_message": "still running"},
-        headers=headers)
+        headers=headers,
+    )
     assert resp.status_code == 401
 
     # Clean up to avoid polluting other tests
@@ -707,7 +770,9 @@ async def test_agent_token_rejected_for_terminated_task(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_active_tasks_include_related_files(client: AsyncClient, db_session):
+async def test_agent_claim_active_tasks_include_related_files(
+    client: AsyncClient, db_session
+):
     """
     Tests that the project_context returned from /api/agent/claim includes
     related_files in each active_tasks entry when the active task has related_files
@@ -757,7 +822,9 @@ async def test_agent_claim_active_tasks_include_related_files(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_active_tasks_related_files_defaults_to_empty(client: AsyncClient, db_session):
+async def test_agent_claim_active_tasks_related_files_defaults_to_empty(
+    client: AsyncClient, db_session
+):
     """
     Tests that active_tasks entries have an empty related_files list when
     the active task has no related_files in its context.
@@ -800,7 +867,9 @@ async def test_agent_claim_active_tasks_related_files_defaults_to_empty(client: 
 
 
 @pytest.mark.asyncio
-async def test_recently_completed_tasks_include_outcome_context(client: AsyncClient, db_session):
+async def test_recently_completed_tasks_include_outcome_context(
+    client: AsyncClient, db_session
+):
     """
     Recently completed tasks in the claim response carry prompt, related_files,
     direction_id, and (for failed tasks) changed_files so the next agent can
@@ -876,7 +945,9 @@ async def test_recently_completed_tasks_include_outcome_context(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_lessons_include_first_feedback_when_distinct(client: AsyncClient, db_session):
+async def test_lessons_include_first_feedback_when_distinct(
+    client: AsyncClient, db_session
+):
     """
     Lessons from high-iteration tasks include first_feedback (iteration 0) in
     addition to last_feedback so the initial rejection reason is visible.
@@ -926,7 +997,9 @@ async def test_lessons_include_first_feedback_when_distinct(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_sibling_tasks_include_terminal_outcomes(client: AsyncClient, db_session):
+async def test_agent_claim_sibling_tasks_include_terminal_outcomes(
+    client: AsyncClient, db_session
+):
     """
     Tests that sibling_tasks in the claim response includes both active and terminal
     siblings. Terminal entries carry status, failure_class (if FAILED), pr_url (if any),
@@ -1017,7 +1090,11 @@ async def test_agent_claim_sibling_tasks_include_terminal_outcomes(client: Async
 
     siblings = resp.json().get("project_context", {}).get("sibling_tasks", [])
     by_title = {s["title"]: s for s in siblings}
-    assert set(by_title.keys()) == {"Completed sibling", "Failed sibling", "In-progress sibling"}
+    assert set(by_title.keys()) == {
+        "Completed sibling",
+        "Failed sibling",
+        "In-progress sibling",
+    }
 
     active_entry = by_title["In-progress sibling"]
     assert active_entry["active"] is True
@@ -1072,9 +1149,16 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     headers = {"x-agent-token": token}
 
     # Set two playbook entries
-    resp = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "set", "key": "build-commands", "value": "npm run build"
-    }, headers=headers)
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "build-commands",
+            "value": "npm run build",
+        },
+        headers=headers,
+    )
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
@@ -1082,9 +1166,16 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert data["key"] == "build-commands"
     assert data["revision"] == 1
 
-    resp2 = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "set", "key": "lint-rules", "value": "eslint --max-warnings 0"
-    }, headers=headers)
+    resp2 = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "lint-rules",
+            "value": "eslint --max-warnings 0",
+        },
+        headers=headers,
+    )
     assert resp2.status_code == 200
     assert resp2.json()["revision"] == 2
 
@@ -1093,13 +1184,17 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert project.design_doc is not None
     assert "playbook/build-commands" in project.design_doc
     assert project.design_doc["playbook/build-commands"]["content"] == "npm run build"
-    assert project.design_doc["playbook/build-commands"]["source_task_id"] == str(task.id)
+    assert project.design_doc["playbook/build-commands"]["source_task_id"] == str(
+        task.id
+    )
     assert "playbook/lint-rules" in project.design_doc
 
     # Get all playbook entries
-    resp3 = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "get"
-    }, headers=headers)
+    resp3 = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
     assert resp3.status_code == 200
     data3 = resp3.json()
     assert data3["status"] == "ok"
@@ -1110,17 +1205,21 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert "lint-rules" in entries
 
     # List keys
-    resp4 = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "list"
-    }, headers=headers)
+    resp4 = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "list"},
+        headers=headers,
+    )
     assert resp4.status_code == 200
     data4 = resp4.json()
     assert set(data4["keys"]) == {"build-commands", "lint-rules"}
 
     # Delete one entry
-    resp5 = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "delete", "key": "lint-rules"
-    }, headers=headers)
+    resp5 = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "delete", "key": "lint-rules"},
+        headers=headers,
+    )
     assert resp5.status_code == 200
     assert resp5.json()["status"] == "ok"
 
@@ -1148,16 +1247,25 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "agent-vm-ddi-test", task_type="design_doc_update")
+    token = create_agent_token(
+        str(task.id), "agent-vm-ddi-test", task_type="design_doc_update"
+    )
     headers = {"x-agent-token": token}
 
     # Set first system
-    resp = await client.post("/api/agent/design-doc", json={
-        "task_id": str(task.id),
-        "op": "set",
-        "key": "systems/auth",
-        "value": {"name": "Auth", "modules": ["backend/app/auth.py", "backend/app/models.py"]},
-    }, headers=headers)
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/auth",
+            "value": {
+                "name": "Auth",
+                "modules": ["backend/app/auth.py", "backend/app/models.py"],
+            },
+        },
+        headers=headers,
+    )
     assert resp.status_code == 200
 
     await db_session.refresh(project)
@@ -1166,12 +1274,19 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     assert idx["backend/app/models.py"] == "auth"
 
     # Set second system — index should include files from both systems
-    resp2 = await client.post("/api/agent/design-doc", json={
-        "task_id": str(task.id),
-        "op": "set",
-        "key": "systems/database",
-        "value": {"name": "Database", "modules": ["backend/app/db.py", "backend/app/models.py"]},
-    }, headers=headers)
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/database",
+            "value": {
+                "name": "Database",
+                "modules": ["backend/app/db.py", "backend/app/models.py"],
+            },
+        },
+        headers=headers,
+    )
     assert resp2.status_code == 200
 
     await db_session.refresh(project)
@@ -1182,16 +1297,27 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     assert idx["backend/app/models.py"] == "database"
 
     # _file_to_system must NOT appear in list
-    resp3 = await client.post("/api/agent/design-doc", json={
-        "task_id": str(task.id), "op": "list",
-    }, headers=headers)
+    resp3 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "list",
+        },
+        headers=headers,
+    )
     assert resp3.status_code == 200
     assert "_file_to_system" not in resp3.json()["keys"]
 
     # Delete a system — index should no longer contain its files
-    resp4 = await client.post("/api/agent/design-doc", json={
-        "task_id": str(task.id), "op": "delete", "key": "systems/auth",
-    }, headers=headers)
+    resp4 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "delete",
+            "key": "systems/auth",
+        },
+        headers=headers,
+    )
     assert resp4.status_code == 200
 
     await db_session.refresh(project)
@@ -1224,9 +1350,16 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
 
     # Per-entry limit: value > 2048 bytes should be rejected
     oversized_value = "x" * 2049
-    resp = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "set", "key": "too-big", "value": oversized_value
-    }, headers=headers)
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "too-big",
+            "value": oversized_value,
+        },
+        headers=headers,
+    )
     assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
     assert "2KB" in resp.json()["error"]["message"]
 
@@ -1239,9 +1372,16 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     large_value = "y" * 1500
     accepted = 0
     for i in range(40):
-        r = await client.post("/api/agent/playbook", json={
-            "task_id": str(task.id), "op": "set", "key": f"entry-{i:02d}", "value": large_value
-        }, headers=headers)
+        r = await client.post(
+            "/api/agent/playbook",
+            json={
+                "task_id": str(task.id),
+                "op": "set",
+                "key": f"entry-{i:02d}",
+                "value": large_value,
+            },
+            headers=headers,
+        )
         if r.status_code == 200:
             accepted += 1
             continue
@@ -1250,7 +1390,9 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
         assert "30KB" in r.json()["error"]["message"]
         break
     else:  # pragma: no cover — only fires if cap never triggered
-        raise AssertionError(f"Playbook size cap never triggered after {accepted} accepted entries")
+        raise AssertionError(
+            f"Playbook size cap never triggered after {accepted} accepted entries"
+        )
     assert accepted >= 10, f"Cap fired too early — only {accepted} entries accepted"
 
 
@@ -1277,9 +1419,16 @@ async def test_playbook_any_task_type_allowed(client: AsyncClient, db_session):
     token = create_agent_token(str(task.id), "agent-vm-playbook3")
     headers = {"x-agent-token": token}
 
-    resp = await client.post("/api/agent/playbook", json={
-        "task_id": str(task.id), "op": "set", "key": "test-pattern", "value": "use pytest fixtures"
-    }, headers=headers)
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "test-pattern",
+            "value": "use pytest fixtures",
+        },
+        headers=headers,
+    )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
 
@@ -1295,6 +1444,7 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
 
     # Seed playbook entries directly in design_doc
     from sqlalchemy.orm.attributes import flag_modified
+
     project.design_doc = {
         "playbook/build-steps": {
             "content": "run npm run build",
@@ -1328,11 +1478,15 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
     assert resp.status_code == 200
 
     data = resp.json()
-    assert "playbook" in data, f"Expected 'playbook' in claim response, got keys: {list(data.keys())}"
+    assert "playbook" in data, (
+        f"Expected 'playbook' in claim response, got keys: {list(data.keys())}"
+    )
     playbook = data["playbook"]
     assert "build-steps" in playbook
     entry = playbook["build-steps"]
-    assert isinstance(entry, dict), f"Expected playbook entry to be a dict, got: {type(entry)}"
+    assert isinstance(entry, dict), (
+        f"Expected playbook entry to be a dict, got: {type(entry)}"
+    )
     assert entry["content"] == "run npm run build"
     assert "effectiveness_score" in entry
     assert "confirmed_count" in entry
@@ -1344,7 +1498,9 @@ async def test_claim_response_includes_playbook(client: AsyncClient, db_session)
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_playbook_demotes_ineffective_entries(client: AsyncClient, db_session):
+async def test_claim_playbook_demotes_ineffective_entries(
+    client: AsyncClient, db_session
+):
     """Entries with low effectiveness score (confirmed/referenced ratio) sort after effective entries."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1456,7 +1612,9 @@ async def test_claim_skips_stale_playbook_entries(client: AsyncClient, db_sessio
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_caps_playbook_entries_for_fix_tasks(client: AsyncClient, db_session):
+async def test_claim_caps_playbook_entries_for_fix_tasks(
+    client: AsyncClient, db_session
+):
     """Playbook is capped per task type: fix gets 8, regardless of how many
     candidates pass the type/stale filters. Without the cap the agent's prompt
     was being flooded with ~30 unrelated entries (see audit on PR #3407)."""
@@ -1500,7 +1658,9 @@ async def test_claim_caps_playbook_entries_for_fix_tasks(client: AsyncClient, db
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_caps_playbook_entries_for_create_tasks(client: AsyncClient, db_session):
+async def test_claim_caps_playbook_entries_for_create_tasks(
+    client: AsyncClient, db_session
+):
     """Create tasks get a wider playbook (12) than fix/qa/review (8) — broader
     investigation surface justifies more priors."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -1538,12 +1698,16 @@ async def test_claim_caps_playbook_entries_for_create_tasks(client: AsyncClient,
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     playbook = resp.json().get("playbook", {})
-    assert len(playbook) == 12, f"create tasks should cap at 12 entries, got {len(playbook)}"
+    assert len(playbook) == 12, (
+        f"create tasks should cap at 12 entries, got {len(playbook)}"
+    )
 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_appends_recent_outcomes_on_reference(client: AsyncClient, db_session):
+async def test_claim_appends_recent_outcomes_on_reference(
+    client: AsyncClient, db_session
+):
     """Claim appends False to recent_outcomes for each shown entry and stores _shown_playbook_keys."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1584,19 +1748,27 @@ async def test_claim_appends_recent_outcomes_on_reference(client: AsyncClient, d
     await db_session.refresh(project)
     entry = project.design_doc["playbook/my-entry"]
     outcomes = entry.get("recent_outcomes", [])
-    assert outcomes == [True, False, True, False], f"Expected [..., False] appended, got {outcomes}"
+    assert outcomes == [True, False, True, False], (
+        f"Expected [..., False] appended, got {outcomes}"
+    )
 
     # Verify task context stores shown keys
     await db_session.refresh(task)
     shown_keys = (task.context or {}).get("_shown_playbook_keys", [])
-    assert "my-entry" in shown_keys, f"Expected 'my-entry' in _shown_playbook_keys, got {shown_keys}"
+    assert "my-entry" in shown_keys, (
+        f"Expected 'my-entry' in _shown_playbook_keys, got {shown_keys}"
+    )
 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_records_review_measurement_attribution(client: AsyncClient, db_session):
+async def test_claim_records_review_measurement_attribution(
+    client: AsyncClient, db_session
+):
     """Claim stores _had_review_measurements=True and _top_review_issue_categories when review data exists."""
-    project = Project(name="Review Measurement Attribution Test", user_id="test-user-123")
+    project = Project(
+        name="Review Measurement Attribution Test", user_id="test-user-123"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -1611,14 +1783,19 @@ async def test_claim_records_review_measurement_attribution(client: AsyncClient,
     await db_session.refresh(task)
 
     # Seed completed tasks with review_loop history containing >=5 categorizable issues
-    review_issue = {"description": "Missing unit test coverage for this function", "severity": "MAJOR"}
+    review_issue = {
+        "description": "Missing unit test coverage for this function",
+        "severity": "MAJOR",
+    }
     review_history_entry = {"issues": [review_issue] * 5, "iteration": 1}
     completed_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "prev"}],
         status=TaskStatus.COMPLETED,
         attempt_count=2,
-        context={"review_loop": {"iteration": 2, "review_history": [review_history_entry]}},
+        context={
+            "review_loop": {"iteration": 2, "review_history": [review_history_entry]}
+        },
     )
     db_session.add(completed_task)
     await db_session.commit()
@@ -1629,15 +1806,23 @@ async def test_claim_records_review_measurement_attribution(client: AsyncClient,
 
     await db_session.refresh(task)
     ctx = task.context or {}
-    assert ctx.get("_had_review_measurements") is True, f"Expected _had_review_measurements=True, got {ctx}"
+    assert ctx.get("_had_review_measurements") is True, (
+        f"Expected _had_review_measurements=True, got {ctx}"
+    )
     categories = ctx.get("_top_review_issue_categories", [])
-    assert len(categories) > 0, f"Expected non-empty _top_review_issue_categories, got {categories}"
-    assert "test-coverage" in categories, f"Expected test-coverage in categories, got {categories}"
+    assert len(categories) > 0, (
+        f"Expected non-empty _top_review_issue_categories, got {categories}"
+    )
+    assert "test-coverage" in categories, (
+        f"Expected test-coverage in categories, got {categories}"
+    )
 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_review_measurement_attribution_false_when_no_data(client: AsyncClient, db_session):
+async def test_claim_review_measurement_attribution_false_when_no_data(
+    client: AsyncClient, db_session
+):
     """Claim stores _had_review_measurements=False when no review data is available."""
     project = Project(name="No Review Data Test", user_id="test-user-123")
     db_session.add(project)
@@ -1659,13 +1844,19 @@ async def test_claim_review_measurement_attribution_false_when_no_data(client: A
 
     await db_session.refresh(task)
     ctx = task.context or {}
-    assert ctx.get("_had_review_measurements") is False, f"Expected _had_review_measurements=False, got {ctx}"
-    assert "_top_review_issue_categories" not in ctx, "Should not store categories when no measurements"
+    assert ctx.get("_had_review_measurements") is False, (
+        f"Expected _had_review_measurements=False, got {ctx}"
+    )
+    assert "_top_review_issue_categories" not in ctx, (
+        "Should not store categories when no measurements"
+    )
 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_recent_outcomes_sorts_by_effectiveness(client: AsyncClient, db_session):
+async def test_claim_recent_outcomes_sorts_by_effectiveness(
+    client: AsyncClient, db_session
+):
     """Claim sorts entries by recent_outcomes effectiveness score (sum/len) descending."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1722,7 +1913,9 @@ async def test_claim_recent_outcomes_sorts_by_effectiveness(client: AsyncClient,
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_injects_direction_context_for_create_task(client: AsyncClient, db_session):
+async def test_claim_injects_direction_context_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects direction_context for create/fix/refactor tasks when direction_id is set."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1767,7 +1960,9 @@ async def test_claim_injects_direction_context_for_create_task(client: AsyncClie
     assert resp.status_code == 200
 
     data = resp.json()
-    assert "direction_context" in data, f"Expected direction_context in claim response, got keys: {list(data.keys())}"
+    assert "direction_context" in data, (
+        f"Expected direction_context in claim response, got keys: {list(data.keys())}"
+    )
     dc = data["direction_context"]
     assert dc["title"] == "Improve auth flow"
     assert dc["priority"] == "high"
@@ -1791,7 +1986,9 @@ async def test_claim_injects_direction_context_for_create_task(client: AsyncClie
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_injects_scope_success_rates_in_direction_context(client: AsyncClient, db_session):
+async def test_claim_injects_scope_success_rates_in_direction_context(
+    client: AsyncClient, db_session
+):
     """direction_context.scope_success_rates aggregates scope_breakdown over last 3 productive cycles."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1805,10 +2002,35 @@ async def test_claim_injects_scope_success_rates_in_direction_context(client: As
             "research_context": "",
             "research_history": [
                 # non-productive cycle should be excluded
-                {"tasks_created": 0, "prs_merged": 0, "scope_breakdown": {"small": {"created": 0, "merged": 0, "failed": 0}}},
-                {"tasks_created": 2, "prs_merged": 2, "scope_breakdown": {"small": {"created": 2, "merged": 2, "failed": 0}}},
-                {"tasks_created": 2, "prs_merged": 1, "scope_breakdown": {"small": {"created": 2, "merged": 1, "failed": 1}, "medium": {"created": 1, "merged": 0, "failed": 1}}},
-                {"tasks_created": 1, "prs_merged": 0, "scope_breakdown": {"empty": {"created": 0, "merged": 0, "failed": 0}}},
+                {
+                    "tasks_created": 0,
+                    "prs_merged": 0,
+                    "scope_breakdown": {
+                        "small": {"created": 0, "merged": 0, "failed": 0}
+                    },
+                },
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 2,
+                    "scope_breakdown": {
+                        "small": {"created": 2, "merged": 2, "failed": 0}
+                    },
+                },
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 1,
+                    "scope_breakdown": {
+                        "small": {"created": 2, "merged": 1, "failed": 1},
+                        "medium": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                },
+                {
+                    "tasks_created": 1,
+                    "prs_merged": 0,
+                    "scope_breakdown": {
+                        "empty": {"created": 0, "merged": 0, "failed": 0}
+                    },
+                },
             ],
         }
     ]
@@ -1832,14 +2054,26 @@ async def test_claim_injects_scope_success_rates_in_direction_context(client: As
     assert resp.status_code == 200
     dc = resp.json()["direction_context"]
     rates = dc["scope_success_rates"]
-    assert rates["small"] == {"created": 4, "merged": 3, "failed": 1, "merged_cross_module": 0}
-    assert rates["medium"] == {"created": 1, "merged": 0, "failed": 1, "merged_cross_module": 0}
+    assert rates["small"] == {
+        "created": 4,
+        "merged": 3,
+        "failed": 1,
+        "merged_cross_module": 0,
+    }
+    assert rates["medium"] == {
+        "created": 1,
+        "merged": 0,
+        "failed": 1,
+        "merged_cross_module": 0,
+    }
     assert "empty" not in rates
 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_injects_avg_expansion_ratio_in_scope_success_rates(client: AsyncClient, db_session):
+async def test_claim_injects_avg_expansion_ratio_in_scope_success_rates(
+    client: AsyncClient, db_session
+):
     """direction_context.scope_success_rates includes weighted-avg avg_expansion_ratio from scope_breakdown."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1852,8 +2086,30 @@ async def test_claim_injects_avg_expansion_ratio_in_scope_success_rates(client: 
             "priority": "medium",
             "research_context": "",
             "research_history": [
-                {"tasks_created": 2, "prs_merged": 2, "scope_breakdown": {"small": {"created": 2, "merged": 2, "failed": 0, "avg_expansion_ratio_merged": 2.0}}},
-                {"tasks_created": 2, "prs_merged": 2, "scope_breakdown": {"small": {"created": 2, "merged": 2, "failed": 0, "avg_expansion_ratio_merged": 1.0}}},
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 2,
+                    "scope_breakdown": {
+                        "small": {
+                            "created": 2,
+                            "merged": 2,
+                            "failed": 0,
+                            "avg_expansion_ratio_merged": 2.0,
+                        }
+                    },
+                },
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 2,
+                    "scope_breakdown": {
+                        "small": {
+                            "created": 2,
+                            "merged": 2,
+                            "failed": 0,
+                            "avg_expansion_ratio_merged": 1.0,
+                        }
+                    },
+                },
             ],
         }
     ]
@@ -1881,7 +2137,9 @@ async def test_claim_injects_avg_expansion_ratio_in_scope_success_rates(client: 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_injects_review_iteration_trend_in_direction_context(client: AsyncClient, db_session):
+async def test_claim_injects_review_iteration_trend_in_direction_context(
+    client: AsyncClient, db_session
+):
     """direction_context includes review_iteration_rolling_median and review_iteration_last_cycle when history has values."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1927,7 +2185,9 @@ async def test_claim_injects_review_iteration_trend_in_direction_context(client:
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_direction_context_absent_review_iteration_when_no_history(client: AsyncClient, db_session):
+async def test_claim_direction_context_absent_review_iteration_when_no_history(
+    client: AsyncClient, db_session
+):
     """direction_context omits review iteration fields when no cycle has recorded median_review_iterations."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1969,7 +2229,9 @@ async def test_claim_direction_context_absent_review_iteration_when_no_history(c
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_direction_context_for_review_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_direction_context_for_review_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint does NOT inject direction_context for review tasks (only create/fix/refactor)."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2011,7 +2273,9 @@ async def test_claim_does_not_inject_direction_context_for_review_task(client: A
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_injects_saturation_signals_for_research_task(client: AsyncClient, db_session):
+async def test_claim_injects_saturation_signals_for_research_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects possibly_saturated + deadlock_detected for research tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2058,7 +2322,9 @@ async def test_claim_injects_saturation_signals_for_research_task(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_failure_hotspots_for_research_task(client: AsyncClient, db_session):
+async def test_claim_injects_failure_hotspots_for_research_task(
+    client: AsyncClient, db_session
+):
     """Research direction_context surfaces diagnosed_affected_files and active anomalies."""
     from sqlalchemy.orm.attributes import flag_modified
     from app import shared_state as _ss
@@ -2121,7 +2387,9 @@ async def test_claim_injects_failure_hotspots_for_research_task(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_dedup_filter_summary_for_research_task(client: AsyncClient, db_session):
+async def test_claim_injects_dedup_filter_summary_for_research_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint surfaces dedup_filter_summary from last research_history entry."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2180,9 +2448,30 @@ async def test_compute_failure_stage_pattern_code_error_dominant():
     from app.routers.agent import _compute_failure_stage_pattern
 
     history = [
-        {"stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 1, "tasks_required_approval": 1, "tasks_merged_staging_only": 0}},
-        {"stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
-        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 2, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 3,
+                "tasks_failed_infra": 1,
+                "tasks_required_approval": 1,
+                "tasks_merged_staging_only": 0,
+            }
+        },
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 2,
+                "tasks_failed_infra": 0,
+                "tasks_required_approval": 0,
+                "tasks_merged_staging_only": 0,
+            }
+        },
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 1,
+                "tasks_failed_infra": 2,
+                "tasks_required_approval": 0,
+                "tasks_merged_staging_only": 0,
+            }
+        },
     ]
     # Non-infra totals: code_error=6, approval=1, total=7 → rate=6/7≈0.857
     result = _compute_failure_stage_pattern(history)
@@ -2198,15 +2487,31 @@ async def test_compute_failure_stage_pattern_approval_dominant():
     from app.routers.agent import _compute_failure_stage_pattern
 
     history = [
-        {"stage_dropout": {"tasks_failed_code_error": 0, "tasks_failed_infra": 1, "tasks_required_approval": 4, "tasks_merged_staging_only": 0}},
-        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 3, "tasks_merged_staging_only": 0}},
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 0,
+                "tasks_failed_infra": 1,
+                "tasks_required_approval": 4,
+                "tasks_merged_staging_only": 0,
+            }
+        },
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 1,
+                "tasks_failed_infra": 0,
+                "tasks_required_approval": 3,
+                "tasks_merged_staging_only": 0,
+            }
+        },
     ]
     # Non-infra totals: code_error=1, approval=7, total=8 → rate=7/8=0.875
     result = _compute_failure_stage_pattern(history)
     assert result is not None
     assert result["stage"] == "approval"
     assert result["rate"] >= 0.6
-    assert "approval" in result["message"].lower() or "review" in result["message"].lower()
+    assert (
+        "approval" in result["message"].lower() or "review" in result["message"].lower()
+    )
 
 
 @pytest.mark.asyncio
@@ -2215,14 +2520,37 @@ async def test_compute_failure_stage_pattern_no_pattern():
     from app.routers.agent import _compute_failure_stage_pattern
 
     # Insufficient data (total < 3)
-    assert _compute_failure_stage_pattern([
-        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 1}},
-    ]) is None
+    assert (
+        _compute_failure_stage_pattern(
+            [
+                {
+                    "stage_dropout": {
+                        "tasks_failed_code_error": 1,
+                        "tasks_failed_infra": 0,
+                        "tasks_required_approval": 1,
+                    }
+                },
+            ]
+        )
+        is None
+    )
 
     # No clear pattern (roughly even split)
     mixed_history = [
-        {"stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 0, "tasks_required_approval": 2}},
-        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 1}},
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 2,
+                "tasks_failed_infra": 0,
+                "tasks_required_approval": 2,
+            }
+        },
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 1,
+                "tasks_failed_infra": 0,
+                "tasks_required_approval": 1,
+            }
+        },
     ]
     # code_error=3, approval=3, total=6 → neither reaches 60%
     assert _compute_failure_stage_pattern(mixed_history) is None
@@ -2237,22 +2565,42 @@ async def test_compute_failure_stage_pattern_staging_only_dominant():
     from app.routers.agent import _compute_failure_stage_pattern
 
     history = [
-        {"stage_dropout": {"tasks_failed_code_error": 0, "tasks_failed_infra": 1, "tasks_required_approval": 1, "tasks_merged_staging_only": 3}},
-        {"stage_dropout": {"tasks_failed_code_error": 1, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 2}},
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 0,
+                "tasks_failed_infra": 1,
+                "tasks_required_approval": 1,
+                "tasks_merged_staging_only": 3,
+            }
+        },
+        {
+            "stage_dropout": {
+                "tasks_failed_code_error": 1,
+                "tasks_failed_infra": 0,
+                "tasks_required_approval": 0,
+                "tasks_merged_staging_only": 2,
+            }
+        },
     ]
     # Non-infra totals: code_error=1, approval=1, staging_only=5, total=7 → rate=5/7≈0.714
     result = _compute_failure_stage_pattern(history)
     assert result is not None
     assert result["stage"] == "staging_only"
     assert result["rate"] >= 0.6
-    assert "integration" in result["message"].lower() or "rollup" in result["message"].lower() or "ci" in result["message"].lower()
+    assert (
+        "integration" in result["message"].lower()
+        or "rollup" in result["message"].lower()
+        or "ci" in result["message"].lower()
+    )
 
 
 def test_parse_failed_approach_extracts_known_category():
     """Known failure categories in parens are extracted into failure_type."""
     from app.routers.agent import _parse_failed_approach
 
-    result = _parse_failed_approach("Use jwt in cookies (CODE_ERROR) — CSRF vulnerability")
+    result = _parse_failed_approach(
+        "Use jwt in cookies (CODE_ERROR) — CSRF vulnerability"
+    )
     assert result["failure_type"] == "CODE_ERROR"
     assert "CODE_ERROR" not in result["text"]
     assert "Use jwt in cookies" in result["text"]
@@ -2272,7 +2620,9 @@ def test_parse_failed_approach_ignores_unknown_parens():
     """Parens whose contents aren't in the known-category set are kept as prose."""
     from app.routers.agent import _parse_failed_approach
 
-    result = _parse_failed_approach("Try batching (see issue #42) to reduce round trips")
+    result = _parse_failed_approach(
+        "Try batching (see issue #42) to reduce round trips"
+    )
     assert result["failure_type"] == ""
     # Prose parens must be preserved — they're part of the description, not metadata
     assert "(see issue #42)" in result["text"]
@@ -2307,7 +2657,9 @@ def test_parse_failed_approach_stage_only_metadata():
     """Metadata block may contain only one of the two fields."""
     from app.routers.agent import _parse_failed_approach
 
-    result = _parse_failed_approach("Approach X (CODE_ERROR) [stage=lint] — ruff flagged style")
+    result = _parse_failed_approach(
+        "Approach X (CODE_ERROR) [stage=lint] — ruff flagged style"
+    )
     assert result["failure_type"] == "CODE_ERROR"
     assert result["failed_at"] == ""
     assert result["failure_stage"] == "lint"
@@ -2325,7 +2677,9 @@ def test_parse_failed_approach_without_metadata_returns_empty_fields():
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_injects_failure_stage_pattern_in_direction_context(client: AsyncClient, db_session):
+async def test_claim_injects_failure_stage_pattern_in_direction_context(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects failure_stage_pattern into direction_context when pattern is clear."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2338,9 +2692,36 @@ async def test_claim_injects_failure_stage_pattern_in_direction_context(client: 
             "priority": "high",
             "research_context": "",
             "research_history": [
-                {"tasks_created": 4, "prs_merged": 1, "stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
-                {"tasks_created": 3, "prs_merged": 1, "stage_dropout": {"tasks_failed_code_error": 2, "tasks_failed_infra": 1, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
-                {"tasks_created": 5, "prs_merged": 2, "stage_dropout": {"tasks_failed_code_error": 3, "tasks_failed_infra": 0, "tasks_required_approval": 0, "tasks_merged_staging_only": 0}},
+                {
+                    "tasks_created": 4,
+                    "prs_merged": 1,
+                    "stage_dropout": {
+                        "tasks_failed_code_error": 3,
+                        "tasks_failed_infra": 0,
+                        "tasks_required_approval": 0,
+                        "tasks_merged_staging_only": 0,
+                    },
+                },
+                {
+                    "tasks_created": 3,
+                    "prs_merged": 1,
+                    "stage_dropout": {
+                        "tasks_failed_code_error": 2,
+                        "tasks_failed_infra": 1,
+                        "tasks_required_approval": 0,
+                        "tasks_merged_staging_only": 0,
+                    },
+                },
+                {
+                    "tasks_created": 5,
+                    "prs_merged": 2,
+                    "stage_dropout": {
+                        "tasks_failed_code_error": 3,
+                        "tasks_failed_infra": 0,
+                        "tasks_required_approval": 0,
+                        "tasks_merged_staging_only": 0,
+                    },
+                },
             ],
         }
     ]
@@ -2408,8 +2789,18 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
             "_test_failure_summary": long_tfs,
             "_pr_changed_files": ["foo.py", "bar.ts"],
             "_pr_diff_summary": [
-                {"file": "foo.py", "additions": 10, "deletions": 5, "change_type": "modified"},
-                {"file": "bar.ts", "additions": 3, "deletions": 2, "change_type": "added"},
+                {
+                    "file": "foo.py",
+                    "additions": 10,
+                    "deletions": 5,
+                    "change_type": "modified",
+                },
+                {
+                    "file": "bar.ts",
+                    "additions": 3,
+                    "deletions": 2,
+                    "change_type": "added",
+                },
             ],
             "_self_review_outcome": {
                 "verdict": "FAIL",
@@ -2469,19 +2860,25 @@ async def test_claim_injects_direction_prior_analysis(client: AsyncClient, db_se
         {"file": "bar.ts", "added": 3, "removed": 2, "change_type": "added"},
     ]
     assert entry["previous_error_fingerprint"] == "abc123def456"
-    assert entry["latest_status_message"] == "TypeError: cannot read property x of undefined"
+    assert (
+        entry["latest_status_message"]
+        == "TypeError: cannot read property x of undefined"
+    )
     assert entry["self_review_outcome"]["verdict"] == "FAIL"
     assert entry["self_review_outcome"]["notes"] == "lint errors remain"
     assert set(entry["self_review_outcome"]["failed_checks"]) == {"lint", "types"}
     assert entry["review_iterations"] == 3
     # Total payload stays under 2000-char cap
     import json as _json
+
     assert len(_json.dumps(dpa)) <= 2000
 
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_includes_structured_review_feedback(client: AsyncClient, db_session):
+async def test_claim_includes_structured_review_feedback(
+    client: AsyncClient, db_session
+):
     """Failed tasks with structured review issues surface top critical/major items."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2523,10 +2920,26 @@ async def test_claim_includes_structured_review_feedback(client: AsyncClient, db
                         "feedback": "second round",
                         "issues": [
                             {"severity": "minor", "description": "nit: rename var"},
-                            {"severity": "critical", "description": "missing null check in handler", "file": "foo.py", "line": 42},
-                            {"severity": "major", "description": "no test for edge case", "file": "test_foo.py"},
-                            {"severity": "critical", "description": "race condition in cache update"},
-                            {"severity": "major", "description": "should be a single bullet but text long " * 10},
+                            {
+                                "severity": "critical",
+                                "description": "missing null check in handler",
+                                "file": "foo.py",
+                                "line": 42,
+                            },
+                            {
+                                "severity": "major",
+                                "description": "no test for edge case",
+                                "file": "test_foo.py",
+                            },
+                            {
+                                "severity": "critical",
+                                "description": "race condition in cache update",
+                            },
+                            {
+                                "severity": "major",
+                                "description": "should be a single bullet but text long "
+                                * 10,
+                            },
                         ],
                     },
                 ],
@@ -2571,7 +2984,9 @@ async def test_claim_includes_structured_review_feedback(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_claim_review_feedback_falls_back_to_text(client: AsyncClient, db_session):
+async def test_claim_review_feedback_falls_back_to_text(
+    client: AsyncClient, db_session
+):
     """When review history lacks structured issues, fall back to truncated feedback string."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2635,7 +3050,9 @@ async def test_claim_review_feedback_falls_back_to_text(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_direction_successful_analysis(client: AsyncClient, db_session):
+async def test_claim_injects_direction_successful_analysis(
+    client: AsyncClient, db_session
+):
     """Claim endpoint surfaces analysis_plan from recent successful sibling tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2726,19 +3143,29 @@ async def test_claim_injects_direction_successful_analysis(client: AsyncClient, 
     assert small["scope"] == "small"
     assert "review_iterations" not in small
     import json as _json
+
     assert len(_json.dumps(dsa)) <= 1500
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_cochange_files_for_create_task(client: AsyncClient, db_session):
+async def test_claim_injects_cochange_files_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects cochange_files in project_context for create tasks when related_files match index."""
     from sqlalchemy.orm.attributes import flag_modified
 
     cochange_index = {
-        "backend/app/models.py": {"backend/app/schemas.py": 3.0, "backend/testing/test_models.py": 2.5},
+        "backend/app/models.py": {
+            "backend/app/schemas.py": 3.0,
+            "backend/testing/test_models.py": 2.5,
+        },
         "backend/app/schemas.py": {"backend/app/models.py": 3.0},
     }
-    project = Project(name="Cochange Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    project = Project(
+        name="Cochange Test",
+        user_id="test-user-123",
+        design_doc={"cochange_index": cochange_index},
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -2760,7 +3187,9 @@ async def test_claim_injects_cochange_files_for_create_task(client: AsyncClient,
 
     data = resp.json()
     project_ctx = data.get("project_context", {})
-    assert "cochange_files" in project_ctx, f"Expected cochange_files in project_context, got: {list(project_ctx.keys())}"
+    assert "cochange_files" in project_ctx, (
+        f"Expected cochange_files in project_context, got: {list(project_ctx.keys())}"
+    )
     cochange_files = project_ctx["cochange_files"]
     assert "backend/app/schemas.py" in cochange_files
     assert "backend/testing/test_models.py" in cochange_files
@@ -2769,14 +3198,20 @@ async def test_claim_injects_cochange_files_for_create_task(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_cochange_files_for_review_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_cochange_files_for_review_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint does NOT inject cochange_files for review tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
     cochange_index = {
         "backend/app/models.py": {"backend/app/schemas.py": 3.0},
     }
-    project = Project(name="Cochange Review Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    project = Project(
+        name="Cochange Review Test",
+        user_id="test-user-123",
+        design_doc={"cochange_index": cochange_index},
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -2804,7 +3239,9 @@ async def test_claim_does_not_inject_cochange_files_for_review_task(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_cochange_hints_for_plan_task(client: AsyncClient, db_session):
+async def test_claim_injects_cochange_hints_for_plan_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects cochange_hints in direction_context for plan tasks restricted to related_files."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2822,7 +3259,11 @@ async def test_claim_injects_cochange_hints_for_plan_task(client: AsyncClient, d
             "backend/app/models.py": 2.5,
         },
     }
-    project = Project(name="Cochange Plan Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    project = Project(
+        name="Cochange Plan Test",
+        user_id="test-user-123",
+        design_doc={"cochange_index": cochange_index},
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -2850,7 +3291,9 @@ async def test_claim_injects_cochange_hints_for_plan_task(client: AsyncClient, d
 
     data = resp.json()
     direction_ctx = data.get("direction_context", {})
-    assert "cochange_hints" in direction_ctx, f"Expected cochange_hints in direction_context, got: {list(direction_ctx.keys())}"
+    assert "cochange_hints" in direction_ctx, (
+        f"Expected cochange_hints in direction_context, got: {list(direction_ctx.keys())}"
+    )
     hints = direction_ctx["cochange_hints"]
     # models.py paired with both schemas.py (3.0) and test_models.py (2.5) — both in related_files, both >= 1.0
     assert hints["backend/app/models.py"]["backend/app/schemas.py"] == 3.0
@@ -2862,7 +3305,9 @@ async def test_claim_injects_cochange_hints_for_plan_task(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_claim_omits_cochange_hints_when_below_threshold(client: AsyncClient, db_session):
+async def test_claim_omits_cochange_hints_when_below_threshold(
+    client: AsyncClient, db_session
+):
     """Claim endpoint omits cochange_hints when no within-set pairs meet the >= 1.0 threshold."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2870,7 +3315,11 @@ async def test_claim_omits_cochange_hints_when_below_threshold(client: AsyncClie
         "backend/app/a.py": {"backend/app/b.py": 0.7},  # below threshold
         "backend/app/b.py": {"backend/app/a.py": 0.7},
     }
-    project = Project(name="Cochange Plan Threshold Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    project = Project(
+        name="Cochange Plan Threshold Test",
+        user_id="test-user-123",
+        design_doc={"cochange_index": cochange_index},
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -2896,7 +3345,9 @@ async def test_claim_omits_cochange_hints_when_below_threshold(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_cochange_hints_for_create_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_cochange_hints_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint does NOT inject cochange_hints (a plan-only signal) into direction_context for create tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2904,7 +3355,11 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(client: Asyn
         "backend/app/models.py": {"backend/app/schemas.py": 3.0},
         "backend/app/schemas.py": {"backend/app/models.py": 3.0},
     }
-    project = Project(name="Cochange Hint Skip Test", user_id="test-user-123", design_doc={"cochange_index": cochange_index})
+    project = Project(
+        name="Cochange Hint Skip Test",
+        user_id="test-user-123",
+        design_doc={"cochange_index": cochange_index},
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -2932,7 +3387,9 @@ async def test_claim_does_not_inject_cochange_hints_for_create_task(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_decomposition_outcomes_for_plan_task(client: AsyncClient, db_session):
+async def test_claim_injects_decomposition_outcomes_for_plan_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint summarizes decomposition_quality from last 3 productive research_history entries for plan tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -2946,24 +3403,60 @@ async def test_claim_injects_decomposition_outcomes_for_plan_task(client: AsyncC
             "research_context": "",
             "research_history": [
                 # Non-productive cycle → excluded
-                {"tasks_created": 0, "prs_merged": 0, "decomposition_quality": [
-                    {"plan_task_id": "ignore-me", "subtask_count": 1, "subtask_merge_rate": 0.0,
-                     "avg_files_per_subtask": 0.0, "max_files_in_subtask": 0,
-                     "dependency_depth": 0, "cross_module_count": 0},
-                ]},
-                {"tasks_created": 2, "prs_merged": 2, "decomposition_quality": [
-                    {"plan_task_id": "p1", "subtask_count": 3, "subtask_merge_rate": 0.9,
-                     "avg_files_per_subtask": 2.0, "max_files_in_subtask": 3,
-                     "dependency_depth": 1, "cross_module_count": 0},
-                ]},
-                {"tasks_created": 2, "prs_merged": 1, "decomposition_quality": [
-                    {"plan_task_id": "p2", "subtask_count": 4, "subtask_merge_rate": 0.2,
-                     "avg_files_per_subtask": 7.0, "max_files_in_subtask": 10,
-                     "dependency_depth": 4, "cross_module_count": 3},
-                    {"plan_task_id": "p3", "subtask_count": 2, "subtask_merge_rate": 0.8,
-                     "avg_files_per_subtask": 3.0, "max_files_in_subtask": 4,
-                     "dependency_depth": 2, "cross_module_count": 0},
-                ]},
+                {
+                    "tasks_created": 0,
+                    "prs_merged": 0,
+                    "decomposition_quality": [
+                        {
+                            "plan_task_id": "ignore-me",
+                            "subtask_count": 1,
+                            "subtask_merge_rate": 0.0,
+                            "avg_files_per_subtask": 0.0,
+                            "max_files_in_subtask": 0,
+                            "dependency_depth": 0,
+                            "cross_module_count": 0,
+                        },
+                    ],
+                },
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 2,
+                    "decomposition_quality": [
+                        {
+                            "plan_task_id": "p1",
+                            "subtask_count": 3,
+                            "subtask_merge_rate": 0.9,
+                            "avg_files_per_subtask": 2.0,
+                            "max_files_in_subtask": 3,
+                            "dependency_depth": 1,
+                            "cross_module_count": 0,
+                        },
+                    ],
+                },
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 1,
+                    "decomposition_quality": [
+                        {
+                            "plan_task_id": "p2",
+                            "subtask_count": 4,
+                            "subtask_merge_rate": 0.2,
+                            "avg_files_per_subtask": 7.0,
+                            "max_files_in_subtask": 10,
+                            "dependency_depth": 4,
+                            "cross_module_count": 3,
+                        },
+                        {
+                            "plan_task_id": "p3",
+                            "subtask_count": 2,
+                            "subtask_merge_rate": 0.8,
+                            "avg_files_per_subtask": 3.0,
+                            "max_files_in_subtask": 4,
+                            "dependency_depth": 2,
+                            "cross_module_count": 0,
+                        },
+                    ],
+                },
             ],
         }
     ]
@@ -2988,7 +3481,9 @@ async def test_claim_injects_decomposition_outcomes_for_plan_task(client: AsyncC
 
     data = resp.json()
     dc = data.get("direction_context", {}) or {}
-    assert "decomposition_outcomes" in dc, f"Expected decomposition_outcomes, got: {list(dc.keys())}"
+    assert "decomposition_outcomes" in dc, (
+        f"Expected decomposition_outcomes, got: {list(dc.keys())}"
+    )
     summary = dc["decomposition_outcomes"]
     # 3 entries flattened from the 2 productive cycles (non-productive excluded)
     assert summary["prior_decomposition_count"] == 3
@@ -3004,7 +3499,9 @@ async def test_claim_injects_decomposition_outcomes_for_plan_task(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_claim_omits_decomposition_outcomes_when_no_history(client: AsyncClient, db_session):
+async def test_claim_omits_decomposition_outcomes_when_no_history(
+    client: AsyncClient, db_session
+):
     """Claim endpoint omits decomposition_outcomes when research_history has no decomposition_quality data."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3046,7 +3543,9 @@ async def test_claim_omits_decomposition_outcomes_when_no_history(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_decomposition_outcomes_for_create_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_decomposition_outcomes_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint omits decomposition_outcomes (plan-only signal) for create tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3059,11 +3558,21 @@ async def test_claim_does_not_inject_decomposition_outcomes_for_create_task(clie
             "priority": "high",
             "research_context": "",
             "research_history": [
-                {"tasks_created": 2, "prs_merged": 2, "decomposition_quality": [
-                    {"plan_task_id": "p1", "subtask_count": 2, "subtask_merge_rate": 1.0,
-                     "avg_files_per_subtask": 2.0, "max_files_in_subtask": 3,
-                     "dependency_depth": 1, "cross_module_count": 0},
-                ]},
+                {
+                    "tasks_created": 2,
+                    "prs_merged": 2,
+                    "decomposition_quality": [
+                        {
+                            "plan_task_id": "p1",
+                            "subtask_count": 2,
+                            "subtask_merge_rate": 1.0,
+                            "avg_files_per_subtask": 2.0,
+                            "max_files_in_subtask": 3,
+                            "dependency_depth": 1,
+                            "cross_module_count": 0,
+                        },
+                    ],
+                },
             ],
         }
     ]
@@ -3093,7 +3602,9 @@ async def test_claim_does_not_inject_decomposition_outcomes_for_create_task(clie
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_module_feedback_warnings_for_create_task(client: AsyncClient, db_session):
+async def test_claim_injects_module_feedback_warnings_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects module_feedback_warnings for create tasks when related_files have profiles."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3124,7 +3635,9 @@ async def test_claim_injects_module_feedback_warnings_for_create_task(client: As
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "Add feature"}],
         vm_instance_id="agent-vm-module-feedback",
-        context={"related_files": ["backend/app/orchestrator.py", "backend/app/models.py"]},
+        context={
+            "related_files": ["backend/app/orchestrator.py", "backend/app/models.py"]
+        },
     )
     db_session.add(task)
     await db_session.commit()
@@ -3140,7 +3653,9 @@ async def test_claim_injects_module_feedback_warnings_for_create_task(client: As
         f"Expected module_feedback_warnings in project_context, got: {list(project_ctx.keys())}"
     )
     warnings = project_ctx["module_feedback_warnings"]
-    assert len(warnings) == 1, f"Expected 1 warning (models.py below threshold), got {len(warnings)}"
+    assert len(warnings) == 1, (
+        f"Expected 1 warning (models.py below threshold), got {len(warnings)}"
+    )
     w = warnings[0]
     assert w["file"] == "backend/app/orchestrator.py"
     assert "test-coverage" in w["top_categories"]
@@ -3151,7 +3666,9 @@ async def test_claim_injects_module_feedback_warnings_for_create_task(client: As
 
 
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint does NOT inject module_feedback_warnings for review tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3194,7 +3711,91 @@ async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(cl
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_architecture_context_for_create_task(client: AsyncClient, db_session):
+async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
+    client: AsyncClient, db_session
+):
+    """Claim endpoint includes false_positive_rate, precision, sr_flag_sample_size in self_review_catch_rate."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {
+                    "miss_rate": 0.10,
+                    "weighted_miss_rate": 0.12,
+                    "false_positive_rate": 0.8,
+                    "fp_count": 8,
+                    "tp_count": 2,
+                },
+                "correctness": {
+                    "miss_rate": 0.20,
+                    # No fp/tp data — calibration fields should be omitted.
+                },
+            },
+            "by_task_type": {
+                "create": {
+                    "security": {
+                        "miss_rate": 0.05,
+                        "false_positive_rate": 0.6,
+                        "fp_count": 6,
+                        "tp_count": 4,
+                    },
+                },
+            },
+        },
+    }
+    project = Project(
+        name="SR FP Calibration Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add feature"}],
+        vm_instance_id="agent-vm-sr-fp-calib",
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sr-fp-calib")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    project_ctx = resp.json().get("project_context", {})
+    sr = project_ctx.get("self_review_catch_rate")
+    assert sr is not None, (
+        f"expected self_review_catch_rate in project_context, got {list(project_ctx.keys())}"
+    )
+
+    cats = sr["categories"]
+    sec = cats["security"]
+    assert sec["false_positive_rate"] == 0.8
+    assert sec["precision"] == round(1 - 0.8, 3)
+    assert sec["sr_flag_sample_size"] == 10
+
+    # Category without fp data: calibration fields must be absent.
+    corr = cats["correctness"]
+    assert "false_positive_rate" not in corr
+    assert "precision" not in corr
+    assert "sr_flag_sample_size" not in corr
+
+    # for_task_type passthrough
+    type_sec = sr["for_task_type"]["security"]
+    assert type_sec["false_positive_rate"] == 0.6
+    assert type_sec["precision"] == round(1 - 0.6, 3)
+    assert type_sec["sr_flag_sample_size"] == 10
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_architecture_context_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects architecture_context in project_context for create tasks when related_files match _file_to_system."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3218,7 +3819,9 @@ async def test_claim_injects_architecture_context_for_create_task(client: AsyncC
             "modules": ["backend/app/models.py"],
         },
     }
-    project = Project(name="Arch Context Test", user_id="test-user-123", design_doc=design_doc)
+    project = Project(
+        name="Arch Context Test", user_id="test-user-123", design_doc=design_doc
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -3254,7 +3857,9 @@ async def test_claim_injects_architecture_context_for_create_task(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_architecture_context_for_review_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_architecture_context_for_review_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint does NOT inject architecture_context for review tasks."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3268,7 +3873,9 @@ async def test_claim_does_not_inject_architecture_context_for_review_task(client
             "modules": ["backend/app/auth.py"],
         },
     }
-    project = Project(name="Arch Context Review Test", user_id="test-user-123", design_doc=design_doc)
+    project = Project(
+        name="Arch Context Review Test", user_id="test-user-123", design_doc=design_doc
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -3297,7 +3904,9 @@ async def test_claim_does_not_inject_architecture_context_for_review_task(client
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_claim_tracks_arch_context_in_task_context(client: AsyncClient, db_session):
+async def test_claim_tracks_arch_context_in_task_context(
+    client: AsyncClient, db_session
+):
     """When arch context is injected at claim time, _had_arch_context=True and
     _shown_arch_system_names are persisted in task.context for effectiveness tracking."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -3322,7 +3931,11 @@ async def test_claim_tracks_arch_context_in_task_context(client: AsyncClient, db
             "modules": ["backend/app/models.py"],
         },
     }
-    project = Project(name="Arch Context Tracking Test", user_id="test-user-123", design_doc=design_doc)
+    project = Project(
+        name="Arch Context Tracking Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
     flag_modified(project, "design_doc")
     db_session.add(project)
     await db_session.commit()
@@ -3361,6 +3974,7 @@ async def test_safe_ws_close_swallows_double_close_runtime_error():
     specific race without breaking."""
     from unittest.mock import AsyncMock
     from app.routers.projects import _safe_ws_close
+
     ws = AsyncMock()
     ws.close.side_effect = RuntimeError(
         'Unexpected ASGI message "websocket.close", after sending "websocket.close".'
@@ -3377,6 +3991,7 @@ async def test_safe_ws_close_swallows_send_once_close_runtime_error():
     and the close is cosmetic; both must be swallowed."""
     from unittest.mock import AsyncMock
     from app.routers.projects import _safe_ws_close
+
     ws = AsyncMock()
     ws.close.side_effect = RuntimeError(
         'Cannot call "send" once a close message has been sent.'
@@ -3391,6 +4006,7 @@ async def test_safe_ws_close_reraises_other_runtime_errors():
     so real bugs don't get hidden."""
     from unittest.mock import AsyncMock
     from app.routers.projects import _safe_ws_close
+
     ws = AsyncMock()
     ws.close.side_effect = RuntimeError("connection closed during handshake")
     with pytest.raises(RuntimeError, match="handshake"):
@@ -3423,7 +4039,9 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
     mocker.patch("app.reaper.reaper_service", new_callable=AsyncMock)
     mocker.patch("app.services.gcp_cleanup_service", new_callable=AsyncMock)
     mocker.patch("app.services.secret_reconciliation_service", new_callable=AsyncMock)
-    mocker.patch.object(orchestrator_module, "orchestrator_worker", new_callable=AsyncMock)
+    mocker.patch.object(
+        orchestrator_module, "orchestrator_worker", new_callable=AsyncMock
+    )
 
     task_id = uuid.uuid4()
     with (
@@ -3437,7 +4055,9 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
 
 
 @pytest.mark.asyncio
-async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient, db_session, mocker):
+async def test_external_api_requeue_sets_exponential_backoff(
+    client: AsyncClient, db_session, mocker
+):
     """
     Tests that EXTERNAL_API failures requeue with exponential backoff in retry_after.
     - 1st retry: ~2 min delay (2^1 * 120 = 240s)
@@ -3490,10 +4110,14 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
         )
 
         retry_after_dt = datetime.fromisoformat(ctx["retry_after"])
-        expected_delay = min(2 ** retry_num * 120, 1800)
+        expected_delay = min(2**retry_num * 120, 1800)
         actual_delay = (retry_after_dt - before).total_seconds()
-        assert actual_delay >= expected_delay - 2, f"retry {retry_num}: delay {actual_delay} < expected {expected_delay}"
-        assert actual_delay <= expected_delay + 5, f"retry {retry_num}: delay {actual_delay} too large"
+        assert actual_delay >= expected_delay - 2, (
+            f"retry {retry_num}: delay {actual_delay} < expected {expected_delay}"
+        )
+        assert actual_delay <= expected_delay + 5, (
+            f"retry {retry_num}: delay {actual_delay} too large"
+        )
 
     # 6th attempt: api_retries=5, increments to 6 > 5 → EXTERNAL_API requeue path is skipped
     # Falls through to general retry (task.attempt_count < max_retries), so no retry_after is set
@@ -3522,11 +4146,15 @@ async def test_external_api_requeue_sets_exponential_backoff(client: AsyncClient
     await db_session.refresh(task)
     # Falls through to general retry path — no EXTERNAL_API-specific retry_after is set
     ctx = task.context or {}
-    assert "retry_after" not in ctx, "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+    assert "retry_after" not in ctx, (
+        "after EXTERNAL_API cap exceeded, retry_after should not be set by EXTERNAL_API path"
+    )
 
 
 @pytest.mark.asyncio
-async def test_external_api_permanent_auth_failure_does_not_requeue(client: AsyncClient, db_session, mocker):
+async def test_external_api_permanent_auth_failure_does_not_requeue(
+    client: AsyncClient, db_session, mocker
+):
     """
     EXTERNAL_API failures with permanent auth indicators (token expired, 401, bad credentials)
     must fail immediately without consuming any retry budget. Requeuing only wastes 30+ minutes
@@ -3580,7 +4208,9 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(client: Asyn
             "logs": logs_msg,
         }
         resp = await client.post("/api/agent/status", json=payload, headers=headers)
-        assert resp.status_code == 200, f"case {i}: unexpected status {resp.status_code}"
+        assert resp.status_code == 200, (
+            f"case {i}: unexpected status {resp.status_code}"
+        )
 
         await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED, (
@@ -3593,22 +4223,34 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(client: Asyn
         )
         # Operator-facing message must direct to re-authentication
         assert task.latest_status_message is not None
-        assert "auth" in task.latest_status_message.lower() or "re-authenticate" in task.latest_status_message.lower(), (
+        assert (
+            "auth" in task.latest_status_message.lower()
+            or "re-authenticate" in task.latest_status_message.lower()
+        ), (
             f"case {i}: status message should mention auth/re-authenticate, got: {task.latest_status_message!r}"
         )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("requested_model", ["gemini-3.1-pro-preview", "gemini-3-pro-preview"])
+@pytest.mark.parametrize(
+    "requested_model", ["gemini-3.1-pro-preview", "gemini-3-pro-preview"]
+)
 async def test_external_api_provider_model_config_falls_back_without_backoff(
     requested_model, client: AsyncClient, db_session, mocker
 ):
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
-    mocker.patch("app.routers.agent_status.release_max_plan_account", new_callable=mocker.AsyncMock)
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.release_max_plan_account",
+        new_callable=mocker.AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
 
-    project = Project(name="Gemini Model Fallback Test", user_id="test-user-gemini-fallback")
+    project = Project(
+        name="Gemini Model Fallback Test", user_id="test-user-gemini-fallback"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -3668,17 +4310,23 @@ async def test_external_api_provider_model_config_falls_back_without_backoff(
 
 
 @pytest.mark.asyncio
-async def test_external_api_provider_model_config_without_fallback_does_not_requeue(client: AsyncClient, db_session, mocker):
+async def test_external_api_provider_model_config_without_fallback_does_not_requeue(
+    client: AsyncClient, db_session, mocker
+):
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
     mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=mocker.AsyncMock,
         return_value={"status": "accepted"},
     )
 
-    project = Project(name="Provider Model No Fallback Test", user_id="test-user-model-no-fallback")
+    project = Project(
+        name="Provider Model No Fallback Test", user_id="test-user-model-no-fallback"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -3731,10 +4379,15 @@ async def test_external_api_provider_model_config_without_fallback_does_not_requ
 # path must mirror the reaper's open-PR handoff (reaper.py:912-1048) and route
 # to EVALUATING + review pipeline instead of QUEUED.
 
+
 @pytest.mark.asyncio
-async def test_failed_with_open_pr_hands_off_to_review(client: AsyncClient, db_session, mocker):
+async def test_failed_with_open_pr_hands_off_to_review(
+    client: AsyncClient, db_session, mocker
+):
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=AsyncMock,
@@ -3767,11 +4420,13 @@ async def test_failed_with_open_pr_hands_off_to_review(client: AsyncClient, db_s
     await db_session.commit()
     await db_session.refresh(task)
 
-    db_session.add(Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/owner/repo/pull/3575",
-    ))
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/3575",
+        )
+    )
     await db_session.commit()
 
     token = create_agent_token(str(task.id), "agent-vm-open-pr-handoff")
@@ -3802,10 +4457,14 @@ async def test_failed_with_open_pr_hands_off_to_review(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_failed_with_merged_pr_marks_completed(client: AsyncClient, db_session, mocker):
+async def test_failed_with_merged_pr_marks_completed(
+    client: AsyncClient, db_session, mocker
+):
     """PR merged out-of-band before agent reported FAILED → COMPLETED, not retry."""
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=AsyncMock,
@@ -3836,11 +4495,13 @@ async def test_failed_with_merged_pr_marks_completed(client: AsyncClient, db_ses
     await db_session.commit()
     await db_session.refresh(task)
 
-    db_session.add(Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/owner/repo/pull/4242",
-    ))
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4242",
+        )
+    )
     await db_session.commit()
 
     token = create_agent_token(str(task.id), "agent-vm-merged-pr")
@@ -3858,10 +4519,14 @@ async def test_failed_with_merged_pr_marks_completed(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_failed_with_closed_unmerged_pr_marks_terminal_failed(client: AsyncClient, db_session, mocker):
+async def test_failed_with_closed_unmerged_pr_marks_terminal_failed(
+    client: AsyncClient, db_session, mocker
+):
     """PR closed without merging → terminal FAILED with closure marker; no retry."""
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=AsyncMock,
@@ -3892,11 +4557,13 @@ async def test_failed_with_closed_unmerged_pr_marks_terminal_failed(client: Asyn
     await db_session.commit()
     await db_session.refresh(task)
 
-    db_session.add(Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/owner/repo/pull/7777",
-    ))
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/7777",
+        )
+    )
     await db_session.commit()
 
     token = create_agent_token(str(task.id), "agent-vm-closed-pr")
@@ -3915,13 +4582,17 @@ async def test_failed_with_closed_unmerged_pr_marks_terminal_failed(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_failed_without_pr_artifact_uses_normal_retry(client: AsyncClient, db_session, mocker):
+async def test_failed_without_pr_artifact_uses_normal_retry(
+    client: AsyncClient, db_session, mocker
+):
     """Without a PR artifact, the FAILED path should still take the normal retry flow.
 
     Guards against the open-PR handoff over-reaching and breaking unrelated retries.
     """
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent_status._process_post_commit",
         new_callable=AsyncMock,
@@ -3958,7 +4629,9 @@ async def test_failed_without_pr_artifact_uses_normal_retry(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncClient, db_session, mocker):
+async def test_agent_claim_non_research_includes_pipeline_health(
+    client: AsyncClient, db_session, mocker
+):
     """Non-gated task type (docs) receives pipeline_health via the else-branch."""
     project = Project(name="Pipeline Health Test", user_id="test-user-ph")
     db_session.add(project)
@@ -3997,11 +4670,18 @@ async def test_agent_claim_non_research_includes_pipeline_health(client: AsyncCl
     data = resp.json()
     assert "project_context" in data
     assert data["project_context"]["pipeline_health"] is not None
-    assert data["project_context"]["pipeline_health"]["first_attempt_success_rate"]["by_type"]["create"] == 0.85
+    assert (
+        data["project_context"]["pipeline_health"]["first_attempt_success_rate"][
+            "by_type"
+        ]["create"]
+        == 0.85
+    )
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_pipeline_health_includes_scope_conversion_rates(client: AsyncClient, db_session, mocker):
+async def test_agent_claim_pipeline_health_includes_scope_conversion_rates(
+    client: AsyncClient, db_session, mocker
+):
     """Claim response includes scope_conversion_rates and medium_scope_review_iterations in pipeline_health."""
     project = Project(name="Scope Merge Rate Test", user_id="test-user-smr")
     db_session.add(project)
@@ -4032,8 +4712,18 @@ async def test_agent_claim_pipeline_health_includes_scope_conversion_rates(clien
         "review_accuracy": None,
         "persistent_review_issues": None,
         "scope_conversion_rates": {
-            "medium": {"current_rate": 0.75, "prev_rate": 0.5, "delta": 0.25, "trend": "improving"},
-            "small": {"current_rate": 0.9, "prev_rate": 0.85, "delta": 0.05, "trend": "stable"},
+            "medium": {
+                "current_rate": 0.75,
+                "prev_rate": 0.5,
+                "delta": 0.25,
+                "trend": "improving",
+            },
+            "small": {
+                "current_rate": 0.9,
+                "prev_rate": 0.85,
+                "delta": 0.05,
+                "trend": "stable",
+            },
         },
         "medium_scope_review_iterations": 2.5,
     }
@@ -4128,7 +4818,9 @@ async def test_playbook_claim_filters_by_task_type(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_includes_entry_when_type_matches(client: AsyncClient, db_session):
+async def test_playbook_claim_includes_entry_when_type_matches(
+    client: AsyncClient, db_session
+):
     """
     Claim endpoint includes playbook entries when task type is in applicable_types.
     """
@@ -4166,7 +4858,9 @@ async def test_playbook_claim_includes_entry_when_type_matches(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_increments_reference_count(client: AsyncClient, db_session):
+async def test_playbook_claim_increments_reference_count(
+    client: AsyncClient, db_session
+):
     """
     After claim, reference_count is incremented and last_referenced_at is set
     for served playbook entries. Non-served entries (filtered by applicable_types) are NOT incremented.
@@ -4280,7 +4974,9 @@ async def test_playbook_claim_ordering_confirmed_count(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_prioritises_local_relevance_and_includes_reasons(client: AsyncClient, db_session):
+async def test_playbook_claim_prioritises_local_relevance_and_includes_reasons(
+    client: AsyncClient, db_session
+):
     """
     Claim prioritises entries that locally match task direction/system/related files and
     includes relevance metadata in response payload.
@@ -4331,7 +5027,9 @@ async def test_playbook_claim_prioritises_local_relevance_and_includes_reasons(c
 
     assert "playbook" in data
     keys = list(data["playbook"].keys())
-    assert keys.index("local-match") < keys.index("high-ratio-generic"), f"Order: {keys}"
+    assert keys.index("local-match") < keys.index("high-ratio-generic"), (
+        f"Order: {keys}"
+    )
     relevance = data["playbook"]["local-match"]["relevance"]
     assert relevance["local_match"] is True
     assert "same direction" in relevance["reasons"]
@@ -4340,12 +5038,16 @@ async def test_playbook_claim_prioritises_local_relevance_and_includes_reasons(c
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_handles_non_dict_file_to_system(client: AsyncClient, db_session):
+async def test_playbook_claim_handles_non_dict_file_to_system(
+    client: AsyncClient, db_session
+):
     """
     Claim tolerates malformed _file_to_system metadata without crashing.
     """
     now = datetime.utcnow().isoformat()
-    project = Project(name="Playbook Bad Metadata Test", user_id="test-user-bad-metadata")
+    project = Project(
+        name="Playbook Bad Metadata Test", user_id="test-user-bad-metadata"
+    )
     project.design_doc = {
         "_file_to_system": ["not", "a", "dict"],
         "playbook/safe-entry": {
@@ -4378,7 +5080,9 @@ async def test_playbook_claim_handles_non_dict_file_to_system(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_age_penalty_deprioritises_old_entries(client: AsyncClient, db_session):
+async def test_playbook_claim_age_penalty_deprioritises_old_entries(
+    client: AsyncClient, db_session
+):
     """
     Old entries (>30 days, confirmed_count < 3) are deprioritised in claim ordering.
     A recent unconfirmed entry should appear before an older unconfirmed entry.
@@ -4428,7 +5132,9 @@ async def test_playbook_claim_age_penalty_deprioritises_old_entries(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_stale_file_refs_deprioritised(client: AsyncClient, db_session):
+async def test_playbook_claim_stale_file_refs_deprioritised(
+    client: AsyncClient, db_session
+):
     """
     Entries with stale_file_refs=True are deprioritised — a clean entry with the same
     confirmed_count should come before a stale entry.
@@ -4479,7 +5185,9 @@ async def test_playbook_claim_stale_file_refs_deprioritised(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_playbook_claim_old_confirmed_entry_not_penalised(client: AsyncClient, db_session):
+async def test_playbook_claim_old_confirmed_entry_not_penalised(
+    client: AsyncClient, db_session
+):
     """
     An old entry with confirmed_count >= 3 should NOT receive the age penalty.
     It should still be ordered before a less-confirmed recent entry.
@@ -4700,7 +5408,7 @@ async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
     )
     # effectiveness_score computed: 2/3 ≈ 0.6667
     assert shown.get("effectiveness_score") is not None
-    assert abs(shown["effectiveness_score"] - round(2/3, 4)) < 0.001
+    assert abs(shown["effectiveness_score"] - round(2 / 3, 4)) < 0.001
     # last_confirmed_at set
     assert shown.get("last_confirmed_at") is not None
 
@@ -4712,7 +5420,9 @@ async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
 
 
 @pytest.mark.asyncio
-async def test_playbook_auto_archive_after_10_unconfirmed_references(client: AsyncClient, db_session):
+async def test_playbook_auto_archive_after_10_unconfirmed_references(
+    client: AsyncClient, db_session
+):
     """
     After 10 references with no confirmations, an entry accumulates 10 Falses in recent_outcomes
     (score=0.0 < 0.1 threshold) and is auto-archived (stale=True) during reference tracking.
@@ -4765,7 +5475,9 @@ async def test_playbook_auto_archive_after_10_unconfirmed_references(client: Asy
     # After first claim: zero-effectiveness should now have stale=True in DB
     await db_session.refresh(project)
     entry = project.design_doc["playbook/zero-effectiveness"]
-    assert entry.get("stale") is True, f"Expected stale=True after 10 Falses, got: {entry}"
+    assert entry.get("stale") is True, (
+        f"Expected stale=True after 10 Falses, got: {entry}"
+    )
     assert entry.get("effectiveness_score") == 0.0
 
     # Second claim: zero-effectiveness should be excluded (stale=True)
@@ -4784,7 +5496,9 @@ async def test_playbook_auto_archive_after_10_unconfirmed_references(client: Asy
 
     data2 = resp2.json()
     playbook2 = data2.get("playbook", {})
-    assert "zero-effectiveness" not in playbook2, "Auto-archived entry should not appear in subsequent claims"
+    assert "zero-effectiveness" not in playbook2, (
+        "Auto-archived entry should not appear in subsequent claims"
+    )
     assert "active-entry" in playbook2, "Active entry should still appear"
 
 
@@ -4871,7 +5585,9 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_agent_create_pr_recreates_when_cached_pr_closed(client: AsyncClient, db_session, mocker):
+async def test_agent_create_pr_recreates_when_cached_pr_closed(
+    client: AsyncClient, db_session, mocker
+):
     """If the cached PR artifact points at a closed PR (e.g. branch was deleted
     on requeue, auto-closing the PR), the endpoint must NOT return the stale URL.
     It should delete the stale artifact and create a fresh PR.
@@ -4896,11 +5612,13 @@ async def test_agent_create_pr_recreates_when_cached_pr_closed(client: AsyncClie
     await db_session.commit()
     await db_session.refresh(task)
 
-    db_session.add(Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/foo/bar/pull/42",
-    ))
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/foo/bar/pull/42",
+        )
+    )
     await db_session.commit()
 
     mocker.patch(
@@ -4911,7 +5629,9 @@ async def test_agent_create_pr_recreates_when_cached_pr_closed(client: AsyncClie
         "app.routers.agent.get_pull_request",
         new=AsyncMock(return_value={"state": "closed", "merged": False}),
     )
-    mock_create = AsyncMock(return_value={"html_url": "https://github.com/foo/bar/pull/99", "number": 99})
+    mock_create = AsyncMock(
+        return_value={"html_url": "https://github.com/foo/bar/pull/99", "number": 99}
+    )
     mocker.patch("app.routers.agent.create_pull_request", new=mock_create)
 
     token = create_agent_token(str(task.id), "agent-vm-stale-pr")
@@ -4934,9 +5654,18 @@ async def test_agent_create_pr_recreates_when_cached_pr_closed(client: AsyncClie
     assert resp.json()["data"]["html_url"] == "https://github.com/foo/bar/pull/99"
     mock_create.assert_called_once()
 
-    artifacts = (await db_session.execute(
-        select(Artifact).where(Artifact.task_id == task.id, Artifact.artifact_type == ArtifactType.PULL_REQUEST)
-    )).scalars().all()
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     pr_urls = sorted(a.pr_url for a in artifacts)
     assert "https://github.com/foo/bar/pull/99" in pr_urls
     assert "https://github.com/foo/bar/pull/42" not in pr_urls, (
@@ -4945,7 +5674,9 @@ async def test_agent_create_pr_recreates_when_cached_pr_closed(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_agent_create_pr_returns_cached_when_open(client: AsyncClient, db_session, mocker):
+async def test_agent_create_pr_returns_cached_when_open(
+    client: AsyncClient, db_session, mocker
+):
     """If the cached PR artifact points at an OPEN PR, the endpoint should
     short-circuit and return its URL without calling create_pull_request."""
     from unittest.mock import AsyncMock
@@ -4965,11 +5696,13 @@ async def test_agent_create_pr_returns_cached_when_open(client: AsyncClient, db_
     await db_session.commit()
     await db_session.refresh(task)
 
-    db_session.add(Artifact(
-        task_id=task.id,
-        artifact_type=ArtifactType.PULL_REQUEST,
-        pr_url="https://github.com/foo/bar/pull/7",
-    ))
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/foo/bar/pull/7",
+        )
+    )
     await db_session.commit()
 
     mocker.patch(
@@ -5005,7 +5738,9 @@ async def test_agent_create_pr_returns_cached_when_open(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_requeue_clears_terminated_cache(client: AsyncClient, db_session, mocker):
+async def test_rate_limit_requeue_clears_terminated_cache(
+    client: AsyncClient, db_session, mocker
+):
     """
     Regression test for the 401 cascade bug.
 
@@ -5072,7 +5807,9 @@ async def test_rate_limit_requeue_clears_terminated_cache(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_completed_terminal_populates_terminated_cache(client: AsyncClient, db_session, mocker):
+async def test_completed_terminal_populates_terminated_cache(
+    client: AsyncClient, db_session, mocker
+):
     """
     Inverse of test_rate_limit_requeue_clears_terminated_cache: a genuinely
     terminal COMPLETED status MUST populate _terminated_task_ids so the agent's
@@ -5128,7 +5865,9 @@ async def test_completed_terminal_populates_terminated_cache(client: AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, db_session, mocker):
+async def test_rate_limit_requeue_allows_subsequent_claim(
+    client: AsyncClient, db_session, mocker
+):
     """
     End-to-end regression: after a rate-limit requeue, a fresh VM must be able
     to re-claim the task without hitting the 401 cascade. Before the fix, the
@@ -5201,7 +5940,9 @@ async def test_rate_limit_requeue_allows_subsequent_claim(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_file_change_details_stored_in_task_context(client: AsyncClient, db_session, mocker):
+async def test_file_change_details_stored_in_task_context(
+    client: AsyncClient, db_session, mocker
+):
     """When an agent reports status with file_change_details, the field is stored
     in task.context['_file_change_details'] so _requeue_parent_task can propagate
     it to the retry clone as _previous_file_change_details."""
@@ -5241,7 +5982,9 @@ async def test_file_change_details_stored_in_task_context(client: AsyncClient, d
         "failure_category": "test_failed",
         "file_change_details": file_details,
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
     await db_session.refresh(task)
@@ -5254,7 +5997,9 @@ async def test_file_change_details_stored_in_task_context(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_scope_gate_triggered_stored_in_task_context(client: AsyncClient, db_session, mocker):
+async def test_scope_gate_triggered_stored_in_task_context(
+    client: AsyncClient, db_session, mocker
+):
     """Agent status with scope_gate_triggered='analysis_overflow' persists
     the value to task.context so direction_outcomes can differentiate
     analysis-phase overflow from post-implementation overflow."""
@@ -5290,7 +6035,9 @@ async def test_scope_gate_triggered_stored_in_task_context(client: AsyncClient, 
         "failure_category": "scope_overflow",
         "scope_gate_triggered": "analysis_overflow",
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
     await db_session.refresh(task)
@@ -5303,7 +6050,9 @@ async def test_scope_gate_triggered_stored_in_task_context(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_agent_status_pr_artifact_stores_enriched_context(client: AsyncClient, db_session, mocker):
+async def test_agent_status_pr_artifact_stores_enriched_context(
+    client: AsyncClient, db_session, mocker
+):
     """COMPLETED+PULL_REQUEST status with diff_summary, self_review_outcome, and
     test_failure_summary stores them in task context as _pr_diff_summary,
     _self_review_outcome, and _test_failure_summary respectively."""
@@ -5335,10 +6084,24 @@ async def test_agent_status_pr_artifact_stores_enriched_context(client: AsyncCli
     await db_session.refresh(task)
 
     diff_summary = [
-        {"file": "backend/app/models.py", "additions": 45, "deletions": 12, "change_type": "modified"},
-        {"file": "backend/testing/test_models.py", "additions": 30, "deletions": 0, "change_type": "added"},
+        {
+            "file": "backend/app/models.py",
+            "additions": 45,
+            "deletions": 12,
+            "change_type": "modified",
+        },
+        {
+            "file": "backend/testing/test_models.py",
+            "additions": 30,
+            "deletions": 0,
+            "change_type": "added",
+        },
     ]
-    self_review_outcome = {"issues_found": False, "fixes_applied": False, "categories": []}
+    self_review_outcome = {
+        "issues_found": False,
+        "fixes_applied": False,
+        "categories": [],
+    }
     test_failure_summary = "FAILED backend/testing/test_models.py::test_create"
 
     token = create_agent_token(str(task.id), "agent-vm-enriched-pr")
@@ -5365,14 +6128,18 @@ async def test_agent_status_pr_artifact_stores_enriched_context(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure(client: AsyncClient, db_session, mocker):
+async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure(
+    client: AsyncClient, db_session, mocker
+):
     """FAILED+ERROR_LOG status with diff_summary and test_failure_summary stores them
     in task context as _pr_diff_summary and _test_failure_summary."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
-    project = Project(name="Enriched Context Failed Test", user_id="test-user-enriched-failed")
+    project = Project(
+        name="Enriched Context Failed Test", user_id="test-user-enriched-failed"
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -5390,9 +6157,16 @@ async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure
     await db_session.refresh(task)
 
     diff_summary = [
-        {"file": "backend/app/models.py", "additions": 10, "deletions": 2, "change_type": "modified"},
+        {
+            "file": "backend/app/models.py",
+            "additions": 10,
+            "deletions": 2,
+            "change_type": "modified",
+        },
     ]
-    test_failure_summary = "FAILED backend/testing/test_models.py::test_create - AssertionError"
+    test_failure_summary = (
+        "FAILED backend/testing/test_models.py::test_create - AssertionError"
+    )
 
     token = create_agent_token(str(task.id), "agent-vm-enriched-failed")
     headers = {"x-agent-token": token}
@@ -5440,7 +6214,12 @@ async def test_claim_top_first_review_issues_populated(client: AsyncClient, db_s
                             "iteration": 0,
                             "feedback": "Needs work",
                             "issues": [
-                                {"severity": "high", "description": common_issue, "file": "app/foo.py", "line": 10},
+                                {
+                                    "severity": "high",
+                                    "description": common_issue,
+                                    "file": "app/foo.py",
+                                    "line": 10,
+                                },
                             ],
                         }
                     ],
@@ -5474,7 +6253,9 @@ async def test_claim_top_first_review_issues_populated(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_claim_direction_top_first_review_issues_populated(client: AsyncClient, db_session):
+async def test_claim_direction_top_first_review_issues_populated(
+    client: AsyncClient, db_session
+):
     """direction_context.top_first_review_issues is populated when a direction has 3+ tasks with review history and a recurring issue."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -5498,9 +6279,23 @@ async def test_claim_direction_top_first_review_issues_populated(client: AsyncCl
     other_issue = "Unique issue seen only once"
     # 3 tasks in this direction with review history; 2 share the recurring issue.
     for i in range(3):
-        issues = [{"severity": "high", "description": direction_issue, "file": "a.py", "line": 1}]
+        issues = [
+            {
+                "severity": "high",
+                "description": direction_issue,
+                "file": "a.py",
+                "line": 1,
+            }
+        ]
         if i == 2:
-            issues = [{"severity": "low", "description": other_issue, "file": "b.py", "line": 2}]
+            issues = [
+                {
+                    "severity": "low",
+                    "description": other_issue,
+                    "file": "b.py",
+                    "line": 2,
+                }
+            ]
         ht = Task(
             project_id=project.id,
             payloads=[{"type": "create", "prompt": f"dir task {i}"}],
@@ -5544,12 +6339,16 @@ async def test_claim_direction_top_first_review_issues_populated(client: AsyncCl
 
 
 @pytest.mark.asyncio
-async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(client: AsyncClient, db_session):
+async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(
+    client: AsyncClient, db_session
+):
     """direction_context.top_first_review_issues stays None when fewer than 3 direction-scoped tasks have review history."""
     from sqlalchemy.orm.attributes import flag_modified
 
     direction_id = str(uuid.uuid4())
-    project = Project(name="Direction Top Review Issues Gated", user_id="test-user-dtri-gate")
+    project = Project(
+        name="Direction Top Review Issues Gated", user_id="test-user-dtri-gate"
+    )
     project.directions = [
         {
             "id": direction_id,
@@ -5580,7 +6379,14 @@ async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(client
                         {
                             "iteration": 0,
                             "feedback": "fix",
-                            "issues": [{"severity": "high", "description": shared_issue, "file": "a.py", "line": 1}],
+                            "issues": [
+                                {
+                                    "severity": "high",
+                                    "description": shared_issue,
+                                    "file": "a.py",
+                                    "line": 1,
+                                }
+                            ],
                         },
                     ],
                 },
@@ -5610,7 +6416,9 @@ async def test_claim_direction_top_first_review_issues_gated_by_min_tasks(client
 
 
 @pytest.mark.asyncio
-async def test_claim_direction_first_attempt_feedback_in_direction_context(client: AsyncClient, db_session):
+async def test_claim_direction_first_attempt_feedback_in_direction_context(
+    client: AsyncClient, db_session
+):
     """direction_context.first_attempt_feedback exposes per-direction rejection category counts from design_doc."""
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -5688,7 +6496,9 @@ async def _setup_smoketest_task(db_session, vm_id: str, base_branch: str = "main
 
 
 @pytest.mark.asyncio
-async def test_smoketest_startup_failure_spawns_plan_task_priority_90(client: AsyncClient, db_session, mocker):
+async def test_smoketest_startup_failure_spawns_plan_task_priority_90(
+    client: AsyncClient, db_session, mocker
+):
     """SMOKETEST_RESULT with a startup-suite failure spawns a plan task at priority 90."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -5697,13 +6507,17 @@ async def test_smoketest_startup_failure_spawns_plan_task_priority_90(client: As
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-startup")
 
     import json as _json
+
     smoketest_payload = {
         "passed": False,
         "tests": [
             {"name": "startup_probe", "status": "fail", "message": "port unreachable"},
         ],
         "suites": {
-            "startup": {"passed": False, "tests": [{"name": "startup_probe", "status": "fail"}]},
+            "startup": {
+                "passed": False,
+                "tests": [{"name": "startup_probe", "status": "fail"}],
+            },
             "curated": {"passed": True, "tests": []},
         },
     }
@@ -5714,10 +6528,14 @@ async def test_smoketest_startup_failure_spawns_plan_task_priority_90(client: As
         "artifact_type": "SMOKETEST_RESULT",
         "logs": _json.dumps(smoketest_payload),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     spawned = result.scalars().all()
     assert len(spawned) == 1, f"Expected 1 spawned plan task, got {len(spawned)}"
     plan_task = spawned[0]
@@ -5727,7 +6545,9 @@ async def test_smoketest_startup_failure_spawns_plan_task_priority_90(client: As
 
 
 @pytest.mark.asyncio
-async def test_smoketest_curated_failure_spawns_plan_task_priority_70(client: AsyncClient, db_session, mocker):
+async def test_smoketest_curated_failure_spawns_plan_task_priority_70(
+    client: AsyncClient, db_session, mocker
+):
     """SMOKETEST_RESULT with a curated-suite failure (startup ok) spawns plan task at priority 70."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -5736,12 +6556,18 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(client: As
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-curated")
 
     import json as _json
+
     smoketest_payload = {
         "passed": False,
-        "tests": [{"name": "login_flow", "status": "fail", "message": "assertion failed"}],
+        "tests": [
+            {"name": "login_flow", "status": "fail", "message": "assertion failed"}
+        ],
         "suites": {
             "startup": {"passed": True, "tests": []},
-            "curated": {"passed": False, "tests": [{"name": "login_flow", "status": "fail"}]},
+            "curated": {
+                "passed": False,
+                "tests": [{"name": "login_flow", "status": "fail"}],
+            },
         },
     }
     token = create_agent_token(str(task.id), "agent-vm-smoke-curated")
@@ -5751,10 +6577,14 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(client: As
         "artifact_type": "SMOKETEST_RESULT",
         "logs": _json.dumps(smoketest_payload),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     spawned = result.scalars().all()
     assert len(spawned) == 1
     assert spawned[0].priority == 70
@@ -5762,7 +6592,9 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(client: As
 
 
 @pytest.mark.asyncio
-async def test_smoketest_passing_does_not_spawn_plan_task(client: AsyncClient, db_session, mocker):
+async def test_smoketest_passing_does_not_spawn_plan_task(
+    client: AsyncClient, db_session, mocker
+):
     """SMOKETEST_RESULT with passed=true (no failures) does not spawn any child task."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -5771,6 +6603,7 @@ async def test_smoketest_passing_does_not_spawn_plan_task(client: AsyncClient, d
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-ok")
 
     import json as _json
+
     # Even when status=FAILED is reported, a passed=true smoketest payload must not spawn.
     smoketest_payload = {
         "passed": True,
@@ -5784,15 +6617,21 @@ async def test_smoketest_passing_does_not_spawn_plan_task(client: AsyncClient, d
         "artifact_type": "SMOKETEST_RESULT",
         "logs": _json.dumps(smoketest_payload),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
-    result = await db_session.execute(select(Task).where(Task.parent_task_id == task.id))
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
     assert result.scalars().all() == []
 
 
 @pytest.mark.asyncio
-async def test_debug_result_high_confidence_spawns_fix_task(client: AsyncClient, db_session, mocker):
+async def test_debug_result_high_confidence_spawns_fix_task(
+    client: AsyncClient, db_session, mocker
+):
     """DEBUG_RESULT with confidence='high' and fix_prompt spawns a create-type fix task."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -5816,6 +6655,7 @@ async def test_debug_result_high_confidence_spawns_fix_task(client: AsyncClient,
     await db_session.refresh(task)
 
     import json as _json
+
     debug_payload = {
         "confidence": "high",
         "fix_prompt": "Update login handler to normalize email before lookup",
@@ -5828,7 +6668,9 @@ async def test_debug_result_high_confidence_spawns_fix_task(client: AsyncClient,
         "artifact_type": "DEBUG_RESULT",
         "logs": _json.dumps(debug_payload),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
     result = await db_session.execute(
@@ -5844,7 +6686,9 @@ async def test_debug_result_high_confidence_spawns_fix_task(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: AsyncClient, db_session, mocker):
+async def test_debug_result_low_confidence_does_not_spawn_fix_task(
+    client: AsyncClient, db_session, mocker
+):
     """DEBUG_RESULT with confidence='low' records plan_output but does not spawn a fix task."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -5868,6 +6712,7 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: Async
     await db_session.refresh(task)
 
     import json as _json
+
     debug_payload = {
         "confidence": "low",
         "fix_prompt": "Possibly add a retry, but unclear",
@@ -5880,7 +6725,9 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: Async
         "artifact_type": "DEBUG_RESULT",
         "logs": _json.dumps(debug_payload),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
     result = await db_session.execute(
@@ -5893,7 +6740,9 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(client: Async
 
 
 @pytest.mark.asyncio
-async def test_debug_result_skips_fix_spawn_if_requeue_already_replaced(client: AsyncClient, db_session, mocker):
+async def test_debug_result_skips_fix_spawn_if_requeue_already_replaced(
+    client: AsyncClient, db_session, mocker
+):
     """DEBUG_RESULT high-confidence does NOT spawn Fix: when the failed task was
     already CANCELLED+replaced by _requeue_parent_task (preventing duplicate work)."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
@@ -5939,13 +6788,17 @@ async def test_debug_result_skips_fix_spawn_if_requeue_already_replaced(client: 
         "task_id": str(debug_task.id),
         "status": "COMPLETED",
         "artifact_type": "DEBUG_RESULT",
-        "logs": _json.dumps({
-            "confidence": "high",
-            "fix_prompt": "Fix the thing",
-            "root_cause": "some root cause",
-        }),
+        "logs": _json.dumps(
+            {
+                "confidence": "high",
+                "fix_prompt": "Fix the thing",
+                "root_cause": "some root cause",
+            }
+        ),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
     # No Fix: task should have been spawned — requeue already handled it
@@ -5964,7 +6817,9 @@ async def test_debug_result_skips_fix_spawn_if_requeue_already_replaced(client: 
 
 
 @pytest.mark.asyncio
-async def test_debug_result_marks_failed_task_on_fix_spawn(client: AsyncClient, db_session, mocker):
+async def test_debug_result_marks_failed_task_on_fix_spawn(
+    client: AsyncClient, db_session, mocker
+):
     """When Fix: task is spawned, _debug_fix_spawned_task_id is written on the failed
     task's context so _requeue_parent_task can detect the debug-fix path and skip cloning."""
     mocker.patch("app.main.delete_agent_vm", return_value=None)
@@ -5982,7 +6837,9 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(client: AsyncClient, 
     failed_task = Task(
         project_id=project.id,
         title="create: another feature",
-        payloads=[{"type": "create", "prompt": "do other thing", "base_branch": "main"}],
+        payloads=[
+            {"type": "create", "prompt": "do other thing", "base_branch": "main"}
+        ],
         vm_instance_id="agent-vm-failed-mark",
         status=TaskStatus.FAILED,
         context={},
@@ -6008,13 +6865,17 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(client: AsyncClient, 
         "task_id": str(debug_task.id),
         "status": "COMPLETED",
         "artifact_type": "DEBUG_RESULT",
-        "logs": _json.dumps({
-            "confidence": "high",
-            "fix_prompt": "Fix the other thing",
-            "root_cause": "another root cause",
-        }),
+        "logs": _json.dumps(
+            {
+                "confidence": "high",
+                "fix_prompt": "Fix the other thing",
+                "root_cause": "another root cause",
+            }
+        ),
     }
-    resp = await client.post("/api/agent/status", json=payload, headers={"x-agent-token": token})
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
     assert resp.status_code == 200
 
     # A Fix: task should have been spawned
@@ -6050,7 +6911,12 @@ async def test_agent_claim_injects_project_vision(client: AsyncClient, db_sessio
             "success_criteria": ["Agents self-improve", "CI stays green"],
             "priorities": ["Stability over features"],
             "systems": [
-                {"id": "orch", "name": "Orchestrator", "status": "functional", "description": "Routes tasks"},
+                {
+                    "id": "orch",
+                    "name": "Orchestrator",
+                    "status": "functional",
+                    "description": "Routes tasks",
+                },
             ],
             "revision": 3,
             "last_updated": "2026-04-21T00:00:00",
@@ -6226,7 +7092,9 @@ async def _make_openai_oauth_task(db_session) -> tuple[Task, MaxPlanAccount, Pro
 
 
 @pytest.mark.asyncio
-async def test_rotate_credentials_updates_openai_oauth_secret(client: AsyncClient, db_session, mocker):
+async def test_rotate_credentials_updates_openai_oauth_secret(
+    client: AsyncClient, db_session, mocker
+):
     mocker.patch(
         "app.secrets_manager.store_user_secret",
         new=AsyncMock(return_value="projects/test/secrets/rotate/versions/2"),
@@ -6249,7 +7117,9 @@ async def test_rotate_credentials_updates_openai_oauth_secret(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_rotate_credentials_rejects_malformed_secret(client: AsyncClient, db_session):
+async def test_rotate_credentials_rejects_malformed_secret(
+    client: AsyncClient, db_session
+):
     task, _, _ = await _make_openai_oauth_task(db_session)
 
     token = create_agent_token(str(task.id), "agent-vm-rotate")
@@ -6266,7 +7136,9 @@ async def test_rotate_credentials_rejects_malformed_secret(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_rotate_credentials_no_op_for_non_openai_oauth(client: AsyncClient, db_session):
+async def test_rotate_credentials_no_op_for_non_openai_oauth(
+    client: AsyncClient, db_session
+):
     """Rotation endpoint must be safe to call unconditionally from the agent —
     a Gemini/SA or Anthropic/OAuth task should get a no-op response, not an
     error. This keeps the agent-side wiring provider-agnostic."""
@@ -6312,7 +7184,9 @@ async def test_rotate_credentials_no_op_for_non_openai_oauth(client: AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_rotate_credentials_rejects_missing_secret(client: AsyncClient, db_session):
+async def test_rotate_credentials_rejects_missing_secret(
+    client: AsyncClient, db_session
+):
     task, _, _ = await _make_openai_oauth_task(db_session)
     token = create_agent_token(str(task.id), "agent-vm-rotate")
 
@@ -6326,7 +7200,9 @@ async def test_rotate_credentials_rejects_missing_secret(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_rotate_credentials_allowed_after_task_terminated(client: AsyncClient, db_session, mocker):
+async def test_rotate_credentials_allowed_after_task_terminated(
+    client: AsyncClient, db_session, mocker
+):
     """Rotation runs in the agent's shutdown finally block — by that point the
     task may already be in COMPLETED state. verify_agent_token must not 401
     rotate calls the way it does for other endpoints post-terminal."""
@@ -6351,16 +7227,23 @@ async def test_rotate_credentials_allowed_after_task_terminated(client: AsyncCli
 
 # ── Strategic-context fetch endpoints ─────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_agent_fetch_direction_returns_full_record_with_history_cap(
     client: AsyncClient, db_session
 ):
     """Agent gets the full direction including capped research_history."""
     project = Project(
-        name="Fetch Test", user_id="test-user-123",
+        name="Fetch Test",
+        user_id="test-user-123",
         directions=[
-            {"id": "dir-1", "status": "active", "text": "First", "priority": "high",
-             "research_history": [{"prs_merged": i} for i in range(30)]}
+            {
+                "id": "dir-1",
+                "status": "active",
+                "text": "First",
+                "priority": "high",
+                "research_history": [{"prs_merged": i} for i in range(30)],
+            }
         ],
     )
     db_session.add(project)
@@ -6395,7 +7278,8 @@ async def test_agent_fetch_direction_rejects_cross_project(
     not 403, so probing can't be used to enumerate project ids)."""
     project_a = Project(name="A", user_id="test-user-a")
     project_b = Project(
-        name="B", user_id="test-user-b",
+        name="B",
+        user_id="test-user-b",
         directions=[{"id": "dir-b1", "status": "active", "text": "B"}],
     )
     db_session.add_all([project_a, project_b])
@@ -6422,7 +7306,8 @@ async def test_agent_fetch_playbook_entry_with_and_without_prefix(
 ):
     """Agent can fetch a playbook entry by either bare key or playbook/<key>."""
     project = Project(
-        name="Playbook Test", user_id="test-user-pb",
+        name="Playbook Test",
+        user_id="test-user-pb",
         design_doc={
             "playbook/frontend-build": {
                 "title": "Frontend build",
@@ -6466,15 +7351,22 @@ async def test_agent_fetch_gap_handles_active_and_archived(
     """Agent can fetch gaps regardless of active/archived status; the response
     flags ``from_archive`` so the agent knows the context."""
     project = Project(
-        name="Gap Test", user_id="test-user-gap",
+        name="Gap Test",
+        user_id="test-user-gap",
         problem_model={
             "gaps": [
-                {"id": "g-active", "name": "Active gap",
-                 "history": [f"h{i}" for i in range(10)]},
+                {
+                    "id": "g-active",
+                    "name": "Active gap",
+                    "history": [f"h{i}" for i in range(10)],
+                },
             ],
             "archived_gaps": [
-                {"id": "g-old", "name": "Closed gap",
-                 "history": [f"h{i}" for i in range(5)]},
+                {
+                    "id": "g-old",
+                    "name": "Closed gap",
+                    "history": [f"h{i}" for i in range(5)],
+                },
             ],
         },
     )
@@ -6527,7 +7419,8 @@ async def test_vm_heartbeat_records_liveness(client: AsyncClient, db_session):
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "fix"}],
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
         vm_instance_id="agent-vm-warm-001",
         status=TaskStatus.IN_PROGRESS,
     )
@@ -6556,7 +7449,8 @@ async def test_vm_heartbeat_rejects_jwt_vm_mismatch(client: AsyncClient, db_sess
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "fix"}],
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
         vm_instance_id="agent-vm-real",
         status=TaskStatus.IN_PROGRESS,
     )
@@ -6574,7 +7468,9 @@ async def test_vm_heartbeat_rejects_jwt_vm_mismatch(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_next_role_returns_204_when_no_warm_pinned_task(client: AsyncClient, db_session):
+async def test_next_role_returns_204_when_no_warm_pinned_task(
+    client: AsyncClient, db_session
+):
     """next-role returns 204 when no QUEUED task is pinned to this VM."""
     project = Project(name="Next-Role Empty", user_id="test-user-123")
     db_session.add(project)
@@ -6582,7 +7478,8 @@ async def test_next_role_returns_204_when_no_warm_pinned_task(client: AsyncClien
     await db_session.refresh(project)
 
     prior_task = Task(
-        project_id=project.id, payloads=[{"type": "review"}],
+        project_id=project.id,
+        payloads=[{"type": "review"}],
         vm_instance_id="agent-vm-warm-empty",
         status=TaskStatus.COMPLETED,
     )
@@ -6604,7 +7501,9 @@ async def test_next_role_returns_204_when_no_warm_pinned_task(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_next_role_claims_warm_pinned_queued_task(client: AsyncClient, db_session):
+async def test_next_role_claims_warm_pinned_queued_task(
+    client: AsyncClient, db_session
+):
     """next-role atomically claims a QUEUED task whose context.warm_target_vm_id matches."""
     from datetime import datetime, timedelta
 
@@ -6614,7 +7513,8 @@ async def test_next_role_claims_warm_pinned_queued_task(client: AsyncClient, db_
     await db_session.refresh(project)
 
     prior_task = Task(
-        project_id=project.id, payloads=[{"type": "review", "pr_number": 1234}],
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 1234}],
         vm_instance_id="agent-vm-warm-claim",
         status=TaskStatus.COMPLETED,
     )
@@ -6658,6 +7558,7 @@ async def test_next_role_claims_warm_pinned_queued_task(client: AsyncClient, db_
     # next-role/vm-heartbeat paths).
     assert isinstance(body.get("agent_token"), str) and body["agent_token"]
     from app.auth import verify_agent_jwt
+
     new_claims = verify_agent_jwt(body["agent_token"])
     assert new_claims["sub"] == str(pinned_task.id)
     assert new_claims["vm_instance_id"] == "agent-vm-warm-claim"
@@ -6668,11 +7569,15 @@ async def test_next_role_claims_warm_pinned_queued_task(client: AsyncClient, db_
     assert pinned_task.status == TaskStatus.IN_PROGRESS
     assert pinned_task.vm_instance_id == "agent-vm-warm-claim"
     assert (pinned_task.context or {}).get("_timing", {}).get("warm_start") is True
-    assert (pinned_task.context or {}).get("_timing", {}).get("prior_role_vm_id") == "agent-vm-warm-claim"
+    assert (pinned_task.context or {}).get("_timing", {}).get(
+        "prior_role_vm_id"
+    ) == "agent-vm-warm-claim"
 
 
 @pytest.mark.asyncio
-async def test_next_role_refuses_warm_claim_on_doomed_vm(client: AsyncClient, db_session):
+async def test_next_role_refuses_warm_claim_on_doomed_vm(
+    client: AsyncClient, db_session
+):
     """Race guard: when a sibling task's agent_completion fired
     fire_and_forget_vm_delete, the VM is alive in GCP for ~30-60s but
     the delete is in flight. Without this guard, next-role races into
@@ -6691,7 +7596,8 @@ async def test_next_role_refuses_warm_claim_on_doomed_vm(client: AsyncClient, db
     await db_session.refresh(project)
 
     prior_task = Task(
-        project_id=project.id, payloads=[{"type": "fix", "pr_number": 4321}],
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 4321}],
         vm_instance_id="agent-vm-doomed",
         status=TaskStatus.COMPLETED,
     )
@@ -6753,7 +7659,8 @@ async def test_next_role_rejects_jwt_vm_mismatch(client: AsyncClient, db_session
     await db_session.refresh(project)
 
     prior_task = Task(
-        project_id=project.id, payloads=[{"type": "review"}],
+        project_id=project.id,
+        payloads=[{"type": "review"}],
         vm_instance_id="agent-vm-real-vm",
         status=TaskStatus.COMPLETED,
     )
@@ -6775,7 +7682,9 @@ async def test_next_role_rejects_jwt_vm_mismatch(client: AsyncClient, db_session
 
 
 @pytest.mark.asyncio
-async def test_next_role_returns_exit_when_other_vm_owns_pr(client: AsyncClient, db_session):
+async def test_next_role_returns_exit_when_other_vm_owns_pr(
+    client: AsyncClient, db_session
+):
     """next-role returns action=exit when an IN_PROGRESS task on the same PR is pinned to a different VM."""
     project = Project(name="Next-Role Other-VM", user_id="test-user-123")
     db_session.add(project)
@@ -6783,7 +7692,8 @@ async def test_next_role_returns_exit_when_other_vm_owns_pr(client: AsyncClient,
     await db_session.refresh(project)
 
     prior_task = Task(
-        project_id=project.id, payloads=[{"type": "review", "pr_number": 4242}],
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 4242}],
         vm_instance_id="agent-vm-warm-A",
         status=TaskStatus.COMPLETED,
     )
@@ -6933,15 +7843,15 @@ async def test_claim_records_vm_liveness(client: AsyncClient, db_session):
     _shared_state.vm_last_heartbeat.pop("agent-vm-claim-liveness", None)
 
     token = create_agent_token(str(task.id), "agent-vm-claim-liveness")
-    resp = await client.post(
-        "/api/agent/claim", headers={"x-agent-token": token}
-    )
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     assert "agent-vm-claim-liveness" in _shared_state.vm_last_heartbeat
 
 
 @pytest.mark.asyncio
-async def test_next_role_token_mint_failure_rolls_back(client: AsyncClient, db_session, mocker):
+async def test_next_role_token_mint_failure_rolls_back(
+    client: AsyncClient, db_session, mocker
+):
     """If create_agent_token raises during the warm-claim path, the task MUST
     stay QUEUED (rollback) so a retry can succeed. Without rollback the task
     would be stuck IN_PROGRESS with no live JWT on the agent side.
@@ -7045,7 +7955,9 @@ async def test_next_role_rejects_empty_vm_instance_id(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_vm_heartbeat_rejects_empty_vm_instance_id(client: AsyncClient, db_session):
+async def test_vm_heartbeat_rejects_empty_vm_instance_id(
+    client: AsyncClient, db_session
+):
     """min_length=1 on VmHeartbeatRequest.vm_instance_id rejects empty strings."""
     project = Project(name="VM-Heartbeat Empty VM", user_id="test-user-123")
     db_session.add(project)
@@ -7144,6 +8056,7 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
 # outside the freshness window (default 30 min, env-tunable). Active-task
 # tokens are unaffected.
 
+
 def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):
     """Mint an agent JWT directly so we can control the iat claim.
 
@@ -7155,6 +8068,7 @@ def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):
     from datetime import timezone as _tz, datetime as _dt, timedelta as _td
 
     from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
+
     now = _dt.now(_tz.utc)
     iat = now + _td(seconds=iat_offset_secs)
     exp = iat + _td(hours=8)
@@ -7170,16 +8084,20 @@ def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):
 
 
 @pytest.mark.asyncio
-async def test_vm_heartbeat_fresh_terminal_jwt_accepted(client: AsyncClient, db_session):
+async def test_vm_heartbeat_fresh_terminal_jwt_accepted(
+    client: AsyncClient, db_session
+):
     """A fresh terminal-task JWT (iat = now-5 min) is allowed on /vm-heartbeat."""
     from app.routers.agent import _terminated_task_ids, _agent_active_cache
+
     project = Project(name="M3 Fresh Heartbeat", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "fix"}],
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
         vm_instance_id="agent-vm-m3-fresh-hb",
         status=TaskStatus.COMPLETED,
     )
@@ -7190,7 +8108,9 @@ async def test_vm_heartbeat_fresh_terminal_jwt_accepted(client: AsyncClient, db_
     _terminated_task_ids.pop(str(task.id), None)
     _agent_active_cache.pop(str(task.id), None)
 
-    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-fresh-hb", iat_offset_secs=-300)
+    token = _make_jwt_with_iat(
+        str(task.id), "agent-vm-m3-fresh-hb", iat_offset_secs=-300
+    )
     resp = await client.post(
         "/api/agent/vm-heartbeat",
         json={"vm_instance_id": "agent-vm-m3-fresh-hb"},
@@ -7200,16 +8120,20 @@ async def test_vm_heartbeat_fresh_terminal_jwt_accepted(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_vm_heartbeat_stale_terminal_jwt_rejected(client: AsyncClient, db_session):
+async def test_vm_heartbeat_stale_terminal_jwt_rejected(
+    client: AsyncClient, db_session
+):
     """A stale terminal-task JWT (iat = now-60 min) is rejected 401 on /vm-heartbeat."""
     from app.routers.agent import _terminated_task_ids, _agent_active_cache
+
     project = Project(name="M3 Stale Heartbeat", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "fix"}],
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
         vm_instance_id="agent-vm-m3-stale-hb",
         status=TaskStatus.COMPLETED,
     )
@@ -7220,7 +8144,9 @@ async def test_vm_heartbeat_stale_terminal_jwt_rejected(client: AsyncClient, db_
     _terminated_task_ids.pop(str(task.id), None)
     _agent_active_cache.pop(str(task.id), None)
 
-    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-stale-hb", iat_offset_secs=-3600)
+    token = _make_jwt_with_iat(
+        str(task.id), "agent-vm-m3-stale-hb", iat_offset_secs=-3600
+    )
     resp = await client.post(
         "/api/agent/vm-heartbeat",
         json={"vm_instance_id": "agent-vm-m3-stale-hb"},
@@ -7240,13 +8166,15 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
     spam-claim future warm-pinned tasks once it's outside the freshness window.
     """
     from app.routers.agent import _terminated_task_ids, _agent_active_cache
+
     project = Project(name="M3 Stale Next-Role", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "review", "pr_number": 9999}],
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 9999}],
         vm_instance_id="agent-vm-m3-stale-nr",
         status=TaskStatus.COMPLETED,
     )
@@ -7257,7 +8185,9 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
     _terminated_task_ids.pop(str(task.id), None)
     _agent_active_cache.pop(str(task.id), None)
 
-    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-stale-nr", iat_offset_secs=-3600)
+    token = _make_jwt_with_iat(
+        str(task.id), "agent-vm-m3-stale-nr", iat_offset_secs=-3600
+    )
     resp = await client.post(
         "/api/agent/next-role",
         json={
@@ -7277,13 +8207,15 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
 async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_session):
     """A fresh terminal-task JWT is allowed on /next-role (returns 204 with no work)."""
     from app.routers.agent import _terminated_task_ids, _agent_active_cache
+
     project = Project(name="M3 Fresh Next-Role", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "review", "pr_number": 5555}],
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 5555}],
         vm_instance_id="agent-vm-m3-fresh-nr",
         status=TaskStatus.COMPLETED,
     )
@@ -7294,7 +8226,9 @@ async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_ses
     _terminated_task_ids.pop(str(task.id), None)
     _agent_active_cache.pop(str(task.id), None)
 
-    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-fresh-nr", iat_offset_secs=-300)
+    token = _make_jwt_with_iat(
+        str(task.id), "agent-vm-m3-fresh-nr", iat_offset_secs=-300
+    )
     resp = await client.post(
         "/api/agent/next-role",
         json={
@@ -7309,19 +8243,23 @@ async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_active_task_jwt_unaffected_by_freshness_check(client: AsyncClient, db_session):
+async def test_active_task_jwt_unaffected_by_freshness_check(
+    client: AsyncClient, db_session
+):
     """An ACTIVE-task JWT (task NOT in _terminated_task_ids) is unaffected by the
     freshness check — the check applies only to terminal tasks. A long-running
     task posting status with a 60-min-old JWT must still succeed.
     """
     from app.routers.agent import _terminated_task_ids, _agent_active_cache
+
     project = Project(name="M3 Active JWT Unaffected", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
-        project_id=project.id, payloads=[{"type": "fix"}],
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
         vm_instance_id="agent-vm-m3-active",
         status=TaskStatus.IN_PROGRESS,
     )
@@ -7334,7 +8272,9 @@ async def test_active_task_jwt_unaffected_by_freshness_check(client: AsyncClient
     _terminated_task_ids.pop(str(task.id), None)
     _agent_active_cache.pop(str(task.id), None)
 
-    token = _make_jwt_with_iat(str(task.id), "agent-vm-m3-active", iat_offset_secs=-3600)
+    token = _make_jwt_with_iat(
+        str(task.id), "agent-vm-m3-active", iat_offset_secs=-3600
+    )
     # /vm-heartbeat is a warm-idempotent path: even with a 60-min-old JWT,
     # an ACTIVE task is unaffected by the freshness window — the freshness
     # check fires only when the task is terminal.
@@ -7350,8 +8290,11 @@ async def test_active_task_jwt_unaffected_by_freshness_check(client: AsyncClient
 # Issue H3: warm_claim_origin diagnostic marker
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
-async def test_next_role_claim_writes_warm_claim_origin(client: AsyncClient, db_session):
+async def test_next_role_claim_writes_warm_claim_origin(
+    client: AsyncClient, db_session
+):
     """The next-role warm-claim writes warm_claim_origin='next_role_endpoint' so
     post-mortems can distinguish server-side seeding from agent-reported values.
     Also pins down the idempotent contract: prior values for warm_start are
@@ -7363,7 +8306,8 @@ async def test_next_role_claim_writes_warm_claim_origin(client: AsyncClient, db_
     await db_session.refresh(project)
 
     prior_task = Task(
-        project_id=project.id, payloads=[{"type": "review", "pr_number": 4321}],
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 4321}],
         vm_instance_id="agent-vm-h3",
         status=TaskStatus.COMPLETED,
     )
@@ -7416,6 +8360,7 @@ async def test_next_role_claim_writes_warm_claim_origin(client: AsyncClient, db_
 # ══════════════════════════════════════════════════════════════════════════════
 # handler_duration_secs: schema field + persistence round-trip
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 @pytest.mark.asyncio
 async def test_process_post_commit_persists_handler_duration_secs(db_session):
@@ -7560,6 +8505,7 @@ def test_handler_duration_secs_rejects_negative_at_schema_layer():
 # background, releasing the row lock immediately. These tests pin the
 # load-bearing properties of that fix.
 
+
 @pytest.mark.asyncio
 async def test_fire_and_forget_vm_delete_records_marker_synchronously():
     """The orchestrator-initiated-delete marker must be written BEFORE
@@ -7585,11 +8531,14 @@ async def test_fire_and_forget_vm_delete_records_marker_synchronously():
     pre_existing_tasks = set(_background_vm_deletes)
 
     import app.main as main_mod
+
     real_ensure = main_mod._ensure_vm_deleted
     fired = asyncio.Event()
+
     async def _stub(*args, **kwargs):
         fired.set()
         return True
+
     main_mod._ensure_vm_deleted = _stub  # type: ignore[assignment]
     try:
         fire_and_forget_vm_delete(vm_id, reason="test_marker_sync")
@@ -7602,7 +8551,9 @@ async def test_fire_and_forget_vm_delete_records_marker_synchronously():
         await asyncio.wait_for(fired.wait(), timeout=2.0)
     finally:
         main_mod._ensure_vm_deleted = real_ensure
-        new_tasks = [t for t in _background_vm_deletes - pre_existing_tasks if not t.done()]
+        new_tasks = [
+            t for t in _background_vm_deletes - pre_existing_tasks if not t.done()
+        ]
         if new_tasks:
             await asyncio.gather(*new_tasks, return_exceptions=True)
 
@@ -7620,6 +8571,7 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
     pre_existing_tasks = set(_background_vm_deletes)
 
     import app.main as main_mod
+
     real_ensure = main_mod._ensure_vm_deleted
 
     async def _slow_delete(*args, **kwargs):
@@ -7636,7 +8588,7 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
         elapsed = time.monotonic() - t0
         # Synchronous return — well below the 100ms budget.
         assert elapsed < 0.1, (
-            f"fire_and_forget_vm_delete blocked caller for {elapsed*1000:.0f}ms; "
+            f"fire_and_forget_vm_delete blocked caller for {elapsed * 1000:.0f}ms; "
             f"expected <100ms — would defeat the lock-window-break"
         )
     finally:
@@ -7644,7 +8596,9 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
         # Cancel rather than await — the slow sleep would block test
         # teardown for 2s and we already proved the property we cared
         # about (synchronous return).
-        new_tasks = [t for t in _background_vm_deletes - pre_existing_tasks if not t.done()]
+        new_tasks = [
+            t for t in _background_vm_deletes - pre_existing_tasks if not t.done()
+        ]
         for t in new_tasks:
             t.cancel()
         if new_tasks:
@@ -7678,45 +8632,61 @@ async def test_fire_and_forget_vm_delete_no_op_on_empty_vm_id():
 async def _seed_blind_spot_tasks(db_session, project_id):
     """Helper: seed COMPLETED tasks with self-review blind_spots for the project."""
     for i in range(3):
-        db_session.add(Task(
+        db_session.add(
+            Task(
+                project_id=project_id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [
+                            f"did not verify file path number {i} thoroughly"
+                        ],
+                    }
+                },
+            )
+        )
+    db_session.add(
+        Task(
+            project_id=project_id,
+            payloads=[{"type": "fix"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": ["async error propagation not checked"],
+                }
+            },
+        )
+    )
+    # Skipped envelope: must NOT contribute
+    db_session.add(
+        Task(
             project_id=project_id,
             payloads=[{"type": "create"}],
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {
-                "verdict": "pass",
-                "fixes_applied": False,
-                "check_results": {"correctness": {"passed": True}},
-                "blind_spots": [f"did not verify file path number {i} thoroughly"],
-            }},
-        ))
-    db_session.add(Task(
-        project_id=project_id,
-        payloads=[{"type": "fix"}],
-        status=TaskStatus.COMPLETED,
-        context={"_self_review_outcome": {
-            "verdict": "pass",
-            "fixes_applied": False,
-            "check_results": {},
-            "blind_spots": ["async error propagation not checked"],
-        }},
-    ))
-    # Skipped envelope: must NOT contribute
-    db_session.add(Task(
-        project_id=project_id,
-        payloads=[{"type": "create"}],
-        status=TaskStatus.COMPLETED,
-        context={"_self_review_outcome": {
-            "verdict": "unknown",
-            "fixes_applied": False,
-            "check_results": {},
-            "blind_spots": [],
-        }},
-    ))
+            context={
+                "_self_review_outcome": {
+                    "verdict": "unknown",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": [],
+                }
+            },
+        )
+    )
     await db_session.commit()
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_sr_blind_spot_themes_for_create_task(client: AsyncClient, db_session):
+async def test_claim_injects_sr_blind_spot_themes_for_create_task(
+    client: AsyncClient, db_session
+):
     """Claim endpoint injects sr_blind_spot_themes in project_context for create tasks."""
     project = Project(name="SR BlindSpots Create", user_id="test-user-123")
     db_session.add(project)
@@ -7747,11 +8717,16 @@ async def test_claim_injects_sr_blind_spot_themes_for_create_task(client: AsyncC
     # Top-N cap (limit=8) — only 2 distinct themes here
     assert len(project_ctx["sr_blind_spot_themes"]) == 2
     # Sorted by count desc
-    assert project_ctx["sr_blind_spot_themes"][0]["count"] >= project_ctx["sr_blind_spot_themes"][1]["count"]
+    assert (
+        project_ctx["sr_blind_spot_themes"][0]["count"]
+        >= project_ctx["sr_blind_spot_themes"][1]["count"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_claim_omits_sr_blind_spot_themes_when_empty(client: AsyncClient, db_session):
+async def test_claim_omits_sr_blind_spot_themes_when_empty(
+    client: AsyncClient, db_session
+):
     """No completed tasks with blind_spots → field absent."""
     project = Project(name="SR BlindSpots Empty", user_id="test-user-123")
     db_session.add(project)
@@ -7776,7 +8751,9 @@ async def test_claim_omits_sr_blind_spot_themes_when_empty(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_claim_does_not_inject_sr_blind_spot_themes_for_review_task(client: AsyncClient, db_session):
+async def test_claim_does_not_inject_sr_blind_spot_themes_for_review_task(
+    client: AsyncClient, db_session
+):
     """Field is NOT injected for non-(create/fix/refactor/migrate) task types."""
     project = Project(name="SR BlindSpots Review", user_id="test-user-123")
     db_session.add(project)
@@ -7802,3 +8779,173 @@ async def test_claim_does_not_inject_sr_blind_spot_themes_for_review_task(client
         f"sr_blind_spot_themes should be absent for review tasks, got: "
         f"{project_ctx.get('sr_blind_spot_themes')}"
     )
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_self_review_catch_rate_for_direction_when_above_threshold(
+    client: AsyncClient,
+    db_session,
+):
+    """When the task has a direction_id and design_doc.sr_catch_rate_trends.by_direction
+    has an entry for that direction, the claim endpoint injects
+    project_context.self_review_catch_rate_for_direction with category data and
+    direction metadata."""
+    direction_id = "d-test-dir-1"
+    project = Project(
+        name="SR Direction Test",
+        user_id="test-user-123",
+        directions=[{"id": direction_id, "text": "Improve self-review accuracy"}],
+        design_doc={
+            "sr_catch_rate_trends": {
+                "categories": {
+                    "test-coverage": {"miss_rate": 0.4},
+                },
+                "by_task_type": {},
+                "by_direction": {
+                    direction_id: {
+                        "sample_count": 5,
+                        "miss_rate": 0.6,
+                        "categories": {
+                            "regression_risk": {
+                                "miss_rate": 0.7,
+                                "examples": [
+                                    {
+                                        "severity": "MAJOR",
+                                        "desc": "Mocked migration masked breakage",
+                                    },
+                                ],
+                            },
+                            "scope-drift": {"miss_rate": 0.3},
+                        },
+                    },
+                },
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add new module"}],
+        context={"direction_id": direction_id},
+        vm_instance_id="agent-vm-srdir-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-srdir-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    # Project-wide payload still present (backward compat)
+    assert "self_review_catch_rate" in project_ctx
+    # New direction-scoped payload
+    assert "self_review_catch_rate_for_direction" in project_ctx
+    payload = project_ctx["self_review_catch_rate_for_direction"]
+    assert payload["direction_id"] == direction_id
+    assert payload["direction_text"] == "Improve self-review accuracy"
+    assert payload["sample_count"] == 5
+    assert payload["miss_rate"] == 0.6
+    assert "regression_risk" in payload["categories"]
+    assert payload["categories"]["regression_risk"]["miss_rate"] == 0.7
+    assert payload["categories"]["regression_risk"]["examples"][0]["desc"].startswith(
+        "Mocked migration"
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_self_review_catch_rate_for_direction_when_no_direction_id(
+    client: AsyncClient,
+    db_session,
+):
+    """Tasks without direction_id never receive the direction-scoped payload, even if
+    by_direction has data."""
+    direction_id = "d-test-dir-2"
+    project = Project(
+        name="SR Direction Test No DID",
+        user_id="test-user-123",
+        directions=[{"id": direction_id, "text": "Some direction"}],
+        design_doc={
+            "sr_catch_rate_trends": {
+                "categories": {"correctness": {"miss_rate": 0.4}},
+                "by_task_type": {},
+                "by_direction": {
+                    direction_id: {
+                        "sample_count": 5,
+                        "miss_rate": 0.5,
+                        "categories": {"correctness": {"miss_rate": 0.5}},
+                    },
+                },
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add module"}],
+        context={},
+        vm_instance_id="agent-vm-srdir-2",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-srdir-2")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "self_review_catch_rate_for_direction" not in project_ctx
+    # Project-wide still present
+    assert "self_review_catch_rate" in project_ctx
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_self_review_catch_rate_for_direction_when_below_threshold(
+    client: AsyncClient,
+    db_session,
+):
+    """When the task's direction_id has no entry in by_direction (insufficient sample),
+    the direction-scoped field is silently omitted but the project-wide payload is still
+    injected."""
+    direction_id = "d-low-sample"
+    project = Project(
+        name="SR Direction Below Threshold",
+        user_id="test-user-123",
+        directions=[{"id": direction_id, "text": "Low-sample direction"}],
+        design_doc={
+            "sr_catch_rate_trends": {
+                "categories": {"correctness": {"miss_rate": 0.4}},
+                "by_task_type": {},
+                "by_direction": {},
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add module"}],
+        context={"direction_id": direction_id},
+        vm_instance_id="agent-vm-srdir-3",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-srdir-3")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    project_ctx = resp.json().get("project_context", {})
+    assert "self_review_catch_rate_for_direction" not in project_ctx
+    assert "self_review_catch_rate" in project_ctx

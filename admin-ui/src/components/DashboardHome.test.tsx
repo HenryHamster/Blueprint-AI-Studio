@@ -876,4 +876,39 @@ describe('DashboardHome', () => {
     expect(screen.queryByText('75%')).not.toBeInTheDocument();
     expect(screen.queryByText('Pipeline stabilized')).not.toBeInTheDocument();
   });
+
+  it('renders fix-iteration SR breakdown buckets when by_fix_iteration data is present', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 0,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy_trends: {
+          computed_at: '2026-05-01T00:00:00Z',
+          categories: {},
+          by_task_type: {},
+          by_fix_iteration: {
+            '1': { hit_rate: 0.8, miss_rate: 0.2, sample_count: 20 },
+            '2': { hit_rate: 0.9, miss_rate: 0.1, sample_count: 10 },
+            '3+': { hit_rate: 0.7, miss_rate: 0.3, sample_count: 3 },
+          },
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    // Buckets with sufficient signal show hit rate
+    expect(await screen.findByText(/fix-1/)).toBeInTheDocument();
+    expect(await screen.findByText(/fix-2/)).toBeInTheDocument();
+    // fix-3+ has sample_count=3 (< 5), so it shows insufficient signal
+    expect(await screen.findByText(/fix-3\+/)).toBeInTheDocument();
+    expect(screen.getByTitle('insufficient signal (<5 qualifying tasks)')).toBeInTheDocument();
+    // fix-1 hit rate: 80%
+    expect(screen.getAllByText('80%').length).toBeGreaterThan(0);
+  });
 });

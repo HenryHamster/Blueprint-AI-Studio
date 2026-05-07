@@ -4112,6 +4112,134 @@ async def test_compute_sr_catch_rate_trends_persists_to_design_doc(
     assert "by_task_type" in stored
 
 
+def _make_sr_task_with_direction(
+    project_id,
+    direction_id: str,
+    *,
+    age_days: float,
+    human_cats: dict,
+    sr_failed_cats: list,
+    task_type: str = "create",
+) -> Task:
+    """SR task with direction_id stamped into context."""
+    check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+    task = Task(
+        project_id=project_id,
+        title="SR direction task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "_self_review_outcome": {"check_results": check_results},
+            "_first_attempt_rejection_categories": human_cats,
+            "direction_id": direction_id,
+        },
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_includes_by_direction_when_above_sample(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends should expose per-direction breakdown via the
+    by_direction key when a direction has at least _MIN_DIRECTION_SR_SAMPLE qualifying tasks."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    direction_id = "d-by-dir-test"
+    tasks = []
+    # 4 tasks for the direction, all missed
+    for i in range(4):
+        t = _make_sr_task_with_direction(
+            project.id,
+            direction_id,
+            age_days=2,
+            human_cats={"regression_risk": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Window-overall threshold (need >= _MIN_SR_SAMPLE in current and previous)
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "by_direction" in result
+    assert direction_id in result["by_direction"]
+    entry = result["by_direction"][direction_id]
+    assert entry["sample_count"] == 4
+    assert "regression_risk" in entry["categories"]
+    # All missed → miss_rate 1.0
+    assert entry["categories"]["regression_risk"]["miss_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_omits_below_sample_directions(
+    db_session: AsyncSession,
+):
+    """Directions with fewer than _MIN_DIRECTION_SR_SAMPLE tasks are not exposed
+    in by_direction (their data is not actionable)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    # Only 2 tasks for this direction (under threshold of 3)
+    tasks = []
+    for i in range(2):
+        t = _make_sr_task_with_direction(
+            project.id,
+            "d-low",
+            age_days=2,
+            human_cats={"regression_risk": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Window-overall threshold padding
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    by_direction = result.get("by_direction", {})
+    assert "d-low" not in by_direction
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests for _categorize_review_issues — scope-drift bucket
 # ─────────────────────────────────────────────────────────────────────────────

@@ -2668,6 +2668,14 @@ async def claim_task(
                         entry["weighted_miss_rate"] = data["weighted_miss_rate"]
                     if isinstance(data.get("examples"), list) and data["examples"]:
                         entry["examples"] = data["examples"]
+                    fp_rate = data.get("false_positive_rate")
+                    if isinstance(fp_rate, (int, float)):
+                        entry["false_positive_rate"] = fp_rate
+                        entry["precision"] = round(1 - float(fp_rate), 3)
+                    fp_count = data.get("fp_count")
+                    tp_count = data.get("tp_count")
+                    if isinstance(fp_count, int) and isinstance(tp_count, int):
+                        entry["sr_flag_sample_size"] = fp_count + tp_count
                     return entry
 
                 cats = {
@@ -2691,6 +2699,48 @@ async def claim_task(
                     response["project_context"]["self_review_catch_rate"] = (
                         catch_rate_payload
                     )
+
+                by_direction = sr_trends.get("by_direction") or {}
+                task_direction_id = (task.context or {}).get("direction_id")
+                if (
+                    task_direction_id
+                    and isinstance(by_direction, dict)
+                    and isinstance(by_direction.get(task_direction_id), dict)
+                ):
+                    dir_entry = by_direction[task_direction_id]
+                    dir_categories_raw = dir_entry.get("categories")
+                    if isinstance(dir_categories_raw, dict):
+                        dir_cats = {
+                            cat: _cat_entry(cdata)
+                            for cat, cdata in dir_categories_raw.items()
+                            if isinstance(cdata, dict)
+                            and isinstance(cdata.get("miss_rate"), (int, float))
+                        }
+                        if dir_cats:
+                            direction_text = ""
+                            for d in project_for_playbook.directions or []:
+                                if d.get("id") == task_direction_id:
+                                    direction_text = (
+                                        d.get("text")
+                                        or d.get("description")
+                                        or d.get("title")
+                                        or ""
+                                    )
+                                    break
+                            direction_payload: dict = {
+                                "direction_id": task_direction_id,
+                                "direction_text": direction_text,
+                                "categories": dir_cats,
+                            }
+                            if isinstance(dir_entry.get("sample_count"), int):
+                                direction_payload["sample_count"] = dir_entry[
+                                    "sample_count"
+                                ]
+                            if isinstance(dir_entry.get("miss_rate"), (int, float)):
+                                direction_payload["miss_rate"] = dir_entry["miss_rate"]
+                            response["project_context"][
+                                "self_review_catch_rate_for_direction"
+                            ] = direction_payload
         except Exception:
             logger.exception(
                 "[AGENT] Failed to inject self_review_catch_rate (non-critical)"
@@ -3200,25 +3250,28 @@ async def next_role(
         return Response(status_code=204)
 
     # Look up a QUEUED task pinned to this VM.
-    # R5-W2-B: lead the predicate with ``Task.context.has_key(...)`` so the
-    # JSONB ``?`` operator can satisfy the lookup via ``ix_task_context_gin``.
-    # The prior ``->>`` equality form casts to text and bypasses the GIN
-    # index, forcing a SeqScan over Task that grows linearly with the
-    # QUEUED queue. ``has_key`` narrows the candidate set to the (small)
-    # warm-pinned QUEUED rows, then the ``->>`` equality finalizes the
-    # match. Postgres consistently picks the GIN-cheaper predicate first.
-    # Optional prior_pr_number filter narrows further so a stray pin from
-    # an unrelated chain doesn't get claimed.
-    stmt = select(Task).where(
-        Task.status == TaskStatus.QUEUED,
-        Task.context.has_key("warm_target_vm_id"),
-        Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id,
+    #
+    # On Postgres, lead with ``has_key`` so the JSONB ``?`` operator can use
+    # ``ix_task_context_gin`` before the ``->>`` equality cast. SQLite lacks
+    # that operator, so test runs fall back to the portable JSON-extract form.
+    # Optional prior_pr_number filter narrows further so a stray pin from an
+    # unrelated chain doesn't get claimed.
+    use_jsonb_has_key = session.get_bind().dialect.name == "postgresql"
+    warm_vm_filters = [Task.status == TaskStatus.QUEUED]
+    if use_jsonb_has_key:
+        warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
+    warm_vm_filters.append(
+        Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
     )
+    stmt = select(Task).where(*warm_vm_filters)
     if req.prior_pr_number is not None:
-        stmt = stmt.where(
-            Task.context.has_key("warm_target_pr"),
-            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number),
+        prior_pr_filters = []
+        if use_jsonb_has_key:
+            prior_pr_filters.append(Task.context.has_key("warm_target_pr"))
+        prior_pr_filters.append(
+            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
         )
+        stmt = stmt.where(*prior_pr_filters)
     stmt = stmt.with_for_update(skip_locked=True)
 
     task = (await session.execute(stmt)).scalars().first()
@@ -3307,16 +3360,16 @@ async def next_role(
     # No matching warm-pinned task. Check whether another VM owns an
     # IN_PROGRESS task for this PR — if so, the warm chain has already
     # forked and this VM should exit cleanly.
-    # R5-W2-B: same GIN-friendly pattern as above — ``has_key`` filters
-    # via the JSONB ``?`` operator before the ``->>`` equality cast.
     if req.prior_pr_number is not None:
-        other_stmt = select(Task).where(
+        other_pr_filters = [
             Task.status == TaskStatus.IN_PROGRESS,
-            Task.context.has_key("warm_target_pr"),
             Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number),
             Task.vm_instance_id.is_not(None),
             Task.vm_instance_id != req.vm_instance_id,
-        )
+        ]
+        if use_jsonb_has_key:
+            other_pr_filters.insert(1, Task.context.has_key("warm_target_pr"))
+        other_stmt = select(Task).where(*other_pr_filters)
         other = (await session.execute(other_stmt)).scalars().first()
         if other is not None:
             return {

@@ -113,6 +113,15 @@ def _task_prompt_fingerprint(task: Task) -> str:
     return "unknown"
 
 
+def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "computed_at": sr_trends.get("computed_at"),
+        "categories": sr_trends.get("categories") or {},
+        "by_task_type": sr_trends.get("by_task_type") or {},
+        "by_fix_iteration": sr_trends.get("by_fix_iteration") or {},
+    }
+
+
 def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
     """Share of code-change tasks (create/fix/refactor/migrate) where the
     self-review JSON was missing or invalid. Detects the bash ./done
@@ -1498,11 +1507,9 @@ async def compute_pipeline_health_summary(
     if project and project.design_doc:
         sr_trends = project.design_doc.get("sr_catch_rate_trends") or {}
         if sr_trends:
-            self_review_prediction_accuracy_trends = {
-                "computed_at": sr_trends.get("computed_at"),
-                "categories": sr_trends.get("categories") or {},
-                "by_task_type": sr_trends.get("by_task_type") or {},
-            }
+            self_review_prediction_accuracy_trends = _serialize_sr_catch_rate_trends(
+                sr_trends
+            )
         sr_rrts = project.design_doc.get("sr_regression_risk_test_signal_trends")
         if sr_rrts:
             sr_regression_risk_test_signal_trends = sr_rrts
@@ -4510,11 +4517,9 @@ async def _compute_digest(
         if _proj:
             _sr_trends = (_proj.design_doc or {}).get("sr_catch_rate_trends") or {}
             if _sr_trends:
-                self_review_prediction_accuracy_trends = {
-                    "computed_at": _sr_trends.get("computed_at"),
-                    "categories": _sr_trends.get("categories") or {},
-                    "by_task_type": _sr_trends.get("by_task_type") or {},
-                }
+                self_review_prediction_accuracy_trends = (
+                    _serialize_sr_catch_rate_trends(_sr_trends)
+                )
             _sr_rrts = (_proj.design_doc or {}).get(
                 "sr_regression_risk_test_signal_trends"
             )
@@ -6321,6 +6326,85 @@ async def list_sr_missed_retrospectives(
         )
 
     return {"items": items, "total": total}
+
+
+@router.get("/projects/{project_id}/sr-alert-drilldown")
+async def get_sr_alert_drilldown(
+    project_id: uuid.UUID,
+    categories: List[str] = Query(...),
+    alert_type: str = Query("trends"),
+    page_size: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return tasks from the current SR alert window where SR missed the given categories.
+
+    Used to drill down from a regression alert to the tasks that contributed to the
+    catch-rate regression.  Window is derived from the stored alert state (cycle_id
+    or 14-day calendar fallback).  alert_type must be 'trends' or 'floor'.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    if alert_type not in ("trends", "floor"):
+        raise HTTPException(
+            status_code=400, detail="alert_type must be 'trends' or 'floor'"
+        )
+
+    from app.playbook_learning import get_sr_alert_drilldown_tasks  # noqa: PLC0415
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    doc = project.design_doc or {}
+
+    stmt = (
+        select(Task)
+        .where(Task.project_id == project_id, Task.status == TaskStatus.COMPLETED)
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.created_at,
+                Task.context,
+                Task.payloads,
+                Task.strategic_cycle_id,
+            )
+        )
+        .order_by(Task.created_at.desc())
+        .limit(2000)
+    )
+    result = await session.execute(stmt)
+    all_tasks = result.scalars().all()
+
+    rows = get_sr_alert_drilldown_tasks(
+        all_tasks, doc, categories, alert_type=alert_type, page_size=page_size
+    )
+
+    task_ids = [uuid.UUID(r["task_id"]) for r in rows]
+    pr_map: Dict[str, str] = {}
+    if task_ids:
+        art_result = await session.execute(
+            select(Artifact.task_id, Artifact.pr_url).where(
+                Artifact.task_id.in_(task_ids),
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            )
+        )
+        for art_row in art_result.all():
+            if art_row.pr_url:
+                pr_map[str(art_row.task_id)] = art_row.pr_url
+
+    for r in rows:
+        r["pr_url"] = pr_map.get(r["task_id"])
+
+    return {
+        "items": rows,
+        "total": len(rows),
+        "alert_type": alert_type,
+        "categories": categories,
+    }
 
 
 @router.get("/pipeline-regressions")

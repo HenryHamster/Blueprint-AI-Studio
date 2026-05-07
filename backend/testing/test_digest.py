@@ -11053,3 +11053,91 @@ async def test_list_recently_closed_time_to_detect_computed_from_signal_first_cr
     assert c["time_to_detect_sec"] == 600
     assert c["signal_first_crossed_at"] is not None
     assert c["time_to_recover_sec"] is None  # no recovered_at
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/sr-alert-drilldown tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_alert_drilldown_returns_missed_tasks(client: AsyncClient, db_session):
+    """Tasks where SR passed but human rejected on target category appear in drilldown."""
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends_alert": {
+                "computed_at": datetime.utcnow().isoformat(),
+                "categories": ["correctness"],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "check_results": {"correctness": {"passed": True}},
+            },
+            "_first_attempt_rejection_categories": ["correctness"],
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-alert-drilldown",
+        params={"categories": "correctness", "alert_type": "trends"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["alert_type"] == "trends"
+    assert data["categories"] == ["correctness"]
+    item = data["items"][0]
+    assert item["task_id"] == str(task.id)
+    assert "correctness" in item["missed_categories"]
+
+
+@pytest.mark.asyncio
+async def test_sr_alert_drilldown_empty_when_no_alert(client: AsyncClient, db_session):
+    """When no alert is active the window falls back to 14 days; no matching tasks → empty."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-alert-drilldown",
+        params={"categories": "correctness"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 0
+    assert data["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_sr_alert_drilldown_invalid_alert_type(client: AsyncClient, db_session):
+    """alert_type values other than 'trends'/'floor' return 400."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-alert-drilldown",
+        params={"categories": "correctness", "alert_type": "invalid"},
+    )
+    assert response.status_code == 400

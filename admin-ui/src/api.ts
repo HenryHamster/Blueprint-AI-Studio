@@ -268,6 +268,44 @@ export async function fetchDirectionSrBreakdown(
   return res.json();
 }
 
+export interface SrAlertDrilldownRow {
+  task_id: string;
+  title: string;
+  missed_categories: string[];
+  sr_verdict: string | null;
+  pr_url?: string | null;
+}
+
+export interface SrAlertDrilldownResponse {
+  items: SrAlertDrilldownRow[];
+  total: number;
+  alert_type: string;
+  categories: string[];
+}
+
+export async function fetchSrAlertDrilldown(
+  projectId: string,
+  categories: string[],
+  alertType: 'trends' | 'floor' = 'trends',
+  pageSize = 50,
+): Promise<SrAlertDrilldownResponse> {
+  const params = new URLSearchParams({ alert_type: alertType, page_size: String(pageSize) });
+  categories.forEach(c => params.append('categories', c));
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/sr-alert-drilldown?${params}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch SR alert drilldown: ${res.status}`);
+  return res.json();
+}
+
+export interface SrFixIterationBucket {
+  hit_rate?: number | null;
+  miss_rate?: number | null;
+  sample_count?: number | null;
+}
+
+export type SrFixIterationBreakdown = Record<string, SrFixIterationBucket>;
+
 export async function onboardProject(
   owner: string,
   repo: string,

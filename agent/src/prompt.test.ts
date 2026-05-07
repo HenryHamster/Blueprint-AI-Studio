@@ -1902,6 +1902,77 @@ describe('formatProjectContext', () => {
     expect(result).not.toContain('Persistent review issues');
   });
 
+  it('renders direction-scoped SR calibration block when self_review_catch_rate_for_direction present', () => {
+    const ctx = {
+      self_review_catch_rate_for_direction: {
+        direction_id: 'd-abc123',
+        direction_text: 'Self-review catches issues a skilled human reviewer would',
+        sample_count: 5,
+        miss_rate: 0.6,
+        categories: {
+          'regression_risk': {
+            miss_rate: 0.7,
+            examples: [{ severity: 'MAJOR', desc: 'Mocked migration masked breakage' }],
+          },
+          'scope-drift': { miss_rate: 0.4 },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('For This Direction: SR Calibration');
+    expect(result).toContain('Self-review catches issues a skilled human reviewer would');
+    expect(result).toContain('5 tasks sampled');
+    expect(result).toContain('regression_risk (70% missed)');
+    expect(result).toContain('[MAJOR] Mocked migration masked breakage');
+    // worst-first ordering
+    const regIdx = result.indexOf('regression_risk');
+    const drIdx = result.indexOf('scope-drift');
+    expect(regIdx).toBeLessThan(drIdx);
+  });
+
+  it('omits direction-scoped SR calibration block when self_review_catch_rate_for_direction absent', () => {
+    const ctx = {
+      self_review_catch_rate: { categories: { 'error-handling': { miss_rate: 0.8 } } },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('For This Direction: SR Calibration');
+  });
+
+  it('renders direction-scoped block alongside project-wide Self-Review Blind Spots', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: { 'error-handling': { miss_rate: 0.8 } },
+      },
+      self_review_catch_rate_for_direction: {
+        direction_id: 'd-abc123',
+        direction_text: 'Some direction',
+        sample_count: 4,
+        miss_rate: 0.5,
+        categories: { 'regression_risk': { miss_rate: 0.6 } },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('Self-Review Blind Spots');
+    expect(result).toContain('For This Direction: SR Calibration');
+    // The project-wide block should appear before the direction block
+    const projectIdx = result.indexOf('Self-Review Blind Spots');
+    const dirIdx = result.indexOf('For This Direction: SR Calibration');
+    expect(projectIdx).toBeLessThan(dirIdx);
+  });
+
+  it('omits direction-scoped block when categories empty', () => {
+    const ctx = {
+      self_review_catch_rate_for_direction: {
+        direction_id: 'd-abc123',
+        direction_text: 'x',
+        sample_count: 3,
+        categories: {},
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).not.toContain('For This Direction: SR Calibration');
+  });
+
   it('renders sr_blind_spot_themes section when themes are provided', () => {
     const ctx = {
       sr_blind_spot_themes: [

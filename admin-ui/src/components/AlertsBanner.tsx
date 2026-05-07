@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Activity, Wrench } from 'lucide-react';
+import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Activity, Wrench, Search } from 'lucide-react';
 import { apiFetch } from '../api';
 
 export type { Alert } from '../types/alert';
@@ -42,6 +42,31 @@ function regressionStatusLabel(status: string | null | undefined): string {
   return status.toLowerCase();
 }
 
+const SR_TRENDS_PREFIX = 'Self-review catch-rate regression';
+const SR_FLOOR_PREFIX = 'Self-review catch-rate below floor';
+
+function parseSrAlert(title: string): { alertType: 'trends' | 'floor'; categories: string[] } | null {
+  const isTrends = title.startsWith(SR_TRENDS_PREFIX);
+  const isFloor = !isTrends && title.startsWith(SR_FLOOR_PREFIX);
+  if (!isTrends && !isFloor) return null;
+  const colonIdx = title.indexOf(': ');
+  if (colonIdx === -1) return null;
+  const categories = title.slice(colonIdx + 2)
+    .replace(/,\s*\+\d+ more$/, '')
+    .split(', ')
+    .map(s => s.trim())
+    .filter(Boolean);
+  return { alertType: isTrends ? 'trends' : 'floor', categories };
+}
+
+interface DrilldownRow {
+  task_id: string;
+  title: string;
+  missed_categories: string[];
+  sr_verdict: string | null;
+  pr_url?: string | null;
+}
+
 interface AlertsBannerProps {
   alerts: Alert[];
   onDismiss: (id: string) => void;
@@ -56,6 +81,9 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
   const [expanded, setExpanded] = useState(false);
   const [fetchedInterventionCount, setFetchedInterventionCount] = useState(0);
   const [fetchedStalledCount, setFetchedStalledCount] = useState(0);
+  const [drilldownId, setDrilldownId] = useState<string | null>(null);
+  const [drilldownRows, setDrilldownRows] = useState<DrilldownRow[]>([]);
+  const [drilldownLoading, setDrilldownLoading] = useState(false);
 
   const fetchInterventionCount = useCallback(async () => {
     if (!projectId) return;
@@ -67,6 +95,23 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
       }
     } catch { /* silent */ }
   }, [projectId]);
+
+  const openDrilldown = useCallback(async (alert: Alert) => {
+    const info = parseSrAlert(alert.title);
+    if (!info || !projectId || info.categories.length === 0) return;
+    if (drilldownId === alert.id) { setDrilldownId(null); return; }
+    setDrilldownId(alert.id);
+    setDrilldownRows([]);
+    setDrilldownLoading(true);
+    try {
+      const params = new URLSearchParams({ alert_type: info.alertType });
+      info.categories.forEach(c => params.append('categories', c));
+      const res = await apiFetch(`/api/admin/projects/${projectId}/sr-alert-drilldown?${params}`);
+      if (res.ok) setDrilldownRows(((await res.json()) as { items: DrilldownRow[] }).items ?? []);
+    } finally {
+      setDrilldownLoading(false);
+    }
+  }, [projectId, drilldownId]);
 
   const fetchStalledCount = useCallback(async () => {
     if (!projectId) return;
@@ -120,38 +165,74 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
           </button>
         </div>
       )}
-      {visibleAlerts.map(alert => (
-        <div
-          key={alert.id}
-          className={`${severityStyles[alert.severity]} border rounded-lg px-4 py-3 text-sm flex items-center gap-3`}
-        >
-          <AlertTriangle className={`w-4 h-4 shrink-0 ${iconColors[alert.severity]}`} />
-          <div className="flex-1 min-w-0">
-            <span className="font-medium">{alert.title}</span>
-            <span className="text-neutral-500 mx-2">&middot;</span>
-            <span className="opacity-80">{alert.message}</span>
+      {visibleAlerts.map(alert => {
+        const srInfo = parseSrAlert(alert.title);
+        const isOpen = drilldownId === alert.id;
+        return (
+          <div key={alert.id} className="flex flex-col gap-1">
+            <div className={`${severityStyles[alert.severity]} border rounded-lg px-4 py-3 text-sm flex items-center gap-3`}>
+              <AlertTriangle className={`w-4 h-4 shrink-0 ${iconColors[alert.severity]}`} />
+              <div className="flex-1 min-w-0">
+                <span className="font-medium">{alert.title}</span>
+                <span className="text-neutral-500 mx-2">&middot;</span>
+                <span className="opacity-80">{alert.message}</span>
+              </div>
+              {srInfo && srInfo.categories.length > 0 && projectId && (
+                <button
+                  onClick={() => void openDrilldown(alert)}
+                  className={`shrink-0 transition-opacity text-xs flex items-center gap-1 ${isOpen ? 'opacity-100' : 'opacity-60 hover:opacity-100'}`}
+                  title="Investigate contributing tasks"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  <span>Why?</span>
+                </button>
+              )}
+              {alert.task_id && onViewTask && (() => {
+                const taskId = alert.task_id;
+                return (
+                  <button
+                    onClick={() => onViewTask(taskId)}
+                    className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center gap-1"
+                    title="View task"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </button>
+                );
+              })()}
+              <button
+                onClick={() => onDismiss(alert.id)}
+                className="shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+                title="Dismiss"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {isOpen && (
+              <div className="bg-neutral-900/60 border border-neutral-700/40 rounded-lg px-4 py-3 text-xs text-neutral-300 flex flex-col gap-2">
+                <span className="text-neutral-500 text-[11px] font-medium uppercase tracking-wide">Contributing tasks</span>
+                {drilldownLoading && <span className="text-neutral-500">Loading…</span>}
+                {!drilldownLoading && drilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found in the current alert window.</span>}
+                {!drilldownLoading && drilldownRows.map(row => (
+                  <div key={row.task_id} className="flex items-start gap-2">
+                    <span className={`shrink-0 mt-0.5 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
+                      SR {row.sr_verdict ?? '?'}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <span className="text-neutral-200 truncate block">{row.title}</span>
+                      <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
+                    </div>
+                    {onViewTask && (
+                      <button onClick={() => onViewTask(row.task_id)} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
+                        <ExternalLink className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-          {alert.task_id && onViewTask && (() => {
-            const taskId = alert.task_id;
-            return (
-            <button
-              onClick={() => onViewTask(taskId)}
-              className="shrink-0 opacity-60 hover:opacity-100 transition-opacity text-xs flex items-center gap-1"
-              title="View task"
-            >
-              <ExternalLink className="w-3.5 h-3.5" />
-            </button>
-            );
-          })()}
-          <button
-            onClick={() => onDismiss(alert.id)}
-            className="shrink-0 opacity-60 hover:opacity-100 transition-opacity"
-            title="Dismiss"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      ))}
+        );
+      })}
       {hiddenCount > 0 && (
         <button
           onClick={() => setExpanded(true)}

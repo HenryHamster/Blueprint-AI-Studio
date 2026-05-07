@@ -361,6 +361,9 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     previous_hit_rate?: number;
     trend?: string;
     rate_history?: number[];
+    false_positive_rate?: number;
+    precision?: number;
+    sr_flag_sample_size?: number;
   };
   const srCatchRate = ctx.self_review_catch_rate as {
     categories?: Record<string, SRCatchRateCategory>;
@@ -426,6 +429,120 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
         const candidate = candidateLines.join('\n');
         if (candidate.length <= budget) {
           srBlindSpotLines = candidateLines;
+          budget -= candidate.length;
+          break;
+        }
+      }
+    }
+  }
+
+  // Build direction-scoped SR calibration block — sibling to the project-wide
+  // Self-Review Blind Spots section. Backend (agent.py) only injects this field
+  // when task has direction_id and there is enough signal for that direction.
+  type SRCatchRateForDirection = {
+    direction_id?: string;
+    direction_text?: string;
+    sample_count?: number;
+    miss_rate?: number;
+    categories?: Record<string, SRCatchRateCategory>;
+  };
+  const srForDirection = ctx.self_review_catch_rate_for_direction as SRCatchRateForDirection | null | undefined;
+  let srForDirectionLines: string[] = [];
+  if (srForDirection && srForDirection.categories && Object.keys(srForDirection.categories).length > 0) {
+    const dirCats = srForDirection.categories;
+    const dirQualifying = Object.entries(dirCats)
+      .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
+      .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate) - (a[1].weighted_miss_rate ?? a[1].miss_rate))
+      .slice(0, 5);
+    if (dirQualifying.length > 0) {
+      const dirLabel = srForDirection.direction_text
+        ? `"${srForDirection.direction_text.slice(0, 100)}"`
+        : (srForDirection.direction_id ?? 'this direction');
+      const sampleSuffix = typeof srForDirection.sample_count === 'number'
+        ? ` (${srForDirection.sample_count} task${srForDirection.sample_count === 1 ? '' : 's'} sampled)`
+        : '';
+
+      const buildDirLines = (withExamples: boolean): string[] => {
+        const lines: string[] = [
+          '### For This Direction: SR Calibration',
+          `In this direction (${dirLabel})${sampleSuffix}, your past self-reviews missed issues in these categories — apply extra scrutiny here:`,
+        ];
+        for (const [cat, data] of dirQualifying) {
+          const rawPct = Math.round(data.miss_rate * 100);
+          const suffix = data.weighted_miss_rate !== undefined
+            ? ` (${rawPct}% missed, ${Math.round(data.weighted_miss_rate * 100)}% severity-weighted)`
+            : ` (${rawPct}% missed)`;
+          lines.push(`- ${cat}${suffix}`);
+          if (withExamples && data.examples && data.examples.length > 0) {
+            for (const ex of data.examples) {
+              lines.push(`  - [${ex.severity}] ${ex.desc}`);
+            }
+          }
+        }
+        lines.push('');
+        return lines;
+      };
+
+      for (const withEx of [true, false]) {
+        const candidateLines = buildDirLines(withEx);
+        const candidate = candidateLines.join('\n');
+        if (candidate.length <= budget) {
+          srForDirectionLines = candidateLines;
+          budget -= candidate.length;
+          break;
+        }
+      }
+    }
+  }
+
+  // Build SR False-Positive Calibration block — only if budget allows.
+  // Surfaces categories where the agent's self-review has been over-flagging
+  // (high FP rate) so the agent can apply lighter scrutiny there. Phrasing
+  // explicitly nudges selectivity without weakening genuine catches.
+  let srFPCalibrationLines: string[] = [];
+  if (srSource && Object.keys(srSource).length > 0) {
+    const fpQualifying = Object.entries(srSource)
+      .filter(([, data]) =>
+        typeof data.false_positive_rate === 'number'
+        && data.false_positive_rate >= 0.5
+        && typeof data.sr_flag_sample_size === 'number'
+        && data.sr_flag_sample_size >= 10,
+      )
+      .sort((a, b) => (b[1].false_positive_rate ?? 0) - (a[1].false_positive_rate ?? 0))
+      .slice(0, 5);
+    if (fpQualifying.length > 0) {
+      const fpScopeNote = srIsTypeFiltered && taskType
+        ? ` (${taskType} tasks only)`
+        : '';
+
+      const buildFPCatLines = (verbose: boolean): string[] => {
+        const lines: string[] = [
+          '### Self-Review False-Positive Calibration',
+          `Categories where past self-reviews have flagged issues that human review did not confirm${fpScopeNote}. Apply lighter scrutiny here unless evidence is concrete — but do not weaken genuine catches.`,
+        ];
+        for (const [cat, data] of fpQualifying) {
+          const fpPct = Math.round((data.false_positive_rate ?? 0) * 100);
+          const sample = data.sr_flag_sample_size ?? 0;
+          const precisionPct = typeof data.precision === 'number'
+            ? Math.round(data.precision * 100)
+            : Math.round((1 - (data.false_positive_rate ?? 0)) * 100);
+          if (verbose) {
+            lines.push(
+              `- **${cat}**: flagged in ${sample} recent SR checks, only ${precisionPct}% confirmed by review (${fpPct}% false-positive rate). Apply lighter scrutiny here unless evidence is concrete — but do not weaken genuine catches.`,
+            );
+          } else {
+            lines.push(`- **${cat}**: ${fpPct}% false-positive (precision ${precisionPct}%, sample ${sample})`);
+          }
+        }
+        lines.push('');
+        return lines;
+      };
+
+      for (const verbose of [true, false]) {
+        const candidateLines = buildFPCatLines(verbose);
+        const candidate = candidateLines.join('\n');
+        if (candidate.length <= budget) {
+          srFPCalibrationLines = candidateLines;
           budget -= candidate.length;
           break;
         }
@@ -545,6 +662,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }
