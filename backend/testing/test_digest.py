@@ -9976,6 +9976,68 @@ async def test_sr_recent_misses_basic(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_sr_recent_misses_includes_drilldown_fields(
+    client: AsyncClient, db_session
+):
+    """SR drilldown fields are filtered to missed categories and truncated."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    long_desc = "x" * 450
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Add feature Y",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": ["correctness", "performance"],
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {
+                        "correctness": {
+                            "passed": True,
+                            "issue": "sr note",
+                            "origin": "reviewer",
+                        },
+                        "performance": {"passed": False},
+                    },
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": long_desc,
+                        },
+                        {
+                            "category": "security",
+                            "severity": "LOW",
+                            "description": "ignored",
+                        },
+                    ],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
+    assert response.status_code == 200
+    row = response.json()["misses"][0]
+    assert set(row["sr_check_results"]) == {"correctness"}
+    assert row["sr_check_results"]["correctness"]["origin"] == "reviewer"
+    assert row["sr_check_results"]["correctness"]["issue"] == "sr note"
+    assert row["reviewer_findings"] == [
+        {
+            "category": "correctness",
+            "severity": "HIGH",
+            "description": long_desc[:400],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_sr_recent_misses_excludes_fully_caught(client: AsyncClient, db_session):
     """Tasks where SR caught all human-flagged categories are excluded."""
     project = make_project()

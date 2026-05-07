@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {
   SrTrendBreakdown,
+  SrMissedRetrospective,
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
   SrScopeDriftVsExpansionCard,
@@ -224,6 +225,89 @@ describe('SrTrendBreakdown CategoryRow chevron', () => {
 
     await user.click(screen.getByRole('button', { name: /collapse correctness examples/i }));
     expect(screen.queryByText(/missed null check on payload field/)).not.toBeInTheDocument();
+  });
+});
+
+describe('SrMissedRetrospective drilldown', () => {
+  it('expands to show SR/reviewer drilldown and keeps the PR link from triggering row click', async () => {
+    const user = userEvent.setup();
+    const onTaskClick = vi.fn();
+    render(
+      <SrMissedRetrospective
+        tasks={[
+          {
+            task_id: 't1',
+            title: 'Task with reviewer findings',
+            task_type: 'create',
+            scope: 'small',
+            created_at: new Date().toISOString(),
+            missed_categories: ['correctness'],
+            caught_categories: [],
+            pr_url: 'https://example.com/pr/1',
+            sr_check_results: { correctness: { passed: true, issue: 'sr note', origin: 'reviewer' } },
+            reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'bad edge' }],
+          },
+        ]}
+        onTaskClick={onTaskClick}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /expand task with reviewer findings/i }));
+    expect(screen.getByText('SR')).toBeInTheDocument();
+    expect(screen.getByText('Reviewer')).toBeInTheDocument();
+    expect(screen.getByText('origin: reviewer')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('link', { name: 'PR' }));
+    expect(onTaskClick).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the rejection category label when reviewer findings are missing', async () => {
+    const user = userEvent.setup();
+    render(
+      <SrMissedRetrospective
+        tasks={[
+          {
+            task_id: 't2',
+            title: 'Task without reviewer findings',
+            created_at: new Date().toISOString(),
+            missed_categories: ['correctness'],
+            caught_categories: [],
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /expand task without reviewer findings/i }));
+    expect(screen.getAllByText('correctness').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('shows mixed SR origin tags for missed categories', async () => {
+    const user = userEvent.setup();
+    render(
+      <SrMissedRetrospective
+        tasks={[
+          {
+            task_id: 't3',
+            title: 'Task with mixed origins',
+            created_at: new Date().toISOString(),
+            missed_categories: ['correctness', 'performance'],
+            caught_categories: [],
+            sr_check_results: {
+              correctness: { passed: true, origin: 'reviewer' },
+              performance: { passed: true, origin: 'author' },
+            },
+            reviewer_findings: [
+              { category: 'correctness', severity: 'HIGH', description: 'issue' },
+              { category: 'performance', severity: 'LOW', description: 'issue' },
+            ],
+          },
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /expand task with mixed origins/i }));
+    expect(screen.getByText('origin: reviewer')).toBeInTheDocument();
+    expect(screen.getByText('origin: author')).toBeInTheDocument();
   });
 });
 

@@ -62,6 +62,10 @@ export interface CodeChangeTaskOpts {
   /** Message to post when Claude exits cleanly with no diff (e.g. read-only
    *  task that decided no changes were needed). */
   noChangesMessage?: string;
+  /** SR categories whose miss-rate is regressing for this task type.
+   *  Forwarded to writeCodeChangeHelpers so ./done enforces a non-trivial
+   *  `reasoning` field in check_results for each regressing category. */
+  regressingCategories?: string[];
   /**
    * Called when SR has categories=["incomplete_review"] and no reviewer_findings yet.
    * Implementations run a fresh-reviewer pass with incompleteSrRecovery=true so
@@ -222,6 +226,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     repo: opts.repo,
     existingPrNumber: opts.existingPrNumber,
     testsOnMainBranch: opts.testsOnMainBranch,
+    regressingCategories: opts.regressingCategories,
   });
 
   // 2. Run Claude with the full task prompt. Claude is responsible for

@@ -112,6 +112,24 @@ describe('formatProjectContext — Self-Review False-Positive Calibration', () =
     expect(result).not.toContain('**security**: flagged');
   });
 
+  it('instructs agents to add reasoning for regressing blind-spot categories', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: { miss_rate: 0.4 },
+          'test-coverage': { miss_rate: 0.3 },
+        },
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('### Self-Review Blind Spots');
+    // Must tell the agent to add a reasoning field for these categories
+    expect(result).toContain('reasoning');
+    expect(result).toContain('check_results');
+    // Instruction must cover both pass and fail outcomes
+    expect(result).toContain('pass and fail');
+  });
+
   it('caps the FP calibration block to top-5 categories by FP rate (regression check)', () => {
     const cats: Record<string, { miss_rate: number; false_positive_rate: number; sr_flag_sample_size: number }> = {};
     for (let i = 0; i < 8; i++) {

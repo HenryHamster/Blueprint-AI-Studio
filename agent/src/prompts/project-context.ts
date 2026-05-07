@@ -453,7 +453,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
       const buildCatLines = (withExamples: boolean): string[] => {
         const lines: string[] = [
           '### Self-Review Blind Spots',
-          `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny. Examples from recent tasks:`,
+          `Your past self-reviews missed issues in these categories${scopeNote} — apply extra scrutiny. For EACH of these categories, add a \`reasoning\` field to your \`check_results\` entry (~1 sentence: what you inspected and what evidence supports the pass/fail call). Required for both pass and fail outcomes. Examples from recent tasks:`,
         ];
         for (const [cat, data] of qualifying) {
           const rawPct = Math.round(data.miss_rate * 100);

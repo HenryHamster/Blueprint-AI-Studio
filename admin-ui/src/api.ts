@@ -214,6 +214,8 @@ export interface SrRecentMiss {
   missed_categories: string[];
   caught_categories: string[];
   pr_url: string | null;
+  sr_check_results?: Record<string, { passed: boolean; issue?: string | null; origin?: string | null }>;
+  reviewer_findings?: Array<{ category: string; severity?: string | null; description: string }>;
 }
 
 export interface SrRecentMissesResponse {

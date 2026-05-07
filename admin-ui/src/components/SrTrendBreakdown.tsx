@@ -14,6 +14,10 @@ export interface SrCategoryTrend {
   weighted_miss_rate?: number | null;
   false_positive_rate?: number | null;
   precision?: number | null;
+  sr_alone_hit_count?: number | null;
+  reviewer_save_hit_count?: number | null;
+  sr_alone_hit_rate?: number | null;
+  reviewer_save_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   rate_history?: number[];
   /** True when the SR prompt version changed within the rate_history window — attribution breaks here. */
@@ -32,6 +36,24 @@ function severityColor(sev: SrMissExample['severity']): string {
   if (sev === 'CRITICAL') return 'text-red-400';
   if (sev === 'MAJOR') return 'text-amber-400';
   return 'text-neutral-400';
+}
+
+export interface SrCheckResultEntry {
+  passed: boolean;
+  issue?: string | null;
+  origin?: string | null;
+}
+
+export interface SrReviewerFinding {
+  category: string;
+  severity?: string | null;
+  description: string;
+}
+
+function reviewerSeverityColor(severity?: string | null): string {
+  if (severity === 'CRITICAL' || severity === 'HIGH') return severityColor('CRITICAL');
+  if (severity === 'MAJOR' || severity === 'MEDIUM') return severityColor('MAJOR');
+  return severityColor('MINOR');
 }
 
 function ExampleList({ examples, indent }: { examples: SrMissExample[]; indent?: boolean }) {
@@ -632,6 +654,8 @@ export interface SrMissedTask {
   missed_categories: string[];
   caught_categories: string[];
   pr_url?: string | null;
+  sr_check_results?: Record<string, SrCheckResultEntry>;
+  reviewer_findings?: SrReviewerFinding[];
 }
 
 interface SrTrendBreakdownProps {
@@ -688,6 +712,11 @@ function CategoryRow({
 
   const sparklineTitle = c.prompt_version_changed ? 'prompt version changed mid-window — attribution may differ' : undefined;
   if (variant === 'card') {
+    const srAlone = c.sr_alone_hit_rate;
+    const reviewerSave = c.reviewer_save_rate;
+    const combined = c.current_hit_rate;
+    const showSplit = srAlone != null || reviewerSave != null;
+
     const rowBody = (
       <>
         <span className="text-neutral-300 truncate flex-1" title={cat}>{cat}</span>
@@ -758,6 +787,16 @@ function CategoryRow({
             </div>
           )}
         </div>
+        {showSplit && (
+          <div className="flex items-center gap-2 text-xs text-neutral-500 ml-5 mt-0.5">
+            <span className="font-mono">
+              SR alone {srAlone != null ? `${Math.round(srAlone * 100)}%` : '–'} ·{' '}
+              reviewer-save {reviewerSave != null ? `${Math.round(reviewerSave * 100)}%` : '–'} ·{' '}
+              combined {combined != null ? `${Math.round(combined * 100)}%` : '–'} ·{' '}
+              miss {miss != null ? `${Math.round(miss * 100)}%` : '–'}
+            </span>
+          </div>
+        )}
         {open && hasExamples && <ExampleList examples={examples} />}
       </div>
     );
@@ -1039,6 +1078,7 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
   const [categoryFilter, setCategoryFilter] = useState(initialCategory ?? '');
   const [typeFilter, setTypeFilter] = useState('');
   const [windowDays, setWindowDays] = useState(14);
+  const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
   const [mountedAt] = useState(() => Date.now());
 
   const allCategories = Array.from(new Set(tasks.flatMap(t => t.missed_categories))).sort();
@@ -1050,6 +1090,11 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
     if (categoryFilter && !t.missed_categories.includes(categoryFilter)) return false;
     if (typeFilter && t.task_type !== typeFilter) return false;
     return true;
+  });
+  const toggleTask = (taskId: string) => setOpenTaskIds(prev => {
+    const next = new Set(prev);
+    if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+    return next;
   });
 
   return (
@@ -1092,33 +1137,59 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
         <div className="flex flex-col gap-1">
           {visible.map(t => (
             // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
-            <div
-              key={t.task_id}
-              className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`}
-              onClick={() => onTaskClick?.(t.task_id)}
-            >
-              <div className="flex items-center gap-2 mb-0.5">
+            <div key={t.task_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] ${onTaskClick ? 'cursor-pointer hover:border-neutral-600' : ''}`} onClick={() => onTaskClick?.(t.task_id)}>
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <button type="button" className="text-neutral-500 hover:text-neutral-300 shrink-0" aria-label={`${openTaskIds.has(t.task_id) ? 'collapse' : 'expand'} ${t.title}`} aria-expanded={openTaskIds.has(t.task_id)} onClick={e => { e.stopPropagation(); toggleTask(t.task_id); }}>
+                  {openTaskIds.has(t.task_id) ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                </button>
                 <span className="text-neutral-200 truncate flex-1 font-medium" title={t.title}>{t.title}</span>
                 {t.task_type && <span className="text-neutral-500 shrink-0">{t.task_type}</span>}
                 {t.scope && <span className="text-neutral-600 shrink-0">{t.scope}</span>}
-                {t.created_at && (
-                  <span className="text-neutral-600 shrink-0" title={t.created_at}>
-                    {new Date(t.created_at).toLocaleDateString()}
-                  </span>
-                )}
+                {t.created_at && <span className="text-neutral-600 shrink-0" title={t.created_at}>{new Date(t.created_at).toLocaleDateString()}</span>}
+                {t.pr_url && <a href={t.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline shrink-0" title={t.pr_url}>PR</a>}
               </div>
               <div className="flex flex-wrap gap-x-3 gap-y-0.5">
-                {t.missed_categories.length > 0 && (
-                  <span className="text-red-400">
-                    missed: {t.missed_categories.join(', ')}
-                  </span>
-                )}
-                {t.caught_categories.length > 0 && (
-                  <span className="text-emerald-600">
-                    caught: {t.caught_categories.join(', ')}
-                  </span>
-                )}
+                {t.missed_categories.length > 0 && <span className="text-red-400">missed: {t.missed_categories.join(', ')}</span>}
+                {t.caught_categories.length > 0 && <span className="text-emerald-600">caught: {t.caught_categories.join(', ')}</span>}
               </div>
+              {openTaskIds.has(t.task_id) && (
+                <div className="mt-1.5 flex flex-col gap-1">
+                  {t.missed_categories.map(cat => {
+                    const sr = t.sr_check_results?.[cat];
+                    const reviewer = t.reviewer_findings?.find(f => f.category === cat);
+                    return (
+                      <div key={cat} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+                        <div className="mb-1 text-neutral-400">{cat}</div>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
+                            <div className="mb-0.5 text-[9px] uppercase tracking-wide text-neutral-500">SR</div>
+                            {sr ? (
+                              <>
+                                <div className={`font-mono ${sr.passed ? 'text-emerald-400' : 'text-red-400'}`}>{sr.passed ? 'passed' : 'failed'}</div>
+                                {sr.issue && <div className="text-neutral-400">{sr.issue}</div>}
+                                {sr.origin && <div className="text-neutral-600">origin: {sr.origin}</div>}
+                              </>
+                            ) : (
+                              <div className="text-neutral-500">not recorded</div>
+                            )}
+                          </div>
+                          <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
+                            <div className="mb-0.5 text-[9px] uppercase tracking-wide text-neutral-500">Reviewer</div>
+                            {reviewer ? (
+                              <>
+                                <div className={`inline-flex rounded px-1 py-0.5 text-[9px] font-mono ${reviewerSeverityColor(reviewer.severity)}`}>{reviewer.severity ?? 'unknown'}</div>
+                                <div className="text-neutral-400">{reviewer.description}</div>
+                              </>
+                            ) : (
+                              <div className="text-neutral-500">{cat}</div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ))}
         </div>

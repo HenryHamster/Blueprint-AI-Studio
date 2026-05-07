@@ -304,6 +304,31 @@ def _compute_fresh_reviewer_effectiveness(
     }
 
 
+def _sr_miss_drilldown(
+    sr_outcome: Dict[str, Any], missed_categories: set[str]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    check_results = sr_outcome.get("check_results") or {}
+    sr_check_results = {}
+    for cat in missed_categories:
+        result = check_results.get(cat)
+        if isinstance(result, dict):
+            sr_check_results[cat] = {
+                "passed": bool(result.get("passed", True)),
+                "issue": result.get("issue"),
+                "origin": result.get("origin"),
+            }
+    reviewer_findings = [
+        {
+            "category": finding.get("category"),
+            "severity": finding.get("severity"),
+            "description": (finding.get("description") or "")[:400],
+        }
+        for finding in (sr_outcome.get("reviewer_findings") or [])
+        if isinstance(finding, dict) and finding.get("category") in missed_categories
+    ]
+    return sr_check_results, reviewer_findings
+
+
 def _partition_edges_by_origin(edges: List[Any]) -> "tuple[list, list]":
     """Split an edges_considered list into (author, reviewer) entries.
 
@@ -6349,7 +6374,8 @@ async def list_sr_missed_retrospectives(
     missed_tasks = []
     for t in all_tasks:
         ctx = t.context or {}
-        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        check_results = sr_outcome.get("check_results") or {}
         if not check_results:
             continue
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
@@ -6360,6 +6386,7 @@ async def list_sr_missed_retrospectives(
         if not missed:
             continue
         caught = human_cats & sr_failed
+        sr_check_results, reviewer_findings = _sr_miss_drilldown(sr_outcome, missed)
         t_type = (t.first_payload or {}).get("type")
         missed_tasks.append(
             {
@@ -6371,6 +6398,8 @@ async def list_sr_missed_retrospectives(
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "missed_categories": sorted(missed),
                 "caught_categories": sorted(caught),
+                "sr_check_results": sr_check_results,
+                "reviewer_findings": reviewer_findings,
             }
         )
 
@@ -7015,6 +7044,7 @@ async def get_sr_recent_misses(
             continue
         if category and category not in missed:
             continue
+        sr_check_results, reviewer_findings = _sr_miss_drilldown(sr_outcome, missed)
         fp = t.first_payload or {}
         rows.append(
             {
@@ -7025,6 +7055,8 @@ async def get_sr_recent_misses(
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "missed_categories": sorted(missed),
                 "caught_categories": sorted(human_cats & sr_failed),
+                "sr_check_results": sr_check_results,
+                "reviewer_findings": reviewer_findings,
                 "pr_url": None,
             }
         )

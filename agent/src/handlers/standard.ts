@@ -229,6 +229,20 @@ function formatFreshReviewerCalibrationSection(
   return `${lines.join('\n')}\n\n`;
 }
 
+function getRegressingCategories(
+  projectContext: Record<string, unknown> | undefined,
+): string[] {
+  const srCatchRate = projectContext?.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
+  const categories = srCatchRate?.categories;
+  if (!categories) return [];
+  return Object.entries(categories)
+    .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
+    .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate ?? 0) - (a[1].weighted_miss_rate ?? a[1].miss_rate ?? 0))
+    .map(([cat]) => cat);
+}
+
 /**
  * Runs a second read-only Claude session to review the current diff as an
  * adversarial reviewer. Findings are merged into /tmp/self_review_<taskId>.json:
@@ -348,9 +362,7 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     const existing = checkResultsLookup[f.category];
     if (!existing || existing.passed === true) {
       const entry: Record<string, unknown> = { passed: false, issue: `[reviewer] ${f.description}` };
-      if (incompleteSrRecovery) {
-        entry.origin = 'reviewer_recovery_after_incomplete_sr';
-      }
+      entry.origin = incompleteSrRecovery ? 'reviewer_recovery_after_incomplete_sr' : 'reviewer';
       checkResults[f.category] = entry;
     }
   }
@@ -393,6 +405,25 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     );
     sr.edges_considered = [...taggedAuthorEdges, ...reviewerEdges];
     sr.reviewer_edges_considered = reviewerEdges;
+  }
+
+  // Track engagement gaps: regressing categories that passed SR without a non-trivial
+  // reasoning string. Stored top-level as engagement_gaps for downstream metric tracking.
+  const regressingCats = getRegressingCategories(projectContext);
+  if (regressingCats.length > 0) {
+    const engagementGaps: string[] = [];
+    const srCheckResults = sr.check_results as Record<string, Record<string, unknown>> | undefined;
+    for (const cat of regressingCats) {
+      const entry = srCheckResults?.[cat];
+      if (entry && entry.passed === true) {
+        const reasoning = typeof entry.reasoning === 'string' ? entry.reasoning.trim() : '';
+        if (reasoning.length < 10) engagementGaps.push(cat);
+      }
+    }
+    if (engagementGaps.length > 0) {
+      sr.engagement_gaps = engagementGaps;
+      sendLog(ws, `[FreshReview] Engagement gaps (regressing categories without SR reasoning): ${engagementGaps.join(', ')}.\n`);
+    }
   }
 
   try {

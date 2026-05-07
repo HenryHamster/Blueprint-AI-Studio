@@ -2464,7 +2464,7 @@ describe('runFreshReviewerPass origin stamp for incompleteSrRecovery', () => {
     expect(capturedRx1.reviewer_recovery_origin).toBe('reviewer_recovery_after_incomplete_sr');
   });
 
-  it('does NOT stamp origin on check_results when incompleteSrRecovery is false/absent', async () => {
+  it('stamps origin: reviewer on check_results when incompleteSrRecovery is false/absent', async () => {
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
     vi.mocked(idx.runClaudeCode).mockResolvedValue({
@@ -2485,7 +2485,7 @@ describe('runFreshReviewerPass origin stamp for incompleteSrRecovery', () => {
     const capturedRx2 = captured as unknown as Record<string, unknown>;
     const checkResults = capturedRx2.check_results as Record<string, Record<string, unknown>>;
     expect(checkResults.correctness).toBeDefined();
-    expect(checkResults.correctness.origin).toBeUndefined();
+    expect(checkResults.correctness.origin).toBe('reviewer');
     expect(capturedRx2.reviewer_recovery_origin).toBeUndefined();
   });
 });
@@ -2550,5 +2550,79 @@ describe('maybeRunIncompleteReviewRecovery', () => {
     const recoveryFn = vi.fn().mockResolvedValue(undefined);
     await realMaybeRunIncompleteReviewRecovery('t-mr5', null, recoveryFn);
     expect(recoveryFn).not.toHaveBeenCalled();
+  });
+});
+
+// ── Engagement gap tracking (regressing categories missing SR reasoning) ──────
+describe('runFreshReviewerPass engagement_gaps', () => {
+  const BIG_DIFF = Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n');
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = (await import('fs')).default;
+  });
+
+  it('records engagement_gaps for regressing categories with passed:true and no reasoning', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: '{"reviewer_findings":[]}',
+    });
+    vi.mocked(fsModule.readFileSync).mockImplementation((p) => {
+      if (typeof p === 'string' && p.includes('self_review_eg-1')) {
+        return JSON.stringify({
+          verdict: 'pass',
+          check_results: {
+            correctness: { passed: true },
+            security: { passed: true, reasoning: 'checked all inputs thoroughly' },
+          },
+        });
+      }
+      return '';
+    });
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      if (typeof _p === 'string' && _p.includes('self_review_eg-1')) {
+        captured = JSON.parse(data as string) as Record<string, unknown>;
+      }
+    });
+
+    const projectCtx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: { miss_rate: 0.4 },
+          security: { miss_rate: 0.2 },
+        },
+      },
+    };
+    await runFreshReviewerPass('eg-1', 'Title', 'Desc', [], null, { value: '' }, undefined, projectCtx);
+
+    expect(captured).not.toBeNull();
+    const json = captured as unknown as Record<string, unknown>;
+    // correctness: passed:true with no reasoning → gap
+    // security: passed:true but has reasoning >= 10 chars → no gap
+    expect(json.engagement_gaps).toEqual(['correctness']);
+  });
+
+  it('omits engagement_gaps when no project context is provided', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: '{"reviewer_findings":[]}',
+    });
+    vi.mocked(fsModule.readFileSync).mockImplementation(() => {
+      return JSON.stringify({ verdict: 'pass', check_results: { correctness: { passed: true } } });
+    });
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+
+    await runFreshReviewerPass('eg-2', 'Title', 'Desc', [], null, { value: '' });
+    expect(captured).not.toBeNull();
+    expect((captured as unknown as Record<string, unknown>).engagement_gaps).toBeUndefined();
   });
 });

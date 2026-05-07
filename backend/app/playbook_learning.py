@@ -21,7 +21,7 @@ import re
 import uuid
 from datetime import datetime
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from app.shared_state import DEFAULT_TASK_SCOPE
 
@@ -2509,6 +2509,15 @@ def _stats_for_tasks(
     issues across all categories.
     """
     _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+
+    def _origin_bucket(
+        entry: dict[str, Any] | None,
+    ) -> Literal["sr_alone", "reviewer_save"]:
+        origin = entry.get("origin") if isinstance(entry, dict) else None
+        if isinstance(origin, str) and origin.startswith("reviewer"):
+            return "reviewer_save"
+        return "sr_alone"
+
     count = 0
     cat_stats: dict[str, dict] = {}
     type_cat_stats: dict[str, dict[str, dict]] = {}
@@ -2538,6 +2547,8 @@ def _stats_for_tasks(
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
+                    "sr_alone_hit_count": 0,
+                    "reviewer_save_hit_count": 0,
                     "human_count": 0,
                     "w_hit": 0.0,
                     "w_total": 0.0,
@@ -2569,6 +2580,8 @@ def _stats_for_tasks(
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
+                    "sr_alone_hit_count": 0,
+                    "reviewer_save_hit_count": 0,
                     "human_count": 0,
                     "w_hit": 0.0,
                     "w_total": 0.0,
@@ -2582,6 +2595,11 @@ def _stats_for_tasks(
             if cat in sr_failed:
                 cat_stats[cat]["hit_count"] += 1
                 cat_stats[cat]["w_hit"] += w
+                bucket = _origin_bucket(check_results.get(cat))
+                if bucket == "sr_alone":
+                    cat_stats[cat]["sr_alone_hit_count"] += 1
+                else:
+                    cat_stats[cat]["reviewer_save_hit_count"] += 1
             else:
                 for issue in rev_cats.get(cat, []):
                     cat_stats[cat]["miss_examples"].append(
@@ -2593,12 +2611,19 @@ def _stats_for_tasks(
                 if cat not in type_cat_stats[task_type]:
                     type_cat_stats[task_type][cat] = {
                         "hit_count": 0,
+                        "sr_alone_hit_count": 0,
+                        "reviewer_save_hit_count": 0,
                         "human_count": 0,
                         "miss_examples": [],
                     }
                 type_cat_stats[task_type][cat]["human_count"] += 1
                 if cat in sr_failed:
                     type_cat_stats[task_type][cat]["hit_count"] += 1
+                    bucket = _origin_bucket(check_results.get(cat))
+                    if bucket == "sr_alone":
+                        type_cat_stats[task_type][cat]["sr_alone_hit_count"] += 1
+                    else:
+                        type_cat_stats[task_type][cat]["reviewer_save_hit_count"] += 1
                 else:
                     for issue in rev_cats.get(cat, []):
                         type_cat_stats[task_type][cat]["miss_examples"].append(
@@ -2828,6 +2853,52 @@ def _compute_cat_fp_stats(
     return cat_fp, type_cat_fp
 
 
+def _compute_reasoning_engagement(
+    tasks: list,
+    regressing_cats: set[str],
+) -> dict[str, dict[str, Any]]:
+    """For each regressing category, compute the fraction of passed entries
+    that include a non-trivial reasoning string.
+
+    A reasoning is 'non-trivial' when it is a non-empty string of more than
+    10 characters.  Only tasks with a non-skip SR outcome contribute.
+
+    Returns {cat: {"engagement_rate": float|None, "with_reasoning": int,
+                   "total_passes": int}}.
+    """
+    from app.sr_blind_spots import is_skipped_sr_outcome  # noqa: PLC0415
+
+    stats: dict[str, dict[str, int]] = {
+        cat: {"with_reasoning": 0, "total_passes": 0} for cat in regressing_cats
+    }
+    for t in tasks:
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        check_results = sro.get("check_results") or {}
+        for cat in regressing_cats:
+            entry = check_results.get(cat)
+            if not isinstance(entry, dict) or not entry.get("passed", True):
+                continue
+            stats[cat]["total_passes"] += 1
+            reasoning = entry.get("reasoning") or ""
+            if isinstance(reasoning, str) and len(reasoning.strip()) > 10:
+                stats[cat]["with_reasoning"] += 1
+
+    result: dict[str, dict[str, Any]] = {}
+    for cat, s in stats.items():
+        total = s["total_passes"]
+        result[cat] = {
+            "engagement_rate": round(s["with_reasoning"] / total, 3)
+            if total > 0
+            else None,
+            "with_reasoning": s["with_reasoning"],
+            "total_passes": total,
+        }
+    return result
+
+
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -2953,6 +3024,8 @@ async def compute_sr_catch_rate_trends(
 
     _empty_cat: dict[str, Any] = {
         "hit_count": 0,
+        "sr_alone_hit_count": 0,
+        "reviewer_save_hit_count": 0,
         "human_count": 0,
         "w_hit": 0.0,
         "w_total": 0.0,
@@ -2975,6 +3048,16 @@ async def compute_sr_catch_rate_trends(
         )
         miss_rate = (
             round(1 - current_hit_rate, 3) if current_hit_rate is not None else None
+        )
+        sr_alone_hit_rate = (
+            round(curr["sr_alone_hit_count"] / curr["human_count"], 3)
+            if curr["human_count"] > 0
+            else None
+        )
+        reviewer_save_rate = (
+            round(curr["reviewer_save_hit_count"] / curr["human_count"], 3)
+            if curr["human_count"] > 0
+            else None
         )
 
         if current_hit_rate is not None and previous_hit_rate is not None:
@@ -3033,6 +3116,10 @@ async def compute_sr_catch_rate_trends(
             "previous_hit_rate": previous_hit_rate,
             "current_human_count": int(curr.get("human_count") or 0),
             "previous_human_count": int(prev.get("human_count") or 0),
+            "sr_alone_hit_count": int(curr.get("sr_alone_hit_count") or 0),
+            "reviewer_save_hit_count": int(curr.get("reviewer_save_hit_count") or 0),
+            "sr_alone_hit_rate": sr_alone_hit_rate,
+            "reviewer_save_rate": reviewer_save_rate,
             "miss_rate": miss_rate,
             "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
@@ -3095,6 +3182,21 @@ async def compute_sr_catch_rate_trends(
             r < _floor_thresh for r in history[-_floor_min_win:]
         )
 
+    # Attach reasoning engagement rate for regressing categories.
+    # Regressing = trend=="decreasing" OR below_floor; engagement = share of
+    # passed entries that include a non-trivial reasoning string (>10 chars).
+    regressing_cats = {
+        cat
+        for cat, data in categories.items()
+        if data.get("trend") == "decreasing" or data.get("below_floor")
+    }
+    if regressing_cats:
+        eng = _compute_reasoning_engagement(current_window_tasks, regressing_cats)
+        for cat, cat_eng in eng.items():
+            categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
+            categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
+            categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
+
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
     cat_fp_stats, type_cat_fp_stats = _compute_cat_fp_stats(current_window_tasks)
     for cat, data in categories.items():
@@ -3116,12 +3218,26 @@ async def compute_sr_catch_rate_trends(
             if stats["human_count"] < _MIN_SR_SAMPLE:
                 continue
             hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            sr_alone_hit_rate = (
+                round(stats["sr_alone_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            reviewer_save_rate = (
+                round(stats["reviewer_save_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
             raw_ex = stats.get("miss_examples", [])
             ex = _finalize_examples(raw_ex)
             entry: dict[str, Any] = {
                 "hit_rate": hit_rate,
                 "miss_rate": round(1 - hit_rate, 3),
                 "sample_count": stats["human_count"],
+                "sr_alone_hit_count": stats["sr_alone_hit_count"],
+                "reviewer_save_hit_count": stats["reviewer_save_hit_count"],
+                "sr_alone_hit_rate": sr_alone_hit_rate,
+                "reviewer_save_rate": reviewer_save_rate,
             }
             if ex:
                 entry["examples"] = ex

@@ -3601,6 +3601,35 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
 
     // Verify that it always includes self_review_outcome in payload
     expect(doneScript).toContain('{self_review_outcome: $self_review}');
+
+    // Without regressingCategories, the gate is absent
+    expect(doneScript).not.toContain('REGRESSING_CATS=');
+    expect(doneScript).toContain('# No regressing categories for this task type');
+  });
+
+  it('generates ./done with regressing-category reasoning gate when regressingCategories is set', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: ['correctness', 'test-coverage'],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // Gate is embedded with the specific categories
+    expect(doneScript).toContain('REGRESSING_CATS=("correctness" "test-coverage")');
+    // Validation checks reasoning length and exits 1 on missing
+    expect(doneScript).toContain('.check_results[$c].reasoning // ""');
+    expect(doneScript).toContain('Regressing categories need a reasoning field');
+    expect(doneScript).toContain('exit 1');
+    // Task-ID-specific error message for recovery instructions
+    expect(doneScript).toContain('self_review_test-task-123.json');
   });
 
   it('generates ./check with the admin-ui viewport gate and no jsdom test command', async () => {
@@ -4092,9 +4121,9 @@ describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () 
 // create/fix/docs/deps focus blocks were added. If this test fails, bump the
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "4" (current pinned version)', async () => {
+  it('is "5" (current pinned version)', async () => {
     const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
-    expect(SELF_REVIEW_PROMPT_VERSION).toBe('4');
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('5');
   });
 
   it('is a non-empty string (used as prompt_version field in self-review JSON)', async () => {
@@ -4361,5 +4390,84 @@ describe('formatSelfReviewCalibrationSection', () => {
   it('returns empty string when categories are empty', () => {
     const source = { categories: {} };
     expect(formatSelfReviewCalibrationSection(source)).toBe('');
+  });
+});
+
+// ── CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning ───────────────
+describe('CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning', () => {
+  it('includes a reasoning field in the schema example for check_results', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('"reasoning"');
+  });
+
+  it('requires reasoning for both pass and fail outcomes on regressing categories', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('BOTH pass and fail');
+  });
+
+  it('references the Self-Review Blind Spots section as the source of regressing categories', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Self-Review Blind Spots');
+  });
+
+  it('instructs agent to describe what was inspected in the reasoning field', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('what you inspected');
+  });
+
+  it('mentions the ./done exit error so agent knows to update SR JSON and re-run', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('reasoning field');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('./done');
+  });
+});
+
+// ── writeCodeChangeHelpers — regressingCategories edge cases ─────────────────
+describe('writeCodeChangeHelpers — regressingCategories edge cases', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('generates ./done without reasoning gate when regressingCategories is empty array', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'edge-task-1',
+      workBranch: 'blueprint/edge-task-1',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: [],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).not.toContain('REGRESSING_CATS=');
+    expect(doneScript).toContain('# No regressing categories for this task type');
+  });
+
+  it('generates ./done with single regressing category in the gate', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'edge-task-2',
+      workBranch: 'blueprint/edge-task-2',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: ['correctness'],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('REGRESSING_CATS=("correctness")');
+    expect(doneScript).toContain('Regressing categories need a reasoning field');
+    expect(doneScript).toContain('exit 1');
   });
 });

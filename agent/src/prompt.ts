@@ -509,6 +509,10 @@ interface CodeChangeHelperConfig {
   /** When true, ./check test runs the Docker backend test suite for any
    *  task whose changes touch ``backend/``. Set when base_branch === 'main'. */
   testsOnMainBranch: boolean;
+  /** SR categories whose miss-rate is regressing for this task type.
+   *  When set, ./done validates that each has a non-trivial `reasoning` field
+   *  in check_results before posting COMPLETED. */
+  regressingCategories?: string[];
 }
 
 /** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */
@@ -1331,6 +1335,26 @@ else
   SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review skipped — investigate"],"skip_reason":"'"$SKIP_REASON"'"}'
 fi
 
+# Regressing-category reasoning gate: require non-trivial reasoning for categories
+# that have above-floor miss rates for this task type (embedded at write time).
+# If any are missing, print the gap and exit so Claude can fix the SR JSON first.
+${cfg.regressingCategories && cfg.regressingCategories.length > 0
+  ? `REGRESSING_CATS=(${cfg.regressingCategories.map((c) => `"${c}"`).join(' ')})
+MISSING_REASONING=()
+for _CAT in "\${REGRESSING_CATS[@]}"; do
+  _R=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+  if [ "\${#_R}" -lt 10 ]; then
+    MISSING_REASONING+=("$_CAT")
+  fi
+done
+if [ "\${#MISSING_REASONING[@]}" -gt 0 ]; then
+  echo "[done] Regressing categories need a reasoning field (>=10 chars) in check_results:" >&2
+  for _CAT in "\${MISSING_REASONING[@]}"; do echo "  - $_CAT" >&2; done
+  echo "Update /tmp/self_review_${cfg.taskId}.json and re-run ./done." >&2
+  exit 1
+fi`
+  : '# No regressing categories for this task type — reasoning check skipped.'}
+
 # Optional enrichment: changed_files from git diff — review-pipeline scope
 # analysis, direction credit, rollup management all read this from
 # task.context._pr_changed_files. Without it those signals degrade.
@@ -1627,7 +1651,7 @@ export function formatPlaybook(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "4";
+export const SELF_REVIEW_PROMPT_VERSION = "5";
 
 type SRCatchRateSource = {
   categories?: Record<string, { miss_rate?: number; weighted_miss_rate?: number; current_hit_rate?: number; hit_rate?: number; below_floor?: boolean }>;
@@ -2008,13 +2032,22 @@ Schema:
   "fixes_applied": true | false,
   "prompt_version": "<string from SELF_REVIEW_PROMPT_VERSION — include verbatim>",
   "check_results": {
-    "<category>": { "passed": true | false, "issue": "..." }
+    "<category>": { "passed": true | false, "issue": "...", "reasoning": "..." }
   },
   "blind_spots": ["...", "..."],
   "truncated_files_read": ["path/a.ts", "path/b.ts"],
   "categories": ["incomplete_review"]
 }
 \`\`\`
+
+**Regressing-category reasoning (required for categories in the Self-Review Blind Spots list):**
+If the project context injected a "Self-Review Blind Spots" section naming specific categories
+for this task type, those categories are *regressing* — the dashboard shows increasing miss rates
+for them. For every regressing category in \`check_results\`, add a \`reasoning\` field (~1 sentence)
+describing exactly what you inspected and what evidence supports the pass/fail call. This is
+required for BOTH pass and fail outcomes. Non-regressing categories keep the existing optional
+schema (no \`reasoning\` required). If \`./done\` exits with a "Regressing categories need a
+reasoning field" error, update the SR JSON and re-run \`./done\`.
 
 \`fixes_applied: true\` means YOU caught something during self-review and
 fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`

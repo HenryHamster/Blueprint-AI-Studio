@@ -3873,9 +3873,14 @@ def _make_sr_task(
     human_cats: dict,
     sr_failed_cats: list,
     task_type: str = "create",
+    check_result_overrides: dict[str, dict] | None = None,
 ) -> Task:
     """Build a Task with both _self_review_outcome.check_results and _first_attempt_rejection_categories."""
     check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
+    if check_result_overrides:
+        for cat, overrides in check_result_overrides.items():
+            if cat in check_results:
+                check_results[cat].update(overrides)
     task = Task(
         project_id=project_id,
         title="SR task",
@@ -3968,6 +3973,139 @@ async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(
     assert cat["current_hit_rate"] == round(3 / 5, 3)
     assert cat["miss_rate"] == round(1 - 3 / 5, 3)
     assert cat["previous_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_splits_sr_and_reviewer_hits(
+    db_session: AsyncSession,
+):
+    """Origin tags split combined hits into SR-alone vs reviewer-save counts."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    current_specs = [
+        (["test-coverage"], None),
+        (["test-coverage"], {"test-coverage": {"origin": "reviewer"}}),
+        (
+            ["test-coverage"],
+            {"test-coverage": {"origin": "reviewer_recovery_after_incomplete_sr"}},
+        ),
+        ([], None),
+        ([], None),
+    ]
+    for failed_cats, overrides in current_specs:
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=failed_cats,
+            check_result_overrides=overrides,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    assert cat["sr_alone_hit_count"] == 1
+    assert cat["reviewer_save_hit_count"] == 2
+    assert cat["sr_alone_hit_rate"] == round(1 / 5, 3)
+    assert cat["reviewer_save_rate"] == round(2 / 5, 3)
+    assert cat["current_hit_rate"] == round(
+        cat["sr_alone_hit_rate"] + cat["reviewer_save_rate"], 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_split_excludes_false_positives(
+    db_session: AsyncSession,
+):
+    """Bucket counts only count true positives — FP sr_failed entries (cat not in
+    human_cats for the same task) must not inflate sr_alone/reviewer_save so
+    the split rates always sum to current_hit_rate."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks where human flagged test-coverage (3 hits, 2 misses)
+    # plus 2 tasks where humans flagged "correctness" but SR (incorrectly) flagged
+    # test-coverage. The 2 extra entries are FPs for test-coverage and must not
+    # add to its sr_alone/reviewer_save buckets (the bug being fixed).
+    current_specs = [
+        # human={test-coverage}, sr_failed=[test-coverage] (TP hits)
+        ({"test-coverage": 1}, ["test-coverage"], None),
+        (
+            {"test-coverage": 1},
+            ["test-coverage"],
+            {"test-coverage": {"origin": "reviewer"}},
+        ),
+        (
+            {"test-coverage": 1},
+            ["test-coverage"],
+            {"test-coverage": {"origin": "reviewer_recovery_after_incomplete_sr"}},
+        ),
+        # human={test-coverage}, sr_failed=[] (TP misses)
+        ({"test-coverage": 1}, [], None),
+        ({"test-coverage": 1}, [], None),
+        # human={correctness}, sr_failed=[test-coverage] (FP for test-coverage)
+        ({"correctness": 1}, ["test-coverage"], None),
+        (
+            {"correctness": 1},
+            ["test-coverage"],
+            {"test-coverage": {"origin": "reviewer"}},
+        ),
+    ]
+    for human, failed_cats, overrides in current_specs:
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats=human,
+            sr_failed_cats=failed_cats,
+            check_result_overrides=overrides,
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    # Combined hit_rate counts only TPs (3/5 — the 2 FP entries don't enter
+    # human_count or hit_count).
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    # Buckets must also count only TPs — not the 2 FP entries.
+    assert cat["sr_alone_hit_count"] == 1
+    assert cat["reviewer_save_hit_count"] == 2
+    assert cat["sr_alone_hit_rate"] == round(1 / 5, 3)
+    assert cat["reviewer_save_rate"] == round(2 / 5, 3)
+    # Invariant: split rates sum to combined rate. With the buggy code the FP
+    # entries would inflate either bucket and break this equality.
+    assert round(cat["sr_alone_hit_rate"] + cat["reviewer_save_rate"], 3) == round(
+        cat["current_hit_rate"], 3
+    )
 
 
 @pytest.mark.asyncio
