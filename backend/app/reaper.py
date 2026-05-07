@@ -634,6 +634,7 @@ async def reaper_service():
                             Task.id,
                             Task.status,
                             Task.last_heartbeat,
+                            Task.last_tool_use_at,
                             Task.started_at,
                             Task.created_at,
                             Task.vm_instance_id,
