@@ -1,4 +1,5 @@
 """Catch-up digest and pipeline health summary endpoints."""
+
 import asyncio
 import uuid
 import logging
@@ -14,18 +15,29 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.notification_dispatch import dispatch_external_notification, post_residual_fix_unsuspend_message
+from app.notification_dispatch import (
+    dispatch_external_notification,
+    post_residual_fix_unsuspend_message,
+)
 
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
 from app.time_utils import _to_naive_utc
 from app.models import (
-    Task, TaskStatus, Project, Artifact, ArtifactType, _utcnow,
+    Task,
+    TaskStatus,
+    Project,
+    Artifact,
+    ArtifactType,
+    _utcnow,
     MaxPlanAccount,
-    ResidualRemediationCase, ResidualRemediationCaseStatus,
-    RegressionRemediationCase, RegressionCaseStatus,
+    ResidualRemediationCase,
+    ResidualRemediationCaseStatus,
+    RegressionRemediationCase,
+    RegressionCaseStatus,
     StrategicCycle,
-    Alert, AlertSeverity,
+    Alert,
+    AlertSeverity,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
@@ -56,7 +68,9 @@ router = APIRouter(
 )
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
-_REGRESSION_STALL_THRESHOLD_HOURS = 4  # ACTIVE case without PR older than this → stalled
+_REGRESSION_STALL_THRESHOLD_HOURS = (
+    4  # ACTIVE case without PR older than this → stalled
+)
 
 
 def _stash_projected_task_fields(
@@ -146,7 +160,9 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     }
 
 
-def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, Any] | None":
+def _compute_sr_prediction_accuracy(
+    tasks_with_both: List[Task],
+) -> "Dict[str, Any] | None":
     """Compute self-review prediction accuracy from tasks that have both
     _self_review_outcome.check_results and _first_attempt_rejection_categories.
     Returns None when sample size < 5.
@@ -170,11 +186,17 @@ def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, A
         cached_entry = ctx.get("_first_attempt_categorized_issues")
         cached_buckets = (cached_entry or {}).get("buckets") if cached_entry else None
         if cached_buckets:
-            for cat, issues in _categorize_review_issues(rev_hist, cached=cached_buckets).items():
-                cat_weights[cat] = max(_SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues)
+            for cat, issues in _categorize_review_issues(
+                rev_hist, cached=cached_buckets
+            ).items():
+                cat_weights[cat] = max(
+                    _SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues
+                )
         elif rev_hist:
             for cat, issues in _categorize_review_issues(rev_hist).items():
-                cat_weights[cat] = max(_SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues)
+                cat_weights[cat] = max(
+                    _SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues
+                )
         for cat in human_cats:
             w = cat_weights.get(cat, 1)
             if cat in sr_failed:
@@ -183,42 +205,58 @@ def _compute_sr_prediction_accuracy(tasks_with_both: List[Task]) -> "Dict[str, A
                 w_missed += w
     total_w = w_caught + w_missed
     return {
-        "prediction_hit_rate": round(total_overlap / total_human, 3) if total_human > 0 else None,
+        "prediction_hit_rate": round(total_overlap / total_human, 3)
+        if total_human > 0
+        else None,
         "miss_rate": round(total_missed / total_human, 3) if total_human > 0 else None,
-        "false_alarm_rate": round(total_false / total_sr_failed, 3) if total_sr_failed > 0 else None,
+        "false_alarm_rate": round(total_false / total_sr_failed, 3)
+        if total_sr_failed > 0
+        else None,
         "weighted_hit_rate": round(w_caught / total_w, 3) if total_w > 0 else None,
         "weighted_miss_rate": round(w_missed / total_w, 3) if total_w > 0 else None,
         "sample_size": len(tasks_with_both),
     }
 
 
-def _compute_fresh_reviewer_effectiveness(terminal_tasks: List[Task]) -> "Dict[str, Any]":
+def _compute_fresh_reviewer_effectiveness(
+    terminal_tasks: List[Task],
+) -> "Dict[str, Any]":
     """Compute fresh-reviewer pass effectiveness: approval rate lift and per-category
     hit rate (did human confirm what fresh-reviewer flagged?). Always returns a dict
     so callers can check sample_size before trusting rates.
     """
     code_change_tasks = [
-        t for t in terminal_tasks
+        t
+        for t in terminal_tasks
         if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
         and "_first_attempt_succeeded" in (t.context or {})
     ]
     tasks_with_reviewer = [
-        t for t in code_change_tasks
+        t
+        for t in code_change_tasks
         if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
     ]
     tasks_without_reviewer = [
-        t for t in code_change_tasks
-        if not (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+        t
+        for t in code_change_tasks
+        if not (t.context or {})
+        .get("_self_review_outcome", {})
+        .get("reviewer_findings")
     ]
 
     def _fa_rate(tasks: List[Task]) -> "float | None":
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
             return None
-        return round(sum(1 for t in measured if t.context["_first_attempt_succeeded"]) / len(measured), 2)
+        return round(
+            sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+            / len(measured),
+            2,
+        )
 
     tasks_with_both = [
-        t for t in tasks_with_reviewer
+        t
+        for t in tasks_with_reviewer
         if "_first_attempt_rejection_categories" in (t.context or {})
     ]
     cat_flagged: Dict[str, int] = {}
@@ -229,7 +267,9 @@ def _compute_fresh_reviewer_effectiveness(terminal_tasks: List[Task]) -> "Dict[s
         findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-        agent_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        agent_failed = {
+            c for c, r in check_results.items() if not r.get("passed", True)
+        }
         for finding in findings:
             cat = finding.get("category") if isinstance(finding, dict) else None
             if not cat:
@@ -285,6 +325,7 @@ def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -
     Entries on either side missing/non-string ``case`` are skipped — we cannot
     correlate them, and per spec we skip rather than crash.
     """
+
     def _norm(c: Any) -> "str | None":
         return c.strip().lower() if isinstance(c, str) and c.strip() else None
 
@@ -307,7 +348,9 @@ def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -
     return False
 
 
-def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, Any] | None":
+def _compute_edges_considered_metrics(
+    terminal_tasks: List[Task],
+) -> "Dict[str, Any] | None":
     """Rolling metrics for the edges_considered field in self-review outcomes.
 
     Computes avg edges enumerated per task and unhandled-edge-flagged rate.
@@ -325,7 +368,8 @@ def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, 
     Returns None when fewer than 3 qualifying code-change tasks exist.
     """
     code_change_tasks = [
-        t for t in terminal_tasks
+        t
+        for t in terminal_tasks
         if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
         and "_self_review_outcome" in (t.context or {})
     ]
@@ -342,7 +386,9 @@ def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, 
     n_with_reviewer = 0
     reviewer_caught = 0
     for t in code_change_tasks:
-        edges = (t.context or {}).get("_self_review_outcome", {}).get("edges_considered") or []
+        edges = (t.context or {}).get("_self_review_outcome", {}).get(
+            "edges_considered"
+        ) or []
         if not isinstance(edges, list):
             edges = []
         author_e, reviewer_e = _partition_edges_by_origin(edges)
@@ -365,12 +411,18 @@ def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, 
     _edge_cats = {"correctness", "error-handling"}
 
     def _rejection_rate(tasks: List[Task]) -> "float | None":
-        measured = [t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})]
+        measured = [
+            t
+            for t in tasks
+            if "_first_attempt_rejection_categories" in (t.context or {})
+        ]
         if not measured:
             return None
         flagged = sum(
-            1 for t in measured
-            if _edge_cats & set(t.context.get("_first_attempt_rejection_categories") or [])
+            1
+            for t in measured
+            if _edge_cats
+            & set(t.context.get("_first_attempt_rejection_categories") or [])
         )
         return round(flagged / len(measured), 3)
 
@@ -381,11 +433,19 @@ def _compute_edges_considered_metrics(terminal_tasks: List[Task]) -> "Dict[str, 
         "tasks_with_edges_count": n_with,
         "tasks_with_edges_rate": round(n_with / sample_size, 3),
         "avg_edges_per_task": round(total_edges / n_with, 2) if n_with else None,
-        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3) if n_with else None,
+        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3)
+        if n_with
+        else None,
         "correctness_rejection_rate_with_edges": _rejection_rate(tasks_with_edges),
-        "correctness_rejection_rate_without_edges": _rejection_rate(tasks_without_edges),
-        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2) if n_with_author else None,
-        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2) if n_with_reviewer else None,
+        "correctness_rejection_rate_without_edges": _rejection_rate(
+            tasks_without_edges
+        ),
+        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
+        if n_with_author
+        else None,
+        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2)
+        if n_with_reviewer
+        else None,
         "tasks_with_reviewer_edges_count": n_with_reviewer,
         "tasks_with_reviewer_edges_rate": round(n_with_reviewer / sample_size, 3),
         "reviewer_caught_count": reviewer_caught,
@@ -398,6 +458,7 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
     from a list of terminal tasks. Returns dict with three keys, each None when
     sample sizes are too small.
     """
+
     def _fa_rate(tasks):
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
@@ -405,10 +466,24 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
         succ = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
         return round(succ / len(measured), 2)
 
-    tasks_with_sr = [t for t in terminal_tasks if "_self_review_outcome" in (t.context or {})]
-    tasks_without_sr = [t for t in terminal_tasks if "_self_review_outcome" not in (t.context or {})]
-    sr_clean = [t for t in tasks_with_sr if not (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)]
-    sr_fixed = [t for t in tasks_with_sr if (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)]
+    tasks_with_sr = [
+        t for t in terminal_tasks if "_self_review_outcome" in (t.context or {})
+    ]
+    tasks_without_sr = [
+        t for t in terminal_tasks if "_self_review_outcome" not in (t.context or {})
+    ]
+    sr_clean = [
+        t
+        for t in tasks_with_sr
+        if not (t.context or {})
+        .get("_self_review_outcome", {})
+        .get("fixes_applied", False)
+    ]
+    sr_fixed = [
+        t
+        for t in tasks_with_sr
+        if (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)
+    ]
 
     self_review_effectiveness: Dict[str, Any] | None = None
     if len(tasks_with_sr) >= 3:
@@ -421,17 +496,28 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
         }
 
     review_tasks = [
-        t for t in terminal_tasks
+        t
+        for t in terminal_tasks
         if (t.first_payload or {}).get("type") == "review"
         and (t.context or {}).get("blueprint_review_verdict") is not None
     ]
     review_accuracy: Dict[str, Any] | None = None
     if len(review_tasks) >= 5:
         total = len(review_tasks)
-        overrides = sum(1 for t in review_tasks if (t.context or {}).get("user_overrode_review"))
-        dismissals = sum(1 for t in review_tasks if (t.context or {}).get("review_dismissed"))
-        misses = sum(1 for t in review_tasks if (t.context or {}).get("user_caught_issues"))
-        approvals = sum(1 for t in review_tasks if (t.context or {}).get("blueprint_review_verdict") == "APPROVE")
+        overrides = sum(
+            1 for t in review_tasks if (t.context or {}).get("user_overrode_review")
+        )
+        dismissals = sum(
+            1 for t in review_tasks if (t.context or {}).get("review_dismissed")
+        )
+        misses = sum(
+            1 for t in review_tasks if (t.context or {}).get("user_caught_issues")
+        )
+        approvals = sum(
+            1
+            for t in review_tasks
+            if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
+        )
         review_accuracy = {
             "total_reviews": total,
             "overrides": overrides,
@@ -443,7 +529,8 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
         }
 
     tasks_with_both = [
-        t for t in terminal_tasks
+        t
+        for t in terminal_tasks
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
         and "_first_attempt_rejection_categories" in (t.context or {})
     ]
@@ -466,6 +553,7 @@ def _compute_first_attempt_breakdowns(
 ) -> Dict[str, Any]:
     """Compute overall first-attempt success rate plus playbook and arch-context
     effectiveness comparisons from a list of terminal tasks."""
+
     def _fa_rate(tasks):
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
@@ -473,11 +561,19 @@ def _compute_first_attempt_breakdowns(
         succ = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
         return round(succ / len(measured), 2)
 
-    measured = [t for t in terminal_tasks if "_first_attempt_succeeded" in (t.context or {})]
+    measured = [
+        t for t in terminal_tasks if "_first_attempt_succeeded" in (t.context or {})
+    ]
     with_pb = [t for t in measured if (t.context or {}).get("_had_playbook") is True]
-    without_pb = [t for t in measured if (t.context or {}).get("_had_playbook") is False]
-    with_arch = [t for t in measured if (t.context or {}).get("_had_arch_context") is True]
-    without_arch = [t for t in measured if (t.context or {}).get("_had_arch_context") is False]
+    without_pb = [
+        t for t in measured if (t.context or {}).get("_had_playbook") is False
+    ]
+    with_arch = [
+        t for t in measured if (t.context or {}).get("_had_arch_context") is True
+    ]
+    without_arch = [
+        t for t in measured if (t.context or {}).get("_had_arch_context") is False
+    ]
     sample_size = len(measured)
 
     by_type_groups: Dict[str, list] = {}
@@ -515,7 +611,8 @@ def _compute_first_attempt_breakdowns(
 
     first_attempt_by_review_category: Dict[str, float] | None = None
     failed_with_cats = [
-        t for t in terminal_tasks
+        t
+        for t in terminal_tasks
         if "_first_attempt_rejection_categories" in (t.context or {})
     ]
     if failed_with_cats:
@@ -544,7 +641,9 @@ def _compute_first_attempt_breakdowns(
     }
 
 
-def _compute_regression_case_summary(rows: List[RegressionRemediationCase]) -> Dict[str, Any]:
+def _compute_regression_case_summary(
+    rows: List[RegressionRemediationCase],
+) -> Dict[str, Any]:
     by_class: Dict[str, Dict[str, List[float]]] = {}
     for case in rows:
         latest_merged_at = None
@@ -552,27 +651,51 @@ def _compute_regression_case_summary(rows: List[RegressionRemediationCase]) -> D
         for entry in case.fingerprint_to_fix_log or []:
             if entry.get("merged_at"):
                 latest_merged_at = _to_naive_utc(
-                    datetime.fromisoformat(str(entry["merged_at"]).replace("Z", "+00:00"))
+                    datetime.fromisoformat(
+                        str(entry["merged_at"]).replace("Z", "+00:00")
+                    )
                 )
             if entry.get("recovered_at") and latest_merged_at is not None:
                 merged_at = latest_merged_at
                 recovered_at = _to_naive_utc(
-                    datetime.fromisoformat(str(entry["recovered_at"]).replace("Z", "+00:00"))
+                    datetime.fromisoformat(
+                        str(entry["recovered_at"]).replace("Z", "+00:00")
+                    )
                 )
         if case.first_seen_at and merged_at and recovered_at:
-            bucket = by_class.setdefault(case.regression_class, {"to_merged": [], "to_recovered": [], "to_detect": []})
-            bucket["to_merged"].append((_to_naive_utc(merged_at) - _to_naive_utc(case.first_seen_at)).total_seconds())
+            bucket = by_class.setdefault(
+                case.regression_class,
+                {"to_merged": [], "to_recovered": [], "to_detect": []},
+            )
+            bucket["to_merged"].append(
+                (
+                    _to_naive_utc(merged_at) - _to_naive_utc(case.first_seen_at)
+                ).total_seconds()
+            )
             bucket["to_recovered"].append((recovered_at - merged_at).total_seconds())
             if case.signal_first_crossed_at:
-                bucket["to_detect"].append((_to_naive_utc(case.first_seen_at) - _to_naive_utc(case.signal_first_crossed_at)).total_seconds())
+                bucket["to_detect"].append(
+                    (
+                        _to_naive_utc(case.first_seen_at)
+                        - _to_naive_utc(case.signal_first_crossed_at)
+                    ).total_seconds()
+                )
     return {
         "by_regression_class": [
             {
                 "regression_class": regression_class,
                 "count": len(bucket["to_merged"]),
-                "median_time_from_first_seen_to_merged_seconds": round(statistics.median(bucket["to_merged"]), 3),
-                "median_time_from_merged_to_recovered_seconds": round(statistics.median(bucket["to_recovered"]), 3),
-                "median_time_to_detect_seconds": round(statistics.median(bucket["to_detect"]), 3) if bucket["to_detect"] else None,
+                "median_time_from_first_seen_to_merged_seconds": round(
+                    statistics.median(bucket["to_merged"]), 3
+                ),
+                "median_time_from_merged_to_recovered_seconds": round(
+                    statistics.median(bucket["to_recovered"]), 3
+                ),
+                "median_time_to_detect_seconds": round(
+                    statistics.median(bucket["to_detect"]), 3
+                )
+                if bucket["to_detect"]
+                else None,
             }
             for regression_class, bucket in sorted(by_class.items())
         ]
@@ -582,22 +705,27 @@ def _compute_regression_case_summary(rows: List[RegressionRemediationCase]) -> D
 _REVIEW_ELIGIBLE_TYPES = {"create", "refactor"}
 
 
-def _compute_first_review_approval_breakdowns(terminal_tasks: List[Task]) -> Dict[str, Any]:
+def _compute_first_review_approval_breakdowns(
+    terminal_tasks: List[Task],
+) -> Dict[str, Any]:
     """Compute first-review approval rate with playbook/measurement/type/scope breakdowns.
 
     A task is 'review-eligible' if it is a create/refactor type with pr_merged=True.
     A task is 'approved on first review' if _first_attempt_rejection_categories is absent.
     """
+
     def _rate(tasks):
         eligible = [
-            t for t in tasks
+            t
+            for t in tasks
             if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
             and (t.context or {}).get("pr_merged") is True
         ]
         if not eligible:
             return None
         approved = sum(
-            1 for t in eligible
+            1
+            for t in eligible
             if "_first_attempt_rejection_categories" not in (t.context or {})
         )
         return round(approved / len(eligible), 2)
@@ -621,13 +749,26 @@ def _compute_first_review_approval_breakdowns(terminal_tasks: List[Task]) -> Dic
         if r is not None:
             fra_by_scope[scope] = r
 
-    with_pb = [t for t in terminal_tasks if (t.context or {}).get("_had_playbook") is True]
-    without_pb = [t for t in terminal_tasks if (t.context or {}).get("_had_playbook") is False]
-    with_m = [t for t in terminal_tasks if (t.context or {}).get("_had_review_measurements") is True]
-    without_m = [t for t in terminal_tasks if (t.context or {}).get("_had_review_measurements") is False]
+    with_pb = [
+        t for t in terminal_tasks if (t.context or {}).get("_had_playbook") is True
+    ]
+    without_pb = [
+        t for t in terminal_tasks if (t.context or {}).get("_had_playbook") is False
+    ]
+    with_m = [
+        t
+        for t in terminal_tasks
+        if (t.context or {}).get("_had_review_measurements") is True
+    ]
+    without_m = [
+        t
+        for t in terminal_tasks
+        if (t.context or {}).get("_had_review_measurements") is False
+    ]
 
     eligible_merged = [
-        t for t in terminal_tasks
+        t
+        for t in terminal_tasks
         if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
         and (t.context or {}).get("pr_merged") is True
     ]
@@ -644,7 +785,9 @@ def _compute_first_review_approval_breakdowns(terminal_tasks: List[Task]) -> Dic
     }
 
 
-async def compute_pipeline_health_summary(session: AsyncSession, project_id: uuid.UUID, lookback_hours: int = 24) -> Dict[str, Any]:
+async def compute_pipeline_health_summary(
+    session: AsyncSession, project_id: uuid.UUID, lookback_hours: int = 24
+) -> Dict[str, Any]:
     """Compute lightweight pipeline health metrics for the specified lookback window.
 
     Returns a dict with:
@@ -676,30 +819,38 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # Post-filter by completion timestamp
     completed_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.COMPLETED and _derive_completed_at(t) >= window_start
     ]
     failed_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
     ]
 
     total_terminal = len(completed_tasks) + len(failed_tasks)
-    success_rate = round(len(completed_tasks) / total_terminal, 2) if total_terminal > 0 else None
+    success_rate = (
+        round(len(completed_tasks) / total_terminal, 2) if total_terminal > 0 else None
+    )
 
     # Previous window for trend comparison
     prev_completed = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.COMPLETED
         and prev_window_start <= _derive_completed_at(t) < window_start
     ]
     prev_failed = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.FAILED
         and prev_window_start <= _derive_completed_at(t) < window_start
     ]
     prev_total = len(prev_completed) + len(prev_failed)
-    prev_success_rate = round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
+    prev_success_rate = (
+        round(len(prev_completed) / prev_total, 2) if prev_total > 0 else None
+    )
 
     trend: str | None = None
     if success_rate is not None and prev_success_rate is not None:
@@ -722,12 +873,17 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     from app.failure_classification import (
         classify_failure_taxonomy as _classify_taxonomy,
-        TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
-        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+        TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_CODE_DEFECT,
+        TAXONOMY_INFRA_RELATED,
     )
+
     _taxonomy_keys = (
-        TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
-        TAXONOMY_INFRA_RELATED, TAXONOMY_CODE_DEFECT,
+        TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_INFRA_RELATED,
+        TAXONOMY_CODE_DEFECT,
     )
     taxonomy_counts: Dict[str, int] = {k: 0 for k in _taxonomy_keys}
     for t in failed_tasks:
@@ -737,18 +893,24 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "categories": {
             k: {
                 "count": taxonomy_counts[k],
-                "percentage": round(taxonomy_counts[k] / _tax_total * 100, 1) if _tax_total else 0.0,
+                "percentage": round(taxonomy_counts[k] / _tax_total * 100, 1)
+                if _tax_total
+                else 0.0,
             }
             for k in _taxonomy_keys
         },
         "total_failures": _tax_total,
-        "dominant_category": max(_taxonomy_keys, key=lambda k: taxonomy_counts[k]) if _tax_total else None,
+        "dominant_category": max(_taxonomy_keys, key=lambda k: taxonomy_counts[k])
+        if _tax_total
+        else None,
     }
 
     _scope_taxonomy_counts: Dict[str, Dict[str, int]] = {}
     for t in failed_tasks:
         scope = (t.context or {}).get("scope", "unknown")
-        bucket = _scope_taxonomy_counts.setdefault(scope, {k: 0 for k in _taxonomy_keys})
+        bucket = _scope_taxonomy_counts.setdefault(
+            scope, {k: 0 for k in _taxonomy_keys}
+        )
         bucket[_classify_taxonomy(t)] += 1
     failure_taxonomy_by_scope = {}
     for scope, counts in _scope_taxonomy_counts.items():
@@ -762,14 +924,18 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 for k in _taxonomy_keys
             },
             "total_failures": tot,
-            "dominant_category": max(_taxonomy_keys, key=lambda k: counts[k]) if tot else None,
+            "dominant_category": max(_taxonomy_keys, key=lambda k: counts[k])
+            if tot
+            else None,
         }
 
     # Direction stats: conversion_rate and cycle count per active direction
     direction_stats: List[Dict[str, Any]] = []
     project = await session.get(Project, project_id)
     if project:
-        active_directions = [d for d in (project.directions or []) if d.get("status") == "active"]
+        active_directions = [
+            d for d in (project.directions or []) if d.get("status") == "active"
+        ]
 
         dir_tasks: Dict[str, list] = {}
         for t in all_tasks:
@@ -784,7 +950,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
             tasks_for_dir = dir_tasks.get(did, [])
             cycles = sum(
-                1 for t in tasks_for_dir
+                1
+                for t in tasks_for_dir
                 if t.status == TaskStatus.COMPLETED
                 and (t.first_payload).get("type", "create") == "research"
                 and _derive_completed_at(t) >= window_start
@@ -809,25 +976,35 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 except (ValueError, TypeError):
                     pass
 
-            dir_conversion_rate = round(prs_merged / tasks_created_total, 3) if tasks_created_total > 0 else None
+            dir_conversion_rate = (
+                round(prs_merged / tasks_created_total, 3)
+                if tasks_created_total > 0
+                else None
+            )
             acceptance_denom = prs_merged + prs_rejected
-            acceptance_rate = round(prs_merged / acceptance_denom, 3) if acceptance_denom > 0 else None
+            acceptance_rate = (
+                round(prs_merged / acceptance_denom, 3)
+                if acceptance_denom > 0
+                else None
+            )
             dominant_dropout = (
                 max(sd_totals, key=lambda k: sd_totals[k])
                 if sd_totals and max(sd_totals.values()) > 0
                 else None
             )
-            direction_stats.append({
-                "direction_id": did,
-                "cycles": cycles,
-                "possibly_saturated": bool(d.get("possibly_saturated", False)),
-                "conversion_rate": dir_conversion_rate,
-                "dominant_dropout_stage": dominant_dropout,
-                "completion_criteria": d.get("completion_criteria"),
-                "possibly_complete": bool(d.get("possibly_complete", False)),
-                "category": d.get("category"),
-                "acceptance_rate": acceptance_rate,
-            })
+            direction_stats.append(
+                {
+                    "direction_id": did,
+                    "cycles": cycles,
+                    "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                    "conversion_rate": dir_conversion_rate,
+                    "dominant_dropout_stage": dominant_dropout,
+                    "completion_criteria": d.get("completion_criteria"),
+                    "possibly_complete": bool(d.get("possibly_complete", False)),
+                    "category": d.get("category"),
+                    "acceptance_rate": acceptance_rate,
+                }
+            )
 
         direction_stats.sort(key=lambda x: x["cycles"], reverse=True)
 
@@ -844,7 +1021,11 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         for entry in (d.get("research_history") or [])
         if _safe_ts_in_window(entry.get("timestamp"), window_start)
     )
-    pipeline_conversion_rate = round(_pipeline_total_merged / _pipeline_total_created, 3) if _pipeline_total_created > 0 else None
+    pipeline_conversion_rate = (
+        round(_pipeline_total_merged / _pipeline_total_created, 3)
+        if _pipeline_total_created > 0
+        else None
+    )
 
     # First-attempt success rate: tasks that completed on the first try
     terminal_tasks_24h = completed_tasks + failed_tasks
@@ -857,14 +1038,17 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         if not tasks:
             return None
         first_success = sum(
-            1 for t in tasks
+            1
+            for t in tasks
             if (t.context or {}).get("_first_attempt_succeeded") is True
         )
         # Only count tasks that have the metric recorded
         measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
         if not measured:
             return None
-        first_success = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+        first_success = sum(
+            1 for t in measured if t.context["_first_attempt_succeeded"]
+        )
         return round(first_success / len(measured), 2)
 
     _review_eligible_types = {"create", "refactor"}
@@ -877,46 +1061,59 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         in its context (meaning the first review returned APPROVE, not REQUEST_CHANGES).
         """
         eligible = [
-            t for t in tasks
+            t
+            for t in tasks
             if (t.first_payload or {}).get("type", "create") in _review_eligible_types
             and (t.context or {}).get("pr_merged") is True
         ]
         if not eligible:
             return None
         approved = sum(
-            1 for t in eligible
+            1
+            for t in eligible
             if "_first_attempt_rejection_categories" not in (t.context or {})
         )
         return round(approved / len(eligible), 2)
 
     tasks_with_playbook = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.context or {}).get("_had_playbook") is True
         and "_first_attempt_succeeded" in (t.context or {})
     ]
     tasks_without_playbook = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.context or {}).get("_had_playbook") is False
         and "_first_attempt_succeeded" in (t.context or {})
     ]
 
-    _arch_eligible = [t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]
-    tasks_with_arch_context = [t for t in _arch_eligible if (t.context or {}).get("_had_arch_context") is True]
-    tasks_without_arch_context = [t for t in _arch_eligible if (t.context or {}).get("_had_arch_context") is False]
+    _arch_eligible = [
+        t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})
+    ]
+    tasks_with_arch_context = [
+        t for t in _arch_eligible if (t.context or {}).get("_had_arch_context") is True
+    ]
+    tasks_without_arch_context = [
+        t for t in _arch_eligible if (t.context or {}).get("_had_arch_context") is False
+    ]
 
     tasks_with_review_measurements = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.context or {}).get("_had_review_measurements") is True
         and "_first_attempt_succeeded" in (t.context or {})
     ]
     tasks_with_measurements = tasks_with_review_measurements
     tasks_without_review_measurements = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.context or {}).get("_had_review_measurements") is False
         and "_first_attempt_succeeded" in (t.context or {})
     ]
     tasks_without_measurements = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if not (t.context or {}).get("_had_review_measurements")
         and "_first_attempt_succeeded" in (t.context or {})
     ]
@@ -941,23 +1138,25 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     # Scope merge rates: per-scope merged/created from research_history scope_breakdown
     _scope_cur: Dict[str, Dict[str, int]] = {}
     _scope_prev: Dict[str, Dict[str, int]] = {}
-    for d in (project.directions or [] if project else []):
-        for entry in (d.get("research_history") or []):
+    for d in project.directions or [] if project else []:
+        for entry in d.get("research_history") or []:
             ts_str = entry.get("timestamp")
             sb = entry.get("scope_breakdown") or {}
             if not sb:
                 continue
             in_cur = _safe_ts_in_window(ts_str, window_start)
-            in_prev = (
-                not in_cur
-                and _safe_ts_in_window(ts_str, prev_window_start)
-            )
+            in_prev = not in_cur and _safe_ts_in_window(ts_str, prev_window_start)
             target = _scope_cur if in_cur else (_scope_prev if in_prev else None)
             if target is None:
                 continue
             for scope, counts in sb.items():
                 if scope not in target:
-                    target[scope] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
+                    target[scope] = {
+                        "created": 0,
+                        "merged": 0,
+                        "calibrated_in": 0,
+                        "calibrated_out": 0,
+                    }
                 target[scope]["created"] += counts.get("created") or 0
                 target[scope]["merged"] += counts.get("merged") or 0
                 target[scope]["calibrated_in"] += counts.get("calibrated_in") or 0
@@ -970,9 +1169,17 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         prev = _scope_prev.get(scope, {})
         cur_created = cur.get("created", 0)
         prev_created = prev.get("created", 0)
-        cur_rate = round(cur.get("merged", 0) / cur_created, 3) if cur_created > 0 else None
-        prev_rate = round(prev.get("merged", 0) / prev_created, 3) if prev_created > 0 else None
-        delta = round(cur_rate - prev_rate, 3) if (cur_rate is not None and prev_rate is not None) else None
+        cur_rate = (
+            round(cur.get("merged", 0) / cur_created, 3) if cur_created > 0 else None
+        )
+        prev_rate = (
+            round(prev.get("merged", 0) / prev_created, 3) if prev_created > 0 else None
+        )
+        delta = (
+            round(cur_rate - prev_rate, 3)
+            if (cur_rate is not None and prev_rate is not None)
+            else None
+        )
         scope_trend: str | None = None
         if delta is not None:
             if delta > 0.05:
@@ -994,7 +1201,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # Medium-scope review iterations: average iteration count for medium-scope terminal tasks
     medium_scope_tasks_with_loop = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.context or {}).get("scope") == "medium"
         and (t.context or {}).get("review_loop") is not None
     ]
@@ -1004,7 +1212,9 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             (t.context or {}).get("review_loop", {}).get("iteration", 0)
             for t in medium_scope_tasks_with_loop
         )
-        medium_scope_review_iterations = round(total_iters / len(medium_scope_tasks_with_loop), 2)
+        medium_scope_review_iterations = round(
+            total_iters / len(medium_scope_tasks_with_loop), 2
+        )
 
     current_first_attempt_rate = _first_attempt_rate(terminal_tasks_24h)
 
@@ -1026,7 +1236,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     # first-attempt rejections, as a fraction of tasks that had their first review rejected.
     first_attempt_by_review_category: Dict[str, float] | None = None
     first_attempt_failed_with_cats = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if "_first_attempt_rejection_categories" in (t.context or {})
     ]
     if first_attempt_failed_with_cats:
@@ -1042,29 +1253,66 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         }
 
     def _arch_rejection_rate(tasks: list) -> float | None:
-        failed = [t for t in tasks if "_first_attempt_rejection_categories" in (t.context or {})]
+        failed = [
+            t
+            for t in tasks
+            if "_first_attempt_rejection_categories" in (t.context or {})
+        ]
         if not failed:
             return None
-        arch = sum(1 for t in failed if "architecture" in (t.context or {}).get("_first_attempt_rejection_categories", {}))
+        arch = sum(
+            1
+            for t in failed
+            if "architecture"
+            in (t.context or {}).get("_first_attempt_rejection_categories", {})
+        )
         return round(arch / len(failed), 2)
 
     first_attempt_success_rate = {
         "overall": current_first_attempt_rate,
         "trend": first_attempt_trend,
-        "with_playbook": _first_attempt_rate(tasks_with_playbook) if tasks_with_playbook else None,
-        "without_playbook": _first_attempt_rate(tasks_without_playbook) if tasks_without_playbook else None,
-        "with_arch_context": _first_attempt_rate(tasks_with_arch_context) if tasks_with_arch_context else None,
-        "without_arch_context": _first_attempt_rate(tasks_without_arch_context) if tasks_without_arch_context else None,
-        "arch_rejection_rate_with_context": _arch_rejection_rate(tasks_with_arch_context),
-        "arch_rejection_rate_without_context": _arch_rejection_rate(tasks_without_arch_context),
-        "with_review_measurements": _first_attempt_rate(tasks_with_review_measurements) if tasks_with_review_measurements else None,
-        "without_review_measurements": _first_attempt_rate(tasks_without_review_measurements) if tasks_without_review_measurements else None,
-        "sample_size": len([t for t in terminal_tasks_24h if "_first_attempt_succeeded" in (t.context or {})]),
+        "with_playbook": _first_attempt_rate(tasks_with_playbook)
+        if tasks_with_playbook
+        else None,
+        "without_playbook": _first_attempt_rate(tasks_without_playbook)
+        if tasks_without_playbook
+        else None,
+        "with_arch_context": _first_attempt_rate(tasks_with_arch_context)
+        if tasks_with_arch_context
+        else None,
+        "without_arch_context": _first_attempt_rate(tasks_without_arch_context)
+        if tasks_without_arch_context
+        else None,
+        "arch_rejection_rate_with_context": _arch_rejection_rate(
+            tasks_with_arch_context
+        ),
+        "arch_rejection_rate_without_context": _arch_rejection_rate(
+            tasks_without_arch_context
+        ),
+        "with_review_measurements": _first_attempt_rate(tasks_with_review_measurements)
+        if tasks_with_review_measurements
+        else None,
+        "without_review_measurements": _first_attempt_rate(
+            tasks_without_review_measurements
+        )
+        if tasks_without_review_measurements
+        else None,
+        "sample_size": len(
+            [
+                t
+                for t in terminal_tasks_24h
+                if "_first_attempt_succeeded" in (t.context or {})
+            ]
+        ),
         "by_type": first_attempt_by_type,
         "by_scope": first_attempt_by_scope,
         "first_attempt_by_review_category": first_attempt_by_review_category,
-        "with_measurements": _first_attempt_rate(tasks_with_measurements) if tasks_with_measurements else None,
-        "without_measurements": _first_attempt_rate(tasks_without_measurements) if tasks_without_measurements else None,
+        "with_measurements": _first_attempt_rate(tasks_with_measurements)
+        if tasks_with_measurements
+        else None,
+        "without_measurements": _first_attempt_rate(tasks_without_measurements)
+        if tasks_without_measurements
+        else None,
     }
 
     # First-review approval rate: of create/refactor tasks that merged, what fraction
@@ -1083,7 +1331,8 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
             _fra_by_scope[scope] = rate
 
     _review_eligible_merged = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.first_payload or {}).get("type", "create") in _review_eligible_types
         and (t.context or {}).get("pr_merged") is True
     ]
@@ -1100,19 +1349,21 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # Self-review effectiveness: correlate self-review verdicts with first-attempt approval outcomes
     tasks_with_self_review = [
-        t for t in terminal_tasks_24h
-        if "_self_review_outcome" in (t.context or {})
+        t for t in terminal_tasks_24h if "_self_review_outcome" in (t.context or {})
     ]
     tasks_without_self_review = [
-        t for t in terminal_tasks_24h
-        if "_self_review_outcome" not in (t.context or {})
+        t for t in terminal_tasks_24h if "_self_review_outcome" not in (t.context or {})
     ]
     tasks_self_review_clean = [
-        t for t in tasks_with_self_review
-        if not (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)
+        t
+        for t in tasks_with_self_review
+        if not (t.context or {})
+        .get("_self_review_outcome", {})
+        .get("fixes_applied", False)
     ]
     tasks_self_review_fixed = [
-        t for t in tasks_with_self_review
+        t
+        for t in tasks_with_self_review
         if (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)
     ]
 
@@ -1122,22 +1373,44 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         # between tasks where that category flagged issues vs tasks where it passed clean.
         all_categories: set = set()
         for t in tasks_with_self_review:
-            check_results = (t.context or {}).get("_self_review_outcome", {}).get("check_results") or {}
+            check_results = (t.context or {}).get("_self_review_outcome", {}).get(
+                "check_results"
+            ) or {}
             all_categories.update(check_results.keys())
 
         category_correlation: Dict[str, Any] = {}
         for cat in all_categories:
             tasks_cat_findings = [
-                t for t in tasks_with_self_review
-                if not (t.context or {}).get("_self_review_outcome", {}).get("check_results", {}).get(cat, {}).get("passed", True)
+                t
+                for t in tasks_with_self_review
+                if not (t.context or {})
+                .get("_self_review_outcome", {})
+                .get("check_results", {})
+                .get(cat, {})
+                .get("passed", True)
             ]
             tasks_cat_clean = [
-                t for t in tasks_with_self_review
-                if cat in ((t.context or {}).get("_self_review_outcome", {}).get("check_results") or {})
-                and (t.context or {}).get("_self_review_outcome", {}).get("check_results", {}).get(cat, {}).get("passed", True)
+                t
+                for t in tasks_with_self_review
+                if cat
+                in (
+                    (t.context or {})
+                    .get("_self_review_outcome", {})
+                    .get("check_results")
+                    or {}
+                )
+                and (t.context or {})
+                .get("_self_review_outcome", {})
+                .get("check_results", {})
+                .get(cat, {})
+                .get("passed", True)
             ]
-            cat_findings_rate = _first_attempt_rate(tasks_cat_findings) if tasks_cat_findings else None
-            cat_clean_rate = _first_attempt_rate(tasks_cat_clean) if tasks_cat_clean else None
+            cat_findings_rate = (
+                _first_attempt_rate(tasks_cat_findings) if tasks_cat_findings else None
+            )
+            cat_clean_rate = (
+                _first_attempt_rate(tasks_cat_clean) if tasks_cat_clean else None
+            )
             if cat_findings_rate is not None or cat_clean_rate is not None:
                 category_correlation[cat] = {
                     "with_findings_approval_rate": cat_findings_rate,
@@ -1145,8 +1418,12 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 }
 
         self_review_effectiveness = {
-            "with_self_review_approval_rate": _first_attempt_rate(tasks_with_self_review),
-            "without_self_review_approval_rate": _first_attempt_rate(tasks_without_self_review),
+            "with_self_review_approval_rate": _first_attempt_rate(
+                tasks_with_self_review
+            ),
+            "without_self_review_approval_rate": _first_attempt_rate(
+                tasks_without_self_review
+            ),
             "clean_verdict_approval_rate": _first_attempt_rate(tasks_self_review_clean),
             "fixed_verdict_approval_rate": _first_attempt_rate(tasks_self_review_fixed),
             "sample_size": len(tasks_with_self_review),
@@ -1155,18 +1432,26 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # Review accuracy: precision and recall from user feedback signals on completed review tasks
     review_tasks = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.first_payload or {}).get("type") == "review"
         and (t.context or {}).get("blueprint_review_verdict") is not None
     ]
     review_accuracy: Dict[str, Any] | None = None
     if len(review_tasks) >= 5:
         total_reviews = len(review_tasks)
-        overrides = sum(1 for t in review_tasks if (t.context or {}).get("user_overrode_review"))
-        dismissals = sum(1 for t in review_tasks if (t.context or {}).get("review_dismissed"))
-        misses = sum(1 for t in review_tasks if (t.context or {}).get("user_caught_issues"))
+        overrides = sum(
+            1 for t in review_tasks if (t.context or {}).get("user_overrode_review")
+        )
+        dismissals = sum(
+            1 for t in review_tasks if (t.context or {}).get("review_dismissed")
+        )
+        misses = sum(
+            1 for t in review_tasks if (t.context or {}).get("user_caught_issues")
+        )
         total_approvals = sum(
-            1 for t in review_tasks
+            1
+            for t in review_tasks
             if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
         )
         precision = round(1 - (overrides + dismissals) / total_reviews, 2)
@@ -1209,6 +1494,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
 
     # SR catch-rate trends from compute_sr_catch_rate_trends stored in project.design_doc.
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
+    sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     if project and project.design_doc:
         sr_trends = project.design_doc.get("sr_catch_rate_trends") or {}
         if sr_trends:
@@ -1217,6 +1503,9 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 "categories": sr_trends.get("categories") or {},
                 "by_task_type": sr_trends.get("by_task_type") or {},
             }
+        sr_rrts = project.design_doc.get("sr_regression_risk_test_signal_trends")
+        if sr_rrts:
+            sr_regression_risk_test_signal_trends = sr_rrts
 
     # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend stored in project.design_doc.
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
@@ -1264,17 +1553,21 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
     auto_playbook_idle_retired_24h: Optional[int] = None
     if project and project.design_doc:
         from app.playbook_learning import count_idle_auto_retired_within  # noqa: PLC0415
+
         auto_playbook_idle_retired_24h = count_idle_auto_retired_within(
             project.design_doc, hours=24
         )
 
     # Self-review prediction accuracy: compare self-review check_results against human rejection categories
     tasks_with_both_24h = [
-        t for t in terminal_tasks_24h
+        t
+        for t in terminal_tasks_24h
         if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
         and "_first_attempt_rejection_categories" in (t.context or {})
     ]
-    self_review_prediction_accuracy = _compute_sr_prediction_accuracy(tasks_with_both_24h)
+    self_review_prediction_accuracy = _compute_sr_prediction_accuracy(
+        tasks_with_both_24h
+    )
     edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks_24h)
 
     # Medium-scope pre/post investment measurement — computed over a longer lookback
@@ -1286,17 +1579,24 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         ms_result = await session.execute(
             select(Task).where(
                 Task.project_id == project_id,
-                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
+                Task.status.in_(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
                 Task.created_at >= ms_cutoff,
             )
         )
         ms_all = ms_result.scalars().all()
         ms_medium = [t for t in ms_all if (t.context or {}).get("scope") == "medium"]
         if ms_medium:
-            from app.routers.admin_scope_measurement import _compute_medium_scope_measurement  # noqa: PLC0415
+            from app.routers.admin_scope_measurement import (
+                _compute_medium_scope_measurement,
+            )  # noqa: PLC0415
+
             full = _compute_medium_scope_measurement(ms_medium, project, None, 365)
             medium_scope_measurement = {
-                "medium_scope_conversion_rate": full.get("medium_scope_conversion_rate"),
+                "medium_scope_conversion_rate": full.get(
+                    "medium_scope_conversion_rate"
+                ),
                 "total_created": full.get("total_created"),
                 "total_merged": full.get("total_merged"),
                 "pre_investment": full.get("pre_investment"),
@@ -1306,7 +1606,9 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
                 "investment_start": full.get("investment_start"),
             }
     except Exception:
-        logger.exception("[ANALYTICS] medium_scope_measurement computation failed (non-critical)")
+        logger.exception(
+            "[ANALYTICS] medium_scope_measurement computation failed (non-critical)"
+        )
 
     from app.research_completion import SCOPE_FILE_BUDGETS  # noqa: PLC0415
 
@@ -1323,6 +1625,7 @@ async def compute_pipeline_health_summary(session: AsyncSession, project_id: uui
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
+        "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
         "fresh_reviewer_trend": fresh_reviewer_trend,
         "edges_trend": edges_trend,
         "edges_considered_metrics": edges_considered_metrics,
@@ -1390,14 +1693,20 @@ async def get_residual_fingerprints(
     result = await session.execute(
         select(Task)
         .where(*filters)
-        .options(load_only(
-            Task.id, Task.project_id, Task.latest_status_message,
-            Task.context, Task.created_at,
-            # Task.status is read by classify_failure → record_residual_fingerprint's
-            # status-gate (added in fc071105). Without it the attribute access
-            # triggers async lazy-load and raises MissingGreenlet under FastAPI.
-            Task.status, Task.status_log,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.latest_status_message,
+                Task.context,
+                Task.created_at,
+                # Task.status is read by classify_failure → record_residual_fingerprint's
+                # status-gate (added in fc071105). Without it the attribute access
+                # triggers async lazy-load and raises MissingGreenlet under FastAPI.
+                Task.status,
+                Task.status_log,
+            )
+        )
         .limit(2000)
     )
     tasks = list(result.scalars().all())
@@ -1412,11 +1721,16 @@ async def get_residual_fingerprints(
         if not msg:
             continue
         fp = _error_fingerprint(msg)
-        entry = clusters.setdefault(fp, {
-            "fingerprint": fp, "count": 0,
-            "most_recent_at": None, "sample_message": msg[:300],
-            "example_task_ids": [],
-        })
+        entry = clusters.setdefault(
+            fp,
+            {
+                "fingerprint": fp,
+                "count": 0,
+                "most_recent_at": None,
+                "sample_message": msg[:300],
+                "example_task_ids": [],
+            },
+        )
         entry["count"] += 1
         ts = task.created_at.isoformat() if task.created_at else None
         if ts and (entry["most_recent_at"] is None or ts > entry["most_recent_at"]):
@@ -1436,15 +1750,17 @@ async def get_residual_fingerprints(
         case_rows = await session.execute(
             select(ResidualRemediationCase)
             .where(*case_filters)
-            .options(load_only(
-                ResidualRemediationCase.fingerprint,
-                ResidualRemediationCase.status,
-                ResidualRemediationCase.last_spawned_pr_number,
-                ResidualRemediationCase.consecutive_failure_count,
-                ResidualRemediationCase.suspended_at,
-                ResidualRemediationCase.audit_defer_count,
-                ResidualRemediationCase.audit_deferred_system_id,
-            ))
+            .options(
+                load_only(
+                    ResidualRemediationCase.fingerprint,
+                    ResidualRemediationCase.status,
+                    ResidualRemediationCase.last_spawned_pr_number,
+                    ResidualRemediationCase.consecutive_failure_count,
+                    ResidualRemediationCase.suspended_at,
+                    ResidualRemediationCase.audit_defer_count,
+                    ResidualRemediationCase.audit_deferred_system_id,
+                )
+            )
         )
         for c in case_rows.scalars().all():
             cases[c.fingerprint] = c
@@ -1463,7 +1779,9 @@ async def get_residual_fingerprints(
             entry["case_status"] = c.status
             entry["last_spawned_pr_number"] = c.last_spawned_pr_number
             entry["consecutive_failure_count"] = c.consecutive_failure_count
-            entry["suspended_at"] = c.suspended_at.isoformat() if c.suspended_at else None
+            entry["suspended_at"] = (
+                c.suspended_at.isoformat() if c.suspended_at else None
+            )
             entry["audit_defer_count"] = c.audit_defer_count
             entry["audit_deferred_system_id"] = c.audit_deferred_system_id
         enriched.append(entry)
@@ -1478,7 +1796,9 @@ async def get_residual_fingerprints(
 
 @router.get("/residual-cases")
 async def list_residual_cases(
-    status: list[str] | None = Query(None, description="Filter by ResidualRemediationCaseStatus values; repeatable"),
+    status: list[str] | None = Query(
+        None, description="Filter by ResidualRemediationCaseStatus values; repeatable"
+    ),
     project_id: uuid.UUID | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
@@ -1528,14 +1848,22 @@ async def list_residual_cases(
                 "fingerprint": c.fingerprint,
                 "status": c.status,
                 "hit_count": c.hit_count,
-                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "first_seen_at": c.first_seen_at.isoformat()
+                if c.first_seen_at
+                else None,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
-                "last_spawned_at": c.last_spawned_at.isoformat() if c.last_spawned_at else None,
+                "last_spawned_at": c.last_spawned_at.isoformat()
+                if c.last_spawned_at
+                else None,
                 "last_spawned_pr_number": c.last_spawned_pr_number,
-                "last_spawned_task_id": str(c.last_spawned_task_id) if c.last_spawned_task_id else None,
+                "last_spawned_task_id": str(c.last_spawned_task_id)
+                if c.last_spawned_task_id
+                else None,
                 "consecutive_failure_count": c.consecutive_failure_count,
                 "suspended_at": c.suspended_at.isoformat() if c.suspended_at else None,
-                "sample_message": (c.sample_messages[0] if c.sample_messages else c.sample_message),
+                "sample_message": (
+                    c.sample_messages[0] if c.sample_messages else c.sample_message
+                ),
                 "audit_defer_count": c.audit_defer_count,
                 "audit_deferred_system_id": c.audit_deferred_system_id,
             }
@@ -1578,7 +1906,11 @@ async def ignore_residual_case(
         case.status = ResidualRemediationCaseStatus.IGNORED
         case.updated_at = now
     await session.commit()
-    return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.IGNORED}
+    return {
+        "id": str(case.id),
+        "fingerprint": fingerprint,
+        "status": ResidualRemediationCaseStatus.IGNORED,
+    }
 
 
 @router.post("/residual-cases/{fingerprint}/unignore")
@@ -1602,11 +1934,18 @@ async def unignore_residual_case(
     )
     case = result.scalar_one_or_none()
     if case is None or case.status != ResidualRemediationCaseStatus.IGNORED:
-        raise HTTPException(status_code=404, detail="No IGNORED case found for this fingerprint and project")
+        raise HTTPException(
+            status_code=404,
+            detail="No IGNORED case found for this fingerprint and project",
+        )
     case.status = ResidualRemediationCaseStatus.ACTIVE
     case.updated_at = _utcnow()
     await session.commit()
-    return {"id": str(case.id), "fingerprint": fingerprint, "status": ResidualRemediationCaseStatus.ACTIVE}
+    return {
+        "id": str(case.id),
+        "fingerprint": fingerprint,
+        "status": ResidualRemediationCaseStatus.ACTIVE,
+    }
 
 
 @router.post("/residual-cases/{fingerprint}/unsuspend")
@@ -1631,7 +1970,10 @@ async def unsuspend_residual_case(
     )
     case = result.scalar_one_or_none()
     if case is None or case.status != ResidualRemediationCaseStatus.SUSPENDED:
-        raise HTTPException(status_code=404, detail="No SUSPENDED case found for this fingerprint and project")
+        raise HTTPException(
+            status_code=404,
+            detail="No SUSPENDED case found for this fingerprint and project",
+        )
     case.status = ResidualRemediationCaseStatus.ACTIVE
     case.suspended_at = None
     case.consecutive_failure_count = 0
@@ -1651,7 +1993,9 @@ async def unsuspend_residual_case(
 @router.get("/regression-cases")
 async def list_regression_cases(
     project_id: uuid.UUID = Query(..., description="Project to query (required)"),
-    status: list[str] | None = Query(None, description="Filter by RegressionCaseStatus values; repeatable"),
+    status: list[str] | None = Query(
+        None, description="Filter by RegressionCaseStatus values; repeatable"
+    ),
     limit: int = Query(50, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),  # noqa: ARG001
@@ -1715,22 +2059,34 @@ async def list_regression_cases(
                 "status": c.status,
                 "attempts": c.attempts,
                 "hit_count": c.hit_count,
-                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "first_seen_at": c.first_seen_at.isoformat()
+                if c.first_seen_at
+                else None,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
-                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
-                "last_remediation_task_id": str(c.last_remediation_task_id) if c.last_remediation_task_id else None,
+                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat()
+                if c.needs_manual_intervention_at
+                else None,
+                "last_remediation_task_id": str(c.last_remediation_task_id)
+                if c.last_remediation_task_id
+                else None,
                 "last_remediation_pr_number": c.last_remediation_pr_number,
                 "last_remediation_result": c.last_remediation_result,
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
-                "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat()
+                if c.signal_first_seen_at
+                else None,
                 "time_to_detect_sec": c.time_to_detect_sec,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "sample_message": c.sample_message,
-                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat() if c.signal_first_crossed_at else None,
+                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat()
+                if c.signal_first_crossed_at
+                else None,
                 "escalation_reason": c.escalation_reason,
-                "stalled": c.status == RegressionCaseStatus.ACTIVE and c.last_remediation_pr_number is None and c.first_seen_at < stall_threshold,
+                "stalled": c.status == RegressionCaseStatus.ACTIVE
+                and c.last_remediation_pr_number is None
+                and c.first_seen_at < stall_threshold,
             }
             for c in rows
         ],
@@ -1786,12 +2142,22 @@ async def list_regression_manual_intervention_cases(
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ):
     """List regression cases escalated to manual intervention."""
-    rows = (await session.execute(
-        select(RegressionRemediationCase).where(
-            RegressionRemediationCase.project_id == project_id,
-            RegressionRemediationCase.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
-        ).order_by(RegressionRemediationCase.last_seen_at.desc()).limit(limit)
-    )).scalars().all()
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status
+                    == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+                )
+                .order_by(RegressionRemediationCase.last_seen_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         "count": len(rows),
         "cases": [
@@ -1806,13 +2172,21 @@ async def list_regression_manual_intervention_cases(
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
-                "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat()
+                if c.signal_first_seen_at
+                else None,
                 "time_to_detect_sec": c.time_to_detect_sec,
                 "fingerprint_to_fix_log": c.fingerprint_to_fix_log,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
-                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat() if c.needs_manual_intervention_at else None,
-                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
-                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat() if c.signal_first_crossed_at else None,
+                "needs_manual_intervention_at": c.needs_manual_intervention_at.isoformat()
+                if c.needs_manual_intervention_at
+                else None,
+                "first_seen_at": c.first_seen_at.isoformat()
+                if c.first_seen_at
+                else None,
+                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat()
+                if c.signal_first_crossed_at
+                else None,
                 "escalation_reason": c.escalation_reason,
             }
             for c in rows
@@ -1830,14 +2204,23 @@ async def list_regression_stalled_cases(
     """List regression cases stalled without PR (ACTIVE, no PR, and older than threshold)."""
     now = _utcnow()
     stall_threshold = now - timedelta(hours=_REGRESSION_STALL_THRESHOLD_HOURS)
-    rows = (await session.execute(
-        select(RegressionRemediationCase).where(
-            RegressionRemediationCase.project_id == project_id,
-            RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE,
-            RegressionRemediationCase.last_remediation_pr_number.is_(None),
-            RegressionRemediationCase.first_seen_at < stall_threshold,
-        ).order_by(RegressionRemediationCase.first_seen_at.asc()).limit(limit)
-    )).scalars().all()
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE,
+                    RegressionRemediationCase.last_remediation_pr_number.is_(None),
+                    RegressionRemediationCase.first_seen_at < stall_threshold,
+                )
+                .order_by(RegressionRemediationCase.first_seen_at.asc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
     return {
         "count": len(rows),
         "cases": [
@@ -1848,9 +2231,13 @@ async def list_regression_stalled_cases(
                 "signal_name": c.regression_class.replace("_", " "),
                 "status": c.status,
                 "attempts": c.attempts,
-                "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat()
+                if c.signal_first_seen_at
+                else None,
                 "time_to_detect_sec": c.time_to_detect_sec,
-                "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
+                "first_seen_at": c.first_seen_at.isoformat()
+                if c.first_seen_at
+                else None,
                 "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
                 "hit_count": c.hit_count,
             }
@@ -1867,12 +2254,21 @@ async def list_recently_closed_regression_cases(
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ):
     """List recently closed regression cases (autonomous wins)."""
-    rows = (await session.execute(
-        select(RegressionRemediationCase).where(
-            RegressionRemediationCase.project_id == project_id,
-            RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
-        ).order_by(RegressionRemediationCase.last_seen_at.desc()).limit(limit)
-    )).scalars().all()
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase)
+                .where(
+                    RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
+                )
+                .order_by(RegressionRemediationCase.last_seen_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     cases = []
     for c in rows:
@@ -1889,25 +2285,37 @@ async def list_recently_closed_regression_cases(
         time_to_recover_sec = None
         if recovered_at and c.first_seen_at:
             try:
-                recovered_dt = datetime.fromisoformat(recovered_at.replace("Z", "+00:00"))
+                recovered_dt = datetime.fromisoformat(
+                    recovered_at.replace("Z", "+00:00")
+                )
                 # first_seen_at is stored as NaiveUTCDateTime; normalize both sides.
                 recovered_naive = _to_naive_utc(recovered_dt)
                 first_seen_naive = _to_naive_utc(c.first_seen_at)
-                time_to_recover_sec = int((recovered_naive - first_seen_naive).total_seconds())
+                time_to_recover_sec = int(
+                    (recovered_naive - first_seen_naive).total_seconds()
+                )
             except (ValueError, TypeError):
                 pass
 
-        cases.append({
-            "id": str(c.id),
-            "regression_class": c.regression_class,
-            "fix_pr_number": fix_pr_number,
-            "recovered_at": recovered_at,
-            "first_seen_at": c.first_seen_at.isoformat() if c.first_seen_at else None,
-            "signal_first_crossed_at": c.signal_first_crossed_at.isoformat() if c.signal_first_crossed_at else None,
-            "signal_first_seen_at": c.signal_first_seen_at.isoformat() if c.signal_first_seen_at else None,
-            "time_to_detect_sec": c.time_to_detect_sec,
-            "time_to_recover_sec": time_to_recover_sec,
-        })
+        cases.append(
+            {
+                "id": str(c.id),
+                "regression_class": c.regression_class,
+                "fix_pr_number": fix_pr_number,
+                "recovered_at": recovered_at,
+                "first_seen_at": c.first_seen_at.isoformat()
+                if c.first_seen_at
+                else None,
+                "signal_first_crossed_at": c.signal_first_crossed_at.isoformat()
+                if c.signal_first_crossed_at
+                else None,
+                "signal_first_seen_at": c.signal_first_seen_at.isoformat()
+                if c.signal_first_seen_at
+                else None,
+                "time_to_detect_sec": c.time_to_detect_sec,
+                "time_to_recover_sec": time_to_recover_sec,
+            }
+        )
 
     return {
         "count": len(cases),
@@ -1927,6 +2335,7 @@ async def clear_residual_fingerprints(
     tracked in-memory for auto-remediation spawn decisions.
     """
     from app.failure_classification import _residual_store, _residual_seen_task_ids  # noqa: PLC0415
+
     count = len(_residual_store)
     _residual_store.clear()
     _residual_seen_task_ids.clear()
@@ -1954,15 +2363,27 @@ async def get_provider_cost_summary(
     if project_id:
         filters.append(Task.project_id == project_id)
 
-    tasks = (await session.execute(
-        select(Task)
-        .where(*filters)
-        .options(load_only(
-            Task.id, Task.status, Task.context,
-            Task.vm_spot, Task.vm_provisioned_at, Task.vm_stopped_at,
-        ))
-        .limit(5000)
-    )).scalars().all()
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*filters)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.context,
+                        Task.vm_spot,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                    )
+                )
+                .limit(5000)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     def _acct_id(ctx: Dict[str, Any] | None) -> str | None:
         if not ctx:
@@ -1974,9 +2395,15 @@ async def get_provider_cost_summary(
     if acct_ids:
         parsed = [uuid.UUID(a) for a in acct_ids if a]
         if parsed:
-            rows = (await session.execute(
-                select(MaxPlanAccount).where(MaxPlanAccount.id.in_(parsed))
-            )).scalars().all()
+            rows = (
+                (
+                    await session.execute(
+                        select(MaxPlanAccount).where(MaxPlanAccount.id.in_(parsed))
+                    )
+                )
+                .scalars()
+                .all()
+            )
             for a in rows:
                 acct_map[str(a.id)] = {"name": a.name, "provider": a.provider.value}
 
@@ -1985,15 +2412,18 @@ async def get_provider_cost_summary(
         acct_id = _acct_id(t.context)
         info = acct_map.get(acct_id or "", {"name": "unknown", "provider": "unknown"})
         key = f"{info['provider']}|{acct_id or 'untracked'}"
-        g = groups.setdefault(key, {
-            "provider": info["provider"],
-            "account_id": acct_id,
-            "account_name": info["name"],
-            "total_tasks": 0,
-            "success_count": 0,
-            "merged_count": 0,
-            "total_cost_usd": 0.0,
-        })
+        g = groups.setdefault(
+            key,
+            {
+                "provider": info["provider"],
+                "account_id": acct_id,
+                "account_name": info["name"],
+                "total_tasks": 0,
+                "success_count": 0,
+                "merged_count": 0,
+                "total_cost_usd": 0.0,
+            },
+        )
         g["total_tasks"] += 1
         if t.status == TaskStatus.COMPLETED:
             g["success_count"] += 1
@@ -2001,16 +2431,24 @@ async def get_provider_cost_summary(
                 g["merged_count"] += 1
         if t.vm_provisioned_at and t.vm_stopped_at:
             rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            g["total_cost_usd"] += (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() * rate
+            g["total_cost_usd"] += (
+                t.vm_stopped_at - t.vm_provisioned_at
+            ).total_seconds() * rate
 
     result_rows = []
     for g in groups.values():
-        result_rows.append({
-            **g,
-            "total_cost_usd": round(g["total_cost_usd"], 2),
-            "success_rate": round(g["success_count"] / g["total_tasks"], 3) if g["total_tasks"] else None,
-            "cost_per_merged_pr": round(g["total_cost_usd"] / g["merged_count"], 2) if g["merged_count"] else None,
-        })
+        result_rows.append(
+            {
+                **g,
+                "total_cost_usd": round(g["total_cost_usd"], 2),
+                "success_rate": round(g["success_count"] / g["total_tasks"], 3)
+                if g["total_tasks"]
+                else None,
+                "cost_per_merged_pr": round(g["total_cost_usd"] / g["merged_count"], 2)
+                if g["merged_count"]
+                else None,
+            }
+        )
     result_rows.sort(key=lambda x: x["total_cost_usd"], reverse=True)
     return {"window_hours": hours, "rows": result_rows}
 
@@ -2044,14 +2482,18 @@ async def get_drift_snapshot(
         }
 
     snapshot = await compute_direction_drift(session, project, window_days=window_days)
-    direction_map = {d["id"]: d.get("text", "") for d in (project.directions or []) if d.get("id")}
+    direction_map = {
+        d["id"]: d.get("text", "") for d in (project.directions or []) if d.get("id")
+    }
 
     _SPARKLINE_N = 7
     flagged = []
     for did, sig in snapshot["by_direction"].items():
         if not (sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag")):
             continue
-        raw_snaps = await last_n_drift_snapshots(session, project.id, did, n=_SPARKLINE_N)
+        raw_snaps = await last_n_drift_snapshots(
+            session, project.id, did, n=_SPARKLINE_N
+        )
         # Reverse to chronological order for sparkline rendering (oldest first).
         history = [
             {
@@ -2062,16 +2504,18 @@ async def get_drift_snapshot(
             }
             for s in reversed(raw_snaps)
         ]
-        flagged.append({
-            "direction_id": did,
-            "direction_text": direction_map.get(did, ""),
-            "over_claim_flag": sig["over_claim_flag"],
-            "stalled_despite_churn_flag": sig["stalled_despite_churn_flag"],
-            "claimed_changes_count": sig["claimed_changes_count"],
-            "actually_merged_prs": sig["actually_merged_prs"],
-            "claim_shipped_consistency": sig["claim_shipped_consistency"],
-            "drift_history": history,
-        })
+        flagged.append(
+            {
+                "direction_id": did,
+                "direction_text": direction_map.get(did, ""),
+                "over_claim_flag": sig["over_claim_flag"],
+                "stalled_despite_churn_flag": sig["stalled_despite_churn_flag"],
+                "claimed_changes_count": sig["claimed_changes_count"],
+                "actually_merged_prs": sig["actually_merged_prs"],
+                "claim_shipped_consistency": sig["claim_shipped_consistency"],
+                "drift_history": history,
+            }
+        )
 
     return {
         "flagged_directions": flagged,
@@ -2136,20 +2580,30 @@ async def _compute_digest(
                 Task.status_log[-1]["t"].astext.label("_projected_completed_at_ts"),
             )
             .where(*task_filters)
-            .options(load_only(
-                Task.id, Task.status, Task.project_id, Task.title,
-                Task.created_at, Task.started_at,
-                Task.context,
-                Task.latest_status_message, Task.attempt_count,
-                Task.requires_approval,
-                Task.vm_provisioned_at, Task.vm_started_at,
-                Task.vm_stopped_at, Task.vm_spot,
-                # Audit W1: promoted columns read in the digest funnel.
-                Task.previous_error_fingerprint,
-                Task.auto_remediation,
-                # Per-(provider, model) cost attribution on direction CPM.
-                Task.provider, Task.model,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.project_id,
+                    Task.title,
+                    Task.created_at,
+                    Task.started_at,
+                    Task.context,
+                    Task.latest_status_message,
+                    Task.attempt_count,
+                    Task.requires_approval,
+                    Task.vm_provisioned_at,
+                    Task.vm_started_at,
+                    Task.vm_stopped_at,
+                    Task.vm_spot,
+                    # Audit W1: promoted columns read in the digest funnel.
+                    Task.previous_error_fingerprint,
+                    Task.auto_remediation,
+                    # Per-(provider, model) cost attribution on direction CPM.
+                    Task.provider,
+                    Task.model,
+                )
+            )
             .limit(_DIGEST_TASK_ROW_CAP)
         )
         tasks_result = await session.execute(tasks_query)
@@ -2166,20 +2620,32 @@ async def _compute_digest(
         tasks_result = await session.execute(
             select(Task)
             .where(*task_filters)
-            .options(load_only(
-                Task.id, Task.status, Task.project_id, Task.title,
-                Task.created_at, Task.started_at,
-                Task.payloads, Task.context, Task.status_log,
-                Task.latest_status_message, Task.attempt_count,
-                Task.requires_approval,
-                Task.vm_provisioned_at, Task.vm_started_at,
-                Task.vm_stopped_at, Task.vm_spot,
-                # Audit W1: promoted columns read in the digest funnel.
-                Task.previous_error_fingerprint,
-                Task.auto_remediation,
-                # Per-(provider, model) cost attribution on direction CPM.
-                Task.provider, Task.model,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.project_id,
+                    Task.title,
+                    Task.created_at,
+                    Task.started_at,
+                    Task.payloads,
+                    Task.context,
+                    Task.status_log,
+                    Task.latest_status_message,
+                    Task.attempt_count,
+                    Task.requires_approval,
+                    Task.vm_provisioned_at,
+                    Task.vm_started_at,
+                    Task.vm_stopped_at,
+                    Task.vm_spot,
+                    # Audit W1: promoted columns read in the digest funnel.
+                    Task.previous_error_fingerprint,
+                    Task.auto_remediation,
+                    # Per-(provider, model) cost attribution on direction CPM.
+                    Task.provider,
+                    Task.model,
+                )
+            )
             .limit(_DIGEST_TASK_ROW_CAP)
         )
         all_tasks = list(tasks_result.scalars().all())
@@ -2187,23 +2653,28 @@ async def _compute_digest(
     if tasks_capped:
         logger.warning(
             "admin_digest task query hit %d-row safety cap (window=%dh, project_id=%s); digest metrics may be truncated",
-            _DIGEST_TASK_ROW_CAP, hours, project_id,
+            _DIGEST_TASK_ROW_CAP,
+            hours,
+            project_id,
         )
 
     # Post-filter completed/failed by completion timestamp, not creation time
     completed_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.COMPLETED and _derive_completed_at(t) >= window_start
     ]
     failed_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.FAILED and _derive_completed_at(t) >= window_start
     ]
     # Approval tasks use created_at (they haven't completed yet)
     # _to_naive_utc strips tz from t.created_at (TIMESTAMPTZ since 0061) for
     # comparison with naive window_start. See time_utils._to_naive_utc.
     approval_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.requires_approval
         and t.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
         and _to_naive_utc(t.created_at) >= window_start
@@ -2224,15 +2695,23 @@ async def _compute_digest(
             select(
                 Task,
                 Task.payloads[0].label("_projected_first_payload"),
-            ).where(*active_filters)
+            )
+            .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
-            .options(load_only(
-                Task.id, Task.status, Task.title,
-                Task.started_at, Task.project_id, Task.context,
-                Task.vm_provisioned_at, Task.vm_spot,
-                Task.previous_error_fingerprint,
-                Task.auto_remediation,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.title,
+                    Task.started_at,
+                    Task.project_id,
+                    Task.context,
+                    Task.vm_provisioned_at,
+                    Task.vm_spot,
+                    Task.previous_error_fingerprint,
+                    Task.auto_remediation,
+                )
+            )
         )
         active_tasks_all: List[Task] = []
         for row in active_result.all():
@@ -2241,21 +2720,31 @@ async def _compute_digest(
             active_tasks_all.append(task)
     else:
         active_result = await session.execute(
-            select(Task).where(*active_filters)
+            select(Task)
+            .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
-            .options(load_only(
-                Task.id, Task.status, Task.title, Task.payloads,
-                Task.started_at, Task.project_id, Task.context,
-                Task.vm_provisioned_at, Task.vm_spot,
-                Task.previous_error_fingerprint,
-                Task.auto_remediation,
-            ))
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.title,
+                    Task.payloads,
+                    Task.started_at,
+                    Task.project_id,
+                    Task.context,
+                    Task.vm_provisioned_at,
+                    Task.vm_spot,
+                    Task.previous_error_fingerprint,
+                    Task.auto_remediation,
+                )
+            )
         )
         active_tasks_all = list(active_result.scalars().all())
 
     # research_cycles: completed tasks with task_type == 'research'
     research_cycles = sum(
-        1 for t in completed_tasks
+        1
+        for t in completed_tasks
         if (t.first_payload).get("type", "create") == "research"
     )
 
@@ -2271,7 +2760,8 @@ async def _compute_digest(
         project = await session.get(Project, project_id)
         if project:
             active_directions = [
-                d for d in (project.directions or [])
+                d
+                for d in (project.directions or [])
                 if d.get("status") in ("active", "held", "auto_paused")
             ]
 
@@ -2279,7 +2769,9 @@ async def _compute_digest(
             for d in active_directions:
                 did = d.get("id") or d.get("direction_id")
                 if did:
-                    dir_id_to_text[str(did)] = d.get("text") or d.get("description") or ""
+                    dir_id_to_text[str(did)] = (
+                        d.get("text") or d.get("description") or ""
+                    )
 
             # Build direction_id -> tasks mapping
             dir_tasks: Dict[str, List] = {}
@@ -2295,13 +2787,15 @@ async def _compute_digest(
 
                 tasks_for_dir = dir_tasks.get(did, [])
                 cycles_in_window = sum(
-                    1 for t in tasks_for_dir
+                    1
+                    for t in tasks_for_dir
                     if t.status == TaskStatus.COMPLETED
                     and (t.first_payload).get("type", "create") == "research"
                     and _derive_completed_at(t) >= window_start
                 )
                 tasks_created_in_window = sum(
-                    1 for t in tasks_for_dir
+                    1
+                    for t in tasks_for_dir
                     if _to_naive_utc(t.created_at) >= window_start
                 )
 
@@ -2340,9 +2834,14 @@ async def _compute_digest(
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
                         # Legacy fallback: pre-attribution entries lack autonomous_prs_merged.
-                        autonomous_prs_merged += entry.get("autonomous_prs_merged", entry.get("prs_merged")) or 0
+                        autonomous_prs_merged += (
+                            entry.get("autonomous_prs_merged", entry.get("prs_merged"))
+                            or 0
+                        )
                         assisted_prs_merged += entry.get("assisted_prs_merged", 0) or 0
-                        operator_action_count += entry.get("operator_action_count", 0) or 0
+                        operator_action_count += (
+                            entry.get("operator_action_count", 0) or 0
+                        )
                         prs_rejected += entry.get("prs_rejected") or 0
                         dir_reviews_dismissed += entry.get("reviews_dismissed") or 0
                         dir_reviews_overridden += entry.get("reviews_overridden") or 0
@@ -2351,17 +2850,49 @@ async def _compute_digest(
                         dir_findings_produced += entry.get("findings_produced") or 0
                         dir_batch_cap_applied += entry.get("batch_cap_applied") or 0
                         for _fk, _fv in (entry.get("filter_breakdown") or {}).items():
-                            dir_filter_breakdown_agg[_fk] = dir_filter_breakdown_agg.get(_fk, 0) + (_fv or 0)
+                            dir_filter_breakdown_agg[_fk] = (
+                                dir_filter_breakdown_agg.get(_fk, 0) + (_fv or 0)
+                            )
                         atm = entry.get("avg_time_to_merge_hours")
                         if atm is not None:
                             merge_time_values.append(float(atm))
-                        for scope, stats in (entry.get("scope_breakdown") or {}).items():
-                            agg = dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "merged_cross_module": 0, "failed": 0, "failed_infra": 0, "failed_code_error": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0, "failure_stages": {}})
-                            for k in ("created", "merged", "merged_cross_module", "failed", "failed_infra", "failed_code_error", "failed_scope_overflow", "calibrated_in", "calibrated_out"):
+                        for scope, stats in (
+                            entry.get("scope_breakdown") or {}
+                        ).items():
+                            agg = dir_scope_agg.setdefault(
+                                scope,
+                                {
+                                    "created": 0,
+                                    "merged": 0,
+                                    "merged_cross_module": 0,
+                                    "failed": 0,
+                                    "failed_infra": 0,
+                                    "failed_code_error": 0,
+                                    "failed_scope_overflow": 0,
+                                    "calibrated_in": 0,
+                                    "calibrated_out": 0,
+                                    "failure_stages": {},
+                                },
+                            )
+                            for k in (
+                                "created",
+                                "merged",
+                                "merged_cross_module",
+                                "failed",
+                                "failed_infra",
+                                "failed_code_error",
+                                "failed_scope_overflow",
+                                "calibrated_in",
+                                "calibrated_out",
+                            ):
                                 agg[k] += stats.get(k, 0)
                             stage_agg = agg.setdefault("failure_stages", {})
-                            for stage_name, stage_cnt in (stats.get("failure_stages") or {}).items():
-                                stage_agg[stage_name] = stage_agg.get(stage_name, 0) + (stage_cnt or 0)
+                            for stage_name, stage_cnt in (
+                                stats.get("failure_stages") or {}
+                            ).items():
+                                stage_agg[stage_name] = stage_agg.get(stage_name, 0) + (
+                                    stage_cnt or 0
+                                )
                             # Weighted predictor accumulators (weight by merged/failed counts
                             # that produced each per-cycle average in direction_outcomes.py).
                             merged_w = stats.get("merged", 0) or 0
@@ -2374,29 +2905,48 @@ async def _compute_digest(
                             ):
                                 v = stats.get(field_name)
                                 if isinstance(v, (int, float)) and weight > 0:
-                                    agg[f"_{field_name}_sum"] = agg.get(f"_{field_name}_sum", 0.0) + float(v) * weight
-                                    agg[f"_{field_name}_w"] = agg.get(f"_{field_name}_w", 0) + weight
-                            for effort, buckets in (stats.get("effort_distribution") or {}).items():
+                                    agg[f"_{field_name}_sum"] = (
+                                        agg.get(f"_{field_name}_sum", 0.0)
+                                        + float(v) * weight
+                                    )
+                                    agg[f"_{field_name}_w"] = (
+                                        agg.get(f"_{field_name}_w", 0) + weight
+                                    )
+                            for effort, buckets in (
+                                stats.get("effort_distribution") or {}
+                            ).items():
                                 if not isinstance(buckets, dict):
                                     continue
                                 ed = agg.setdefault("effort_distribution", {})
-                                eb = ed.setdefault(effort, {"created": 0, "merged": 0, "failed": 0})
+                                eb = ed.setdefault(
+                                    effort, {"created": 0, "merged": 0, "failed": 0}
+                                )
                                 for bk in ("created", "merged", "failed"):
                                     eb[bk] += buckets.get(bk, 0) or 0
                         pr = entry.get("product_ratio")
                         if pr is not None:
                             window_product_ratios.append(float(pr))
-                        for ttype, cnt in (entry.get("type_distribution") or {}).items():
-                            agg_type_distribution[ttype] = agg_type_distribution.get(ttype, 0) + cnt
+                        for ttype, cnt in (
+                            entry.get("type_distribution") or {}
+                        ).items():
+                            agg_type_distribution[ttype] = (
+                                agg_type_distribution.get(ttype, 0) + cnt
+                            )
                         for ttype, stats in (entry.get("type_breakdown") or {}).items():
-                            tb = agg_type_breakdown.setdefault(ttype, {"created": 0, "merged": 0, "failed": 0})
+                            tb = agg_type_breakdown.setdefault(
+                                ttype, {"created": 0, "merged": 0, "failed": 0}
+                            )
                             for k in ("created", "merged", "failed"):
                                 tb[k] += (stats or {}).get(k, 0) or 0
                         for tax, cnt in (entry.get("taxonomy_summary") or {}).items():
-                            dir_taxonomy_summary[tax] = dir_taxonomy_summary.get(tax, 0) + cnt
+                            dir_taxonomy_summary[tax] = (
+                                dir_taxonomy_summary.get(tax, 0) + cnt
+                            )
                         for stage, cnt in (entry.get("stage_dropout") or {}).items():
-                            dir_stage_dropout[stage] = dir_stage_dropout.get(stage, 0) + (cnt or 0)
-                        for dq in (entry.get("decomposition_quality") or []):
+                            dir_stage_dropout[stage] = dir_stage_dropout.get(
+                                stage, 0
+                            ) + (cnt or 0)
+                        for dq in entry.get("decomposition_quality") or []:
                             if not isinstance(dq, dict):
                                 continue
                             dq_plans += 1
@@ -2406,24 +2956,51 @@ async def _compute_digest(
                                 dq_merge_rate_count += 1
                             dq_subtask_count_sum += dq.get("subtask_count") or 0
                             dq_cross_module_sum += dq.get("cross_module_count") or 0
-                        for fd in (entry.get("failed_task_details") or []):
+                        for fd in entry.get("failed_task_details") or []:
                             title = (fd or {}).get("title")
                             if title:
                                 recent_failed_titles.append(title)
                     elif entry_ts >= prev_window_start:
-                        for scope, stats in (entry.get("scope_breakdown") or {}).items():
-                            agg = prev_dir_scope_agg.setdefault(scope, {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0})
-                            for k in ("created", "merged", "calibrated_in", "calibrated_out"):
+                        for scope, stats in (
+                            entry.get("scope_breakdown") or {}
+                        ).items():
+                            agg = prev_dir_scope_agg.setdefault(
+                                scope,
+                                {
+                                    "created": 0,
+                                    "merged": 0,
+                                    "calibrated_in": 0,
+                                    "calibrated_out": 0,
+                                },
+                            )
+                            for k in (
+                                "created",
+                                "merged",
+                                "calibrated_in",
+                                "calibrated_out",
+                            ):
                                 agg[k] += stats.get(k, 0)
 
                 if cycles_in_window == 0 and tasks_created_in_window == 0:
                     continue
 
-                last_entry = (d.get("research_history") or [])[-1] if d.get("research_history") else None
-                latest_insights = last_entry.get("cycle_insights", []) if last_entry else []
-                recent_finding_titles = last_entry.get("finding_titles", []) if last_entry else []
+                last_entry = (
+                    (d.get("research_history") or [])[-1]
+                    if d.get("research_history")
+                    else None
+                )
+                latest_insights = (
+                    last_entry.get("cycle_insights", []) if last_entry else []
+                )
+                recent_finding_titles = (
+                    last_entry.get("finding_titles", []) if last_entry else []
+                )
                 latest_research_at = last_entry.get("timestamp") if last_entry else None
-                dir_product_ratio = round(sum(window_product_ratios) / len(window_product_ratios), 3) if window_product_ratios else None
+                dir_product_ratio = (
+                    round(sum(window_product_ratios) / len(window_product_ratios), 3)
+                    if window_product_ratios
+                    else None
+                )
 
                 dir_cost = 0.0
                 dir_spot_cost = 0.0
@@ -2433,93 +3010,175 @@ async def _compute_digest(
                 cost_by_type: Dict[str, float] = {}
                 cost_by_provider_model: Dict[str, float] = {}
                 for t in tasks_for_dir:
-                    if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+                    if not (
+                        t.vm_provisioned_at
+                        and t.vm_stopped_at
+                        and t.vm_stopped_at >= window_start
+                    ):
                         continue
                     rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-                    t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                    t_cost = (
+                        rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                    )
                     dir_cost += t_cost
                     if t.vm_spot:
                         dir_spot_cost += t_cost
                     else:
                         dir_on_demand_cost += t_cost
                     scope_key = (t.context or {}).get("scope", "unknown")
-                    cost_by_scope[scope_key] = cost_by_scope.get(scope_key, 0.0) + t_cost
-                    status_key = t.status.value if hasattr(t.status, "value") else str(t.status)
-                    cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
+                    cost_by_scope[scope_key] = (
+                        cost_by_scope.get(scope_key, 0.0) + t_cost
+                    )
+                    status_key = (
+                        t.status.value if hasattr(t.status, "value") else str(t.status)
+                    )
+                    cost_by_status[status_key] = (
+                        cost_by_status.get(status_key, 0.0) + t_cost
+                    )
                     type_key = (t.first_payload or {}).get("type", "create")
                     cost_by_type[type_key] = cost_by_type.get(type_key, 0.0) + t_cost
                     provider_key = t.provider or "unknown"
                     model_key = t.model or "unknown"
                     pm_key = f"{provider_key}|{model_key}"
-                    cost_by_provider_model[pm_key] = cost_by_provider_model.get(pm_key, 0.0) + t_cost
+                    cost_by_provider_model[pm_key] = (
+                        cost_by_provider_model.get(pm_key, 0.0) + t_cost
+                    )
                 cost_by_scope = {k: round(v, 4) for k, v in cost_by_scope.items()}
                 cost_by_status = {k: round(v, 4) for k, v in cost_by_status.items()}
                 cost_by_type = {k: round(v, 4) for k, v in cost_by_type.items()}
-                cost_by_provider_model = {k: round(v, 4) for k, v in cost_by_provider_model.items()}
+                cost_by_provider_model = {
+                    k: round(v, 4) for k, v in cost_by_provider_model.items()
+                }
 
                 dir_fa_measured = [
-                    t for t in tasks_for_dir
+                    t
+                    for t in tasks_for_dir
                     if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
                     and _derive_completed_at(t) >= window_start
                     and "_first_attempt_succeeded" in (t.context or {})
                 ]
                 dir_fa_sample_size = len(dir_fa_measured)
                 dir_fa_rate = (
-                    round(sum(1 for t in dir_fa_measured if (t.context or {}).get("_first_attempt_succeeded")) / dir_fa_sample_size, 3)
-                    if dir_fa_sample_size > 0 else None
+                    round(
+                        sum(
+                            1
+                            for t in dir_fa_measured
+                            if (t.context or {}).get("_first_attempt_succeeded")
+                        )
+                        / dir_fa_sample_size,
+                        3,
+                    )
+                    if dir_fa_sample_size > 0
+                    else None
                 )
 
                 _history_all = d.get("research_history") or []
                 _agg = d.get("history_aggregate") or {}
                 lifetime_cycles = len(_history_all) + (_agg.get("total_cycles") or 0)
-                lifetime_prs_merged = sum(h.get("prs_merged", 0) for h in _history_all) + (_agg.get("total_prs_merged") or 0)
-                lifetime_prs_rejected = sum(h.get("prs_rejected", 0) for h in _history_all) + (_agg.get("total_prs_rejected") or 0)
-                lifetime_tasks_created = sum(h.get("tasks_created", 0) for h in _history_all) + (_agg.get("total_tasks_created") or 0)
-                lifetime_tasks_failed = sum(h.get("tasks_failed", 0) for h in _history_all) + (_agg.get("total_tasks_failed") or 0)
+                lifetime_prs_merged = sum(
+                    h.get("prs_merged", 0) for h in _history_all
+                ) + (_agg.get("total_prs_merged") or 0)
+                lifetime_prs_rejected = sum(
+                    h.get("prs_rejected", 0) for h in _history_all
+                ) + (_agg.get("total_prs_rejected") or 0)
+                lifetime_tasks_created = sum(
+                    h.get("tasks_created", 0) for h in _history_all
+                ) + (_agg.get("total_tasks_created") or 0)
+                lifetime_tasks_failed = sum(
+                    h.get("tasks_failed", 0) for h in _history_all
+                ) + (_agg.get("total_tasks_failed") or 0)
                 lifetime_conversion_rate = (
-                    round(lifetime_prs_merged / lifetime_tasks_created, 3) if lifetime_tasks_created > 0 else None
+                    round(lifetime_prs_merged / lifetime_tasks_created, 3)
+                    if lifetime_tasks_created > 0
+                    else None
                 )
-                lifetime_autonomous_prs_merged = (
-                    sum(h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in _history_all)
-                    + (_agg.get("total_autonomous_prs_merged") or 0)
+                lifetime_autonomous_prs_merged = sum(
+                    h.get("autonomous_prs_merged", h.get("prs_merged", 0))
+                    for h in _history_all
+                ) + (_agg.get("total_autonomous_prs_merged") or 0)
+                lifetime_operator_actions = sum(
+                    h.get("operator_action_count", 0) for h in _history_all
+                ) + (_agg.get("total_operator_actions") or 0)
+                retirement_eligible = (
+                    lifetime_autonomous_prs_merged >= 10
+                    and lifetime_operator_actions == 0
                 )
-                lifetime_operator_actions = (
-                    sum(h.get("operator_action_count", 0) for h in _history_all)
-                    + (_agg.get("total_operator_actions") or 0)
-                )
-                retirement_eligible = lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
 
                 direction_text = (d.get("text") or d.get("description") or "")[:80]
                 total_prs = prs_merged + prs_rejected
-                acceptance_rate = round(prs_merged / total_prs, 3) if total_prs > 0 else None
-                avg_time_to_merge_hours = round(sum(merge_time_values) / len(merge_time_values), 2) if merge_time_values else None
-                conversion_rate = round(prs_merged / findings_tasks_created, 3) if findings_tasks_created > 0 else None
+                acceptance_rate = (
+                    round(prs_merged / total_prs, 3) if total_prs > 0 else None
+                )
+                avg_time_to_merge_hours = (
+                    round(sum(merge_time_values) / len(merge_time_values), 2)
+                    if merge_time_values
+                    else None
+                )
+                conversion_rate = (
+                    round(prs_merged / findings_tasks_created, 3)
+                    if findings_tasks_created > 0
+                    else None
+                )
                 # Accumulate into project-level scope rate aggregates
                 for _s, _st in dir_scope_agg.items():
                     if _s not in scope_conversion_rates:
-                        scope_conversion_rates[_s] = {"created": 0, "merged": 0, "merged_cross_module": 0, "failed_scope_overflow": 0, "calibrated_in": 0, "calibrated_out": 0, "failure_stages": {}}
+                        scope_conversion_rates[_s] = {
+                            "created": 0,
+                            "merged": 0,
+                            "merged_cross_module": 0,
+                            "failed_scope_overflow": 0,
+                            "calibrated_in": 0,
+                            "calibrated_out": 0,
+                            "failure_stages": {},
+                        }
                     scope_conversion_rates[_s]["created"] += _st["created"]
                     scope_conversion_rates[_s]["merged"] += _st["merged"]
-                    scope_conversion_rates[_s]["merged_cross_module"] += _st.get("merged_cross_module", 0)
-                    scope_conversion_rates[_s]["failed_scope_overflow"] += _st.get("failed_scope_overflow", 0)
-                    scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
-                    scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
-                    _stage_acc = scope_conversion_rates[_s].setdefault("failure_stages", {})
+                    scope_conversion_rates[_s]["merged_cross_module"] += _st.get(
+                        "merged_cross_module", 0
+                    )
+                    scope_conversion_rates[_s]["failed_scope_overflow"] += _st.get(
+                        "failed_scope_overflow", 0
+                    )
+                    scope_conversion_rates[_s]["calibrated_in"] += _st.get(
+                        "calibrated_in", 0
+                    )
+                    scope_conversion_rates[_s]["calibrated_out"] += _st.get(
+                        "calibrated_out", 0
+                    )
+                    _stage_acc = scope_conversion_rates[_s].setdefault(
+                        "failure_stages", {}
+                    )
                     for _stg, _scnt in (_st.get("failure_stages") or {}).items():
                         _stage_acc[_stg] = _stage_acc.get(_stg, 0) + (_scnt or 0)
-                    for _f in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed"):
+                    for _f in (
+                        "avg_expansion_ratio_merged",
+                        "avg_expansion_ratio_failed",
+                    ):
                         _sum = _st.get(f"_{_f}_sum", 0.0)
                         _w = _st.get(f"_{_f}_w", 0)
                         if _w > 0:
-                            scope_conversion_rates[_s][f"_{_f}_sum"] = scope_conversion_rates[_s].get(f"_{_f}_sum", 0.0) + _sum
-                            scope_conversion_rates[_s][f"_{_f}_w"] = scope_conversion_rates[_s].get(f"_{_f}_w", 0) + _w
+                            scope_conversion_rates[_s][f"_{_f}_sum"] = (
+                                scope_conversion_rates[_s].get(f"_{_f}_sum", 0.0) + _sum
+                            )
+                            scope_conversion_rates[_s][f"_{_f}_w"] = (
+                                scope_conversion_rates[_s].get(f"_{_f}_w", 0) + _w
+                            )
                 for _s, _st in prev_dir_scope_agg.items():
                     if _s not in prev_scope_conversion_rates:
-                        prev_scope_conversion_rates[_s] = {"created": 0, "merged": 0, "calibrated_in": 0, "calibrated_out": 0}
+                        prev_scope_conversion_rates[_s] = {
+                            "created": 0,
+                            "merged": 0,
+                            "calibrated_in": 0,
+                            "calibrated_out": 0,
+                        }
                     prev_scope_conversion_rates[_s]["created"] += _st["created"]
                     prev_scope_conversion_rates[_s]["merged"] += _st["merged"]
-                    prev_scope_conversion_rates[_s]["calibrated_in"] += _st.get("calibrated_in", 0)
-                    prev_scope_conversion_rates[_s]["calibrated_out"] += _st.get("calibrated_out", 0)
+                    prev_scope_conversion_rates[_s]["calibrated_in"] += _st.get(
+                        "calibrated_in", 0
+                    )
+                    prev_scope_conversion_rates[_s]["calibrated_out"] += _st.get(
+                        "calibrated_out", 0
+                    )
 
                 decomposition_summary = None
                 if dq_plans > 0:
@@ -2527,27 +3186,46 @@ async def _compute_digest(
                         "plans_assessed": dq_plans,
                         "avg_subtask_merge_rate": (
                             round(dq_merge_rate_sum / dq_merge_rate_count, 3)
-                            if dq_merge_rate_count > 0 else None
+                            if dq_merge_rate_count > 0
+                            else None
                         ),
                         "avg_subtask_count": round(dq_subtask_count_sum / dq_plans, 2),
-                        "avg_cross_module_count": round(dq_cross_module_sum / dq_plans, 2),
+                        "avg_cross_module_count": round(
+                            dq_cross_module_sum / dq_plans, 2
+                        ),
                     }
 
                 filter_funnel = None
-                if dir_findings_produced or dir_batch_cap_applied or dir_filter_breakdown_agg or findings_tasks_created:
+                if (
+                    dir_findings_produced
+                    or dir_batch_cap_applied
+                    or dir_filter_breakdown_agg
+                    or findings_tasks_created
+                ):
                     filter_funnel = {
                         "findings_produced": dir_findings_produced,
                         "hash_dedup": dir_filter_breakdown_agg.get("hash_dedup", 0),
-                        "word_overlap": dir_filter_breakdown_agg.get("word_overlap_dedup", 0),
-                        "file_overlap": dir_filter_breakdown_agg.get("file_overlap_dedup", 0),
-                        "type_filtered": dir_filter_breakdown_agg.get("type_filtered", 0),
+                        "word_overlap": dir_filter_breakdown_agg.get(
+                            "word_overlap_dedup", 0
+                        ),
+                        "file_overlap": dir_filter_breakdown_agg.get(
+                            "file_overlap_dedup", 0
+                        ),
+                        "type_filtered": dir_filter_breakdown_agg.get(
+                            "type_filtered", 0
+                        ),
                         "empty_prompt": dir_filter_breakdown_agg.get("empty_prompt", 0),
                         "batch_cap": dir_batch_cap_applied,
                         "tasks_created": findings_tasks_created,
                     }
 
                 for _sk, _agg in dir_scope_agg.items():
-                    for _field in ("avg_expansion_ratio_merged", "avg_expansion_ratio_failed", "avg_complexity_merged", "avg_complexity_failed"):
+                    for _field in (
+                        "avg_expansion_ratio_merged",
+                        "avg_expansion_ratio_failed",
+                        "avg_complexity_merged",
+                        "avg_complexity_failed",
+                    ):
                         w = _agg.pop(f"_{_field}_w", 0)
                         s = _agg.pop(f"_{_field}_sum", 0.0)
                         if w > 0:
@@ -2566,13 +3244,17 @@ async def _compute_digest(
                     _dir_rejections.append((_ts, _t))
                 _dir_rejections.sort(key=lambda x: x[0], reverse=True)
 
-                _pq_notes = synthesize_prompt_quality_patterns(d.get("research_history") or [])
+                _pq_notes = synthesize_prompt_quality_patterns(
+                    d.get("research_history") or []
+                )
                 prompt_quality_hint = _pq_notes[0] if _pq_notes else None
                 rejection_reasons = [
                     {
                         "task_id": str(_t.id),
                         "title": _t.title,
-                        "rejection_note": ((_t.context or {}).get("pr_rejection_note") or "")[:200],
+                        "rejection_note": (
+                            (_t.context or {}).get("pr_rejection_note") or ""
+                        )[:200],
                     }
                     for _ts, _t in _dir_rejections[:3]
                 ]
@@ -2581,92 +3263,104 @@ async def _compute_digest(
                 budget_utilization_pct = None
                 budget_exceeded = False
                 if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
-                    budget_utilization_pct = round((dir_cost / cost_budget_usd) * 100, 1)
+                    budget_utilization_pct = round(
+                        (dir_cost / cost_budget_usd) * 100, 1
+                    )
                     budget_exceeded = dir_cost > cost_budget_usd
                     if budget_utilization_pct >= 80 and not d.get("_budget_alerted"):
                         d["_budget_alerted"] = True
                         flag_modified(project, "directions")
                         _budget_alert_fired = True
-                        asyncio.ensure_future(dispatch_external_notification(
-                            project_id,
-                            "BUDGET_EXCEEDED",
-                            {
-                                "direction_id": did,
-                                "direction_name": direction_text,
-                                "current_spend_usd": round(dir_cost, 2),
-                                "budget_limit_usd": float(cost_budget_usd),
-                                "utilization_pct": budget_utilization_pct,
-                            },
-                        ))
+                        asyncio.ensure_future(
+                            dispatch_external_notification(
+                                project_id,
+                                "BUDGET_EXCEEDED",
+                                {
+                                    "direction_id": did,
+                                    "direction_name": direction_text,
+                                    "current_spend_usd": round(dir_cost, 2),
+                                    "budget_limit_usd": float(cost_budget_usd),
+                                    "utilization_pct": budget_utilization_pct,
+                                },
+                            )
+                        )
 
-                direction_progress_list.append({
-                    "direction_id": did,
-                    "direction_text": direction_text,
-                    "priority": d.get("priority") or "medium",
-                    "cost_budget_usd": cost_budget_usd,
-                    "budget_utilization_pct": budget_utilization_pct,
-                    "budget_exceeded": budget_exceeded,
-                    "cycles_in_window": cycles_in_window,
-                    "tasks_created": tasks_created_in_window,
-                    "prs_merged": prs_merged,
-                    "autonomous_prs_merged": autonomous_prs_merged,
-                    "assisted_prs_merged": assisted_prs_merged,
-                    "operator_action_count": operator_action_count,
-                    "prs_rejected": prs_rejected,
-                    "acceptance_rate": acceptance_rate,
-                    "conversion_rate": conversion_rate,
-                    "avg_time_to_merge_hours": avg_time_to_merge_hours,
-                    "possibly_saturated": bool(d.get("possibly_saturated", False)),
-                    "possibly_complete": bool(d.get("possibly_complete", False)),
-                    "auto_paused": bool(d.get("auto_paused", False)),
-                    "paused_reason": d.get("paused_reason"),
-                    "needs_manual_intervention": bool(d.get("needs_manual_intervention", False)),
-                    "completion_criteria": d.get("completion_criteria"),
-                    "completion_suggestion": d.get("completion_suggestion"),
-                    "category": d.get("category"),
-                    "status": d.get("status"),
-                    "added_at": d.get("added_at"),
-                    "latest_insights": latest_insights,
-                    "recent_finding_titles": recent_finding_titles,
-                    "latest_research_at": latest_research_at,
-                    "product_ratio": dir_product_ratio,
-                    "type_distribution": agg_type_distribution or None,
-                    "type_breakdown": agg_type_breakdown or None,
-                    "estimated_cost_usd": round(dir_cost, 2),
-                    "spot_cost_usd": round(dir_spot_cost, 2),
-                    "on_demand_cost_usd": round(dir_on_demand_cost, 2),
-                    "cost_by_scope": cost_by_scope or None,
-                    "cost_by_status": cost_by_status or None,
-                    "cost_by_type": cost_by_type or None,
-                    "cost_by_provider_model": cost_by_provider_model or None,
-                    "cost_per_merged_pr": round(dir_cost / autonomous_prs_merged, 4) if autonomous_prs_merged > 0 else None,
-                    "scope_breakdown": dir_scope_agg or None,
-                    "taxonomy_summary": dir_taxonomy_summary or None,
-                    "stage_dropout": dir_stage_dropout or None,
-                    "recent_failure_titles": recent_failed_titles[-3:] or None,
-                    "filter_funnel": filter_funnel,
-                    "decomposition_summary": decomposition_summary,
-                    "first_attempt_success_rate": dir_fa_rate,
-                    "first_attempt_sample_size": dir_fa_sample_size,
-                    "quality_score": round(_compute_direction_quality_score(d), 3),
-                    "lifetime_cycles": lifetime_cycles,
-                    "lifetime_prs_merged": lifetime_prs_merged,
-                    "lifetime_prs_rejected": lifetime_prs_rejected,
-                    "lifetime_tasks_failed": lifetime_tasks_failed,
-                    "lifetime_conversion_rate": lifetime_conversion_rate,
-                    "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
-                    "lifetime_operator_actions": lifetime_operator_actions,
-                    "retirement_eligible": retirement_eligible,
-                    "review_quality": {
-                        "reviews_dismissed": dir_reviews_dismissed,
-                        "reviews_overridden": dir_reviews_overridden,
-                        "user_issues_caught": dir_user_issues_caught,
-                    },
-                    "rejection_reasons": rejection_reasons or None,
-                    "prompt_quality_hint": prompt_quality_hint,
-                })
+                direction_progress_list.append(
+                    {
+                        "direction_id": did,
+                        "direction_text": direction_text,
+                        "priority": d.get("priority") or "medium",
+                        "cost_budget_usd": cost_budget_usd,
+                        "budget_utilization_pct": budget_utilization_pct,
+                        "budget_exceeded": budget_exceeded,
+                        "cycles_in_window": cycles_in_window,
+                        "tasks_created": tasks_created_in_window,
+                        "prs_merged": prs_merged,
+                        "autonomous_prs_merged": autonomous_prs_merged,
+                        "assisted_prs_merged": assisted_prs_merged,
+                        "operator_action_count": operator_action_count,
+                        "prs_rejected": prs_rejected,
+                        "acceptance_rate": acceptance_rate,
+                        "conversion_rate": conversion_rate,
+                        "avg_time_to_merge_hours": avg_time_to_merge_hours,
+                        "possibly_saturated": bool(d.get("possibly_saturated", False)),
+                        "possibly_complete": bool(d.get("possibly_complete", False)),
+                        "auto_paused": bool(d.get("auto_paused", False)),
+                        "paused_reason": d.get("paused_reason"),
+                        "needs_manual_intervention": bool(
+                            d.get("needs_manual_intervention", False)
+                        ),
+                        "completion_criteria": d.get("completion_criteria"),
+                        "completion_suggestion": d.get("completion_suggestion"),
+                        "category": d.get("category"),
+                        "status": d.get("status"),
+                        "added_at": d.get("added_at"),
+                        "latest_insights": latest_insights,
+                        "recent_finding_titles": recent_finding_titles,
+                        "latest_research_at": latest_research_at,
+                        "product_ratio": dir_product_ratio,
+                        "type_distribution": agg_type_distribution or None,
+                        "type_breakdown": agg_type_breakdown or None,
+                        "estimated_cost_usd": round(dir_cost, 2),
+                        "spot_cost_usd": round(dir_spot_cost, 2),
+                        "on_demand_cost_usd": round(dir_on_demand_cost, 2),
+                        "cost_by_scope": cost_by_scope or None,
+                        "cost_by_status": cost_by_status or None,
+                        "cost_by_type": cost_by_type or None,
+                        "cost_by_provider_model": cost_by_provider_model or None,
+                        "cost_per_merged_pr": round(dir_cost / autonomous_prs_merged, 4)
+                        if autonomous_prs_merged > 0
+                        else None,
+                        "scope_breakdown": dir_scope_agg or None,
+                        "taxonomy_summary": dir_taxonomy_summary or None,
+                        "stage_dropout": dir_stage_dropout or None,
+                        "recent_failure_titles": recent_failed_titles[-3:] or None,
+                        "filter_funnel": filter_funnel,
+                        "decomposition_summary": decomposition_summary,
+                        "first_attempt_success_rate": dir_fa_rate,
+                        "first_attempt_sample_size": dir_fa_sample_size,
+                        "quality_score": round(_compute_direction_quality_score(d), 3),
+                        "lifetime_cycles": lifetime_cycles,
+                        "lifetime_prs_merged": lifetime_prs_merged,
+                        "lifetime_prs_rejected": lifetime_prs_rejected,
+                        "lifetime_tasks_failed": lifetime_tasks_failed,
+                        "lifetime_conversion_rate": lifetime_conversion_rate,
+                        "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
+                        "lifetime_operator_actions": lifetime_operator_actions,
+                        "retirement_eligible": retirement_eligible,
+                        "review_quality": {
+                            "reviews_dismissed": dir_reviews_dismissed,
+                            "reviews_overridden": dir_reviews_overridden,
+                            "user_issues_caught": dir_user_issues_caught,
+                        },
+                        "rejection_reasons": rejection_reasons or None,
+                        "prompt_quality_hint": prompt_quality_hint,
+                    }
+                )
 
-            direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
+            direction_progress_list.sort(
+                key=lambda x: x["cycles_in_window"], reverse=True
+            )
 
             if _budget_alert_fired:
                 try:
@@ -2684,18 +3378,20 @@ async def _compute_digest(
     # --- Batch artifact query ---
     all_task_ids = [t.id for t in all_tasks]
     pr_count = 0
-    pr_artifact_map: Dict[str, str] = {}   # task_id -> pr_url
-    error_log_map: Dict[str, str] = {}     # task_id -> truncated error snippet
+    pr_artifact_map: Dict[str, str] = {}  # task_id -> pr_url
+    error_log_map: Dict[str, str] = {}  # task_id -> truncated error snippet
 
     if all_task_ids:
         artifacts_result = await session.execute(
             select(Artifact)
             .where(
                 Artifact.task_id.in_(all_task_ids),
-                Artifact.artifact_type.in_([
-                    ArtifactType.PULL_REQUEST,
-                    ArtifactType.ERROR_LOG,
-                ])
+                Artifact.artifact_type.in_(
+                    [
+                        ArtifactType.PULL_REQUEST,
+                        ArtifactType.ERROR_LOG,
+                    ]
+                ),
             )
             .order_by(Artifact.created_at.asc())
         )
@@ -2705,53 +3401,75 @@ async def _compute_digest(
                 if a.created_at >= window_start:
                     pr_count += 1
                 pr_artifact_map[tid] = a.pr_url or ""
-            elif a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in error_log_map:
+            elif (
+                a.artifact_type == ArtifactType.ERROR_LOG
+                and a.logs
+                and tid not in error_log_map
+            ):
                 error_log_map[tid] = a.logs[:500]
 
     # --- needs_attention: failed + pending approval ---
     from app.failure_classification import classify_failure as _classify_failure
+
     _now = _utcnow()
     needs_attention = []
     for t in failed_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        waiting_hours = (
+            round((_now - waiting_since).total_seconds() / 3600)
+            if waiting_since
+            else None
+        )
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
-        needs_attention.append({
-            "task_id": tid,
-            "title": t.title or "Failed task",
-            "reason": "failed",
-            "error_snippet": error_log_map.get(tid),
-            "pr_url": pr_artifact_map.get(tid),
-            "waiting_since": waiting_since.isoformat() if waiting_since else None,
-            "waiting_hours": waiting_hours,
-            "direction_id": t_dir_id,
-            "direction_text": t_dir_text,
-            "failure_class": _classify_failure(t, error_log_map.get(tid)),
-            "scope": (t.context or {}).get("scope"),
-            "merge_retries_saved": (t.context or {}).get("_merge_retries_saved"),
-        })
+        needs_attention.append(
+            {
+                "task_id": tid,
+                "title": t.title or "Failed task",
+                "reason": "failed",
+                "error_snippet": error_log_map.get(tid),
+                "pr_url": pr_artifact_map.get(tid),
+                "waiting_since": waiting_since.isoformat() if waiting_since else None,
+                "waiting_hours": waiting_hours,
+                "direction_id": t_dir_id,
+                "direction_text": t_dir_text,
+                "failure_class": _classify_failure(t, error_log_map.get(tid)),
+                "scope": (t.context or {}).get("scope"),
+                "merge_retries_saved": (t.context or {}).get("_merge_retries_saved"),
+            }
+        )
     for t in approval_tasks:
         tid = str(t.id)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        waiting_hours = (
+            round((_now - waiting_since).total_seconds() / 3600)
+            if waiting_since
+            else None
+        )
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
-        needs_attention.append({
-            "task_id": tid,
-            "title": t.title or "Pending approval",
-            "reason": "approval_required",
-            "error_snippet": None,
-            "pr_url": pr_artifact_map.get(tid),
-            "waiting_since": waiting_since.isoformat() if waiting_since else None,
-            "waiting_hours": waiting_hours,
-            "approval_reason": t.latest_status_message,
-            "touched_critical": (t.context or {}).get("touched_critical", []),
-            "direction_id": t_dir_id,
-            "direction_text": t_dir_text,
-        })
-    needs_attention.sort(key=lambda x: (0 if x["reason"] == "approval_required" else 1, -(x["waiting_hours"] or 0)))
+        needs_attention.append(
+            {
+                "task_id": tid,
+                "title": t.title or "Pending approval",
+                "reason": "approval_required",
+                "error_snippet": None,
+                "pr_url": pr_artifact_map.get(tid),
+                "waiting_since": waiting_since.isoformat() if waiting_since else None,
+                "waiting_hours": waiting_hours,
+                "approval_reason": t.latest_status_message,
+                "touched_critical": (t.context or {}).get("touched_critical", []),
+                "direction_id": t_dir_id,
+                "direction_text": t_dir_text,
+            }
+        )
+    needs_attention.sort(
+        key=lambda x: (
+            0 if x["reason"] == "approval_required" else 1,
+            -(x["waiting_hours"] or 0),
+        )
+    )
 
     # --- recent_failures (up to 10, desc) ---
     from app.failure_classification import (
@@ -2759,41 +3477,53 @@ async def _compute_digest(
         classify_timeout_subtype as _classify_timeout_subtype,
         AGENT_TIMEOUT as _AGENT_TIMEOUT,
     )
+
     sorted_failures = sorted(failed_tasks, key=_derive_completed_at, reverse=True)
     recent_failures = []
     for t in sorted_failures[:10]:
         tid = str(t.id)
         ts = _derive_completed_at(t)
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        waiting_hours = (
+            round((_now - waiting_since).total_seconds() / 3600)
+            if waiting_since
+            else None
+        )
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         task_type = (t.first_payload).get("type", "create")
         _rf_cls = _classify_failure_rf(t, error_log_map.get(tid))
-        recent_failures.append({
-            "task_id": tid,
-            "title": t.title or "Failed task",
-            "failed_at": ts.isoformat() if ts else None,
-            "error_snippet": error_log_map.get(tid),
-            "waiting_hours": waiting_hours,
-            "attempt_count": t.attempt_count,
-            "direction_id": t_dir_id,
-            "direction_text": t_dir_text,
-            "task_type": task_type,
-            "failure_class": _rf_cls,
-            "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid)) if _rf_cls == _AGENT_TIMEOUT else None,
-            "scope": (t.context or {}).get("scope"),
-            "merge_retries_saved": (t.context or {}).get("_merge_retries_saved"),
-        })
+        recent_failures.append(
+            {
+                "task_id": tid,
+                "title": t.title or "Failed task",
+                "failed_at": ts.isoformat() if ts else None,
+                "error_snippet": error_log_map.get(tid),
+                "waiting_hours": waiting_hours,
+                "attempt_count": t.attempt_count,
+                "direction_id": t_dir_id,
+                "direction_text": t_dir_text,
+                "task_type": task_type,
+                "failure_class": _rf_cls,
+                "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid))
+                if _rf_cls == _AGENT_TIMEOUT
+                else None,
+                "scope": (t.context or {}).get("scope"),
+                "merge_retries_saved": (t.context or {}).get("_merge_retries_saved"),
+            }
+        )
 
     # --- failure_groups (classify failures by type) ---
     from app.failure_classification import (
         classify_failure as _classify_failure,
         classify_failure_taxonomy as _classify_taxonomy,
-        TAXONOMY_REVIEW_QUALITY, TAXONOMY_SCOPE_RELATED,
-        TAXONOMY_CODE_DEFECT, TAXONOMY_INFRA_RELATED,
+        TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_CODE_DEFECT,
+        TAXONOMY_INFRA_RELATED,
     )
     from app.failure_stage import _derive_failure_stage
+
     _failure_class_labels = {
         "CODE_ERROR": "Code Error",
         "PROVISION_FAILURE": "Provision Failure",
@@ -2814,41 +3544,56 @@ async def _compute_digest(
         if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
             _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
             _task_cost = _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            _cost_by_failure_class[cls] = _cost_by_failure_class.get(cls, 0.0) + _task_cost
+            _cost_by_failure_class[cls] = (
+                _cost_by_failure_class.get(cls, 0.0) + _task_cost
+            )
         if cls == "PROVISION_FAILURE":
             _provision_waste_cost += _task_cost
             _pw_did = (t.context or {}).get("direction_id")
             if _pw_did:
                 _pw_key = str(_pw_did)
-                _pw_entry = _provision_waste_by_dir.setdefault(_pw_key, {
-                    "direction_id": _pw_key,
-                    "direction_text": dir_id_to_text.get(_pw_key, ""),
-                    "provision_cost_usd": 0.0,
-                    "provision_task_count": 0,
-                })
+                _pw_entry = _provision_waste_by_dir.setdefault(
+                    _pw_key,
+                    {
+                        "direction_id": _pw_key,
+                        "direction_text": dir_id_to_text.get(_pw_key, ""),
+                        "provision_cost_usd": 0.0,
+                        "provision_task_count": 0,
+                    },
+                )
                 _pw_entry["provision_cost_usd"] += _task_cost
                 _pw_entry["provision_task_count"] += 1
         waiting_since = _derive_completed_at(t)
-        waiting_hours = round((_now - waiting_since).total_seconds() / 3600) if waiting_since else None
+        waiting_hours = (
+            round((_now - waiting_since).total_seconds() / 3600)
+            if waiting_since
+            else None
+        )
         t_dir_id = (t.context or {}).get("direction_id")
         t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
         _stage = (t.context or {}).get("_previous_failure_stage")
         if not _stage:
-            _stage = _derive_failure_stage(cls, t.latest_status_message or error_log_map.get(tid) or "")
+            _stage = _derive_failure_stage(
+                cls, t.latest_status_message or error_log_map.get(tid) or ""
+            )
         if _stage:
             _failure_stage_counts[_stage] = _failure_stage_counts.get(_stage, 0) + 1
-        _failure_class_groups.setdefault(cls, []).append({
-            "task_id": tid,
-            "title": t.title or "Failed task",
-            "error_snippet": error_log_map.get(tid),
-            "attempt_count": t.attempt_count,
-            "waiting_hours": waiting_hours,
-            "taxonomy": _classify_taxonomy(t),
-            "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid)) if cls == _AGENT_TIMEOUT else None,
-            "direction_id": t_dir_id,
-            "direction_text": t_dir_text,
-            "failure_stage": _stage,
-        })
+        _failure_class_groups.setdefault(cls, []).append(
+            {
+                "task_id": tid,
+                "title": t.title or "Failed task",
+                "error_snippet": error_log_map.get(tid),
+                "attempt_count": t.attempt_count,
+                "waiting_hours": waiting_hours,
+                "taxonomy": _classify_taxonomy(t),
+                "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid))
+                if cls == _AGENT_TIMEOUT
+                else None,
+                "direction_id": t_dir_id,
+                "direction_text": t_dir_text,
+                "failure_stage": _stage,
+            }
+        )
     failure_groups = sorted(
         [
             {
@@ -2874,10 +3619,18 @@ async def _compute_digest(
         if _ctx.get("scope_gate_triggered") == "analysis_overflow":
             _analysis_overflow_count += 1
             _scope = _ctx.get("scope") or "unknown"
-            _analysis_overflow_by_scope[_scope] = _analysis_overflow_by_scope.get(_scope, 0) + 1
-            if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
+            _analysis_overflow_by_scope[_scope] = (
+                _analysis_overflow_by_scope.get(_scope, 0) + 1
+            )
+            if (
+                t.vm_provisioned_at
+                and t.vm_stopped_at
+                and t.vm_stopped_at >= window_start
+            ):
                 _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-                _analysis_overflow_cost += _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                _analysis_overflow_cost += (
+                    _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                )
     analysis_overflow_summary = {
         "total_count": _analysis_overflow_count,
         "by_scope": _analysis_overflow_by_scope,
@@ -2897,24 +3650,33 @@ async def _compute_digest(
     _retry_attempt_sum = 0
     _retry_waste_by_dir: Dict[str, Dict[str, Any]] = {}
     for t in failed_tasks:
-        _attempt = ((t.context or {}).get("_attempt_number") or 0)
+        _attempt = (t.context or {}).get("_attempt_number") or 0
         if _attempt > 1:
             _retry_task_count += 1
             _retry_attempt_sum += _attempt
             _task_retry_cost = 0.0
-            if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
+            if (
+                t.vm_provisioned_at
+                and t.vm_stopped_at
+                and t.vm_stopped_at >= window_start
+            ):
                 _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-                _task_retry_cost = _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                _task_retry_cost = (
+                    _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                )
                 _retry_overhead_cost += _task_retry_cost
             _rw_did = (t.context or {}).get("direction_id")
             if _rw_did:
                 _key = str(_rw_did)
-                _entry = _retry_waste_by_dir.setdefault(_key, {
-                    "direction_id": _key,
-                    "direction_text": dir_id_to_text.get(_key, ""),
-                    "retry_cost_usd": 0.0,
-                    "retry_task_count": 0,
-                })
+                _entry = _retry_waste_by_dir.setdefault(
+                    _key,
+                    {
+                        "direction_id": _key,
+                        "direction_text": dir_id_to_text.get(_key, ""),
+                        "retry_cost_usd": 0.0,
+                        "retry_task_count": 0,
+                    },
+                )
                 _entry["retry_cost_usd"] += _task_retry_cost
                 _entry["retry_task_count"] += 1
     retry_overhead_cost_usd = round(_retry_overhead_cost, 4)
@@ -2927,7 +3689,9 @@ async def _compute_digest(
         reverse=True,
     )[:5]
     retry_task_count = _retry_task_count
-    avg_retries_before_failure = round(_retry_attempt_sum / _retry_task_count, 2) if _retry_task_count else None
+    avg_retries_before_failure = (
+        round(_retry_attempt_sum / _retry_task_count, 2) if _retry_task_count else None
+    )
 
     # Retry success/waste metrics by _previous_failure_class (the class that triggered the retry)
     _retry_success_by_class: Dict[str, int] = {}
@@ -2957,7 +3721,10 @@ async def _compute_digest(
             "failed": _retry_failure_by_class.get(_cls, 0),
             "success_rate": round(
                 _retry_success_by_class.get(_cls, 0)
-                / (_retry_success_by_class.get(_cls, 0) + _retry_failure_by_class.get(_cls, 0)),
+                / (
+                    _retry_success_by_class.get(_cls, 0)
+                    + _retry_failure_by_class.get(_cls, 0)
+                ),
                 4,
             ),
         }
@@ -2965,12 +3732,16 @@ async def _compute_digest(
     }
     retry_success_count = _retry_success_count
     _total_retried = _retry_success_count + _retry_task_count
-    retry_wasted_rate = round(_retry_task_count / _total_retried, 4) if _total_retried else None
+    retry_wasted_rate = (
+        round(_retry_task_count / _total_retried, 4) if _total_retried else None
+    )
 
     # Taxonomy distribution (4-category: scope/review/infra/code_defect)
     _tax_keys = (
-        TAXONOMY_SCOPE_RELATED, TAXONOMY_REVIEW_QUALITY,
-        TAXONOMY_INFRA_RELATED, TAXONOMY_CODE_DEFECT,
+        TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_INFRA_RELATED,
+        TAXONOMY_CODE_DEFECT,
     )
     _tax_counts: Dict[str, int] = {k: 0 for k in _tax_keys}
     for t in failed_tasks:
@@ -2980,12 +3751,16 @@ async def _compute_digest(
         "categories": {
             k: {
                 "count": _tax_counts[k],
-                "percentage": round(_tax_counts[k] / _tax_total * 100, 1) if _tax_total else 0.0,
+                "percentage": round(_tax_counts[k] / _tax_total * 100, 1)
+                if _tax_total
+                else 0.0,
             }
             for k in _tax_keys
         },
         "total_failures": _tax_total,
-        "dominant_category": max(_tax_keys, key=lambda k: _tax_counts[k]) if _tax_total else None,
+        "dominant_category": max(_tax_keys, key=lambda k: _tax_counts[k])
+        if _tax_total
+        else None,
     }
 
     _stage_total = sum(_failure_stage_counts.values())
@@ -2994,7 +3769,8 @@ async def _compute_digest(
         "total_classified": _stage_total,
         "dominant_stage": (
             max(_failure_stage_counts.items(), key=lambda kv: kv[1])[0]
-            if _stage_total else None
+            if _stage_total
+            else None
         ),
     }
 
@@ -3010,29 +3786,36 @@ async def _compute_digest(
         duration_seconds = None
         if t.started_at and ts:
             duration_seconds = int((ts - t.started_at).total_seconds())
-        recent_completions.append({
-            "task_id": tid,
-            "title": t.title or "Completed task",
-            "completed_at": ts.isoformat() if ts else None,
-            "pr_url": pr_artifact_map.get(tid),
-            "task_type": task_type,
-            "direction_id": t_dir_id,
-            "direction_text": t_dir_text,
-            "duration_seconds": duration_seconds,
-            "scope": (t.context or {}).get("scope"),
-            "review_iterations": (t.context or {}).get("review_loop", {}).get("iteration", 0),
-        })
+        recent_completions.append(
+            {
+                "task_id": tid,
+                "title": t.title or "Completed task",
+                "completed_at": ts.isoformat() if ts else None,
+                "pr_url": pr_artifact_map.get(tid),
+                "task_type": task_type,
+                "direction_id": t_dir_id,
+                "direction_text": t_dir_text,
+                "duration_seconds": duration_seconds,
+                "scope": (t.context or {}).get("scope"),
+                "review_iterations": (t.context or {})
+                .get("review_loop", {})
+                .get("iteration", 0),
+            }
+        )
 
     # --- active_tasks list (oldest started first, capped at _ACTIVE_TASKS_DISPLAY_LIMIT) ---
     _now_active = _utcnow()
     from app.review_pipeline import _max_review_iterations
+
     active_tasks_list = []
     for t in active_tasks_all[:_ACTIVE_TASKS_DISPLAY_LIMIT]:
         at_dir_id = (t.context or {}).get("direction_id")
         at_dir_text = dir_id_to_text.get(str(at_dir_id)) if at_dir_id else None
         if t.vm_provisioned_at:
             rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            running_cost_usd = rate * (_now_active - t.vm_provisioned_at).total_seconds()
+            running_cost_usd = (
+                rate * (_now_active - t.vm_provisioned_at).total_seconds()
+            )
         else:
             running_cost_usd = None
         t_ctx = t.context or {}
@@ -3042,19 +3825,21 @@ async def _compute_digest(
         except Exception:
             scope_val = t_ctx.get("scope")
             review_cap = {"small": 10, "medium": 12}.get(scope_val, 16)
-        active_tasks_list.append({
-            "task_id": str(t.id),
-            "title": t.title or "Active task",
-            "status": t.status.value if hasattr(t.status, "value") else t.status,
-            "task_type": (t.first_payload).get("type", "create"),
-            "started_at": t.started_at.isoformat() if t.started_at else None,
-            "direction_id": at_dir_id,
-            "direction_text": at_dir_text,
-            "running_cost_usd": running_cost_usd,
-            "scope": t_ctx.get("scope"),
-            "review_iteration": review_iteration,
-            "review_cap": review_cap,
-        })
+        active_tasks_list.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or "Active task",
+                "status": t.status.value if hasattr(t.status, "value") else t.status,
+                "task_type": (t.first_payload).get("type", "create"),
+                "started_at": t.started_at.isoformat() if t.started_at else None,
+                "direction_id": at_dir_id,
+                "direction_text": at_dir_text,
+                "running_cost_usd": running_cost_usd,
+                "scope": t_ctx.get("scope"),
+                "review_iteration": review_iteration,
+                "review_cap": review_cap,
+            }
+        )
 
     running_statuses = {TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING}
     queued_statuses = {TaskStatus.QUEUED, TaskStatus.EVALUATING}
@@ -3062,7 +3847,9 @@ async def _compute_digest(
     queued_count = sum(1 for t in active_tasks_all if t.status in queued_statuses)
 
     total_terminal = len(completed_tasks) + len(failed_tasks)
-    success_rate = round(len(completed_tasks) / total_terminal, 2) if total_terminal > 0 else None
+    success_rate = (
+        round(len(completed_tasks) / total_terminal, 2) if total_terminal > 0 else None
+    )
 
     # --- narrative_summary ---
     completed_count = len(completed_tasks)
@@ -3071,17 +3858,23 @@ async def _compute_digest(
 
     # --- Previous window metrics for trend comparison ---
     prev_completed_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.COMPLETED
         and prev_window_start <= _derive_completed_at(t) < window_start
     ]
     prev_failed_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.FAILED
         and prev_window_start <= _derive_completed_at(t) < window_start
     ]
     prev_total_terminal = len(prev_completed_tasks) + len(prev_failed_tasks)
-    prev_success_rate = round(len(prev_completed_tasks) / prev_total_terminal, 2) if prev_total_terminal > 0 else None
+    prev_success_rate = (
+        round(len(prev_completed_tasks) / prev_total_terminal, 2)
+        if prev_total_terminal > 0
+        else None
+    )
     prev_completed_count = len(prev_completed_tasks)
     prev_failed_count = len(prev_failed_tasks)
 
@@ -3109,12 +3902,14 @@ async def _compute_digest(
         _p_start = _now - timedelta(hours=hours * (7 - _i))
         _p_end = _now - timedelta(hours=hours * (6 - _i))
         _p_completed = sum(
-            1 for t in all_tasks
+            1
+            for t in all_tasks
             if t.status == TaskStatus.COMPLETED
             and _p_start <= _derive_completed_at(t) < _p_end
         )
         _p_failed_tasks = [
-            t for t in all_tasks
+            t
+            for t in all_tasks
             if t.status == TaskStatus.FAILED
             and _p_start <= _derive_completed_at(t) < _p_end
         ]
@@ -3127,25 +3922,51 @@ async def _compute_digest(
             _tax = _classify_taxonomy(_ft)
             _p_by_taxonomy[_tax] = _p_by_taxonomy.get(_tax, 0) + 1
         _p_total = _p_completed + _p_failed
-        _p_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and _p_start <= t.vm_stopped_at < _p_end)
+        _p_cost = sum(
+            ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
+            * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            for t in all_tasks
+            if t.vm_provisioned_at
+            and t.vm_stopped_at
+            and _p_start <= t.vm_stopped_at < _p_end
+        )
         _p_terminal = [
-            t for t in all_tasks
+            t
+            for t in all_tasks
             if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
             and _p_start <= _derive_completed_at(t) < _p_end
         ]
-        _p_measured = [t for t in _p_terminal if "_first_attempt_succeeded" in (t.context or {})]
-        _p_fa_rate = round(sum(1 for t in _p_measured if (t.context or {}).get("_first_attempt_succeeded")) / len(_p_measured), 2) if _p_measured else None
-        trend_history.append({
-            "period_end": _p_end.isoformat(),
-            "success_rate": round(_p_completed / _p_total, 2) if _p_total > 0 else None,
-            "completed": _p_completed,
-            "failed": _p_failed,
-            "failed_by_class": _p_by_class,
-            "failed_by_taxonomy": _p_by_taxonomy,
-            "period_cost_usd": round(_p_cost, 4),
-            "first_attempt_success_rate": _p_fa_rate,
-            "first_attempt_sample_size": len(_p_measured),
-        })
+        _p_measured = [
+            t for t in _p_terminal if "_first_attempt_succeeded" in (t.context or {})
+        ]
+        _p_fa_rate = (
+            round(
+                sum(
+                    1
+                    for t in _p_measured
+                    if (t.context or {}).get("_first_attempt_succeeded")
+                )
+                / len(_p_measured),
+                2,
+            )
+            if _p_measured
+            else None
+        )
+        trend_history.append(
+            {
+                "period_end": _p_end.isoformat(),
+                "success_rate": round(_p_completed / _p_total, 2)
+                if _p_total > 0
+                else None,
+                "completed": _p_completed,
+                "failed": _p_failed,
+                "failed_by_class": _p_by_class,
+                "failed_by_taxonomy": _p_by_taxonomy,
+                "period_cost_usd": round(_p_cost, 4),
+                "first_attempt_success_rate": _p_fa_rate,
+                "first_attempt_sample_size": len(_p_measured),
+            }
+        )
 
     # Action-first narrative: executives want "what do I need to do?" before "how did things go?"
     narrative_parts = []
@@ -3163,7 +3984,9 @@ async def _compute_digest(
             approval_items = [
                 x for x in needs_attention if x["reason"] == "approval_required"
             ]
-            max_wait = max((x.get("waiting_hours") or 0 for x in approval_items), default=0)
+            max_wait = max(
+                (x.get("waiting_hours") or 0 for x in approval_items), default=0
+            )
             approval_str = f"{pending_approval_count} task{'s' if pending_approval_count != 1 else ''} awaiting your approval"
             if max_wait > 0:
                 approval_str += f" ({max_wait}h)"
@@ -3173,7 +3996,11 @@ async def _compute_digest(
         if failed_count > 0:
             dominant_group = failure_groups[0] if failure_groups else None
             dominant_msg = None
-            if dominant_group and dominant_group["count"] >= 2 and dominant_group["count"] / failed_count >= 0.6:
+            if (
+                dominant_group
+                and dominant_group["count"] >= 2
+                and dominant_group["count"] / failed_count >= 0.6
+            ):
                 cls = dominant_group["failure_class"]
                 cnt = dominant_group["count"]
                 _root_cause_msgs = {
@@ -3187,7 +4014,10 @@ async def _compute_digest(
                 if cls == "CODE_ERROR":
                     _ce_tax: Dict[str, int] = {}
                     for _t in failed_tasks:
-                        if _classify_failure(_t, error_log_map.get(str(_t.id))) == "CODE_ERROR":
+                        if (
+                            _classify_failure(_t, error_log_map.get(str(_t.id)))
+                            == "CODE_ERROR"
+                        ):
                             _sub = _classify_taxonomy(_t)
                             _ce_tax[_sub] = _ce_tax.get(_sub, 0) + 1
                     if _ce_tax:
@@ -3206,7 +4036,9 @@ async def _compute_digest(
                 narrative_parts.append(dominant_msg)
             else:
                 failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
-                failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
+                failed_str = (
+                    f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
+                )
                 if failure_titles:
                     failed_str += f" ({', '.join(failure_titles)})"
                 narrative_parts.append(failed_str + ".")
@@ -3214,7 +4046,9 @@ async def _compute_digest(
             _dom_cat = failure_taxonomy_distribution.get("dominant_category")
             _tax_tot = failure_taxonomy_distribution.get("total_failures") or 0
             if _dom_cat and _tax_tot >= 2:
-                _dom_count = failure_taxonomy_distribution["categories"][_dom_cat]["count"]
+                _dom_count = failure_taxonomy_distribution["categories"][_dom_cat][
+                    "count"
+                ]
                 if _dom_count / _tax_tot >= 0.5:
                     _taxonomy_msgs = {
                         "review_quality": "Review quality issues dominate failures — improving lint/test coverage may help.",
@@ -3236,8 +4070,12 @@ async def _compute_digest(
             shipped = f"{trend_prefix}{completed_count} task{'s' if completed_count != 1 else ''} completed"
             if pr_count > 0:
                 shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
-            completion_titles = [t.title or "Completed task" for t in sorted_completions[:2]]
-            completion_titles = [t[:50] + "..." if len(t) > 50 else t for t in completion_titles]
+            completion_titles = [
+                t.title or "Completed task" for t in sorted_completions[:2]
+            ]
+            completion_titles = [
+                t[:50] + "..." if len(t) > 50 else t for t in completion_titles
+            ]
             if completion_titles:
                 shipped += f" including {', '.join(completion_titles)}"
             if completed_delta > 0:
@@ -3292,13 +4130,28 @@ async def _compute_digest(
             narrative_summary = f"All quiet — no activity in the last {hours}h."
 
     # Compute total estimated cost (directed + undirected tasks)
-    directed_task_ids = {t.id for t in all_tasks if (t.context or {}).get("direction_id")}
-    undirected_cost = sum(((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start and t.id not in directed_task_ids)
-    total_estimated_cost_usd = round(sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost, 2)
+    directed_task_ids = {
+        t.id for t in all_tasks if (t.context or {}).get("direction_id")
+    }
+    undirected_cost = sum(
+        ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
+        * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        for t in all_tasks
+        if t.vm_provisioned_at
+        and t.vm_stopped_at
+        and t.vm_stopped_at >= window_start
+        and t.id not in directed_task_ids
+    )
+    total_estimated_cost_usd = round(
+        sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost,
+        2,
+    )
     total_spot_cost_usd = 0.0
     total_on_demand_cost_usd = 0.0
     for t in all_tasks:
-        if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+        if not (
+            t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start
+        ):
             continue
         rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
         t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
@@ -3315,37 +4168,69 @@ async def _compute_digest(
     _provisioning_overhead_raw = 0.0
     _total_compute_cost_raw = total_spot_cost_usd + total_on_demand_cost_usd
     for t in all_tasks:
-        if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+        if not (
+            t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start
+        ):
             continue
         rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-        prov_end = t.vm_started_at if (t.vm_started_at and t.vm_started_at >= t.vm_provisioned_at) else t.vm_stopped_at
+        prov_end = (
+            t.vm_started_at
+            if (t.vm_started_at and t.vm_started_at >= t.vm_provisioned_at)
+            else t.vm_stopped_at
+        )
         if prov_end <= t.vm_provisioned_at:
             continue
-        _provisioning_overhead_raw += rate * (prov_end - t.vm_provisioned_at).total_seconds()
+        _provisioning_overhead_raw += (
+            rate * (prov_end - t.vm_provisioned_at).total_seconds()
+        )
     provisioning_overhead_usd = round(_provisioning_overhead_raw, 2)
     provisioning_overhead_pct = (
         round(_provisioning_overhead_raw / _total_compute_cost_raw, 3)
-        if _total_compute_cost_raw > 0 else None
+        if _total_compute_cost_raw > 0
+        else None
     )
 
     # Compute today's cost for cost ceiling warning
     today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    daily_cost_usd = round(sum(
-        ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE) * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-        for t in all_tasks if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= today_start
-    ), 2)
+    daily_cost_usd = round(
+        sum(
+            ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
+            * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            for t in all_tasks
+            if t.vm_provisioned_at
+            and t.vm_stopped_at
+            and t.vm_stopped_at >= today_start
+        ),
+        2,
+    )
     daily_cost_ceiling_usd = float(_runtime_config.get("daily_cost_ceiling_usd", 0))
 
     # Compute overall product_ratio and type_distribution across all directions
-    all_product_ratios = [d["product_ratio"] for d in direction_progress_list if d.get("product_ratio") is not None]
-    overall_product_ratio = round(sum(all_product_ratios) / len(all_product_ratios), 3) if all_product_ratios else None
+    all_product_ratios = [
+        d["product_ratio"]
+        for d in direction_progress_list
+        if d.get("product_ratio") is not None
+    ]
+    overall_product_ratio = (
+        round(sum(all_product_ratios) / len(all_product_ratios), 3)
+        if all_product_ratios
+        else None
+    )
 
-    all_cpms = [d["cost_per_merged_pr"] for d in direction_progress_list if d.get("cost_per_merged_pr") is not None]
-    median_cost_per_merged_pr = round(statistics.median(all_cpms), 4) if all_cpms else None
+    all_cpms = [
+        d["cost_per_merged_pr"]
+        for d in direction_progress_list
+        if d.get("cost_per_merged_pr") is not None
+    ]
+    median_cost_per_merged_pr = (
+        round(statistics.median(all_cpms), 4) if all_cpms else None
+    )
     for d in direction_progress_list:
         cpm = d.get("cost_per_merged_pr")
         if cpm is not None and median_cost_per_merged_pr is not None:
-            d["cost_per_merge_exceeds_threshold"] = cpm > (median_cost_per_merged_pr * _CPM_RETIREMENT_MULTIPLIER)
+            d["cost_per_merge_exceeds_threshold"] = cpm > (
+                median_cost_per_merged_pr * _CPM_RETIREMENT_MULTIPLIER
+            )
         else:
             d["cost_per_merge_exceeds_threshold"] = False
 
@@ -3353,7 +4238,9 @@ async def _compute_digest(
     _type_cost: Dict[str, float] = {}
     _type_merges: Dict[str, int] = {}
     for t in all_tasks:
-        if not (t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start):
+        if not (
+            t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start
+        ):
             continue
         rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
         t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
@@ -3366,12 +4253,16 @@ async def _compute_digest(
         for ttype in _type_cost
         if _type_merges.get(ttype, 0) > 0
     }
-    _median_cpm_by_type = round(statistics.median(list(_type_cpms.values())), 4) if _type_cpms else None
+    _median_cpm_by_type = (
+        round(statistics.median(list(_type_cpms.values())), 4) if _type_cpms else None
+    )
     cost_per_merge_by_type = {
         ttype: {
             "total_cost_usd": round(_type_cost[ttype], 4),
             "merged_count": _type_merges.get(ttype, 0),
-            "cost_per_merge": round(_type_cpms[ttype], 4) if ttype in _type_cpms else None,
+            "cost_per_merge": round(_type_cpms[ttype], 4)
+            if ttype in _type_cpms
+            else None,
             "exceeds_threshold": (
                 _type_cpms[ttype] > (_median_cpm_by_type * _CPM_RETIREMENT_MULTIPLIER)
                 if ttype in _type_cpms and _median_cpm_by_type is not None
@@ -3382,25 +4273,41 @@ async def _compute_digest(
     }
 
     # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
-    _pipeline_total_merged_d = sum(d.get("prs_merged") or 0 for d in direction_progress_list)
-    _pipeline_total_rejected_d = sum(d.get("prs_rejected") or 0 for d in direction_progress_list)
+    _pipeline_total_merged_d = sum(
+        d.get("prs_merged") or 0 for d in direction_progress_list
+    )
+    _pipeline_total_rejected_d = sum(
+        d.get("prs_rejected") or 0 for d in direction_progress_list
+    )
     _pipeline_total_decided = _pipeline_total_merged_d + _pipeline_total_rejected_d
     pipeline_acceptance_rate = (
         round(_pipeline_total_merged_d / _pipeline_total_decided, 3)
-        if _pipeline_total_decided > 0 else None
+        if _pipeline_total_decided > 0
+        else None
     )
-    _pipeline_total_created_d = sum(d.get("tasks_created") or 0 for d in direction_progress_list)
+    _pipeline_total_created_d = sum(
+        d.get("tasks_created") or 0 for d in direction_progress_list
+    )
     pipeline_conversion_rate = (
         round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
-        if _pipeline_total_created_d > 0 else None
+        if _pipeline_total_created_d > 0
+        else None
     )
-    pipeline_autonomous_prs_merged = sum(d.get("autonomous_prs_merged") or 0 for d in direction_progress_list)
-    pipeline_assisted_prs_merged = sum(d.get("assisted_prs_merged") or 0 for d in direction_progress_list)
-    pipeline_operator_action_count = sum(d.get("operator_action_count") or 0 for d in direction_progress_list)
+    pipeline_autonomous_prs_merged = sum(
+        d.get("autonomous_prs_merged") or 0 for d in direction_progress_list
+    )
+    pipeline_assisted_prs_merged = sum(
+        d.get("assisted_prs_merged") or 0 for d in direction_progress_list
+    )
+    pipeline_operator_action_count = sum(
+        d.get("operator_action_count") or 0 for d in direction_progress_list
+    )
     overall_type_distribution: Dict[str, int] = {}
     for d in direction_progress_list:
         for ttype, cnt in (d.get("type_distribution") or {}).items():
-            overall_type_distribution[ttype] = overall_type_distribution.get(ttype, 0) + cnt
+            overall_type_distribution[ttype] = (
+                overall_type_distribution.get(ttype, 0) + cnt
+            )
 
     pipeline_filter_funnel: Dict[str, int] = {}
     for d in direction_progress_list:
@@ -3413,19 +4320,22 @@ async def _compute_digest(
     # systematic scope-estimation drift and chronic-calibration directions.
     _terminal_in_window = completed_tasks + failed_tasks
     _calibrated_tasks = [
-        t for t in _terminal_in_window
-        if (t.context or {}).get("scope_calibrated_from")
+        t for t in _terminal_in_window if (t.context or {}).get("scope_calibrated_from")
     ]
     scope_mismatch_summary: Optional[Dict[str, Any]] = None
     if _calibrated_tasks:
-        _cal_completed = sum(1 for t in _calibrated_tasks if t.status == TaskStatus.COMPLETED)
+        _cal_completed = sum(
+            1 for t in _calibrated_tasks if t.status == TaskStatus.COMPLETED
+        )
         _cal_total = len(_calibrated_tasks)
         _by_orig: Dict[str, Dict[str, int]] = {}
         _by_dir_calibrated: Dict[str, int] = {}
         for t in _calibrated_tasks:
             _orig_raw = str((t.context or {}).get("scope_calibrated_from") or "")
             _orig = _orig_raw.split(":", 1)[0] or "unknown"
-            _bucket = _by_orig.setdefault(_orig, {"total": 0, "completed": 0, "failed": 0})
+            _bucket = _by_orig.setdefault(
+                _orig, {"total": 0, "completed": 0, "failed": 0}
+            )
             _bucket["total"] += 1
             if t.status == TaskStatus.COMPLETED:
                 _bucket["completed"] += 1
@@ -3446,18 +4356,24 @@ async def _compute_digest(
             _tot = _by_dir_total.get(_did, 0)
             if _tot <= 0:
                 continue
-            _top_dirs.append({
-                "direction_id": _did,
-                "direction_text": dir_id_to_text.get(_did, ""),
-                "calibrated_count": _cal_cnt,
-                "total_tasks": _tot,
-                "calibration_rate": round(_cal_cnt / _tot, 3),
-            })
-        _top_dirs.sort(key=lambda d: (d["calibration_rate"], d["calibrated_count"]), reverse=True)
+            _top_dirs.append(
+                {
+                    "direction_id": _did,
+                    "direction_text": dir_id_to_text.get(_did, ""),
+                    "calibrated_count": _cal_cnt,
+                    "total_tasks": _tot,
+                    "calibration_rate": round(_cal_cnt / _tot, 3),
+                }
+            )
+        _top_dirs.sort(
+            key=lambda d: (d["calibration_rate"], d["calibrated_count"]), reverse=True
+        )
 
         scope_mismatch_summary = {
             "total_calibrated": _cal_total,
-            "calibrated_success_rate": round(_cal_completed / _cal_total, 3) if _cal_total else None,
+            "calibrated_success_rate": round(_cal_completed / _cal_total, 3)
+            if _cal_total
+            else None,
             "by_original_scope": _by_orig,
             "top_directions": _top_dirs[:3],
         }
@@ -3471,7 +4387,7 @@ async def _compute_digest(
         _proj_esc = await session.get(Project, project_id)
         if _proj_esc:
             _esc_paths: Dict[str, Dict[str, int]] = {}
-            for _d in (_proj_esc.directions or []):
+            for _d in _proj_esc.directions or []:
                 if _d.get("status") not in ("active", "held", "auto_paused"):
                     continue
                 for _entry in _d.get("research_history") or []:
@@ -3481,7 +4397,9 @@ async def _compute_digest(
                         continue
                     if _ets < window_start:
                         continue
-                    for _path, _counts in (_entry.get("escalation_outcomes") or {}).items():
+                    for _path, _counts in (
+                        _entry.get("escalation_outcomes") or {}
+                    ).items():
                         if not isinstance(_counts, dict):
                             continue
                         _b = _esc_paths.setdefault(
@@ -3507,7 +4425,9 @@ async def _compute_digest(
                 "total_attempted": _tot_att,
                 "total_merged": _tot_mer,
                 "total_failed": _tot_fail,
-                "overall_success_rate": round(_tot_mer / _tot_att, 3) if _tot_att else None,
+                "overall_success_rate": round(_tot_mer / _tot_att, 3)
+                if _tot_att
+                else None,
                 "by_path": _by_path,
             }
 
@@ -3524,7 +4444,7 @@ async def _compute_digest(
             _prev_failed = 0
             _all_created = 0
             _all_merged = 0
-            for _d in (_proj_prev.directions or []):
+            for _d in _proj_prev.directions or []:
                 for _entry in _d.get("research_history") or []:
                     try:
                         _ets = datetime.fromisoformat(_entry.get("timestamp", ""))
@@ -3532,9 +4452,15 @@ async def _compute_digest(
                         continue
                     if _ets < window_start:
                         continue
-                    _prev_created += int(_entry.get("preventive_context_tasks_created") or 0)
-                    _prev_merged += int(_entry.get("preventive_context_tasks_merged") or 0)
-                    _prev_failed += int(_entry.get("preventive_context_tasks_failed") or 0)
+                    _prev_created += int(
+                        _entry.get("preventive_context_tasks_created") or 0
+                    )
+                    _prev_merged += int(
+                        _entry.get("preventive_context_tasks_merged") or 0
+                    )
+                    _prev_failed += int(
+                        _entry.get("preventive_context_tasks_failed") or 0
+                    )
                     _all_created += int(_entry.get("tasks_created") or 0)
                     _all_merged += int(_entry.get("prs_merged") or 0)
             if _prev_created == 0:
@@ -3543,7 +4469,9 @@ async def _compute_digest(
                     "preventive_tasks_merged": 0,
                     "preventive_tasks_failed": 0,
                     "preventive_merge_rate": None,
-                    "overall_merge_rate": round(_all_merged / _all_created, 3) if _all_created else None,
+                    "overall_merge_rate": round(_all_merged / _all_created, 3)
+                    if _all_created
+                    else None,
                     "assessment": "no_data",
                 }
             else:
@@ -3564,7 +4492,9 @@ async def _compute_digest(
                     "preventive_tasks_merged": _prev_merged,
                     "preventive_tasks_failed": _prev_failed,
                     "preventive_merge_rate": round(_prev_rate, 3),
-                    "overall_merge_rate": round(_overall_rate, 3) if _overall_rate is not None else None,
+                    "overall_merge_rate": round(_overall_rate, 3)
+                    if _overall_rate is not None
+                    else None,
                     "assessment": _assessment,
                 }
 
@@ -3574,6 +4504,7 @@ async def _compute_digest(
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
+    sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     if project_id:
         _proj = await session.get(Project, project_id)
         if _proj:
@@ -3584,8 +4515,17 @@ async def _compute_digest(
                     "categories": _sr_trends.get("categories") or {},
                     "by_task_type": _sr_trends.get("by_task_type") or {},
                 }
+            _sr_rrts = (_proj.design_doc or {}).get(
+                "sr_regression_risk_test_signal_trends"
+            )
+            if _sr_rrts:
+                sr_regression_risk_test_signal_trends = _sr_rrts
             cycle_history = (_proj.vision or {}).get("_strategic_cycle_history", [])
-            completed_cycles = [c for c in cycle_history if c.get("outcome") not in (None, "in_progress")]
+            completed_cycles = [
+                c
+                for c in cycle_history
+                if c.get("outcome") not in (None, "in_progress")
+            ]
             if completed_cycles:
                 last = max(completed_cycles, key=lambda c: c.get("started_at") or "")
                 latest_cycle = {
@@ -3599,7 +4539,9 @@ async def _compute_digest(
                     "summary_text": last.get("summary_text"),
                 }
             _sc_history = await _strategic_cycle.recent_for_agent_context(
-                session, project_id, limit=20,
+                session,
+                project_id,
+                limit=20,
             )
             prediction_calibration = _compute_prediction_calibration(_proj, _sc_history)
             # Fresh-reviewer cycle-over-cycle trend persisted by compute_fresh_reviewer_trend.
@@ -3612,7 +4554,8 @@ async def _compute_digest(
                     "previous_cycle_id": _fr_trends.get("previous_cycle_id"),
                     "current_sample_size": _fr_trends.get("current_sample_size"),
                     "previous_sample_size": _fr_trends.get("previous_sample_size"),
-                    "per_category_hit_rate": _fr_trends.get("per_category_hit_rate") or {},
+                    "per_category_hit_rate": _fr_trends.get("per_category_hit_rate")
+                    or {},
                     "added_value": _fr_trends.get("added_value") or {},
                     "approval_rate_lift": _fr_trends.get("approval_rate_lift") or {},
                 }
@@ -3626,13 +4569,16 @@ async def _compute_digest(
                     "previous_cycle_id": _et.get("previous_cycle_id"),
                     "current": _et.get("current") or {},
                     "previous": _et.get("previous") or {},
-                    "tasks_with_edges_rate_delta": _et.get("tasks_with_edges_rate_delta"),
+                    "tasks_with_edges_rate_delta": _et.get(
+                        "tasks_with_edges_rate_delta"
+                    ),
                     "trend": _et.get("trend"),
                     "rate_history": _et.get("rate_history") or [],
                 }
 
     _rejected_in_window = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if (t.context or {}).get("pr_rejected")
         and _derive_completed_at(t) >= window_start
     ]
@@ -3654,18 +4600,21 @@ async def _compute_digest(
     # whether retries changed the failure class or repeated the same one.
     _multi_attempt = []
     for _t in failed_tasks:
-        _hist = failure_class_history_classes((_t.context or {}).get("_failure_class_history"))
+        _hist = failure_class_history_classes(
+            (_t.context or {}).get("_failure_class_history")
+        )
         if len(_hist) >= 2:
             _multi_attempt.append(_hist)
     _repeat_count = sum(
-        1 for h in _multi_attempt
-        if any(h[i] == h[i + 1] for i in range(len(h) - 1))
+        1 for h in _multi_attempt if any(h[i] == h[i + 1] for i in range(len(h) - 1))
     )
     _pattern_counts: Dict[str, int] = {}
     for _hist in _multi_attempt:
         _key = " -> ".join(_hist)
         _pattern_counts[_key] = _pattern_counts.get(_key, 0) + 1
-    _top_patterns = sorted(_pattern_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    _top_patterns = sorted(_pattern_counts.items(), key=lambda x: x[1], reverse=True)[
+        :3
+    ]
     retry_pattern_summary = {
         "total_multi_attempt_failures": len(_multi_attempt),
         "repeat_class_count": _repeat_count,
@@ -3677,7 +4626,8 @@ async def _compute_digest(
     # (failure_detail=review_cap_exhausted) — distinct from tasks that failed
     # because the code itself was wrong.
     _cap_tasks = [
-        t for t in failed_tasks
+        t
+        for t in failed_tasks
         if (t.context or {}).get("failure_detail") == "review_cap_exhausted"
     ]
     _cap_iters: List[int] = []
@@ -3692,22 +4642,33 @@ async def _compute_digest(
         if _did:
             _did_s = str(_did)
             _cap_dir_counts[_did_s] = _cap_dir_counts.get(_did_s, 0) + 1
-        if _t.vm_provisioned_at and _t.vm_stopped_at and _t.vm_stopped_at >= window_start:
+        if (
+            _t.vm_provisioned_at
+            and _t.vm_stopped_at
+            and _t.vm_stopped_at >= window_start
+        ):
             _rate = SPOT_RATE if _t.vm_spot else ON_DEMAND_RATE
-            _cap_total_cost += _rate * (_t.vm_stopped_at - _t.vm_provisioned_at).total_seconds()
-    _top_cap_dirs = sorted(_cap_dir_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+            _cap_total_cost += (
+                _rate * (_t.vm_stopped_at - _t.vm_provisioned_at).total_seconds()
+            )
+    _top_cap_dirs = sorted(_cap_dir_counts.items(), key=lambda x: x[1], reverse=True)[
+        :3
+    ]
     review_cap_exhaustion_summary = {
         "count": len(_cap_tasks),
         "avg_iterations": (sum(_cap_iters) / len(_cap_iters)) if _cap_iters else None,
         "top_directions": [{"direction_id": d, "count": c} for d, c in _top_cap_dirs],
         "total_cost_usd": round(_cap_total_cost, 4),
-        "avg_cost_usd": round(_cap_total_cost / len(_cap_tasks), 4) if _cap_tasks else None,
+        "avg_cost_usd": round(_cap_total_cost / len(_cap_tasks), 4)
+        if _cap_tasks
+        else None,
     }
 
     # --- Recurring error fingerprint clusters ---
     # Group failed tasks by normalized error fingerprint to surface systemic
     # failures manifesting across multiple tasks.
     from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+
     _clusters: Dict[str, Dict[str, Any]] = {}
     for _t in failed_tasks:
         _tid = str(_t.id)
@@ -3769,7 +4730,9 @@ async def _compute_digest(
         "total": _resurrected_total,
         "completed": _resurrected_completed,
         "failed_again": _resurrected_failed,
-        "success_rate": (_resurrected_completed / _resurrected_total) if _resurrected_total else None,
+        "success_rate": (_resurrected_completed / _resurrected_total)
+        if _resurrected_total
+        else None,
     }
 
     # Remediation funnel: investigation -> diagnosis -> remediation -> merge.
@@ -3797,16 +4760,26 @@ async def _compute_digest(
     _rem_tasks = _rem_result.scalars().all()
 
     investigations_spawned = len(_inv_tasks)
-    investigations_completed = sum(1 for t in _inv_tasks if t.status == TaskStatus.COMPLETED)
+    investigations_completed = sum(
+        1 for t in _inv_tasks if t.status == TaskStatus.COMPLETED
+    )
     investigations_with_diagnosis = sum(
-        1 for t in _inv_tasks
+        1
+        for t in _inv_tasks
         if t.status == TaskStatus.COMPLETED
         and isinstance(t.plan_output, dict)
         and str((t.plan_output or {}).get("summary") or "").strip()
     )
     active_investigations = sum(
-        1 for t in _inv_tasks
-        if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+        1
+        for t in _inv_tasks
+        if t.status
+        in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        )
     )
     remediations_spawned = len(_rem_tasks)
     remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
@@ -3819,8 +4792,8 @@ async def _compute_digest(
     fixes_held = 0
     _window_iso = window_start.isoformat()
     for _p in _held_projects:
-        for _d in (_p.directions or []):
-            for _h in (_d.get("remediation_history") or []):
+        for _d in _p.directions or []:
+            for _h in _d.get("remediation_history") or []:
                 if (_h.get("result") or "") != "held":
                     continue
                 _ts = _h.get("held_at") or _h.get("timestamp") or ""
@@ -3838,7 +4811,11 @@ async def _compute_digest(
             continue
         completed_at = _derive_completed_at(r)
         if completed_at and inv.created_at:
-            inv_created = inv.created_at.replace(tzinfo=None) if inv.created_at.tzinfo is not None else inv.created_at
+            inv_created = (
+                inv.created_at.replace(tzinfo=None)
+                if inv.created_at.tzinfo is not None
+                else inv.created_at
+            )
             delta = (completed_at - inv_created).total_seconds() / 3600.0
             if delta >= 0:
                 _ttr_values.append(delta)
@@ -3850,8 +4827,13 @@ async def _compute_digest(
     for t in _inv_tasks:
         if t.status != TaskStatus.COMPLETED or not isinstance(t.plan_output, dict):
             continue
-        conf = str((t.plan_output or {}).get("confidence") or "unknown").strip().lower() or "unknown"
-        investigations_by_confidence[conf] = investigations_by_confidence.get(conf, 0) + 1
+        conf = (
+            str((t.plan_output or {}).get("confidence") or "unknown").strip().lower()
+            or "unknown"
+        )
+        investigations_by_confidence[conf] = (
+            investigations_by_confidence.get(conf, 0) + 1
+        )
 
     failed_remediations_by_class: Dict[str, int] = {}
     for r in _rem_tasks:
@@ -3863,15 +4845,27 @@ async def _compute_digest(
     investigations_spawned_by_class: Dict[str, int] = {}
     investigations_completed_by_class: Dict[str, int] = {}
     for t in _inv_tasks:
-        cls = str((t.context or {}).get("last_failure_class") or "unknown").strip() or "unknown"
-        investigations_spawned_by_class[cls] = investigations_spawned_by_class.get(cls, 0) + 1
+        cls = (
+            str((t.context or {}).get("last_failure_class") or "unknown").strip()
+            or "unknown"
+        )
+        investigations_spawned_by_class[cls] = (
+            investigations_spawned_by_class.get(cls, 0) + 1
+        )
         if t.status == TaskStatus.COMPLETED:
-            investigations_completed_by_class[cls] = investigations_completed_by_class.get(cls, 0) + 1
+            investigations_completed_by_class[cls] = (
+                investigations_completed_by_class.get(cls, 0) + 1
+            )
 
     remediations_spawned_by_class: Dict[str, int] = {}
     for r in _rem_tasks:
-        cls = str((r.context or {}).get("trigger_failure_class") or "unknown").strip() or "unknown"
-        remediations_spawned_by_class[cls] = remediations_spawned_by_class.get(cls, 0) + 1
+        cls = (
+            str((r.context or {}).get("trigger_failure_class") or "unknown").strip()
+            or "unknown"
+        )
+        remediations_spawned_by_class[cls] = (
+            remediations_spawned_by_class.get(cls, 0) + 1
+        )
 
     merged_remediations_by_trigger_class: Dict[str, int] = {}
     for r in _rem_tasks:
@@ -3886,7 +4880,9 @@ async def _compute_digest(
         key = str(trigger_cls).strip() if trigger_cls else "unknown"
         if not key:
             key = "unknown"
-        merged_remediations_by_trigger_class[key] = merged_remediations_by_trigger_class.get(key, 0) + 1
+        merged_remediations_by_trigger_class[key] = (
+            merged_remediations_by_trigger_class.get(key, 0) + 1
+        )
 
     remediation_success_by_confidence: Dict[str, Dict[str, int]] = {}
     for r in _rem_tasks:
@@ -3896,15 +4892,23 @@ async def _compute_digest(
         inv = _inv_by_id.get(str(diag_id)) if diag_id else None
         conf = "unknown"
         if inv is not None and isinstance(inv.plan_output, dict):
-            conf = str((inv.plan_output or {}).get("confidence") or "unknown").strip().lower() or "unknown"
-        bucket = remediation_success_by_confidence.setdefault(conf, {"merged": 0, "failed": 0})
+            conf = (
+                str((inv.plan_output or {}).get("confidence") or "unknown")
+                .strip()
+                .lower()
+                or "unknown"
+            )
+        bucket = remediation_success_by_confidence.setdefault(
+            conf, {"merged": 0, "failed": 0}
+        )
         if r.status == TaskStatus.COMPLETED:
             bucket["merged"] += 1
         else:
             bucket["failed"] += 1
 
     _completed_inv = [
-        t for t in _inv_tasks
+        t
+        for t in _inv_tasks
         if t.status == TaskStatus.COMPLETED and isinstance(t.plan_output, dict)
     ]
     _completed_inv.sort(
@@ -3918,28 +4922,39 @@ async def _compute_digest(
         if len(summary) > 200:
             summary = summary[:200].rstrip() + "…"
         completed_at = _derive_completed_at(t)
-        recent_investigations.append({
-            "task_id": str(t.id),
-            "direction_id": (t.context or {}).get("direction_id"),
-            "summary": summary,
-            "confidence": str(po.get("confidence") or "").strip().lower() or None,
-            "severity": str(po.get("severity") or "").strip().lower() or None,
-            "completed_at": completed_at.isoformat() if completed_at else None,
-        })
+        recent_investigations.append(
+            {
+                "task_id": str(t.id),
+                "direction_id": (t.context or {}).get("direction_id"),
+                "summary": summary,
+                "confidence": str(po.get("confidence") or "").strip().lower() or None,
+                "severity": str(po.get("severity") or "").strip().lower() or None,
+                "completed_at": completed_at.isoformat() if completed_at else None,
+            }
+        )
 
     active_investigations_detail: List[Dict[str, Any]] = []
     _now = _utcnow()
     for t in _inv_tasks:
-        if t.status not in (TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING):
+        if t.status not in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ):
             continue
         elapsed_hours = None
         if t.created_at:
-            elapsed_hours = round((_now - _to_naive_utc(t.created_at)).total_seconds() / 3600.0, 2)
-        active_investigations_detail.append({
-            "task_id": str(t.id),
-            "direction_id": (t.context or {}).get("direction_id"),
-            "elapsed_hours": elapsed_hours,
-        })
+            elapsed_hours = round(
+                (_now - _to_naive_utc(t.created_at)).total_seconds() / 3600.0, 2
+            )
+        active_investigations_detail.append(
+            {
+                "task_id": str(t.id),
+                "direction_id": (t.context or {}).get("direction_id"),
+                "elapsed_hours": elapsed_hours,
+            }
+        )
 
     _ci_rem_result = await session.execute(
         select(Task).where(
@@ -3951,18 +4966,28 @@ async def _compute_digest(
     ci_auto_remediation: Dict[str, Any] = {
         "spawned": len(_ci_rem_tasks),
         "merged": sum(
-            1 for t in _ci_rem_tasks
-            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged") is True
+            1
+            for t in _ci_rem_tasks
+            if t.status == TaskStatus.COMPLETED
+            and (t.context or {}).get("pr_merged") is True
         ),
         "failed": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.FAILED),
         "by_ci_failure_type": {},
     }
     _ci_type_buckets: Dict[str, Dict[str, int]] = {}
     for t in _ci_rem_tasks:
-        ci_type = str((t.context or {}).get("ci_failure_type") or "unknown").strip() or "unknown"
-        bucket = _ci_type_buckets.setdefault(ci_type, {"spawned": 0, "merged": 0, "failed": 0})
+        ci_type = (
+            str((t.context or {}).get("ci_failure_type") or "unknown").strip()
+            or "unknown"
+        )
+        bucket = _ci_type_buckets.setdefault(
+            ci_type, {"spawned": 0, "merged": 0, "failed": 0}
+        )
         bucket["spawned"] += 1
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged") is True:
+        if (
+            t.status == TaskStatus.COMPLETED
+            and (t.context or {}).get("pr_merged") is True
+        ):
             bucket["merged"] += 1
         elif t.status == TaskStatus.FAILED:
             bucket["failed"] += 1
@@ -3985,56 +5010,82 @@ async def _compute_digest(
         select(ResidualRemediationCase).where(*_rr_active_filters)
     )
     _rr_open_filters = [
-        ResidualRemediationCase.status.in_([
-            ResidualRemediationCaseStatus.ACTIVE,
-            ResidualRemediationCaseStatus.REMEDIATING,
-            ResidualRemediationCaseStatus.SUSPENDED,
-        ]),
+        ResidualRemediationCase.status.in_(
+            [
+                ResidualRemediationCaseStatus.ACTIVE,
+                ResidualRemediationCaseStatus.REMEDIATING,
+                ResidualRemediationCaseStatus.SUSPENDED,
+            ]
+        ),
     ]
     if project_id:
         _rr_open_filters.append(ResidualRemediationCase.project_id == project_id)
     _rr_open_result = await session.execute(
-        select(ResidualRemediationCase).where(*_rr_open_filters).order_by(ResidualRemediationCase.last_seen_at.desc())
+        select(ResidualRemediationCase)
+        .where(*_rr_open_filters)
+        .order_by(ResidualRemediationCase.last_seen_at.desc())
     )
     _rr_open_cases = list(_rr_open_result.scalars().all())
     residual_remediation_funnel: Dict[str, Any] = {
         "spawned": len(_rr_cases),
-        "merged": sum(1 for c in _rr_cases if c.status == ResidualRemediationCaseStatus.MERGED),
-        "failed": sum(1 for c in _rr_cases if c.status in (
-            ResidualRemediationCaseStatus.FAILED, ResidualRemediationCaseStatus.SUSPENDED
-        )),
+        "merged": sum(
+            1 for c in _rr_cases if c.status == ResidualRemediationCaseStatus.MERGED
+        ),
+        "failed": sum(
+            1
+            for c in _rr_cases
+            if c.status
+            in (
+                ResidualRemediationCaseStatus.FAILED,
+                ResidualRemediationCaseStatus.SUSPENDED,
+            )
+        ),
         "remediating": len(list(_rr_active_result.scalars().all())),
         "open_cases_by_error_class": [
             {
                 "error_class": "CODE_ERROR",
                 "count": len(_rr_open_cases),
-                "most_recent_at": _rr_open_cases[0].last_seen_at.isoformat() if _rr_open_cases else None,
+                "most_recent_at": _rr_open_cases[0].last_seen_at.isoformat()
+                if _rr_open_cases
+                else None,
                 "cases": [
                     {
                         "fingerprint": c.fingerprint,
                         "status": c.status,
                         "hit_count": c.hit_count,
-                        "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
-                        "last_spawned_at": c.last_spawned_at.isoformat() if c.last_spawned_at else None,
+                        "last_seen_at": c.last_seen_at.isoformat()
+                        if c.last_seen_at
+                        else None,
+                        "last_spawned_at": c.last_spawned_at.isoformat()
+                        if c.last_spawned_at
+                        else None,
                         "sample_message": c.sample_message,
                         "consecutive_failure_count": c.consecutive_failure_count,
                     }
                     for c in _rr_open_cases[:30]
                 ],
             }
-        ] if _rr_open_cases else [],
+        ]
+        if _rr_open_cases
+        else [],
     }
 
-    _prior_tasks = [t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")]
+    _prior_tasks = [
+        t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")
+    ]
     _total_with_prior = len(_prior_tasks)
-    _merged_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.COMPLETED)
+    _merged_with_prior = sum(
+        1 for t in _prior_tasks if t.status == TaskStatus.COMPLETED
+    )
     _failed_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.FAILED)
     _prior_resolved = _merged_with_prior + _failed_with_prior
     prior_investigation_reuse: Dict[str, Any] = {
         "total_with_prior": _total_with_prior,
         "merged_with_prior": _merged_with_prior,
         "failed_with_prior": _failed_with_prior,
-        "merge_rate": round(_merged_with_prior / _prior_resolved, 4) if _prior_resolved else None,
+        "merge_rate": round(_merged_with_prior / _prior_resolved, 4)
+        if _prior_resolved
+        else None,
     }
 
     # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
@@ -4062,7 +5113,9 @@ async def _compute_digest(
         key = str(trigger_cls).strip() if trigger_cls else "unknown"
         if not key:
             key = "unknown"
-        cumulative_merged_by_trigger_class[key] = cumulative_merged_by_trigger_class.get(key, 0) + 1
+        cumulative_merged_by_trigger_class[key] = (
+            cumulative_merged_by_trigger_class.get(key, 0) + 1
+        )
 
     from app.task_completion import _is_structural_diagnosis
 
@@ -4084,7 +5137,9 @@ async def _compute_digest(
             continue
         ic_total += 1
         po = t.plan_output if isinstance(t.plan_output, dict) else None
-        parseable = bool(po) and any(str(po.get(k) or "").strip() for k in _PARSEABLE_KEYS)
+        parseable = bool(po) and any(
+            str(po.get(k) or "").strip() for k in _PARSEABLE_KEYS
+        )
         if parseable:
             ic_parseable += 1
         else:
@@ -4138,7 +5193,9 @@ async def _compute_digest(
             reason = "no_direction"
         else:
             continue
-        diagnosis_drop_off_by_reason[reason] = diagnosis_drop_off_by_reason.get(reason, 0) + 1
+        diagnosis_drop_off_by_reason[reason] = (
+            diagnosis_drop_off_by_reason.get(reason, 0) + 1
+        )
 
     remediation_funnel = {
         "investigations_spawned": investigations_spawned,
@@ -4168,6 +5225,7 @@ async def _compute_digest(
 
     # --- Anomaly-driven pipeline adjustment snapshot ---
     from app.shared_state import anomaly_adjustments as _anomaly_adjustments  # noqa: PLC0415
+
     anomaly_adjustment_summary = {
         "active": bool(_anomaly_adjustments.get("active")),
         "adjusted_at": _anomaly_adjustments.get("adjusted_at"),
@@ -4175,13 +5233,18 @@ async def _compute_digest(
         "pre_adjustment_max_vms": _anomaly_adjustments.get("pre_adjustment_max_vms"),
         "adjusted_max_vms": _anomaly_adjustments.get("adjusted_max_vms"),
         "failure_gate_threshold": _anomaly_adjustments.get("failure_gate_threshold"),
-        "pre_adjustment_failure_gate": _anomaly_adjustments.get("pre_adjustment_failure_gate"),
-        "forced_restoration_count": _anomaly_adjustments.get("forced_restoration_count", 0),
+        "pre_adjustment_failure_gate": _anomaly_adjustments.get(
+            "pre_adjustment_failure_gate"
+        ),
+        "forced_restoration_count": _anomaly_adjustments.get(
+            "forced_restoration_count", 0
+        ),
         "forced_restored_at": _anomaly_adjustments.get("forced_restored_at"),
     }
 
     # --- Recurring failure patterns (from persistent_anomalies) ---
     from app.shared_state import persistent_anomalies as _persistent_anomalies  # noqa: PLC0415
+
     _fp_48h_cutoff = _utcnow() - timedelta(hours=48)
     _fp_dirs_48h: Dict[str, set] = {}
     _fp_count_48h: Dict[str, int] = {}
@@ -4198,7 +5261,12 @@ async def _compute_digest(
         _fp_count_48h[_fp_] = _fp_count_48h.get(_fp_, 0) + 1
 
     _fp_task_states: Dict[str, Dict[str, Any]] = {}
-    _inflight_statuses = {TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING}
+    _inflight_statuses = {
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    }
     for _t in list(all_tasks) + list(active_tasks_all):
         _ctx = _t.context or {}
         # Audit W1: previous_error_fingerprint is a column.
@@ -4209,7 +5277,9 @@ async def _compute_digest(
         )
         if not _fp_:
             continue
-        _entry = _fp_task_states.setdefault(str(_fp_), {"inflight": False, "merged": False, "proactive": False})
+        _entry = _fp_task_states.setdefault(
+            str(_fp_), {"inflight": False, "merged": False, "proactive": False}
+        )
         if _t.status == TaskStatus.COMPLETED and _ctx.get("pr_url"):
             _entry["merged"] = True
         if _t.status in _inflight_statuses:
@@ -4221,9 +5291,11 @@ async def _compute_digest(
     early_warnings: List[Dict[str, Any]] = []
     _anoms_map = (
         {str(project_id): _persistent_anomalies.get(str(project_id), {})}
-        if project_id else _persistent_anomalies
+        if project_id
+        else _persistent_anomalies
     )
     import re as _re  # noqa: PLC0415
+
     _momentum_rate_re = _re.compile(r"(\d+)%")
     _recent_24h_cutoff = _utcnow() - timedelta(hours=24)
     _dirs_last_24h = {
@@ -4238,23 +5310,31 @@ async def _compute_digest(
                 continue
             if _key.startswith("FailureRateMomentum"):
                 _pcts = _momentum_rate_re.findall(_info.get("latest_details") or "")[:3]
-                early_warnings.append({
-                    "failure_class": _key,
-                    "rate_progression": [int(p) / 100 for p in _pcts] if len(_pcts) == 3 else [],
-                    "occurrence_count": _info.get("occurrence_count", 0),
-                    "first_seen": _info.get("first_seen"),
-                    "last_seen": _info.get("last_seen"),
-                    "severity": _info.get("severity"),
-                    "details": _info.get("latest_details") or "",
-                    "affected_direction_count": len(_dirs_last_24h),
-                    "suggested_action": (
-                        "Investigate the upward trend before it trips the surge "
-                        "threshold — check recent deploys, infra health, and "
-                        "direction-level failure patterns."
-                    ),
-                })
+                early_warnings.append(
+                    {
+                        "failure_class": _key,
+                        "rate_progression": [int(p) / 100 for p in _pcts]
+                        if len(_pcts) == 3
+                        else [],
+                        "occurrence_count": _info.get("occurrence_count", 0),
+                        "first_seen": _info.get("first_seen"),
+                        "last_seen": _info.get("last_seen"),
+                        "severity": _info.get("severity"),
+                        "details": _info.get("latest_details") or "",
+                        "affected_direction_count": len(_dirs_last_24h),
+                        "suggested_action": (
+                            "Investigate the upward trend before it trips the surge "
+                            "threshold — check recent deploys, infra health, and "
+                            "direction-level failure patterns."
+                        ),
+                    }
+                )
                 continue
-            _fp_key = _key[len("CrossDirectionFingerprint_"):] if _key.startswith("CrossDirectionFingerprint_") else _key
+            _fp_key = (
+                _key[len("CrossDirectionFingerprint_") :]
+                if _key.startswith("CrossDirectionFingerprint_")
+                else _key
+            )
             _state = _fp_task_states.get(_fp_key, {})
             _recent = _fp_count_48h.get(_fp_key, 0)
             if _state.get("merged") and _recent == 0:
@@ -4266,21 +5346,26 @@ async def _compute_digest(
             else:
                 _status = "unaddressed"
             _affected_dir_ids = sorted(_fp_dirs_48h.get(_fp_key, set()))
-            recurring_patterns.append({
-                "fingerprint": _fp_key,
-                "occurrence_count": _info.get("occurrence_count", 0),
-                "first_seen": _info.get("first_seen"),
-                "last_seen": _info.get("last_seen"),
-                "severity": _info.get("severity"),
-                "example_message": (_info.get("latest_details") or "")[:240],
-                "affected_direction_count": len(_affected_dir_ids),
-                "affected_directions": [
-                    {"direction_id": _did, "direction_text": dir_id_to_text.get(_did, "")}
-                    for _did in _affected_dir_ids
-                ],
-                "remediation_status": _status,
-                "proactive": bool(_state.get("proactive", False)),
-            })
+            recurring_patterns.append(
+                {
+                    "fingerprint": _fp_key,
+                    "occurrence_count": _info.get("occurrence_count", 0),
+                    "first_seen": _info.get("first_seen"),
+                    "last_seen": _info.get("last_seen"),
+                    "severity": _info.get("severity"),
+                    "example_message": (_info.get("latest_details") or "")[:240],
+                    "affected_direction_count": len(_affected_dir_ids),
+                    "affected_directions": [
+                        {
+                            "direction_id": _did,
+                            "direction_text": dir_id_to_text.get(_did, ""),
+                        }
+                        for _did in _affected_dir_ids
+                    ],
+                    "remediation_status": _status,
+                    "proactive": bool(_state.get("proactive", False)),
+                }
+            )
     recurring_patterns.sort(key=lambda x: x["occurrence_count"], reverse=True)
 
     _review_quality = _compute_review_quality_metrics(completed_tasks + failed_tasks)
@@ -4289,7 +5374,9 @@ async def _compute_digest(
         completed_tasks + failed_tasks,
         prev_terminal_tasks=prev_completed_tasks + prev_failed_tasks,
     )
-    _first_review_approval_rate = _compute_first_review_approval_breakdowns(completed_tasks + failed_tasks)
+    _first_review_approval_rate = _compute_first_review_approval_breakdowns(
+        completed_tasks + failed_tasks
+    )
 
     from app.main import EXPECTED_SCHEMA_REVISION
     from app.failure_classification import classify_failure as _mig_classify
@@ -4301,23 +5388,27 @@ async def _compute_digest(
         ctx = t.context or {}
         files = ctx.get("related_files") or []
         if isinstance(files, list) and any(
-            isinstance(f, str) and f.startswith("backend/alembic/versions/") for f in files
+            isinstance(f, str) and f.startswith("backend/alembic/versions/")
+            for f in files
         ):
             return True
         payload_files = (t.first_payload or {}).get("related_files") or []
         return isinstance(payload_files, list) and any(
-            isinstance(f, str) and f.startswith("backend/alembic/versions/") for f in payload_files
+            isinstance(f, str) and f.startswith("backend/alembic/versions/")
+            for f in payload_files
         )
 
     _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
     _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
     _migration_errors = sum(
-        1 for t in failed_tasks
+        1
+        for t in failed_tasks
         if (t.context or {}).get("failure_class") == "MIGRATION_ERROR"
         or _mig_classify(t, error_log_map.get(str(t.id))) == "MIGRATION_ERROR"
     )
     _auto_generated_migrations = sum(
-        1 for t in (completed_tasks + failed_tasks)
+        1
+        for t in (completed_tasks + failed_tasks)
         if _task_type(t) != "migrate" and _touched_migration(t)
     )
     migration_health = {
@@ -4336,8 +5427,11 @@ async def _compute_digest(
         "first_attempt_success_rate": _first_attempt_success_rate,
         "first_review_approval_rate": _first_review_approval_rate,
         "self_review_effectiveness": _review_quality["self_review_effectiveness"],
-        "self_review_prediction_accuracy": _review_quality["self_review_prediction_accuracy"],
+        "self_review_prediction_accuracy": _review_quality[
+            "self_review_prediction_accuracy"
+        ],
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
+        "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
         "self_review_skip_rate": _self_review_skip_rate,
         "review_accuracy": _review_quality["review_accuracy"],
         "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
@@ -4420,15 +5514,22 @@ async def _compute_digest(
         "investigation_conversion": investigation_conversion,
         "anomaly_adjustment": anomaly_adjustment_summary,
         "migration_health": migration_health,
-        "prediction_calibration_factor": prediction_calibration["factor"] if prediction_calibration else None,
-        "prediction_calibration_note": prediction_calibration["note"] if prediction_calibration else None,
-        "prediction_calibration_sample_count": prediction_calibration["sample_count"] if prediction_calibration else None,
+        "prediction_calibration_factor": prediction_calibration["factor"]
+        if prediction_calibration
+        else None,
+        "prediction_calibration_note": prediction_calibration["note"]
+        if prediction_calibration
+        else None,
+        "prediction_calibration_sample_count": prediction_calibration["sample_count"]
+        if prediction_calibration
+        else None,
     }
 
 
 # ---------------------------------------------------------------------------
 # Fix-loop convergence aggregate endpoint
 # ---------------------------------------------------------------------------
+
 
 @router.get("/fix-loop-convergence")
 async def get_fix_loop_convergence(
@@ -4452,7 +5553,15 @@ async def get_fix_loop_convergence(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.project_id, Task.status, Task.fix_loop_history, Task.context))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.fix_loop_history,
+                Task.context,
+            )
+        )
     )
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
@@ -4468,12 +5577,14 @@ async def get_fix_loop_convergence(
     for t in tasks:
         if (t.context or {}).get("fix_loop_abandoned"):
             abandoned_ids.append(str(t.id))
-    abandoned_ids_recent = abandoned_ids[-25:]  # keep 25 most recent (insertion order ~ created_at)
+    abandoned_ids_recent = abandoned_ids[
+        -25:
+    ]  # keep 25 most recent (insertion order ~ created_at)
 
     loop_names = ("lint", "test", "check")
 
     # Per-loop bucket: list of (iterations, exit_reason) tuples
-    per_loop: Dict[str, List[tuple]] = {l: [] for l in loop_names}
+    per_loop: Dict[str, List[tuple]] = {loop: [] for loop in loop_names}
 
     for task in tasks_with_history:
         history = task.fix_loop_history or {}
@@ -4490,7 +5601,11 @@ async def get_fix_loop_convergence(
                     last_exit = reason
                     break
             if last_exit is None and bucket:
-                last_exit = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+                last_exit = (
+                    bucket[-1].get("exit_reason")
+                    if isinstance(bucket[-1], dict)
+                    else None
+                )
             per_loop[loop].append((iterations, last_exit))
 
     def _aggregate_loop(entries: List[tuple]) -> Dict[str, Any]:
@@ -4562,11 +5677,19 @@ async def get_retirement_critiques(
     strategic agent when it retires directions. Returns the most recent `limit`
     critiques across the last 20 completed cycles, ordered newest-cycle-first.
     """
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
 
     result = await session.execute(
         select(StrategicCycle)
-        .options(load_only(StrategicCycle.id, StrategicCycle.cycle_metadata, StrategicCycle.created_at))
+        .options(
+            load_only(
+                StrategicCycle.id,
+                StrategicCycle.cycle_metadata,
+                StrategicCycle.created_at,
+            )
+        )
         .where(StrategicCycle.project_id == project_id)
         .order_by(StrategicCycle.created_at.desc())
         .limit(20)
@@ -4586,14 +5709,18 @@ async def get_retirement_critiques(
                 continue
             if c.get("no_eligible_retirements"):
                 continue
-            critiques_out.append({
-                "direction_id": c.get("direction_id"),
-                "what_it_addressed": c.get("what_it_addressed", ""),
-                "pattern_that_produced_it": c.get("pattern_that_produced_it", ""),
-                "lesson": c.get("lesson", ""),
-                "cycle_id": cycle.id,
-                "cycle_created_at": cycle.created_at.isoformat() if cycle.created_at else None,
-            })
+            critiques_out.append(
+                {
+                    "direction_id": c.get("direction_id"),
+                    "what_it_addressed": c.get("what_it_addressed", ""),
+                    "pattern_that_produced_it": c.get("pattern_that_produced_it", ""),
+                    "lesson": c.get("lesson", ""),
+                    "cycle_id": cycle.id,
+                    "cycle_created_at": cycle.created_at.isoformat()
+                    if cycle.created_at
+                    else None,
+                }
+            )
             if len(critiques_out) >= limit:
                 break
 
@@ -4653,7 +5780,11 @@ def _aggregate_actionability_bucket(
             continue
         key = str(dir_id)
         research_at = dir_research_first_at.get(key)
-        if research_at is not None and t.created_at is not None and t.created_at <= research_at:
+        if (
+            research_at is not None
+            and t.created_at is not None
+            and t.created_at <= research_at
+        ):
             continue
         entry = dir_outcome.setdefault(key, {"tasked": False, "merged": False})
         entry["tasked"] = True
@@ -4702,6 +5833,7 @@ def _compute_actionability_rates(
     )
     return grade_merge_rate, grade_merge_rate_of_tasked, calibration_score
 
+
 @router.get("/projects/{project_id}/research-actionability")
 async def get_research_actionability(
     project_id: uuid.UUID,
@@ -4726,7 +5858,9 @@ async def get_research_actionability(
     proxy for "has a merged-PR artifact." This is conservative — it under-counts
     rather than over-counts.
     """
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
 
     # Determine time window from the N most recent strategic cycles.
     cycle_result = await session.execute(
@@ -4765,7 +5899,11 @@ async def get_research_actionability(
     # payloads so we can exclude research-type tasks below.
     followon_result = await session.execute(
         select(Task)
-        .options(load_only(Task.id, Task.status, Task.context, Task.created_at, Task.payloads))
+        .options(
+            load_only(
+                Task.id, Task.status, Task.context, Task.created_at, Task.payloads
+            )
+        )
         .where(
             Task.project_id == project_id,
             Task.created_at >= oldest_cycle_at,
@@ -4776,7 +5914,9 @@ async def get_research_actionability(
 
     # Global aggregation across the full window.
     grade_counts, grade_tasked, grade_merged = _aggregate_actionability_bucket(
-        research_tasks, followon_tasks, research_task_ids,
+        research_tasks,
+        followon_tasks,
+        research_task_ids,
     )
     grade_merge_rate, grade_merge_rate_of_tasked, calibration_score = (
         _compute_actionability_rates(grade_counts, grade_tasked, grade_merged)
@@ -4797,29 +5937,40 @@ async def get_research_actionability(
             else None
         )
         bucket_tasks = [
-            t for t in research_tasks
-            if t.created_at is not None and t.created_at >= lo
+            t
+            for t in research_tasks
+            if t.created_at is not None
+            and t.created_at >= lo
             and (hi is None or t.created_at < hi)
         ]
         b_counts, b_tasked, b_merged = _aggregate_actionability_bucket(
-            bucket_tasks, followon_tasks, research_task_ids,
+            bucket_tasks,
+            followon_tasks,
+            research_task_ids,
         )
         b_rate, _b_rate_t, b_calib = _compute_actionability_rates(
-            b_counts, b_tasked, b_merged,
+            b_counts,
+            b_tasked,
+            b_merged,
         )
-        cycle_history.append({
-            "cycle_id": cyc.id,
-            "cycle_created_at": cyc.created_at.isoformat(),
-            "total_findings": sum(b_counts.values()),
-            "structural_downgrades": sum(
-                int((t.context or {}).get("_actionability_structural_downgrades", 0) or 0)
-                for t in bucket_tasks
-            ),
-            "grade_distribution": b_counts,
-            "grade_merged": b_merged,
-            "grade_merge_rate": b_rate,
-            "calibration_score": b_calib,
-        })
+        cycle_history.append(
+            {
+                "cycle_id": cyc.id,
+                "cycle_created_at": cyc.created_at.isoformat(),
+                "total_findings": sum(b_counts.values()),
+                "structural_downgrades": sum(
+                    int(
+                        (t.context or {}).get("_actionability_structural_downgrades", 0)
+                        or 0
+                    )
+                    for t in bucket_tasks
+                ),
+                "grade_distribution": b_counts,
+                "grade_merged": b_merged,
+                "grade_merge_rate": b_rate,
+                "calibration_score": b_calib,
+            }
+        )
 
     total = sum(grade_counts.values())
     return {
@@ -4838,6 +5989,7 @@ async def get_research_actionability(
 # ---------------------------------------------------------------------------
 # Fix-loop convergence daily trend endpoint
 # ---------------------------------------------------------------------------
+
 
 @router.get("/fix-loop-convergence-trend")
 async def get_fix_loop_convergence_trend(
@@ -4861,7 +6013,15 @@ async def get_fix_loop_convergence_trend(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
         )
-        .options(load_only(Task.id, Task.project_id, Task.status, Task.fix_loop_history, Task.created_at))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.fix_loop_history,
+                Task.created_at,
+            )
+        )
     )
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
@@ -4873,7 +6033,7 @@ async def get_fix_loop_convergence_trend(
 
     # day_str -> loop -> list of exit_reasons
     day_buckets: Dict[str, Dict[str, List[Optional[str]]]] = defaultdict(
-        lambda: {l: [] for l in loop_names}
+        lambda: {loop: [] for loop in loop_names}
     )
 
     for task in tasks:
@@ -4895,7 +6055,11 @@ async def get_fix_loop_convergence_trend(
                     last_exit = reason
                     break
             if last_exit is None and bucket:
-                last_exit = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+                last_exit = (
+                    bucket[-1].get("exit_reason")
+                    if isinstance(bucket[-1], dict)
+                    else None
+                )
             day_buckets[day_str][loop].append(last_exit)
 
     def _day_loop_stats(reasons: List[Optional[str]]) -> Dict[str, Any]:
@@ -4915,7 +6079,7 @@ async def get_fix_loop_convergence_trend(
     for i in range(days - 1, -1, -1):
         day = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
         entry: Dict[str, Any] = {"date": day}
-        day_data = day_buckets.get(day, {l: [] for l in loop_names})
+        day_data = day_buckets.get(day, {ln: [] for ln in loop_names})
         for loop in loop_names:
             entry[loop] = _day_loop_stats(day_data.get(loop, []))
         buckets.append(entry)
@@ -4923,9 +6087,12 @@ async def get_fix_loop_convergence_trend(
     if project_id is not None:
         try:
             from app.playbook_learning import check_fix_loop_divergence_regression  # noqa: PLC0415
+
             await check_fix_loop_divergence_regression(project_id, session)
         except Exception:
-            logger.exception("[ANALYTICS] fix_loop_divergence_regression check failed (non-critical)")
+            logger.exception(
+                "[ANALYTICS] fix_loop_divergence_regression check failed (non-critical)"
+            )
 
     return {
         "days": days,
@@ -4937,12 +6104,17 @@ async def get_fix_loop_convergence_trend(
 # Fix-loop diverged-task drill-down endpoint
 # ---------------------------------------------------------------------------
 
+
 @router.get("/fix-loop-diverged-tasks")
 async def get_fix_loop_diverged_tasks(
     hours: int = Query(24, ge=1, le=168),
     project_id: uuid.UUID | None = Query(None),
-    loop: str | None = Query(None, description="Filter by loop name: lint, test, or check"),
-    exit_reason: str | None = Query(None, description="Filter by exit reason, e.g. divergence_oscillation"),
+    loop: str | None = Query(
+        None, description="Filter by loop name: lint, test, or check"
+    ),
+    exit_reason: str | None = Query(
+        None, description="Filter by exit reason, e.g. divergence_oscillation"
+    ),
     limit: int = Query(50, ge=1, le=50),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),  # noqa: ARG001
@@ -4967,10 +6139,18 @@ async def get_fix_loop_diverged_tasks(
             Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
             Task.created_at >= cutoff,
         )
-        .options(load_only(
-            Task.id, Task.project_id, Task.title, Task.status,
-            Task.fix_loop_history, Task.context, Task.payloads, Task.created_at,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.title,
+                Task.status,
+                Task.fix_loop_history,
+                Task.context,
+                Task.payloads,
+                Task.created_at,
+            )
+        )
         .order_by(Task.created_at.desc())
     )
     if project_id is not None:
@@ -5006,18 +6186,20 @@ async def get_fix_loop_diverged_tasks(
             if last_exit is None or last_exit == "passed":
                 continue
             ctx = task.context or {}
-            rows.append({
-                "task_id": str(task.id),
-                "title": task.title or "Untitled",
-                "task_type": (task.first_payload or {}).get("type", "unknown"),
-                "scope": ctx.get("scope"),
-                "project_id": str(task.project_id),
-                "status": task.status,
-                "loop": lname,
-                "exit_reason": last_exit,
-                "iteration_count": len(bucket),
-                "error_tail": last_error_tail,
-            })
+            rows.append(
+                {
+                    "task_id": str(task.id),
+                    "title": task.title or "Untitled",
+                    "task_type": (task.first_payload or {}).get("type", "unknown"),
+                    "scope": ctx.get("scope"),
+                    "project_id": str(task.project_id),
+                    "status": task.status,
+                    "loop": lname,
+                    "exit_reason": last_exit,
+                    "iteration_count": len(bucket),
+                    "error_tail": last_error_tail,
+                }
+            )
             if len(rows) >= limit:
                 break
 
@@ -5055,9 +6237,16 @@ async def list_sr_missed_retrospectives(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(
-            Task.id, Task.title, Task.created_at, Task.context, Task.project_id, Task.payloads,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.created_at,
+                Task.context,
+                Task.project_id,
+                Task.payloads,
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(2000)
     )
@@ -5080,16 +6269,18 @@ async def list_sr_missed_retrospectives(
             continue
         caught = human_cats & sr_failed
         t_type = (t.first_payload or {}).get("type")
-        missed_tasks.append({
-            "_task": t,
-            "task_id": str(t.id),
-            "title": t.title or "",
-            "task_type": t_type,
-            "scope": ctx.get("scope"),
-            "created_at": t.created_at.isoformat() if t.created_at else None,
-            "missed_categories": sorted(missed),
-            "caught_categories": sorted(caught),
-        })
+        missed_tasks.append(
+            {
+                "_task": t,
+                "task_id": str(t.id),
+                "title": t.title or "",
+                "task_type": t_type,
+                "scope": ctx.get("scope"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "missed_categories": sorted(missed),
+                "caught_categories": sorted(caught),
+            }
+        )
 
     # Apply optional filters
     if category:
@@ -5098,15 +6289,14 @@ async def list_sr_missed_retrospectives(
         missed_tasks = [m for m in missed_tasks if m["task_type"] == task_type]
 
     total = len(missed_tasks)
-    page_items = missed_tasks[page * page_size: (page + 1) * page_size]
+    page_items = missed_tasks[page * page_size : (page + 1) * page_size]
 
     # Batch-fetch PR artifacts for items on this page
     page_task_ids = [uuid.UUID(m["task_id"]) for m in page_items]
     pr_map: Dict[str, str] = {}
     if page_task_ids:
         art_result = await session.execute(
-            select(Artifact.task_id, Artifact.pr_url)
-            .where(
+            select(Artifact.task_id, Artifact.pr_url).where(
                 Artifact.task_id.in_(page_task_ids),
                 Artifact.artifact_type == ArtifactType.PULL_REQUEST,
             )
@@ -5117,16 +6307,18 @@ async def list_sr_missed_retrospectives(
 
     items = []
     for m in page_items:
-        items.append({
-            "task_id": m["task_id"],
-            "title": m["title"],
-            "task_type": m["task_type"],
-            "scope": m["scope"],
-            "created_at": m["created_at"],
-            "missed_categories": m["missed_categories"],
-            "caught_categories": m["caught_categories"],
-            "pr_url": pr_map.get(m["task_id"]),
-        })
+        items.append(
+            {
+                "task_id": m["task_id"],
+                "title": m["title"],
+                "task_type": m["task_type"],
+                "scope": m["scope"],
+                "created_at": m["created_at"],
+                "missed_categories": m["missed_categories"],
+                "caught_categories": m["caught_categories"],
+                "pr_url": pr_map.get(m["task_id"]),
+            }
+        )
 
     return {"items": items, "total": total}
 
@@ -5156,76 +6348,104 @@ async def get_pipeline_regressions(
     # dispatcher actually persists (pipeline_regression_dispatcher.py:306).
     sr_alert = doc.get("sr_catch_rate_trends_alert") or {}
     for cat in list(sr_alert.get("categories") or []):
-        cat_data = ((doc.get("sr_catch_rate_trends") or {}).get("categories") or {}).get(cat) or {}
-        regressions.append({
-            "signal_name": f"SR catch-rate regression: {cat}",
-            "regression_class": f"sr_catch_rate:{cat}",
-            "detected_at": sr_alert.get("computed_at"),
-            "severity": "warning",
-            "current_rate": cat_data.get("current_hit_rate"),
-            "prior_rate": cat_data.get("previous_hit_rate"),
-            "resolved": False,
-            "resolved_at": None,
-        })
+        cat_data = (
+            (doc.get("sr_catch_rate_trends") or {}).get("categories") or {}
+        ).get(cat) or {}
+        regressions.append(
+            {
+                "signal_name": f"SR catch-rate regression: {cat}",
+                "regression_class": f"sr_catch_rate:{cat}",
+                "detected_at": sr_alert.get("computed_at"),
+                "severity": "warning",
+                "current_rate": cat_data.get("current_hit_rate"),
+                "prior_rate": cat_data.get("previous_hit_rate"),
+                "resolved": False,
+                "resolved_at": None,
+            }
+        )
 
     # Fix-loop divergence regression signals — colon form per dispatcher line 394.
     iso_year, iso_week, _ = now.isocalendar()
     if doc.get("fix_loop_divergence_alerted_window") == f"{iso_year}-W{iso_week:02d}":
         for reg in list(doc.get("fix_loop_divergence_regressions") or []):
             loop = reg.get("loop", "unknown")
-            regressions.append({
-                "signal_name": f"Fix-loop divergence regression: {loop} loop",
-                "regression_class": f"fix_loop_divergence:{loop}",
-                "detected_at": doc.get("fix_loop_divergence_detected_at"),
-                "severity": "warning",
-                "current_rate": reg.get("current_rate"),
-                "prior_rate": reg.get("prior_rate"),
-                "resolved": False,
-                "resolved_at": None,
-            })
+            regressions.append(
+                {
+                    "signal_name": f"Fix-loop divergence regression: {loop} loop",
+                    "regression_class": f"fix_loop_divergence:{loop}",
+                    "detected_at": doc.get("fix_loop_divergence_detected_at"),
+                    "severity": "warning",
+                    "current_rate": reg.get("current_rate"),
+                    "prior_rate": reg.get("prior_rate"),
+                    "resolved": False,
+                    "resolved_at": None,
+                }
+            )
 
     # Background service crash signals — undismissed ERROR alerts in last 48h.
     crash_cutoff = now - timedelta(hours=48)
-    crash_rows = (await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.severity == AlertSeverity.ERROR,
-            Alert.created_at >= crash_cutoff,
-            Alert.dismissed_at.is_(None),
-        ).order_by(Alert.created_at.desc()).limit(10)
-    )).scalars().all()
+    crash_rows = (
+        (
+            await session.execute(
+                select(Alert)
+                .where(
+                    Alert.project_id == project_id,
+                    Alert.severity == AlertSeverity.ERROR,
+                    Alert.created_at >= crash_cutoff,
+                    Alert.dismissed_at.is_(None),
+                )
+                .order_by(Alert.created_at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
+    )
     _CRASH_TITLE_PREFIX = "Background service crashed: "
     for alert in crash_rows:
         if alert.title and alert.title.startswith(_CRASH_TITLE_PREFIX):
-            service_name = alert.title[len(_CRASH_TITLE_PREFIX):].strip() or "unknown"
+            service_name = alert.title[len(_CRASH_TITLE_PREFIX) :].strip() or "unknown"
             reg_class = f"background_service_crash:{service_name}"
         else:
             reg_class = "background_service_crash"
-        regressions.append({
-            "signal_name": alert.title,
-            "regression_class": reg_class,
-            "detected_at": alert.created_at.isoformat() if alert.created_at else None,
-            "severity": "critical",
-            "current_rate": None,
-            "prior_rate": None,
-            "resolved": False,
-            "resolved_at": None,
-        })
+        regressions.append(
+            {
+                "signal_name": alert.title,
+                "regression_class": reg_class,
+                "detected_at": alert.created_at.isoformat()
+                if alert.created_at
+                else None,
+                "severity": "critical",
+                "current_rate": None,
+                "prior_rate": None,
+                "resolved": False,
+                "resolved_at": None,
+            }
+        )
 
     # Enrich each regression with the status of any spawned investigation task.
     # Includes both pipeline_regression_dispatcher tasks (SR/fix-loop classes) and
     # crash_investigation tasks spawned by lifecycle._spawn_crash_investigations.
     if regressions:
-        dispatcher_tasks = (await session.execute(
-            select(Task).where(
-                Task.project_id == project_id,
-                Task.context["spawned_by"].as_string().in_(
-                    ("pipeline_regression_dispatcher", "crash_investigation")
-                ),
-                Task.created_at >= now - timedelta(hours=48),
-            ).options(load_only(Task.id, Task.title, Task.status, Task.context))
-            .order_by(Task.created_at.desc()).limit(50)
-        )).scalars().all()
+        dispatcher_tasks = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.context["spawned_by"]
+                        .as_string()
+                        .in_(("pipeline_regression_dispatcher", "crash_investigation")),
+                        Task.created_at >= now - timedelta(hours=48),
+                    )
+                    .options(load_only(Task.id, Task.title, Task.status, Task.context))
+                    .order_by(Task.created_at.desc())
+                    .limit(50)
+                )
+            )
+            .scalars()
+            .all()
+        )
         by_class: Dict[str, Task] = {}
         for t in dispatcher_tasks:
             rc = (t.context or {}).get("regression_class")
@@ -5239,10 +6459,18 @@ async def get_pipeline_regressions(
                 r["spawned_task_title"] = None
             else:
                 r["spawned_task_id"] = str(task.id)
-                r["spawned_task_status"] = task.status.value if hasattr(task.status, "value") else str(task.status)
+                r["spawned_task_status"] = (
+                    task.status.value
+                    if hasattr(task.status, "value")
+                    else str(task.status)
+                )
                 r["spawned_task_title"] = task.title
 
-    return {"project_id": str(project_id), "regressions": regressions, "healthy": len(regressions) == 0}
+    return {
+        "project_id": str(project_id),
+        "regressions": regressions,
+        "healthy": len(regressions) == 0,
+    }
 
 
 @router.get("/projects/{project_id}/sr-blind-spots")
@@ -5261,7 +6489,10 @@ async def list_sr_blind_spots(
     theme counts.
     """
     return await aggregate_sr_blind_spot_envelope(
-        session, project_id, days=days, limit=limit,
+        session,
+        project_id,
+        days=days,
+        limit=limit,
     )
 
 
@@ -5285,7 +6516,9 @@ async def get_prompt_fingerprint_analytics(
     `min_sample_size` are excluded so a single-task fingerprint cannot dominate
     the view.
     """
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
 
     cutoff = datetime.utcnow() - timedelta(days=days)
     stmt = (
@@ -5295,14 +6528,16 @@ async def get_prompt_fingerprint_analytics(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
         )
-        .options(load_only(
-            Task.id,
-            Task.created_at,
-            Task.context,
-            Task.payloads,
-            Task.prompt_fingerprint,
-            Task.project_id,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.created_at,
+                Task.context,
+                Task.payloads,
+                Task.prompt_fingerprint,
+                Task.project_id,
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(2000)
     )
@@ -5315,14 +6550,16 @@ async def get_prompt_fingerprint_analytics(
         if ttype in _SR_CODE_CHANGE_TYPES:
             code_change_tasks.append(t)
 
-    buckets: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
-        "sample_size": 0,
-        "first_attempt_measured": 0,
-        "first_attempt_succeeded": 0,
-        "sr_skip_measured": 0,
-        "sr_skipped": 0,
-        "rejection_category_counts": defaultdict(int),
-    })
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "sample_size": 0,
+            "first_attempt_measured": 0,
+            "first_attempt_succeeded": 0,
+            "sr_skip_measured": 0,
+            "sr_skipped": 0,
+            "rejection_category_counts": defaultdict(int),
+        }
+    )
 
     project_first_attempt_measured = 0
     project_first_attempt_succeeded = 0
@@ -5388,15 +6625,17 @@ async def get_prompt_fingerprint_analytics(
             if first_attempt_rate is not None and project_first_attempt_rate is not None
             else None
         )
-        fingerprints_out.append({
-            "fingerprint": fp,
-            "sample_size": b["sample_size"],
-            "first_attempt_measured": b["first_attempt_measured"],
-            "first_attempt_success_rate": first_attempt_rate,
-            "sr_skip_rate": sr_skip_rate,
-            "rejection_category_counts": dict(b["rejection_category_counts"]),
-            "delta_vs_project_mean": delta,
-        })
+        fingerprints_out.append(
+            {
+                "fingerprint": fp,
+                "sample_size": b["sample_size"],
+                "first_attempt_measured": b["first_attempt_measured"],
+                "first_attempt_success_rate": first_attempt_rate,
+                "sr_skip_rate": sr_skip_rate,
+                "rejection_category_counts": dict(b["rejection_category_counts"]),
+                "delta_vs_project_mean": delta,
+            }
+        )
 
     fingerprints_out.sort(key=lambda x: x["sample_size"], reverse=True)
     fingerprints_out = fingerprints_out[:top_n]
@@ -5426,7 +6665,10 @@ async def list_sr_reviewer_disagreements(
     ``check_results`` and ``reviewer_findings`` are included.
     """
     entries = await aggregate_sr_reviewer_disagreements(
-        session, project_id, days=days, limit=limit,
+        session,
+        project_id,
+        days=days,
+        limit=limit,
     )
     return {
         "window_days": days,
@@ -5453,8 +6695,14 @@ async def get_direction_sr_breakdown(
     cutoff = datetime.utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
-        .where(Task.project_id == project_id, Task.status == TaskStatus.COMPLETED, Task.created_at >= cutoff)
-        .options(load_only(Task.id, Task.title, Task.context, Task.payloads, Task.project_id))
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(Task.id, Task.title, Task.context, Task.payloads, Task.project_id)
+        )
         .order_by(Task.created_at.desc())
         .limit(2000)
     )
@@ -5463,7 +6711,9 @@ async def get_direction_sr_breakdown(
     dir_tasks: Dict[str, list] = {}
     for t in all_tasks:
         ctx = t.context or {}
-        if "_self_review_outcome" not in ctx or not ctx.get("_first_attempt_rejection_categories"):
+        if "_self_review_outcome" not in ctx or not ctx.get(
+            "_first_attempt_rejection_categories"
+        ):
             continue
         did = str(ctx.get("direction_id") or "")
         if did:
@@ -5472,7 +6722,7 @@ async def get_direction_sr_breakdown(
     dir_text: Dict[str, str] = {}
     project = await session.get(Project, project_id)
     if project:
-        for d in ((project.design_doc or {}).get("directions") or []):
+        for d in (project.design_doc or {}).get("directions") or []:
             did = str(d.get("id") or d.get("direction_id") or "")
             if did:
                 dir_text[did] = d.get("text") or d.get("description") or ""
@@ -5486,39 +6736,58 @@ async def get_direction_sr_breakdown(
             ctx = t.context or {}
             human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
             check_results = ctx["_self_review_outcome"].get("check_results") or {}
-            sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            sr_failed = {
+                c for c, r in check_results.items() if not r.get("passed", True)
+            }
             rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
             rev_cats = _categorize_review_issues(rev_hist) if rev_hist else {}
             for cat in human_cats:
-                s = cat_stats.setdefault(cat, {"hit_count": 0, "human_count": 0, "miss_examples": []})
+                s = cat_stats.setdefault(
+                    cat, {"hit_count": 0, "human_count": 0, "miss_examples": []}
+                )
                 s["human_count"] += 1
                 if cat in sr_failed:
                     s["hit_count"] += 1
                 else:
                     for issue in rev_cats.get(cat, []):
                         if len(s["miss_examples"]) < 3:
-                            s["miss_examples"].append({"desc": issue["desc"], "severity": issue["severity"]})
+                            s["miss_examples"].append(
+                                {"desc": issue["desc"], "severity": issue["severity"]}
+                            )
         total_human = sum(s["human_count"] for s in cat_stats.values())
         total_hit = sum(s["hit_count"] for s in cat_stats.values())
         cats_out: Dict[str, Any] = {}
         worst_cat: Optional[str] = None
         worst_miss = -1.0
         for cat, s in cat_stats.items():
-            miss_rate = round(1 - s["hit_count"] / s["human_count"], 3) if s["human_count"] else None
-            cats_out[cat] = {"human_count": s["human_count"], "hit_count": s["hit_count"], "miss_rate": miss_rate, "miss_examples": s["miss_examples"]}
+            miss_rate = (
+                round(1 - s["hit_count"] / s["human_count"], 3)
+                if s["human_count"]
+                else None
+            )
+            cats_out[cat] = {
+                "human_count": s["human_count"],
+                "hit_count": s["hit_count"],
+                "miss_rate": miss_rate,
+                "miss_examples": s["miss_examples"],
+            }
             if miss_rate is not None and miss_rate > worst_miss:
                 worst_miss = miss_rate
                 worst_cat = cat
-        directions_out.append({
-            "direction_id": did,
-            "direction_text": dir_text.get(did, ""),
-            "sample_size": len(tasks),
-            "overall_catch_rate": round(total_hit / total_human, 3) if total_human else None,
-            "categories": cats_out,
-            "worst_category": worst_cat,
-        })
+        directions_out.append(
+            {
+                "direction_id": did,
+                "direction_text": dir_text.get(did, ""),
+                "sample_size": len(tasks),
+                "overall_catch_rate": round(total_hit / total_human, 3)
+                if total_human
+                else None,
+                "categories": cats_out,
+                "worst_category": worst_cat,
+            }
+        )
 
-    directions_out.sort(key=lambda x: (x.get("overall_catch_rate") or 1.0))
+    directions_out.sort(key=lambda x: x.get("overall_catch_rate") or 1.0)
     return {"directions": directions_out, "min_sample": _MIN_DIRECTION_SR_SAMPLE}
 
 
@@ -5539,8 +6808,21 @@ async def get_sr_recent_misses(
     cutoff = datetime.utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
-        .where(Task.project_id == project_id, Task.status == TaskStatus.COMPLETED, Task.created_at >= cutoff)
-        .options(load_only(Task.id, Task.title, Task.created_at, Task.context, Task.payloads, Task.project_id))
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.created_at,
+                Task.context,
+                Task.payloads,
+                Task.project_id,
+            )
+        )
         .order_by(Task.created_at.desc())
         .limit(2000)
     )
@@ -5563,28 +6845,27 @@ async def get_sr_recent_misses(
         if category and category not in missed:
             continue
         fp = t.first_payload or {}
-        rows.append({
-            "task_id": str(t.id),
-            "title": t.title,
-            "scope": ctx.get("scope"),
-            "task_type": fp.get("type") or ctx.get("type"),
-            "created_at": t.created_at.isoformat() if t.created_at else None,
-            "missed_categories": sorted(missed),
-            "caught_categories": sorted(human_cats & sr_failed),
-            "pr_url": None,
-        })
+        rows.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title,
+                "scope": ctx.get("scope"),
+                "task_type": fp.get("type") or ctx.get("type"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "missed_categories": sorted(missed),
+                "caught_categories": sorted(human_cats & sr_failed),
+                "pr_url": None,
+            }
+        )
         matched_task_ids.append(t.id)
         if len(rows) >= limit:
             break
 
     if matched_task_ids:
-        art_stmt = (
-            select(Artifact.task_id, Artifact.pr_url)
-            .where(
-                Artifact.task_id.in_(matched_task_ids),
-                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                Artifact.pr_url.isnot(None),
-            )
+        art_stmt = select(Artifact.task_id, Artifact.pr_url).where(
+            Artifact.task_id.in_(matched_task_ids),
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            Artifact.pr_url.isnot(None),
         )
         art_rows = (await session.execute(art_stmt)).all()
         pr_map = {str(r.task_id): r.pr_url for r in art_rows}
@@ -5597,7 +6878,9 @@ async def get_sr_recent_misses(
 @router.get("/projects/{project_id}/findings-by-source")
 async def get_findings_by_source(
     project_id: uuid.UUID,
-    ref: str = Query(..., description="File path or PR ref to look up (e.g. 'backend/app/foo.py')"),
+    ref: str = Query(
+        ..., description="File path or PR ref to look up (e.g. 'backend/app/foo.py')"
+    ),
     limit: int = Query(100, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
@@ -5608,8 +6891,12 @@ async def get_findings_by_source(
     Prefix matching is applied for file paths — e.g. 'backend/app' matches
     any finding that cites a file under that path.
     """
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
-    findings = await lookup_findings_by_source_ref(session, project_id, ref, limit=limit)
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    findings = await lookup_findings_by_source_ref(
+        session, project_id, ref, limit=limit
+    )
     return {"ref": ref, "findings": findings, "total": len(findings)}
 
 
@@ -5629,20 +6916,26 @@ async def get_evicted_findings(
     Each entry has: title, claims, source_refs, status, evicted_at.
     Supports offset/limit pagination over the stored list.
     """
-    await _get_user_project_with_role(project_id, current_user["user_id"], session, "viewer")
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
     project = await session.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     directions = project.directions or []
     direction = next(
-        (d for d in directions if str(d.get("id") or d.get("direction_id") or "") == direction_id),
+        (
+            d
+            for d in directions
+            if str(d.get("id") or d.get("direction_id") or "") == direction_id
+        ),
         None,
     )
     if direction is None:
         raise HTTPException(status_code=404, detail="Direction not found")
     agg = direction.get("history_aggregate") or {}
     all_evicted = list(agg.get("evicted_findings") or [])
-    page = all_evicted[offset: offset + limit]
+    page = all_evicted[offset : offset + limit]
     return {
         "direction_id": direction_id,
         "total": len(all_evicted),

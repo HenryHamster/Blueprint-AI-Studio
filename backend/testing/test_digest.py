@@ -1,4 +1,5 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
+
 from datetime import datetime, timedelta
 
 import pytest
@@ -29,7 +30,9 @@ from testing.factories import make_project, make_task, make_membership, _utcnow
 @pytest_asyncio.fixture(scope="function")
 async def unauthenticated_client(override_get_session):
     """Client with no auth override — useful for testing 401/403 responses."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
         yield ac
 
 
@@ -119,7 +122,9 @@ async def test_digest_recent_completions_include_scope_and_review_iterations(
     assert response.status_code == 200
     data = response.json()
 
-    entries = [c for c in data["recent_completions"] if c["title"] == "Scoped Completed Task"]
+    entries = [
+        c for c in data["recent_completions"] if c["title"] == "Scoped Completed Task"
+    ]
     assert len(entries) == 1
     assert entries[0]["scope"] == "medium"
     assert entries[0]["review_iterations"] == 3
@@ -172,18 +177,37 @@ async def test_digest_migration_health(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add_all([
-        make_task(project_id=project.id, status=TaskStatus.COMPLETED, payloads=[{"type": "migrate"}]),
-        make_task(
-            project_id=project.id, status=TaskStatus.FAILED, payloads=[{"type": "migrate"}],
-            context={"failure_class": "MIGRATION_ERROR"},
-        ),
-        make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED, payloads=[{"type": "create"}],
-            context={"related_files": ["backend/alembic/versions/0099_x.py", "backend/app/models.py"]},
-        ),
-        make_task(project_id=project.id, status=TaskStatus.COMPLETED, payloads=[{"type": "create"}]),
-    ])
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "migrate"}],
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "migrate"}],
+                context={"failure_class": "MIGRATION_ERROR"},
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "related_files": [
+                        "backend/alembic/versions/0099_x.py",
+                        "backend/app/models.py",
+                    ]
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+            ),
+        ]
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -206,9 +230,21 @@ async def test_digest_aggregates_merge_retries_saved(client: AsyncClient, db_ses
     await db_session.commit()
     await db_session.refresh(project)
 
-    t1 = make_task(project_id=project.id, status=TaskStatus.FAILED, context={"_merge_retries_saved": 3})
-    t2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED, context={"_merge_retries_saved": 2})
-    t3 = make_task(project_id=project.id, status=TaskStatus.FAILED, context={"_merge_retries_saved": 0})
+    t1 = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        context={"_merge_retries_saved": 3},
+    )
+    t2 = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"_merge_retries_saved": 2},
+    )
+    t3 = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        context={"_merge_retries_saved": 0},
+    )
     t4 = make_task(project_id=project.id, status=TaskStatus.FAILED, context={})
     for t in (t1, t2, t3, t4):
         db_session.add(t)
@@ -222,12 +258,12 @@ async def test_digest_aggregates_merge_retries_saved(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
-async def test_digest_failed_task_direction_attribution(client: AsyncClient, db_session):
+async def test_digest_failed_task_direction_attribution(
+    client: AsyncClient, db_session
+):
     """Failed tasks with direction_id context expose direction_id/direction_text in needs_attention, recent_failures, and failure_groups."""
     project = make_project(
-        directions=[
-            {"id": "dir-f1", "text": "Harden reliability", "status": "active"}
-        ]
+        directions=[{"id": "dir-f1", "text": "Harden reliability", "status": "active"}]
     )
     db_session.add(project)
     await db_session.commit()
@@ -451,7 +487,9 @@ async def test_digest_analysis_overflow_summary(client: AsyncClient, db_session)
 
 
 @pytest.mark.asyncio
-async def test_digest_recent_failures_includes_failure_class_and_scope(client: AsyncClient, db_session):
+async def test_digest_recent_failures_includes_failure_class_and_scope(
+    client: AsyncClient, db_session
+):
     """recent_failures entries include failure_class and scope fields."""
     project = make_project()
     db_session.add(project)
@@ -483,9 +521,7 @@ async def test_digest_recent_failures_includes_failure_class_and_scope(client: A
 async def test_digest_recurring_error_clusters(client: AsyncClient, db_session):
     """Failed tasks sharing a normalized error are grouped into a recurring cluster (count >= 2)."""
     project = make_project(
-        directions=[
-            {"id": "dir-rc", "text": "Reliability", "status": "active"}
-        ]
+        directions=[{"id": "dir-rc", "text": "Reliability", "status": "active"}]
     )
     db_session.add(project)
     await db_session.commit()
@@ -493,30 +529,36 @@ async def test_digest_recurring_error_clusters(client: AsyncClient, db_session):
 
     # Two failures with the same root cause but differing PR numbers — should
     # normalize to the same fingerprint.
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Fail A",
-        status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-rc"},
-        latest_status_message="Merge conflict on PR #1234",
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Fail B",
-        status=TaskStatus.FAILED,
-        payloads=[{"type": "fix"}],
-        context={"direction_id": "dir-rc"},
-        latest_status_message="Merge conflict on PR #5678",
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Fail A",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-rc"},
+            latest_status_message="Merge conflict on PR #1234",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Fail B",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "fix"}],
+            context={"direction_id": "dir-rc"},
+            latest_status_message="Merge conflict on PR #5678",
+        )
+    )
     # Singleton — should be excluded from clusters.
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Fail C",
-        status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        latest_status_message="Unique failure: disk full",
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Fail C",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            latest_status_message="Unique failure: disk full",
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -534,24 +576,30 @@ async def test_digest_recurring_error_clusters(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_recurring_error_clusters_empty_when_all_unique(client: AsyncClient, db_session):
+async def test_digest_recurring_error_clusters_empty_when_all_unique(
+    client: AsyncClient, db_session
+):
     """If every failed task has a distinct fingerprint, recurring_error_clusters is empty."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    for i, msg in enumerate([
-        "TypeError: foo is undefined",
-        "Rate limit exceeded for region us-west",
-        "SyntaxError: unexpected token in parser",
-    ]):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Unique {i}",
-            status=TaskStatus.FAILED,
-            latest_status_message=msg,
-        ))
+    for i, msg in enumerate(
+        [
+            "TypeError: foo is undefined",
+            "Rate limit exceeded for region us-west",
+            "SyntaxError: unexpected token in parser",
+        ]
+    ):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Unique {i}",
+                status=TaskStatus.FAILED,
+                latest_status_message=msg,
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -561,7 +609,9 @@ async def test_digest_recurring_error_clusters_empty_when_all_unique(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_digest_recurring_patterns_from_persistent_anomalies(client: AsyncClient, db_session):
+async def test_digest_recurring_patterns_from_persistent_anomalies(
+    client: AsyncClient, db_session
+):
     """persistent_anomalies entries with occurrence_count >= 2 appear in recurring_patterns."""
     from app import shared_state as _ss
 
@@ -590,18 +640,21 @@ async def test_digest_recurring_patterns_from_persistent_anomalies(client: Async
     try:
         # Failed task in last 48h with same fingerprint and a direction, so
         # affected_direction_count > 0 and remediation_status is unaddressed.
-        db_session.add(make_task(
-            project_id=project.id,
-            title="Recurring fail",
-            status=TaskStatus.FAILED,
-            payloads=[{"type": "create"}],
-            context={"direction_id": "dir-recur"},
-            latest_status_message="boom: same root cause",
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Recurring fail",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create"}],
+                context={"direction_id": "dir-recur"},
+                latest_status_message="boom: same root cause",
+            )
+        )
         await db_session.commit()
 
         # Seed persistent_anomalies key with the actual fingerprint of the message.
         from app.anomaly_detection import _error_fingerprint
+
         actual_fp = _error_fingerprint("boom: same root cause")
         _ss.persistent_anomalies[proj_key][f"CrossDirectionFingerprint_{actual_fp}"] = {
             "first_seen": "2026-04-18T00:00:00+00:00",
@@ -637,7 +690,9 @@ async def test_digest_recurring_patterns_from_persistent_anomalies(client: Async
 
 
 @pytest.mark.asyncio
-async def test_digest_recurring_patterns_remediation_status_investigating(client: AsyncClient, db_session):
+async def test_digest_recurring_patterns_remediation_status_investigating(
+    client: AsyncClient, db_session
+):
     """An in-flight investigate task with matching diagnosis_fingerprint marks status=investigating."""
     from app import shared_state as _ss
 
@@ -657,13 +712,15 @@ async def test_digest_recurring_patterns_remediation_status_investigating(client
         },
     }
     try:
-        db_session.add(make_task(
-            project_id=project.id,
-            title="Active investigation",
-            status=TaskStatus.IN_PROGRESS,
-            payloads=[{"type": "investigate"}],
-            context={"diagnosis_fingerprint": "fp-inv-001", "proactive": True},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Active investigation",
+                status=TaskStatus.IN_PROGRESS,
+                payloads=[{"type": "investigate"}],
+                context={"diagnosis_fingerprint": "fp-inv-001", "proactive": True},
+            )
+        )
         await db_session.commit()
 
         response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -678,12 +735,12 @@ async def test_digest_recurring_patterns_remediation_status_investigating(client
 
 
 @pytest.mark.asyncio
-async def test_digest_approval_task_direction_attribution(client: AsyncClient, db_session):
+async def test_digest_approval_task_direction_attribution(
+    client: AsyncClient, db_session
+):
     """Approval-pending tasks with direction_id context expose direction attribution in needs_attention."""
     project = make_project(
-        directions=[
-            {"id": "dir-a1", "text": "Approval direction", "status": "active"}
-        ]
+        directions=[{"id": "dir-a1", "text": "Approval direction", "status": "active"}]
     )
     db_session.add(project)
     await db_session.commit()
@@ -703,7 +760,9 @@ async def test_digest_approval_task_direction_attribution(client: AsyncClient, d
     assert response.status_code == 200
     data = response.json()
 
-    approval_items = [a for a in data["needs_attention"] if a["reason"] == "approval_required"]
+    approval_items = [
+        a for a in data["needs_attention"] if a["reason"] == "approval_required"
+    ]
     assert approval_items
     assert approval_items[0]["direction_id"] == "dir-a1"
     assert approval_items[0]["direction_text"] == "Approval direction"
@@ -736,7 +795,9 @@ async def test_digest_with_pending_approval(client: AsyncClient, db_session):
     attention_reasons = {a["reason"] for a in data["needs_attention"]}
     assert "approval_required" in attention_reasons
 
-    approval_items = [a for a in data["needs_attention"] if a["reason"] == "approval_required"]
+    approval_items = [
+        a for a in data["needs_attention"] if a["reason"] == "approval_required"
+    ]
     assert len(approval_items) == 1
     assert approval_items[0]["task_id"] == str(task.id)
     assert approval_items[0]["title"] == "Approval Task"
@@ -854,7 +915,9 @@ async def test_digest_active_count(client: AsyncClient, db_session):
 @pytest.mark.asyncio
 async def test_digest_active_tasks_direction_and_cost(client: AsyncClient, db_session):
     """active_tasks entries expose direction_id, direction_text and running_cost_usd."""
-    project = make_project(directions=[{"id": "d-1", "text": "Improve perf", "status": "active"}])
+    project = make_project(
+        directions=[{"id": "d-1", "text": "Improve perf", "status": "active"}]
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -927,7 +990,9 @@ async def test_digest_active_tasks_includes_scope(client: AsyncClient, db_sessio
 
 
 @pytest.mark.asyncio
-async def test_digest_active_tasks_includes_review_iteration(client: AsyncClient, db_session):
+async def test_digest_active_tasks_includes_review_iteration(
+    client: AsyncClient, db_session
+):
     """active_tasks entries expose review_iteration and review_cap from task.context."""
     project = make_project()
     db_session.add(project)
@@ -962,7 +1027,9 @@ async def test_digest_active_tasks_includes_review_iteration(client: AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_digest_includes_long_running_completed_task(client: AsyncClient, db_session):
+async def test_digest_includes_long_running_completed_task(
+    client: AsyncClient, db_session
+):
     """A task created before the window but completed within it appears in completed_count."""
     project = make_project()
     db_session.add(project)
@@ -1111,7 +1178,9 @@ async def test_activity_limit(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_activity_failed_includes_failure_class_and_taxonomy(client: AsyncClient, db_session):
+async def test_activity_failed_includes_failure_class_and_taxonomy(
+    client: AsyncClient, db_session
+):
     """TASK_FAILED events expose failure_class and taxonomy from task context."""
     project = make_project()
     db_session.add(project)
@@ -1200,7 +1269,9 @@ async def test_digest_direction_progress_basic(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_excludes_inactive(client: AsyncClient, db_session):
+async def test_digest_direction_progress_excludes_inactive(
+    client: AsyncClient, db_session
+):
     """Inactive directions are not included in direction_progress even if tasks exist."""
     project = make_project(
         directions=[
@@ -1213,13 +1284,15 @@ async def test_digest_direction_progress_excludes_inactive(client: AsyncClient, 
     await db_session.refresh(project)
 
     for did in ("dir-active", "dir-inactive"):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Task for {did}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": did},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task for {did}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": did},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -1232,7 +1305,9 @@ async def test_digest_direction_progress_excludes_inactive(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_includes_held_and_paused(client: AsyncClient, db_session):
+async def test_digest_direction_progress_includes_held_and_paused(
+    client: AsyncClient, db_session
+):
     """Held and auto_paused directions with recent task activity appear in direction_progress."""
     project = make_project(
         directions=[
@@ -1246,13 +1321,15 @@ async def test_digest_direction_progress_includes_held_and_paused(client: AsyncC
     await db_session.refresh(project)
 
     for did in ("dir-held", "dir-paused", "dir-inactive"):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Task for {did}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": did},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task for {did}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": did},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -1268,7 +1345,9 @@ async def test_digest_direction_progress_includes_held_and_paused(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_excludes_no_activity(client: AsyncClient, db_session):
+async def test_digest_direction_progress_excludes_no_activity(
+    client: AsyncClient, db_session
+):
     """Active directions with no tasks in the window are omitted from direction_progress."""
     project = make_project(
         directions=[
@@ -1281,13 +1360,15 @@ async def test_digest_direction_progress_excludes_no_activity(client: AsyncClien
     await db_session.refresh(project)
 
     # Only create a task for dir-busy
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Task for busy",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-busy"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Task for busy",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-busy"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -1312,8 +1393,8 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
                 "text": "Direction with PRs",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "prs_merged": 3},   # inside window
-                    {"timestamp": old_ts, "prs_merged": 10},      # outside window
+                    {"timestamp": recent_ts, "prs_merged": 3},  # inside window
+                    {"timestamp": old_ts, "prs_merged": 10},  # outside window
                 ],
             }
         ]
@@ -1322,13 +1403,15 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1340,16 +1423,26 @@ async def test_digest_direction_progress_prs_merged(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_prompt_quality_hint(client: AsyncClient, db_session):
+async def test_digest_direction_progress_prompt_quality_hint(
+    client: AsyncClient, db_session
+):
     """prompt_quality_hint is synthesized from research_history prompt_telemetry when available."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     telemetry_cycle = {
         "timestamp": recent_ts,
         "prompt_telemetry": {
-            "merged": {"avg_char_count": 800, "avg_related_file_count": 3,
-                       "frac_mentions_tests": 0.8, "frac_mentions_symbols": 0.8},
-            "failed": {"avg_char_count": 300, "avg_related_file_count": 1,
-                       "frac_mentions_tests": 0.2, "frac_mentions_symbols": 0.2},
+            "merged": {
+                "avg_char_count": 800,
+                "avg_related_file_count": 3,
+                "frac_mentions_tests": 0.8,
+                "frac_mentions_symbols": 0.8,
+            },
+            "failed": {
+                "avg_char_count": 300,
+                "avg_related_file_count": 1,
+                "frac_mentions_tests": 0.2,
+                "frac_mentions_symbols": 0.2,
+            },
         },
     }
     project = make_project(
@@ -1373,13 +1466,15 @@ async def test_digest_direction_progress_prompt_quality_hint(client: AsyncClient
     await db_session.refresh(project)
 
     for did in ("dir-pq", "dir-no-pq"):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Research {did}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": did},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Research {did}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": did},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1410,13 +1505,15 @@ async def test_digest_direction_progress_quality_score(client: AsyncClient, db_s
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-q"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-q"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1428,7 +1525,9 @@ async def test_digest_direction_progress_quality_score(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_review_quality(client: AsyncClient, db_session):
+async def test_digest_direction_progress_review_quality(
+    client: AsyncClient, db_session
+):
     """review_quality aggregates reviews_dismissed/overridden/user_issues_caught across in-window entries."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
@@ -1441,9 +1540,24 @@ async def test_digest_direction_progress_review_quality(client: AsyncClient, db_
                 "text": "Review quality direction",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "reviews_dismissed": 2, "reviews_overridden": 1, "user_issues_caught": 3},
-                    {"timestamp": recent_ts2, "reviews_dismissed": 1, "reviews_overridden": 0, "user_issues_caught": 2},
-                    {"timestamp": old_ts, "reviews_dismissed": 99, "reviews_overridden": 99, "user_issues_caught": 99},
+                    {
+                        "timestamp": recent_ts,
+                        "reviews_dismissed": 2,
+                        "reviews_overridden": 1,
+                        "user_issues_caught": 3,
+                    },
+                    {
+                        "timestamp": recent_ts2,
+                        "reviews_dismissed": 1,
+                        "reviews_overridden": 0,
+                        "user_issues_caught": 2,
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "reviews_dismissed": 99,
+                        "reviews_overridden": 99,
+                        "user_issues_caught": 99,
+                    },
                 ],
             }
         ]
@@ -1452,13 +1566,15 @@ async def test_digest_direction_progress_review_quality(client: AsyncClient, db_
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-rq"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-rq"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1472,7 +1588,9 @@ async def test_digest_direction_progress_review_quality(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, db_session):
+async def test_digest_direction_progress_lifetime_metrics(
+    client: AsyncClient, db_session
+):
     """Lifetime fields combine research_history with history_aggregate evicted totals."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
@@ -1484,8 +1602,20 @@ async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, d
                 "text": "Lifetime direction",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "prs_merged": 2, "prs_rejected": 1, "tasks_created": 5, "tasks_failed": 1},
-                    {"timestamp": old_ts, "prs_merged": 1, "prs_rejected": 0, "tasks_created": 3, "tasks_failed": 2},
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 2,
+                        "prs_rejected": 1,
+                        "tasks_created": 5,
+                        "tasks_failed": 1,
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 1,
+                        "prs_rejected": 0,
+                        "tasks_created": 3,
+                        "tasks_failed": 2,
+                    },
                 ],
                 "history_aggregate": {
                     "total_cycles": 7,
@@ -1501,13 +1631,15 @@ async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, d
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-life"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-life"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1518,11 +1650,15 @@ async def test_digest_direction_progress_lifetime_metrics(client: AsyncClient, d
     assert dp["lifetime_prs_merged"] == 11  # 2 + 1 + 8
     assert dp["lifetime_prs_rejected"] == 5  # 1 + 0 + 4
     assert dp["lifetime_tasks_failed"] == 6  # 1 + 2 + 3
-    assert dp["lifetime_conversion_rate"] == round(11 / 28, 3)  # 11 merged / (5 + 3 + 20) created
+    assert dp["lifetime_conversion_rate"] == round(
+        11 / 28, 3
+    )  # 11 merged / (5 + 3 + 20) created
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_retirement_eligibility(client: AsyncClient, db_session):
+async def test_digest_direction_progress_retirement_eligibility(
+    client: AsyncClient, db_session
+):
     """lifetime_autonomous_prs_merged, lifetime_operator_actions, and retirement_eligible are computed correctly."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
@@ -1535,8 +1671,18 @@ async def test_digest_direction_progress_retirement_eligibility(client: AsyncCli
                 "status": "active",
                 # 4 autonomous from history (2 explicit + legacy fallback 2), aggregate adds 7 → total 11
                 "research_history": [
-                    {"timestamp": recent_ts, "autonomous_prs_merged": 2, "prs_merged": 2, "operator_action_count": 0, "tasks_created": 3},
-                    {"timestamp": old_ts, "prs_merged": 2, "tasks_created": 2},  # legacy: no autonomous_prs_merged, falls back to prs_merged
+                    {
+                        "timestamp": recent_ts,
+                        "autonomous_prs_merged": 2,
+                        "prs_merged": 2,
+                        "operator_action_count": 0,
+                        "tasks_created": 3,
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "prs_merged": 2,
+                        "tasks_created": 2,
+                    },  # legacy: no autonomous_prs_merged, falls back to prs_merged
                 ],
                 "history_aggregate": {
                     "total_cycles": 5,
@@ -1551,18 +1697,40 @@ async def test_digest_direction_progress_retirement_eligibility(client: AsyncCli
                 "text": "Ineligible: has operator actions",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "autonomous_prs_merged": 10, "prs_merged": 10, "operator_action_count": 1, "tasks_created": 10},
+                    {
+                        "timestamp": recent_ts,
+                        "autonomous_prs_merged": 10,
+                        "prs_merged": 10,
+                        "operator_action_count": 1,
+                        "tasks_created": 10,
+                    },
                 ],
-                "history_aggregate": {"total_cycles": 0, "total_prs_merged": 0, "total_autonomous_prs_merged": 0, "total_operator_actions": 0},
+                "history_aggregate": {
+                    "total_cycles": 0,
+                    "total_prs_merged": 0,
+                    "total_autonomous_prs_merged": 0,
+                    "total_operator_actions": 0,
+                },
             },
             {
                 "id": "dir-ineligible-count",
                 "text": "Ineligible: not enough autonomous merges",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "autonomous_prs_merged": 5, "prs_merged": 5, "operator_action_count": 0, "tasks_created": 5},
+                    {
+                        "timestamp": recent_ts,
+                        "autonomous_prs_merged": 5,
+                        "prs_merged": 5,
+                        "operator_action_count": 0,
+                        "tasks_created": 5,
+                    },
                 ],
-                "history_aggregate": {"total_cycles": 0, "total_prs_merged": 0, "total_autonomous_prs_merged": 4, "total_operator_actions": 0},
+                "history_aggregate": {
+                    "total_cycles": 0,
+                    "total_prs_merged": 0,
+                    "total_autonomous_prs_merged": 4,
+                    "total_operator_actions": 0,
+                },
             },
         ]
     )
@@ -1571,13 +1739,15 @@ async def test_digest_direction_progress_retirement_eligibility(client: AsyncCli
     await db_session.refresh(project)
 
     for dir_id in ("dir-eligible", "dir-ineligible-ops", "dir-ineligible-count"):
-        db_session.add(make_task(
-            project_id=project.id,
-            title="Research task",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": dir_id},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Research task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": dir_id},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1599,7 +1769,9 @@ async def test_digest_direction_progress_retirement_eligibility(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_digest_retirement_eligibility_boundary_cases(client: AsyncClient, db_session):
+async def test_digest_retirement_eligibility_boundary_cases(
+    client: AsyncClient, db_session
+):
     """At-threshold (exactly 10, 0 ops → True) and above-threshold + operator action (12, 1 op → False)."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
 
@@ -1611,7 +1783,13 @@ async def test_digest_retirement_eligibility_boundary_cases(client: AsyncClient,
                 "status": "active",
                 # 4 from history + 6 from aggregate = 10 total, 0 operator actions
                 "research_history": [
-                    {"timestamp": recent_ts, "autonomous_prs_merged": 4, "prs_merged": 4, "operator_action_count": 0, "tasks_created": 4},
+                    {
+                        "timestamp": recent_ts,
+                        "autonomous_prs_merged": 4,
+                        "prs_merged": 4,
+                        "operator_action_count": 0,
+                        "tasks_created": 4,
+                    },
                 ],
                 "history_aggregate": {
                     "total_cycles": 3,
@@ -1627,7 +1805,13 @@ async def test_digest_retirement_eligibility_boundary_cases(client: AsyncClient,
                 "status": "active",
                 # 12 autonomous merges total, but 1 operator action → zero-tolerance blocks eligibility
                 "research_history": [
-                    {"timestamp": recent_ts, "autonomous_prs_merged": 6, "prs_merged": 6, "operator_action_count": 1, "tasks_created": 6},
+                    {
+                        "timestamp": recent_ts,
+                        "autonomous_prs_merged": 6,
+                        "prs_merged": 6,
+                        "operator_action_count": 1,
+                        "tasks_created": 6,
+                    },
                 ],
                 "history_aggregate": {
                     "total_cycles": 3,
@@ -1644,13 +1828,15 @@ async def test_digest_retirement_eligibility_boundary_cases(client: AsyncClient,
     await db_session.refresh(project)
 
     for dir_id in ("dir-at-threshold", "dir-above-with-ops"):
-        db_session.add(make_task(
-            project_id=project.id,
-            title="Research task",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": dir_id},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Research task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": dir_id},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1665,11 +1851,15 @@ async def test_digest_retirement_eligibility_boundary_cases(client: AsyncClient,
     above_with_ops = by_id["dir-above-with-ops"]
     assert above_with_ops["lifetime_autonomous_prs_merged"] == 12  # 6 + 6
     assert above_with_ops["lifetime_operator_actions"] == 1
-    assert above_with_ops["retirement_eligible"] is False  # zero-tolerance: any operator action blocks
+    assert (
+        above_with_ops["retirement_eligible"] is False
+    )  # zero-tolerance: any operator action blocks
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_sorted_by_cycles(client: AsyncClient, db_session):
+async def test_digest_direction_progress_sorted_by_cycles(
+    client: AsyncClient, db_session
+):
     """direction_progress list is sorted by cycles_in_window descending."""
     project = make_project(
         directions=[
@@ -1682,21 +1872,25 @@ async def test_digest_direction_progress_sorted_by_cycles(client: AsyncClient, d
     await db_session.refresh(project)
 
     # 1 research task for dir-few, 3 for dir-many
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Few task 1",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-few"},
-    ))
-    for i in range(3):
-        db_session.add(make_task(
+    db_session.add(
+        make_task(
             project_id=project.id,
-            title=f"Many task {i}",
+            title="Few task 1",
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
-            context={"direction_id": "dir-many"},
-        ))
+            context={"direction_id": "dir-few"},
+        )
+    )
+    for i in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Many task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": "dir-many"},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -1708,7 +1902,9 @@ async def test_digest_direction_progress_sorted_by_cycles(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_absent_without_project_id(client: AsyncClient, db_session):
+async def test_digest_direction_progress_absent_without_project_id(
+    client: AsyncClient, db_session
+):
     """direction_progress is empty when no project_id is supplied."""
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
@@ -1717,7 +1913,9 @@ async def test_digest_direction_progress_absent_without_project_id(client: Async
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_taxonomy_and_failure_titles(client: AsyncClient, db_session):
+async def test_digest_direction_progress_taxonomy_and_failure_titles(
+    client: AsyncClient, db_session
+):
     """direction_progress aggregates taxonomy_summary and recent_failure_titles across research_history entries in-window."""
     recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
     recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
@@ -1766,13 +1964,15 @@ async def test_digest_direction_progress_taxonomy_and_failure_titles(client: Asy
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-tax"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-tax"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1785,7 +1985,11 @@ async def test_digest_direction_progress_taxonomy_and_failure_titles(client: Asy
     assert dp["direction_id"] == "dir-tax"
 
     # taxonomy counts summed across both in-window entries, old entry excluded
-    assert dp["taxonomy_summary"] == {"scope_related": 3, "infra_related": 1, "code_defect": 3}
+    assert dp["taxonomy_summary"] == {
+        "scope_related": 3,
+        "infra_related": 1,
+        "code_defect": 3,
+    }
 
     # recent_failure_titles: last 3 titles from in-window failed_task_details
     titles = dp["recent_failure_titles"]
@@ -1796,7 +2000,9 @@ async def test_digest_direction_progress_taxonomy_and_failure_titles(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_type_breakdown(client: AsyncClient, db_session):
+async def test_digest_direction_progress_type_breakdown(
+    client: AsyncClient, db_session
+):
     """direction_progress aggregates type_breakdown across in-window research_history entries."""
     recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
     recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
@@ -1844,13 +2050,15 @@ async def test_digest_direction_progress_type_breakdown(client: AsyncClient, db_
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-tb"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-tb"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1870,7 +2078,9 @@ async def test_digest_direction_progress_type_breakdown(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_decomposition_summary(client: AsyncClient, db_session):
+async def test_digest_direction_progress_decomposition_summary(
+    client: AsyncClient, db_session
+):
     """decomposition_summary aggregates decomposition_quality across in-window research_history entries."""
     recent_ts_1 = (_utcnow() - timedelta(hours=10)).isoformat()
     recent_ts_2 = (_utcnow() - timedelta(hours=5)).isoformat()
@@ -1888,8 +2098,18 @@ async def test_digest_direction_progress_decomposition_summary(client: AsyncClie
                         "prs_merged": 1,
                         "tasks_created": 2,
                         "decomposition_quality": [
-                            {"plan_task_id": "p1", "subtask_count": 3, "subtask_merge_rate": 0.5, "cross_module_count": 1},
-                            {"plan_task_id": "p2", "subtask_count": 5, "subtask_merge_rate": None, "cross_module_count": 0},
+                            {
+                                "plan_task_id": "p1",
+                                "subtask_count": 3,
+                                "subtask_merge_rate": 0.5,
+                                "cross_module_count": 1,
+                            },
+                            {
+                                "plan_task_id": "p2",
+                                "subtask_count": 5,
+                                "subtask_merge_rate": None,
+                                "cross_module_count": 0,
+                            },
                         ],
                     },
                     {
@@ -1897,7 +2117,12 @@ async def test_digest_direction_progress_decomposition_summary(client: AsyncClie
                         "prs_merged": 1,
                         "tasks_created": 1,
                         "decomposition_quality": [
-                            {"plan_task_id": "p3", "subtask_count": 2, "subtask_merge_rate": 1.0, "cross_module_count": 3},
+                            {
+                                "plan_task_id": "p3",
+                                "subtask_count": 2,
+                                "subtask_merge_rate": 1.0,
+                                "cross_module_count": 3,
+                            },
                         ],
                     },
                     {
@@ -1905,7 +2130,12 @@ async def test_digest_direction_progress_decomposition_summary(client: AsyncClie
                         "prs_merged": 0,
                         "tasks_created": 0,
                         "decomposition_quality": [
-                            {"plan_task_id": "p_old", "subtask_count": 99, "subtask_merge_rate": 0.0, "cross_module_count": 99},
+                            {
+                                "plan_task_id": "p_old",
+                                "subtask_count": 99,
+                                "subtask_merge_rate": 0.0,
+                                "cross_module_count": 99,
+                            },
                         ],
                     },
                 ],
@@ -1916,13 +2146,15 @@ async def test_digest_direction_progress_decomposition_summary(client: AsyncClie
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-dq"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-dq"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -1940,7 +2172,9 @@ async def test_digest_direction_progress_decomposition_summary(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_taxonomy_absent_when_no_entries(client: AsyncClient, db_session):
+async def test_digest_direction_progress_taxonomy_absent_when_no_entries(
+    client: AsyncClient, db_session
+):
     """taxonomy_summary and recent_failure_titles are null when research_history entries omit those fields."""
     recent_ts = (_utcnow() - timedelta(hours=5)).isoformat()
 
@@ -1960,13 +2194,15 @@ async def test_digest_direction_progress_taxonomy_absent_when_no_entries(client:
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-plain"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-plain"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -2021,13 +2257,15 @@ async def test_digest_direction_progress_stage_dropout(client: AsyncClient, db_s
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-drop"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-drop"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -2067,28 +2305,44 @@ async def test_narrative_good_progress_prefix(client: AsyncClient, db_session):
 
     # Previous window: 1 completed + 3 failed = 0.25 success rate
     prev = _prev_ts()
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=prev,
+            status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        )
+    )
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+            )
+        )
 
     # Current window: 3 completed + 1 failed = 0.75 success rate
     # delta = 0.75 - 0.25 = 0.50 > 0.05 → trend="improving" → "Good progress —"
     curr = _curr_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2112,27 +2366,43 @@ async def test_narrative_declining_prefix(client: AsyncClient, db_session):
     # Previous window: 3 completed + 1 failed = 0.75 success rate
     prev = _prev_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=prev,
+            status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+        )
+    )
 
     # Current window: 1 completed + 3 failed = 0.25 success rate
     # delta = 0.25 - 0.75 = -0.50 < -0.05 → trend="declining" → "Pipeline health declining —"
     curr = _curr_ts()
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        )
+    )
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2156,25 +2426,41 @@ async def test_narrative_no_trend_prefix_when_stable(client: AsyncClient, db_ses
     # Both windows: 3 completed + 1 failed = 0.75 success rate → delta = 0.0 → stable
     prev = _prev_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=prev,
+            status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+        )
+    )
 
     curr = _curr_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2203,23 +2489,35 @@ async def test_narrative_up_from_x(client: AsyncClient, db_session):
 
     # Previous window: 1 completed
     prev = _prev_ts()
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=prev,
+            status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+        )
+    )
 
     # Current window: 2 completed + 1 failed → forces standard narrative path
     # completed_delta = 2 - 1 = 1 > 0 → "(up from 1 last period)"
     curr = _curr_ts()
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2245,7 +2543,9 @@ async def test_narrative_all_quiet_fallback(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_narrative_taxonomy_insight_dominant_category(client: AsyncClient, db_session):
+async def test_narrative_taxonomy_insight_dominant_category(
+    client: AsyncClient, db_session
+):
     """When a taxonomy category dominates failures (>=50%), narrative appends an actionable hint."""
     project = make_project()
     db_session.add(project)
@@ -2253,11 +2553,13 @@ async def test_narrative_taxonomy_insight_dominant_category(client: AsyncClient,
     await db_session.refresh(project)
 
     for i in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Failed Task {i}",
-            status=TaskStatus.FAILED,
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Failed Task {i}",
+                status=TaskStatus.FAILED,
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2269,7 +2571,9 @@ async def test_narrative_taxonomy_insight_dominant_category(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_narrative_taxonomy_insight_review_quality(client: AsyncClient, db_session):
+async def test_narrative_taxonomy_insight_review_quality(
+    client: AsyncClient, db_session
+):
     """CODE_ERROR failures with test/lint keywords → review_quality narrative hint."""
     project = make_project()
     db_session.add(project)
@@ -2277,25 +2581,31 @@ async def test_narrative_taxonomy_insight_review_quality(client: AsyncClient, db
     await db_session.refresh(project)
 
     for i in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Lint Fail {i}",
-            status=TaskStatus.FAILED,
-            context={"failure_category": "test_failed"},
-            latest_status_message="pytest failed on test_foo",
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Lint Fail {i}",
+                status=TaskStatus.FAILED,
+                context={"failure_category": "test_failed"},
+                latest_status_message="pytest failed on test_foo",
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
     data = response.json()
 
-    assert data["failure_taxonomy_distribution"]["dominant_category"] == "review_quality"
+    assert (
+        data["failure_taxonomy_distribution"]["dominant_category"] == "review_quality"
+    )
     assert "Review quality issues dominate" in data["narrative_summary"]
 
 
 @pytest.mark.asyncio
-async def test_narrative_taxonomy_insight_scope_related(client: AsyncClient, db_session):
+async def test_narrative_taxonomy_insight_scope_related(
+    client: AsyncClient, db_session
+):
     """CODE_ERROR failures with expansion_ratio > 1.5 → scope_related narrative hint."""
     project = make_project()
     db_session.add(project)
@@ -2303,13 +2613,15 @@ async def test_narrative_taxonomy_insight_scope_related(client: AsyncClient, db_
     await db_session.refresh(project)
 
     for i in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Scope Fail {i}",
-            status=TaskStatus.FAILED,
-            context={"failure_category": "test_failed", "expansion_ratio": 2.5},
-            latest_status_message="assertion error in handler",
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Scope Fail {i}",
+                status=TaskStatus.FAILED,
+                context={"failure_category": "test_failed", "expansion_ratio": 2.5},
+                latest_status_message="assertion error in handler",
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2329,13 +2641,15 @@ async def test_narrative_taxonomy_insight_code_defect(client: AsyncClient, db_se
     await db_session.refresh(project)
 
     for i in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Defect {i}",
-            status=TaskStatus.FAILED,
-            context={"failure_category": "test_failed"},
-            latest_status_message="null pointer exception in handler",
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Defect {i}",
+                status=TaskStatus.FAILED,
+                context={"failure_category": "test_failed"},
+                latest_status_message="null pointer exception in handler",
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2362,28 +2676,44 @@ async def test_trend_improving(client: AsyncClient, db_session):
     # Previous window: 5 completed + 5 failed = 0.50 success rate
     prev = _prev_ts()
     for _ in range(5):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+            )
+        )
     for _ in range(5):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+            )
+        )
 
     # Current window: 6 completed + 4 failed = 0.60 success rate → delta = 0.10 > 0.05
     curr = _curr_ts()
     for _ in range(6):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2407,28 +2737,44 @@ async def test_trend_declining(client: AsyncClient, db_session):
     # Previous window: 8 completed + 2 failed = 0.80 success rate
     prev = _prev_ts()
     for _ in range(8):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+            )
+        )
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+            )
+        )
 
     # Current window: 7 completed + 3 failed = 0.70 success rate → delta = -0.10 < -0.05
     curr = _curr_ts()
     for _ in range(7):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2452,25 +2798,41 @@ async def test_trend_stable(client: AsyncClient, db_session):
     # Both windows: 3 completed + 1 failed = 0.75 success rate → delta = 0.0
     prev = _prev_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=prev,
+            status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+        )
+    )
 
     curr = _curr_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2482,7 +2844,9 @@ async def test_trend_stable(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_trend_none_when_no_previous_terminal_tasks(client: AsyncClient, db_session):
+async def test_trend_none_when_no_previous_terminal_tasks(
+    client: AsyncClient, db_session
+):
     """trend=None when the previous window has zero terminal tasks (can't compute prev_success_rate)."""
     project = make_project()
     db_session.add(project)
@@ -2492,10 +2856,14 @@ async def test_trend_none_when_no_previous_terminal_tasks(client: AsyncClient, d
     # Current window only: 2 completed — no tasks in previous window
     curr = _curr_ts()
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2521,14 +2889,16 @@ async def test_failure_group_rate_limit(client: AsyncClient, db_session):
     await db_session.refresh(project)
 
     curr = _curr_ts()
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Rate Limited Task",
-        status=TaskStatus.FAILED,
-        latest_status_message="API Error: Rate limit reached",
-        created_at=curr,
-        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Rate Limited Task",
+            status=TaskStatus.FAILED,
+            latest_status_message="API Error: Rate limit reached",
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2538,9 +2908,13 @@ async def test_failure_group_rate_limit(client: AsyncClient, db_session):
     failure_classes = {g["failure_class"] for g in data["failure_groups"]}
     assert "RATE_LIMIT" in failure_classes
 
-    rate_limit_group = next(g for g in data["failure_groups"] if g["failure_class"] == "RATE_LIMIT")
+    rate_limit_group = next(
+        g for g in data["failure_groups"] if g["failure_class"] == "RATE_LIMIT"
+    )
     assert rate_limit_group["count"] == 1
-    assert any("Rate Limited Task" in t.get("title", "") for t in rate_limit_group["tasks"])
+    assert any(
+        "Rate Limited Task" in t.get("title", "") for t in rate_limit_group["tasks"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2552,14 +2926,16 @@ async def test_failure_group_provision_failure(client: AsyncClient, db_session):
     await db_session.refresh(project)
 
     curr = _curr_ts()
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Quota Exceeded Task",
-        status=TaskStatus.FAILED,
-        latest_status_message="CPUS_ALL_REGIONS quota exceeded for region us-central1",
-        created_at=curr,
-        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Quota Exceeded Task",
+            status=TaskStatus.FAILED,
+            latest_status_message="CPUS_ALL_REGIONS quota exceeded for region us-central1",
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2569,7 +2945,9 @@ async def test_failure_group_provision_failure(client: AsyncClient, db_session):
     failure_classes = {g["failure_class"] for g in data["failure_groups"]}
     assert "PROVISION_FAILURE" in failure_classes
 
-    provision_group = next(g for g in data["failure_groups"] if g["failure_class"] == "PROVISION_FAILURE")
+    provision_group = next(
+        g for g in data["failure_groups"] if g["failure_class"] == "PROVISION_FAILURE"
+    )
     assert provision_group["count"] == 1
 
 
@@ -2582,14 +2960,16 @@ async def test_failure_group_code_error_default(client: AsyncClient, db_session)
     await db_session.refresh(project)
 
     curr = _curr_ts()
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Generic Error Task",
-        status=TaskStatus.FAILED,
-        latest_status_message="TypeError: cannot read property 'foo' of undefined",
-        created_at=curr,
-        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Generic Error Task",
+            status=TaskStatus.FAILED,
+            latest_status_message="TypeError: cannot read property 'foo' of undefined",
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2599,15 +2979,24 @@ async def test_failure_group_code_error_default(client: AsyncClient, db_session)
     failure_classes = {g["failure_class"] for g in data["failure_groups"]}
     assert "CODE_ERROR" in failure_classes
 
-    code_error_group = next(g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR")
+    code_error_group = next(
+        g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR"
+    )
     assert code_error_group["count"] == 1
     task_entry = code_error_group["tasks"][0]
     assert "taxonomy" in task_entry
-    assert task_entry["taxonomy"] in {"scope_related", "review_quality", "code_defect", "infra_related"}
+    assert task_entry["taxonomy"] in {
+        "scope_related",
+        "review_quality",
+        "code_defect",
+        "infra_related",
+    }
 
 
 @pytest.mark.asyncio
-async def test_failure_groups_sorted_by_count_descending(client: AsyncClient, db_session):
+async def test_failure_groups_sorted_by_count_descending(
+    client: AsyncClient, db_session
+):
     """failure_groups are sorted by count descending (most frequent failure class first)."""
     project = make_project()
     db_session.add(project)
@@ -2617,23 +3006,27 @@ async def test_failure_groups_sorted_by_count_descending(client: AsyncClient, db
     curr = _curr_ts()
     # 2 CODE_ERROR tasks (generic messages)
     for i in range(2):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Code Error Task {i}",
+                status=TaskStatus.FAILED,
+                latest_status_message="SyntaxError: unexpected token",
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            )
+        )
+    # 1 RATE_LIMIT task
+    db_session.add(
+        make_task(
             project_id=project.id,
-            title=f"Code Error Task {i}",
+            title="Rate Limit Task",
             status=TaskStatus.FAILED,
-            latest_status_message="SyntaxError: unexpected token",
+            latest_status_message="API Error: Rate limit reached",
             created_at=curr,
             status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        ))
-    # 1 RATE_LIMIT task
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Rate Limit Task",
-        status=TaskStatus.FAILED,
-        latest_status_message="API Error: Rate limit reached",
-        created_at=curr,
-        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2661,29 +3054,46 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
         ("Heartbeat Task", "No heartbeat received after 300s", "heartbeat_lost"),
         ("OOM Task", "exit code 137 out of memory", "oom"),
         ("Exec Task", "execution timed out after 1800s", "execution_timeout"),
-        ("Cascade Task", "Cancelled: parent evaluation timeout", "cascade_cancellation"),
-        ("Iter Task", "merge blocked, fix not spawned (iteration cap)", "iteration_limit"),
+        (
+            "Cascade Task",
+            "Cancelled: parent evaluation timeout",
+            "cascade_cancellation",
+        ),
+        (
+            "Iter Task",
+            "merge blocked, fix not spawned (iteration cap)",
+            "iteration_limit",
+        ),
         ("Crash Task", "[FATAL:uncaughtException] boom", "process_crash"),
     ]
     for title, msg, _ in cases:
-        db_session.add(make_task(
-            project_id=project.id,
-            title=title,
-            status=TaskStatus.FAILED,
-            latest_status_message=msg,
-            created_at=curr,
-            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=title,
+                status=TaskStatus.FAILED,
+                latest_status_message=msg,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
     data = response.json()
 
-    timeout_group = next(g for g in data["failure_groups"] if g["failure_class"] == "AGENT_TIMEOUT")
-    title_to_subtype = {t["title"]: t["timeout_subtype"] for t in timeout_group["tasks"]}
+    timeout_group = next(
+        g for g in data["failure_groups"] if g["failure_class"] == "AGENT_TIMEOUT"
+    )
+    title_to_subtype = {
+        t["title"]: t["timeout_subtype"] for t in timeout_group["tasks"]
+    }
     for title, _, expected_subtype in cases:
-        assert title_to_subtype[title] == expected_subtype, (title, title_to_subtype[title])
+        assert title_to_subtype[title] == expected_subtype, (
+            title,
+            title_to_subtype[title],
+        )
 
     rf_by_title = {f["title"]: f for f in data["recent_failures"]}
     for title, _, expected_subtype in cases:
@@ -2691,7 +3101,9 @@ async def test_failure_group_agent_timeout_subtypes(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_non_timeout_failures_have_null_timeout_subtype(client: AsyncClient, db_session):
+async def test_non_timeout_failures_have_null_timeout_subtype(
+    client: AsyncClient, db_session
+):
     """Non-AGENT_TIMEOUT failures expose timeout_subtype=None."""
     project = make_project()
     db_session.add(project)
@@ -2699,21 +3111,25 @@ async def test_non_timeout_failures_have_null_timeout_subtype(client: AsyncClien
     await db_session.refresh(project)
 
     curr = _curr_ts()
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Code Error Task",
-        status=TaskStatus.FAILED,
-        latest_status_message="TypeError: something broke",
-        created_at=curr,
-        status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Code Error Task",
+            status=TaskStatus.FAILED,
+            latest_status_message="TypeError: something broke",
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
     data = response.json()
 
-    code_group = next(g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR")
+    code_group = next(
+        g for g in data["failure_groups"] if g["failure_class"] == "CODE_ERROR"
+    )
     assert code_group["tasks"][0]["timeout_subtype"] is None
     assert data["recent_failures"][0]["timeout_subtype"] is None
 
@@ -2733,18 +3149,24 @@ async def test_narrative_approval_before_completion(client: AsyncClient, db_sess
 
     curr = _curr_ts()
     # One completed task
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        )
+    )
     # One task awaiting approval
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Approval Task",
-        status=TaskStatus.IN_PROGRESS,
-        requires_approval=True,
-        created_at=curr,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Approval Task",
+            status=TaskStatus.IN_PROGRESS,
+            requires_approval=True,
+            created_at=curr,
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2760,7 +3182,9 @@ async def test_narrative_approval_before_completion(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_narrative_all_clear_when_no_attention_needed(client: AsyncClient, db_session):
+async def test_narrative_all_clear_when_no_attention_needed(
+    client: AsyncClient, db_session
+):
     """Narrative is a single 'All clear' sentence when only completions exist (no failures, no approvals)."""
     project = make_project()
     db_session.add(project)
@@ -2769,10 +3193,14 @@ async def test_narrative_all_clear_when_no_attention_needed(client: AsyncClient,
 
     curr = _curr_ts()
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2794,7 +3222,9 @@ async def test_narrative_all_clear_when_no_attention_needed(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_trend_history_includes_first_attempt_rate(client: AsyncClient, db_session):
+async def test_trend_history_includes_first_attempt_rate(
+    client: AsyncClient, db_session
+):
     """trend_history entries include first_attempt_success_rate and first_attempt_sample_size."""
     project = make_project()
     db_session.add(project)
@@ -2803,21 +3233,33 @@ async def test_trend_history_includes_first_attempt_rate(client: AsyncClient, db
 
     # Add two completed tasks in the current window with _first_attempt_succeeded context
     curr = _curr_ts()
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        context={"_first_attempt_succeeded": True},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        context={"_first_attempt_succeeded": False},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            context={"_first_attempt_succeeded": True},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            context={"_first_attempt_succeeded": False},
+        )
+    )
     # A task without the metric — should not count toward sample
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2851,30 +3293,45 @@ async def test_first_attempt_success_rate_breakdowns(client: AsyncClient, db_ses
     prev = _prev_ts()
 
     # Current window: create/small success, refactor/medium failure w/ review cats
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        payloads=[{"type": "create"}],
-        context={"_first_attempt_succeeded": True, "scope": "small"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        payloads=[{"type": "refactor"}],
-        context={
-            "_first_attempt_succeeded": False,
-            "scope": "medium",
-            "_first_attempt_rejection_categories": {"architecture": 1, "correctness": 1},
-        },
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": True, "scope": "small"},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            payloads=[{"type": "refactor"}],
+            context={
+                "_first_attempt_succeeded": False,
+                "scope": "medium",
+                "_first_attempt_rejection_categories": {
+                    "architecture": 1,
+                    "correctness": 1,
+                },
+            },
+        )
+    )
     # Previous window: all failures — to produce an 'improving' trend
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-            payloads=[{"type": "create"}],
-            context={"_first_attempt_succeeded": False, "scope": "small"},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+                payloads=[{"type": "create"}],
+                context={"_first_attempt_succeeded": False, "scope": "small"},
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2884,7 +3341,10 @@ async def test_first_attempt_success_rate_breakdowns(client: AsyncClient, db_ses
     assert fa["by_type"] == {"create": 1.0, "refactor": 0.0}
     assert fa["by_scope"] == {"small": 1.0, "medium": 0.0}
     assert fa["trend"] == "improving"
-    assert fa["first_attempt_by_review_category"] == {"architecture": 1.0, "correctness": 1.0}
+    assert fa["first_attempt_by_review_category"] == {
+        "architecture": 1.0,
+        "correctness": 1.0,
+    }
 
 
 @pytest.mark.asyncio
@@ -2901,30 +3361,42 @@ async def test_first_attempt_by_review_category_includes_regression_risk(
     curr = _curr_ts()
     prev = _prev_ts()
 
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        payloads=[{"type": "create"}],
-        context={"_first_attempt_succeeded": True, "scope": "small"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.COMPLETED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-        payloads=[{"type": "fix"}],
-        context={
-            "_first_attempt_succeeded": False,
-            "scope": "small",
-            "_first_attempt_rejection_categories": {"regression_risk": 1},
-        },
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_succeeded": True, "scope": "small"},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_succeeded": False,
+                "scope": "small",
+                "_first_attempt_rejection_categories": {"regression_risk": 1},
+            },
+        )
+    )
     # Previous window: needed so trend computes without errors.
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.FAILED,
-            created_at=prev, status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
-            payloads=[{"type": "create"}],
-            context={"_first_attempt_succeeded": False, "scope": "small"},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                created_at=prev,
+                status_log=[{"t": prev.isoformat(), "status": "FAILED"}],
+                payloads=[{"type": "create"}],
+                context={"_first_attempt_succeeded": False, "scope": "small"},
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2968,22 +3440,36 @@ async def test_heuristic_regression_risk_not_skipped_in_sr_skip_rate(
 
     # 3 fix tasks with heuristic-derived regression_risk (the new signal)
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr,
-            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-            payloads=[{"type": "fix"}],
-            context={"_self_review_outcome": _make_sr("[heuristic-derived] +120 source lines / 0 test lines")},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": _make_sr(
+                        "[heuristic-derived] +120 source lines / 0 test lines"
+                    )
+                },
+            )
+        )
     # 2 fix tasks with baseline-style regression_risk (no heuristic tag)
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id, status=TaskStatus.COMPLETED,
-            created_at=curr,
-            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
-            payloads=[{"type": "fix"}],
-            context={"_self_review_outcome": _make_sr("test_foo.py::test_bar now fails after change", passed=True)},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": _make_sr(
+                        "test_foo.py::test_bar now fails after change", passed=True
+                    )
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -2991,7 +3477,9 @@ async def test_heuristic_regression_risk_not_skipped_in_sr_skip_rate(
     data = response.json()
 
     skip_rate = data.get("self_review_skip_rate")
-    assert skip_rate is not None, "self_review_skip_rate must be present (≥5 code-change tasks)"
+    assert skip_rate is not None, (
+        "self_review_skip_rate must be present (≥5 code-change tasks)"
+    )
     # All 5 tasks have valid SR outcomes — none should be classified as skipped
     assert skip_rate["skipped_count"] == 0, (
         "heuristic-derived regression_risk entries must not count as skipped SR outcomes — "
@@ -3001,12 +3489,16 @@ async def test_heuristic_regression_risk_not_skipped_in_sr_skip_rate(
 
     # self_review_effectiveness sample_size must include both heuristic and baseline tasks
     sre = data.get("self_review_effectiveness")
-    assert sre is not None, "self_review_effectiveness must be present (≥3 tasks with SR outcomes)"
+    assert sre is not None, (
+        "self_review_effectiveness must be present (≥3 tasks with SR outcomes)"
+    )
     assert sre["sample_size"] == 5
 
 
 @pytest.mark.asyncio
-async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db_session):
+async def test_trend_history_includes_failed_by_taxonomy(
+    client: AsyncClient, db_session
+):
     """trend_history entries include failed_by_taxonomy counts parallel to failed_by_class."""
     project = make_project()
     db_session.add(project)
@@ -3015,24 +3507,36 @@ async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db
 
     curr = _curr_ts()
     # A review_quality failure (status message contains a keyword)
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        latest_status_message="pytest tests failed",
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            latest_status_message="pytest tests failed",
+        )
+    )
     # A scope_related failure (positive evidence: status-msg scope keyword)
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        latest_status_message="scope too large for task",
-        context={"scope": "medium", "scope_calibrated_from": "small"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            latest_status_message="scope too large for task",
+            context={"scope": "medium", "scope_calibrated_from": "small"},
+        )
+    )
     # A residual code_defect failure (no scope, no review keywords)
-    db_session.add(make_task(
-        project_id=project.id, status=TaskStatus.FAILED,
-        created_at=curr, status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
-        latest_status_message="unexpected exception",
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+            latest_status_message="unexpected exception",
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -3060,7 +3564,9 @@ async def test_trend_history_includes_failed_by_taxonomy(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_conversion_rates_aggregated(client: AsyncClient, db_session):
+async def test_digest_scope_conversion_rates_aggregated(
+    client: AsyncClient, db_session
+):
     """scope_conversion_rates aggregates scope_breakdown from research_history within the window."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
@@ -3097,13 +3603,15 @@ async def test_digest_scope_conversion_rates_aggregated(client: AsyncClient, db_
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3130,7 +3638,9 @@ async def test_digest_scope_conversion_rates_aggregated(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: AsyncClient, db_session):
+async def test_digest_scope_breakdown_preserves_failure_sub_counts(
+    client: AsyncClient, db_session
+):
     """scope_breakdown in direction_progress aggregates failed_infra/failed_code_error/failed_scope_overflow."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
 
@@ -3147,8 +3657,12 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
                         "tasks_created": 5,
                         "scope_breakdown": {
                             "small": {
-                                "created": 5, "merged": 1, "failed": 4,
-                                "failed_infra": 1, "failed_code_error": 2, "failed_scope_overflow": 1,
+                                "created": 5,
+                                "merged": 1,
+                                "failed": 4,
+                                "failed_infra": 1,
+                                "failed_code_error": 2,
+                                "failed_scope_overflow": 1,
                             },
                         },
                     },
@@ -3160,13 +3674,15 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3178,7 +3694,9 @@ async def test_digest_scope_breakdown_preserves_failure_sub_counts(client: Async
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(client: AsyncClient, db_session):
+async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(
+    client: AsyncClient, db_session
+):
     """scope_breakdown aggregates merged_cross_module and failure_stages per scope."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
@@ -3196,7 +3714,9 @@ async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(c
                         "tasks_created": 3,
                         "scope_breakdown": {
                             "medium": {
-                                "created": 3, "merged": 2, "merged_cross_module": 1,
+                                "created": 3,
+                                "merged": 2,
+                                "merged_cross_module": 1,
                                 "failed": 1,
                                 "failure_stages": {"test": 1},
                             },
@@ -3208,7 +3728,9 @@ async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(c
                         "tasks_created": 2,
                         "scope_breakdown": {
                             "medium": {
-                                "created": 2, "merged": 1, "merged_cross_module": 1,
+                                "created": 2,
+                                "merged": 1,
+                                "merged_cross_module": 1,
                                 "failed": 1,
                                 "failure_stages": {"test": 1, "merge": 1},
                             },
@@ -3222,13 +3744,15 @@ async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(c
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-xmod"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-xmod"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3240,7 +3764,9 @@ async def test_digest_scope_breakdown_includes_cross_module_and_failure_stages(c
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_breakdown_includes_efficiency_predictors(client: AsyncClient, db_session):
+async def test_digest_scope_breakdown_includes_efficiency_predictors(
+    client: AsyncClient, db_session
+):
     """scope_breakdown aggregates weighted expansion/complexity averages and effort_distribution totals."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     recent_ts2 = (_utcnow() - timedelta(hours=2)).isoformat()
@@ -3257,7 +3783,9 @@ async def test_digest_scope_breakdown_includes_efficiency_predictors(client: Asy
                         "tasks_created": 3,
                         "scope_breakdown": {
                             "small": {
-                                "created": 3, "merged": 2, "failed": 1,
+                                "created": 3,
+                                "merged": 2,
+                                "failed": 1,
                                 "avg_expansion_ratio_merged": 1.0,
                                 "avg_expansion_ratio_failed": 3.0,
                                 "avg_complexity_merged": 2.0,
@@ -3275,7 +3803,9 @@ async def test_digest_scope_breakdown_includes_efficiency_predictors(client: Asy
                         "tasks_created": 3,
                         "scope_breakdown": {
                             "small": {
-                                "created": 3, "merged": 2, "failed": 1,
+                                "created": 3,
+                                "merged": 2,
+                                "failed": 1,
                                 "avg_expansion_ratio_merged": 2.0,
                                 "avg_complexity_merged": 3.0,
                                 "effort_distribution": {
@@ -3292,13 +3822,15 @@ async def test_digest_scope_breakdown_includes_efficiency_predictors(client: Asy
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3318,7 +3850,9 @@ async def test_digest_scope_breakdown_includes_efficiency_predictors(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_cost_by_scope_and_status(client: AsyncClient, db_session):
+async def test_digest_direction_progress_cost_by_scope_and_status(
+    client: AsyncClient, db_session
+):
     """direction_progress entries include cost_by_scope and cost_by_status breakdowns."""
     now = _utcnow()
     project = make_project(
@@ -3329,26 +3863,30 @@ async def test_digest_direction_progress_cost_by_scope_and_status(client: AsyncC
     await db_session.refresh(project)
 
     # Two tasks: small/completed (on-demand, 3600s) and medium/failed (spot, 1800s)
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t1",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1", "scope": "small"},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t2",
-        status=TaskStatus.FAILED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1", "scope": "medium"},
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t1",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1", "scope": "small"},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t2",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1", "scope": "medium"},
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3366,7 +3904,9 @@ async def test_digest_direction_progress_cost_by_scope_and_status(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_cost_budget_fields(client: AsyncClient, db_session, mocker):
+async def test_digest_direction_progress_cost_budget_fields(
+    client: AsyncClient, db_session, mocker
+):
     """direction_progress exposes budget utilization and fires alert when >=80%."""
     dispatch_mock = mocker.patch(
         "app.routers.admin_digest.dispatch_external_notification",
@@ -3374,27 +3914,31 @@ async def test_digest_direction_progress_cost_budget_fields(client: AsyncClient,
     )
     now = _utcnow()
     project = make_project(
-        directions=[{
-            "id": "dir-b",
-            "text": "Budgeted dir",
-            "status": "active",
-            "cost_budget_usd": 0.01,  # 1 hour spot = $0.02 -> 200% utilization
-        }]
+        directions=[
+            {
+                "id": "dir-b",
+                "text": "Budgeted dir",
+                "status": "active",
+                "cost_budget_usd": 0.01,  # 1 hour spot = $0.02 -> 200% utilization
+            }
+        ]
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-b", "scope": "small"},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-b", "scope": "small"},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3407,6 +3951,7 @@ async def test_digest_direction_progress_cost_budget_fields(client: AsyncClient,
 
     # Allow the scheduled ensure_future task to run.
     import asyncio as _a
+
     await _a.sleep(0)
     assert dispatch_mock.await_count == 1
     args, _kwargs = dispatch_mock.call_args
@@ -3415,7 +3960,9 @@ async def test_digest_direction_progress_cost_budget_fields(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_no_budget_fields(client: AsyncClient, db_session):
+async def test_digest_direction_progress_no_budget_fields(
+    client: AsyncClient, db_session
+):
     """When no cost_budget_usd is set, estimated_cost_usd is populated but utilization fields are null."""
     now = _utcnow()
     project = make_project(
@@ -3425,16 +3972,18 @@ async def test_digest_direction_progress_no_budget_fields(client: AsyncClient, d
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-nb", "scope": "small"},
-        vm_provisioned_at=now - timedelta(hours=1),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-nb", "scope": "small"},
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3448,7 +3997,9 @@ async def test_digest_direction_progress_no_budget_fields(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_cost_by_provider_model(client: AsyncClient, db_session):
+async def test_digest_direction_progress_cost_by_provider_model(
+    client: AsyncClient, db_session
+):
     """direction_progress entries include cost_by_provider_model breakdown
     keyed by `<provider>|<model>`; per-provider sums match estimated_cost_usd."""
     now = _utcnow()
@@ -3461,41 +4012,47 @@ async def test_digest_direction_progress_cost_by_provider_model(client: AsyncCli
 
     # Two tasks split across (provider, model). One missing both fields buckets
     # under "unknown|unknown".
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t-anth",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-pm", "scope": "small"},
-        provider="anthropic",
-        model="claude-opus-4-7",
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t-oai",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-pm", "scope": "small"},
-        provider="openai",
-        model="gpt-5.4",
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t-legacy",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-pm", "scope": "small"},
-        # No provider/model — legacy row should bucket under "unknown|unknown".
-        vm_provisioned_at=now - timedelta(minutes=20),
-        vm_stopped_at=now - timedelta(minutes=10),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t-anth",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-pm", "scope": "small"},
+            provider="anthropic",
+            model="claude-opus-4-7",
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t-oai",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-pm", "scope": "small"},
+            provider="openai",
+            model="gpt-5.4",
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t-legacy",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-pm", "scope": "small"},
+            # No provider/model — legacy row should bucket under "unknown|unknown".
+            vm_provisioned_at=now - timedelta(minutes=20),
+            vm_stopped_at=now - timedelta(minutes=10),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3523,26 +4080,30 @@ async def test_digest_direction_progress_cost_by_type(client: AsyncClient, db_se
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t1",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1", "scope": "small"},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t2",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-1", "scope": "small"},
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t1",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1", "scope": "small"},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t2",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-1", "scope": "small"},
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3569,37 +4130,43 @@ async def test_digest_spot_vs_on_demand_cost_split(client: AsyncClient, db_sessi
     await db_session.refresh(project)
 
     # Directed: one on-demand, one spot
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t1",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1", "scope": "small"},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t2",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1", "scope": "medium"},
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t1",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1", "scope": "small"},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t2",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1", "scope": "medium"},
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
     # Undirected spot task contributes to top-level split only
-    db_session.add(make_task(
-        project_id=project.id,
-        title="t3",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={},
-        vm_provisioned_at=now - timedelta(hours=3),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t3",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={},
+            vm_provisioned_at=now - timedelta(hours=3),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3610,7 +4177,10 @@ async def test_digest_spot_vs_on_demand_cost_split(client: AsyncClient, db_sessi
     assert "on_demand_cost_usd" in dp
     assert dp["spot_cost_usd"] > 0
     assert dp["on_demand_cost_usd"] > 0
-    assert round(dp["spot_cost_usd"] + dp["on_demand_cost_usd"], 2) == dp["estimated_cost_usd"]
+    assert (
+        round(dp["spot_cost_usd"] + dp["on_demand_cost_usd"], 2)
+        == dp["estimated_cost_usd"]
+    )
 
     assert "spot_cost_usd" in body
     assert "on_demand_cost_usd" in body
@@ -3628,24 +4198,28 @@ async def test_digest_cost_by_failure_class(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="timeout task",
-        status=TaskStatus.FAILED,
-        latest_status_message="",
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        title="external api task",
-        status=TaskStatus.FAILED,
-        latest_status_message="could not connect to server",
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="timeout task",
+            status=TaskStatus.FAILED,
+            latest_status_message="",
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="external api task",
+            status=TaskStatus.FAILED,
+            latest_status_message="could not connect to server",
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3663,7 +4237,9 @@ async def test_digest_cost_by_failure_class(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_scope_conversion_rates_absent_without_project(client: AsyncClient, db_session):
+async def test_digest_scope_conversion_rates_absent_without_project(
+    client: AsyncClient, db_session
+):
     """scope_conversion_rates is null when no project_id is provided."""
     response = await client.get("/api/admin/digest")
     assert response.status_code == 200
@@ -3676,7 +4252,9 @@ async def test_digest_scope_conversion_rates_absent_without_project(client: Asyn
 async def test_digest_prev_scope_conversion_rates(client: AsyncClient, db_session):
     """prev_scope_conversion_rates aggregates scope_breakdown from the previous window."""
     curr_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-    prev_ts = (_utcnow() - timedelta(hours=36)).isoformat()  # in prev 24h window (24–48h ago)
+    prev_ts = (
+        _utcnow() - timedelta(hours=36)
+    ).isoformat()  # in prev 24h window (24–48h ago)
 
     project = make_project(
         directions=[
@@ -3709,13 +4287,15 @@ async def test_digest_prev_scope_conversion_rates(client: AsyncClient, db_sessio
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3790,13 +4370,15 @@ async def test_digest_direction_progress_filter_funnel(client: AsyncClient, db_s
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3824,7 +4406,9 @@ async def test_digest_direction_progress_filter_funnel(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_digest_pipeline_filter_funnel_sums_across_directions(client: AsyncClient, db_session):
+async def test_digest_pipeline_filter_funnel_sums_across_directions(
+    client: AsyncClient, db_session
+):
     """pipeline_filter_funnel sums filter_funnel counters across all directions."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
 
@@ -3865,13 +4449,15 @@ async def test_digest_pipeline_filter_funnel_sums_across_directions(client: Asyn
     await db_session.refresh(project)
 
     for did in ("dir-a", "dir-b"):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Research {did}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": did},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Research {did}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": did},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3902,34 +4488,40 @@ async def test_digest_review_rejection_summary(client: AsyncClient, db_session):
 
     now = _utcnow()
     # Two rejected tasks with identical notes (after normalization) + one unique
-    for i, (title, note) in enumerate([
-        ("Task A", "Scope too broad; split into smaller PRs"),
-        ("Task B", "scope too broad;   split into smaller prs"),
-        ("Task C", "Missing tests for new logic"),
-    ]):
-        db_session.add(make_task(
+    for i, (title, note) in enumerate(
+        [
+            ("Task A", "Scope too broad; split into smaller PRs"),
+            ("Task B", "scope too broad;   split into smaller prs"),
+            ("Task C", "Missing tests for new logic"),
+        ]
+    ):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=title,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create"}],
+                context={
+                    "direction_id": "dir-rej",
+                    "pr_rejected": True,
+                    "pr_rejection_note": note,
+                },
+                created_at=now - timedelta(hours=2),
+                updated_at=now - timedelta(minutes=30 + i),
+            )
+        )
+    # Non-rejected failure should not count
+    db_session.add(
+        make_task(
             project_id=project.id,
-            title=title,
+            title="Unrelated failure",
             status=TaskStatus.FAILED,
             payloads=[{"type": "create"}],
-            context={
-                "direction_id": "dir-rej",
-                "pr_rejected": True,
-                "pr_rejection_note": note,
-            },
+            context={"direction_id": "dir-rej"},
             created_at=now - timedelta(hours=2),
-            updated_at=now - timedelta(minutes=30 + i),
-        ))
-    # Non-rejected failure should not count
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Unrelated failure",
-        status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-rej"},
-        created_at=now - timedelta(hours=2),
-        updated_at=now - timedelta(minutes=10),
-    ))
+            updated_at=now - timedelta(minutes=10),
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -3966,26 +4558,54 @@ async def test_digest_scope_mismatch_summary(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id, title="c1", status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-sm1", "scope": "small", "scope_calibrated_from": "medium"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="c2", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-sm1", "scope": "small", "scope_calibrated_from": "medium:cross_module"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="c3", status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-sm1", "scope": "small"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="c4", status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-sm2", "scope": "medium", "scope_calibrated_from": "large"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c1",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "direction_id": "dir-sm1",
+                "scope": "small",
+                "scope_calibrated_from": "medium",
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c2",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "direction_id": "dir-sm1",
+                "scope": "small",
+                "scope_calibrated_from": "medium:cross_module",
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c3",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-sm1", "scope": "small"},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c4",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "direction_id": "dir-sm2",
+                "scope": "medium",
+                "scope_calibrated_from": "large",
+            },
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -4020,10 +4640,15 @@ async def test_digest_scope_mismatch_summary_empty(client: AsyncClient, db_sessi
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id, title="nc", status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}], context={"scope": "small"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="nc",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"scope": "small"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -4040,34 +4665,54 @@ async def test_digest_retry_pattern_summary(client: AsyncClient, db_session):
     await db_session.refresh(project)
 
     # Two tasks with identical repeating pattern (retry didn't help)
-    db_session.add(make_task(
-        project_id=project.id, title="r1", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="r2", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="r1",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="r2",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
+        )
+    )
     # One task where retry changed class (not a repeat)
-    db_session.add(make_task(
-        project_id=project.id, title="r3", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"_failure_class_history": ["PROVISION_FAILURE", "CODE_ERROR"]},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="r3",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"_failure_class_history": ["PROVISION_FAILURE", "CODE_ERROR"]},
+        )
+    )
     # Single-entry history — should be ignored
-    db_session.add(make_task(
-        project_id=project.id, title="r4", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"_failure_class_history": ["CODE_ERROR"]},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="r4",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"_failure_class_history": ["CODE_ERROR"]},
+        )
+    )
     # Completed task — should be ignored even with history
-    db_session.add(make_task(
-        project_id=project.id, title="r5", status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="r5",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_failure_class_history": ["CODE_ERROR", "CODE_ERROR"]},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -4090,27 +4735,55 @@ async def test_digest_review_cap_exhaustion_summary(client: AsyncClient, db_sess
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id, title="c1", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 16, "direction_id": "d-aaa"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="c2", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 12, "direction_id": "d-aaa"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="c3", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 8, "direction_id": "d-bbb"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c1",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "failure_detail": "review_cap_exhausted",
+                "review_cap_iterations": 16,
+                "direction_id": "d-aaa",
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c2",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "failure_detail": "review_cap_exhausted",
+                "review_cap_iterations": 12,
+                "direction_id": "d-aaa",
+            },
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c3",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "failure_detail": "review_cap_exhausted",
+                "review_cap_iterations": 8,
+                "direction_id": "d-bbb",
+            },
+        )
+    )
     # Unrelated FAILED task — should NOT be counted
-    db_session.add(make_task(
-        project_id=project.id, title="other", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"failure_detail": "something_else", "direction_id": "d-ccc"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="other",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={"failure_detail": "something_else", "direction_id": "d-ccc"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -4128,10 +4801,13 @@ async def test_digest_review_cap_exhaustion_summary(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_digest_review_cap_exhaustion_summary_cost(client: AsyncClient, db_session):
+async def test_digest_review_cap_exhaustion_summary_cost(
+    client: AsyncClient, db_session
+):
     """review_cap_exhaustion_summary.total_cost_usd sums VM cost for cap-exhausted tasks."""
     from app.routers.admin_analytics import SPOT_RATE, ON_DEMAND_RATE
     from datetime import datetime, timezone
+
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -4139,23 +4815,39 @@ async def test_digest_review_cap_exhaustion_summary_cost(client: AsyncClient, db
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     # 1 hour spot task
-    db_session.add(make_task(
-        project_id=project.id, title="c1", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 16, "direction_id": "d-aaa"},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c1",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "failure_detail": "review_cap_exhausted",
+                "review_cap_iterations": 16,
+                "direction_id": "d-aaa",
+            },
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=True,
+        )
+    )
     # 30 min on-demand task
-    db_session.add(make_task(
-        project_id=project.id, title="c2", status=TaskStatus.FAILED,
-        payloads=[{"type": "create"}],
-        context={"failure_detail": "review_cap_exhausted", "review_cap_iterations": 12, "direction_id": "d-aaa"},
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=False,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="c2",
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "create"}],
+            context={
+                "failure_detail": "review_cap_exhausted",
+                "review_cap_iterations": 12,
+                "direction_id": "d-aaa",
+            },
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=False,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -4167,17 +4859,23 @@ async def test_digest_review_cap_exhaustion_summary_cost(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_digest_review_cap_exhaustion_summary_empty(client: AsyncClient, db_session):
+async def test_digest_review_cap_exhaustion_summary_empty(
+    client: AsyncClient, db_session
+):
     """review_cap_exhaustion_summary returns zero count and None avg when no cap exhaustion."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id, title="ok", status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="ok",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -4191,33 +4889,47 @@ async def test_digest_review_cap_exhaustion_summary_empty(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_failure_stage_distribution_aggregates_stages(client: AsyncClient, db_session):
+async def test_failure_stage_distribution_aggregates_stages(
+    client: AsyncClient, db_session
+):
     """failure_stage_distribution tallies _previous_failure_stage and falls back to _derive_failure_stage."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id, title="ctx stage",
-        status=TaskStatus.FAILED,
-        context={"_previous_failure_stage": "test"},
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="derived lint",
-        status=TaskStatus.FAILED,
-        latest_status_message="ruff lint error in handler",
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="derived lint 2",
-        status=TaskStatus.FAILED,
-        latest_status_message="eslint failure",
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="provision",
-        status=TaskStatus.FAILED,
-        context={"failure_category": "clone_failed"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="ctx stage",
+            status=TaskStatus.FAILED,
+            context={"_previous_failure_stage": "test"},
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="derived lint",
+            status=TaskStatus.FAILED,
+            latest_status_message="ruff lint error in handler",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="derived lint 2",
+            status=TaskStatus.FAILED,
+            latest_status_message="eslint failure",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="provision",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "clone_failed"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -4245,42 +4957,50 @@ async def test_digest_retry_overhead_cost_computation(client: AsyncClient, db_se
     await db_session.refresh(project)
 
     # Retry on-demand: attempt 2, 1h of VM time (in-window)
-    db_session.add(make_task(
-        project_id=project.id,
-        title="retry on-demand",
-        status=TaskStatus.FAILED,
-        context={"_attempt_number": 2},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="retry on-demand",
+            status=TaskStatus.FAILED,
+            context={"_attempt_number": 2},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
     # Retry spot: attempt 3, 30m of VM time (in-window)
-    db_session.add(make_task(
-        project_id=project.id,
-        title="retry spot",
-        status=TaskStatus.FAILED,
-        context={"_attempt_number": 3},
-        vm_provisioned_at=now - timedelta(minutes=60),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="retry spot",
+            status=TaskStatus.FAILED,
+            context={"_attempt_number": 3},
+            vm_provisioned_at=now - timedelta(minutes=60),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=True,
+        )
+    )
     # First-attempt failure: must be excluded from retry counts
-    db_session.add(make_task(
-        project_id=project.id,
-        title="first attempt",
-        status=TaskStatus.FAILED,
-        context={"_attempt_number": 1},
-        vm_provisioned_at=now - timedelta(hours=1),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=False,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="first attempt",
+            status=TaskStatus.FAILED,
+            context={"_attempt_number": 1},
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=False,
+        )
+    )
     # Retry with no VM timing: counts toward retry_task_count but not cost
-    db_session.add(make_task(
-        project_id=project.id,
-        title="retry no-vm",
-        status=TaskStatus.FAILED,
-        context={"_attempt_number": 4},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="retry no-vm",
+            status=TaskStatus.FAILED,
+            context={"_attempt_number": 4},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -4296,7 +5016,9 @@ async def test_digest_retry_overhead_cost_computation(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_digest_retry_recovery_cost_from_prior_attempts(client: AsyncClient, db_session):
+async def test_digest_retry_recovery_cost_from_prior_attempts(
+    client: AsyncClient, db_session
+):
     """retry_recovery_cost_usd sums _prior_attempts_cost across completed tasks
     with _attempt_number > 1 — the compute burned on failed attempts that
     eventually succeeded via retry."""
@@ -4307,35 +5029,41 @@ async def test_digest_retry_recovery_cost_from_prior_attempts(client: AsyncClien
     await db_session.refresh(project)
 
     # Successful retry with recorded prior-attempt cost
-    db_session.add(make_task(
-        project_id=project.id,
-        title="succeeded on retry",
-        status=TaskStatus.COMPLETED,
-        context={"_attempt_number": 2, "_prior_attempts_cost": 0.50},
-        vm_provisioned_at=now - timedelta(hours=1),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=False,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="succeeded on retry",
+            status=TaskStatus.COMPLETED,
+            context={"_attempt_number": 2, "_prior_attempts_cost": 0.50},
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=False,
+        )
+    )
     # Successful retry with multi-attempt accumulated cost
-    db_session.add(make_task(
-        project_id=project.id,
-        title="succeeded on 3rd",
-        status=TaskStatus.COMPLETED,
-        context={"_attempt_number": 3, "_prior_attempts_cost": 1.25},
-        vm_provisioned_at=now - timedelta(hours=1),
-        vm_stopped_at=now - timedelta(minutes=15),
-        vm_spot=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="succeeded on 3rd",
+            status=TaskStatus.COMPLETED,
+            context={"_attempt_number": 3, "_prior_attempts_cost": 1.25},
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now - timedelta(minutes=15),
+            vm_spot=True,
+        )
+    )
     # First-attempt success — excluded (no prior cost)
-    db_session.add(make_task(
-        project_id=project.id,
-        title="first attempt success",
-        status=TaskStatus.COMPLETED,
-        context={"_attempt_number": 1, "_prior_attempts_cost": 9.0},
-        vm_provisioned_at=now - timedelta(hours=1),
-        vm_stopped_at=now - timedelta(minutes=30),
-        vm_spot=False,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="first attempt success",
+            status=TaskStatus.COMPLETED,
+            context={"_attempt_number": 1, "_prior_attempts_cost": 9.0},
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now - timedelta(minutes=30),
+            vm_spot=False,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -4359,13 +5087,31 @@ async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session
                 "text": "Dir 1",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "escalation_outcomes": {
-                        "small_to_medium": {"attempted": 4, "merged": 2, "failed": 2},
-                        "medium_to_large": {"attempted": 1, "merged": 0, "failed": 1},
-                    }},
-                    {"timestamp": old_ts, "escalation_outcomes": {
-                        "small_to_medium": {"attempted": 99, "merged": 99, "failed": 0},
-                    }},
+                    {
+                        "timestamp": recent_ts,
+                        "escalation_outcomes": {
+                            "small_to_medium": {
+                                "attempted": 4,
+                                "merged": 2,
+                                "failed": 2,
+                            },
+                            "medium_to_large": {
+                                "attempted": 1,
+                                "merged": 0,
+                                "failed": 1,
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": old_ts,
+                        "escalation_outcomes": {
+                            "small_to_medium": {
+                                "attempted": 99,
+                                "merged": 99,
+                                "failed": 0,
+                            },
+                        },
+                    },
                 ],
             },
             {
@@ -4373,10 +5119,21 @@ async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session
                 "text": "Dir 2",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts2, "escalation_outcomes": {
-                        "small_to_medium": {"attempted": 2, "merged": 1, "failed": 1},
-                        "small_to_large": {"attempted": 1, "merged": 1, "failed": 0},
-                    }},
+                    {
+                        "timestamp": recent_ts2,
+                        "escalation_outcomes": {
+                            "small_to_medium": {
+                                "attempted": 2,
+                                "merged": 1,
+                                "failed": 1,
+                            },
+                            "small_to_large": {
+                                "attempted": 1,
+                                "merged": 1,
+                                "failed": 0,
+                            },
+                        },
+                    },
                 ],
             },
         ]
@@ -4396,7 +5153,10 @@ async def test_digest_escalation_outcome_summary(client: AsyncClient, db_session
 
     by_path = summary["by_path"]
     assert by_path["small_to_medium"] == {
-        "attempted": 6, "merged": 3, "failed": 3, "success_rate": 0.5,
+        "attempted": 6,
+        "merged": 3,
+        "failed": 3,
+        "success_rate": 0.5,
     }
     assert by_path["small_to_large"]["attempted"] == 1
     assert by_path["small_to_large"]["success_rate"] == 1.0
@@ -4536,7 +5296,9 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_cumulative_merged_by_trigger_class(client: AsyncClient, db_session):
+async def test_digest_cumulative_merged_by_trigger_class(
+    client: AsyncClient, db_session
+):
     """cumulative_merged_by_trigger_class counts across all time; per-window counts only in-window."""
     project = make_project()
     db_session.add(project)
@@ -4694,7 +5456,9 @@ async def test_digest_ci_auto_remediation(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_includes_first_review_approval_rate(client: AsyncClient, db_session):
+async def test_digest_includes_first_review_approval_rate(
+    client: AsyncClient, db_session
+):
     """/api/admin/digest returns first_review_approval_rate with expected structure."""
     project = make_project()
     db_session.add(project)
@@ -4702,30 +5466,34 @@ async def test_digest_includes_first_review_approval_rate(client: AsyncClient, d
     await db_session.refresh(project)
 
     # Merged create task approved on first review (no rejection categories).
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={
-            "pr_merged": True,
-            "scope": "small",
-            "_had_playbook": True,
-            "_had_review_measurements": True,
-        },
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "pr_merged": True,
+                "scope": "small",
+                "_had_playbook": True,
+                "_had_review_measurements": True,
+            },
+        )
+    )
     # Merged refactor task rejected on first review.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "refactor"}],
-        context={
-            "pr_merged": True,
-            "scope": "medium",
-            "_had_playbook": False,
-            "_had_review_measurements": False,
-            "_first_attempt_rejection_categories": ["correctness"],
-        },
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "refactor"}],
+            context={
+                "pr_merged": True,
+                "scope": "medium",
+                "_had_playbook": False,
+                "_had_review_measurements": False,
+                "_first_attempt_rejection_categories": ["correctness"],
+            },
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -4734,9 +5502,14 @@ async def test_digest_includes_first_review_approval_rate(client: AsyncClient, d
 
     fra = data["first_review_approval_rate"]
     assert set(fra.keys()) >= {
-        "overall", "sample_size", "by_type", "by_scope",
-        "with_playbook", "without_playbook",
-        "with_measurements", "without_measurements",
+        "overall",
+        "sample_size",
+        "by_type",
+        "by_scope",
+        "with_playbook",
+        "without_playbook",
+        "with_measurements",
+        "without_measurements",
     }
     assert fra["sample_size"] == 2
     assert fra["overall"] == 0.5
@@ -4808,7 +5581,9 @@ async def test_digest_prior_investigation_reuse(client: AsyncClient, db_session)
 
 
 @pytest.mark.asyncio
-async def test_digest_investigation_conversion_breakdown(client: AsyncClient, db_session):
+async def test_digest_investigation_conversion_breakdown(
+    client: AsyncClient, db_session
+):
     """investigate tasks categorize into structural/low/actionable/unparseable buckets."""
     project = make_project()
     db_session.add(project)
@@ -4877,7 +5652,9 @@ async def test_digest_investigation_conversion_breakdown(client: AsyncClient, db
             "confidence": "medium",
         },
     )
-    db_session.add_all([inv_structural, inv_low, inv_actionable, inv_unparseable, inv_nofix])
+    db_session.add_all(
+        [inv_structural, inv_low, inv_actionable, inv_unparseable, inv_nofix]
+    )
     await db_session.commit()
     await db_session.refresh(inv_actionable)
 
@@ -4915,19 +5692,25 @@ async def test_digest_investigation_conversion_breakdown(client: AsyncClient, db
 async def test_digest_prevention_efficacy_positive(client: AsyncClient, db_session):
     """prevention_efficacy reports positive when preventive merge rate > overall."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-    project = make_project(directions=[{
-        "id": "dir-p1",
-        "text": "D",
-        "status": "active",
-        "research_history": [{
-            "timestamp": recent_ts,
-            "tasks_created": 10,
-            "prs_merged": 3,
-            "preventive_context_tasks_created": 4,
-            "preventive_context_tasks_merged": 3,
-            "preventive_context_tasks_failed": 1,
-        }],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-p1",
+                "text": "D",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 10,
+                        "prs_merged": 3,
+                        "preventive_context_tasks_created": 4,
+                        "preventive_context_tasks_merged": 3,
+                        "preventive_context_tasks_failed": 1,
+                    }
+                ],
+            }
+        ]
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -4947,19 +5730,25 @@ async def test_digest_prevention_efficacy_positive(client: AsyncClient, db_sessi
 async def test_digest_prevention_efficacy_neutral(client: AsyncClient, db_session):
     """prevention_efficacy reports neutral when rates are similar."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-    project = make_project(directions=[{
-        "id": "dir-p2",
-        "text": "D",
-        "status": "active",
-        "research_history": [{
-            "timestamp": recent_ts,
-            "tasks_created": 10,
-            "prs_merged": 5,
-            "preventive_context_tasks_created": 4,
-            "preventive_context_tasks_merged": 2,
-            "preventive_context_tasks_failed": 2,
-        }],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-p2",
+                "text": "D",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 10,
+                        "prs_merged": 5,
+                        "preventive_context_tasks_created": 4,
+                        "preventive_context_tasks_merged": 2,
+                        "preventive_context_tasks_failed": 2,
+                    }
+                ],
+            }
+        ]
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -4976,16 +5765,22 @@ async def test_digest_prevention_efficacy_neutral(client: AsyncClient, db_sessio
 async def test_digest_prevention_efficacy_no_data(client: AsyncClient, db_session):
     """prevention_efficacy returns no_data assessment when zero preventive tasks."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
-    project = make_project(directions=[{
-        "id": "dir-p3",
-        "text": "D",
-        "status": "active",
-        "research_history": [{
-            "timestamp": recent_ts,
-            "tasks_created": 5,
-            "prs_merged": 2,
-        }],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-p3",
+                "text": "D",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "tasks_created": 5,
+                        "prs_merged": 2,
+                    }
+                ],
+            }
+        ]
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -5021,23 +5816,28 @@ async def test_digest_includes_anomaly_adjustment_when_active(client: AsyncClien
 
     prev = dict(shared_state.anomaly_adjustments)
     try:
-        shared_state.anomaly_adjustments.update({
-            "active": True,
-            "adjusted_at": "2026-04-20T12:00:00",
-            "trigger_anomalies": ["PROVISION_FAILURE_SURGE", "EXTERNAL_API_SURGE"],
-            "pre_adjustment_max_vms": 20,
-            "adjusted_max_vms": 8,
-            "failure_gate_threshold": 0.6,
-            "pre_adjustment_failure_gate": 0.8,
-            "forced_restoration_count": 1,
-            "forced_restored_at": "2026-04-20T11:00:00",
-        })
+        shared_state.anomaly_adjustments.update(
+            {
+                "active": True,
+                "adjusted_at": "2026-04-20T12:00:00",
+                "trigger_anomalies": ["PROVISION_FAILURE_SURGE", "EXTERNAL_API_SURGE"],
+                "pre_adjustment_max_vms": 20,
+                "adjusted_max_vms": 8,
+                "failure_gate_threshold": 0.6,
+                "pre_adjustment_failure_gate": 0.8,
+                "forced_restoration_count": 1,
+                "forced_restored_at": "2026-04-20T11:00:00",
+            }
+        )
         response = await client.get("/api/admin/digest")
         assert response.status_code == 200
         adj = response.json()["anomaly_adjustment"]
         assert adj["active"] is True
         assert adj["adjusted_at"] == "2026-04-20T12:00:00"
-        assert adj["trigger_anomalies"] == ["PROVISION_FAILURE_SURGE", "EXTERNAL_API_SURGE"]
+        assert adj["trigger_anomalies"] == [
+            "PROVISION_FAILURE_SURGE",
+            "EXTERNAL_API_SURGE",
+        ]
         assert adj["pre_adjustment_max_vms"] == 20
         assert adj["adjusted_max_vms"] == 8
         assert adj["failure_gate_threshold"] == 0.6
@@ -5088,7 +5888,8 @@ async def test_digest_uses_first_payload_projection(client: AsyncClient, db_sess
 
 @pytest.mark.asyncio
 async def test_digest_derives_completed_at_from_status_log_projection(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     """_derive_completed_at reads the SQL-projected status_log[-1]->>'t' timestamp.
 
@@ -5136,7 +5937,9 @@ async def test_digest_derives_completed_at_from_status_log_projection(
 
 
 @pytest.mark.asyncio
-async def test_digest_handles_empty_payloads_and_status_log(client: AsyncClient, db_session):
+async def test_digest_handles_empty_payloads_and_status_log(
+    client: AsyncClient, db_session
+):
     """Empty payloads and status_log must not crash the projection path.
 
     Edge case: SQL `payloads[0]` returns NULL for empty array; `status_log[-1]->>'t'`
@@ -5193,7 +5996,9 @@ async def test_stash_projected_task_fields_works_for_orm_loaded_tasks(db_session
     )
 
     assert loaded.first_payload == {"type": "research"}
-    assert _derive_completed_at(loaded) == datetime.fromisoformat(projected_completed_at)
+    assert _derive_completed_at(loaded) == datetime.fromisoformat(
+        projected_completed_at
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5213,7 +6018,9 @@ async def test_residual_fingerprints_empty(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprints_clusters_code_errors(client: AsyncClient, db_session):
+async def test_residual_fingerprints_clusters_code_errors(
+    client: AsyncClient, db_session
+):
     """FAILED tasks without failure_category cluster by fingerprint; excludes non-CODE_ERROR."""
     project = make_project()
     db_session.add(project)
@@ -5222,37 +6029,47 @@ async def test_residual_fingerprints_clusters_code_errors(client: AsyncClient, d
 
     # Two tasks with nearly identical message — same fingerprint cluster
     for _ in range(2):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                latest_status_message="compilation failed: unexpected token in expression",
+            )
+        )
+    # One task with a different message — second fingerprint
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="assertion error: value mismatch in test suite",
+        )
+    )
+    # Task with failure_category set — excluded from residuals
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.FAILED,
             latest_status_message="compilation failed: unexpected token in expression",
-        ))
-    # One task with a different message — second fingerprint
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.FAILED,
-        latest_status_message="assertion error: value mismatch in test suite",
-    ))
-    # Task with failure_category set — excluded from residuals
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.FAILED,
-        latest_status_message="compilation failed: unexpected token in expression",
-        context={"failure_category": "CODE_ERROR"},
-    ))
+            context={"failure_category": "CODE_ERROR"},
+        )
+    )
     # PROVISION_FAILURE — classify_failure returns non-CODE_ERROR, excluded
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.FAILED,
-        latest_status_message="quota exceeded: cpus_all_regions limit reached",
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="quota exceeded: cpus_all_regions limit reached",
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/residual-fingerprints")
     assert response.status_code == 200
     data = response.json()
 
-    assert data["total_code_error_count"] == 3  # 2 + 1, excludes categorized + provision
+    assert (
+        data["total_code_error_count"] == 3
+    )  # 2 + 1, excludes categorized + provision
     assert data["residual_count"] == 2
     top = data["top_residuals"]
     assert len(top) == 2
@@ -5294,9 +6111,13 @@ async def test_clear_residual_fingerprints_empties_store(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_clear_residual_fingerprints_requires_auth(unauthenticated_client: AsyncClient):
+async def test_clear_residual_fingerprints_requires_auth(
+    unauthenticated_client: AsyncClient,
+):
     """Clear endpoint requires admin auth."""
-    response = await unauthenticated_client.post("/api/admin/residual-fingerprints/clear")
+    response = await unauthenticated_client.post(
+        "/api/admin/residual-fingerprints/clear"
+    )
     assert response.status_code in (401, 403)
 
 
@@ -5392,7 +6213,9 @@ async def test_unignore_residual_case_404_when_missing(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
-async def test_unignore_residual_case_404_when_not_ignored(client: AsyncClient, db_session):
+async def test_unignore_residual_case_404_when_not_ignored(
+    client: AsyncClient, db_session
+):
     """POST /residual-cases/{fp}/unignore returns 404 when case is not IGNORED."""
     project = make_project()
     db_session.add(project)
@@ -5416,7 +6239,9 @@ async def test_unignore_residual_case_404_when_not_ignored(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_unignore_residual_case_requires_auth(unauthenticated_client: AsyncClient):
+async def test_unignore_residual_case_requires_auth(
+    unauthenticated_client: AsyncClient,
+):
     """Unignore endpoint requires admin auth."""
     response = await unauthenticated_client.post(
         "/api/admin/residual-cases/some-fp/unignore",
@@ -5429,7 +6254,9 @@ async def test_unignore_residual_case_requires_auth(unauthenticated_client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_unsuspend_residual_case_clears_state(client: AsyncClient, db_session, mocker):
+async def test_unsuspend_residual_case_clears_state(
+    client: AsyncClient, db_session, mocker
+):
     """POST /residual-cases/{fp}/unsuspend transitions SUSPENDED→ACTIVE and clears fields."""
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -5471,7 +6298,9 @@ async def test_unsuspend_residual_case_clears_state(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_unsuspend_residual_case_404_when_missing(client: AsyncClient, db_session):
+async def test_unsuspend_residual_case_404_when_missing(
+    client: AsyncClient, db_session
+):
     """POST /residual-cases/{fp}/unsuspend returns 404 when no case row exists."""
     project = make_project()
     db_session.add(project)
@@ -5486,7 +6315,9 @@ async def test_unsuspend_residual_case_404_when_missing(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_unsuspend_residual_case_404_when_not_suspended(client: AsyncClient, db_session):
+async def test_unsuspend_residual_case_404_when_not_suspended(
+    client: AsyncClient, db_session
+):
     """POST /residual-cases/{fp}/unsuspend returns 404 when case is ACTIVE (not SUSPENDED)."""
     project = make_project()
     db_session.add(project)
@@ -5510,7 +6341,9 @@ async def test_unsuspend_residual_case_404_when_not_suspended(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_unsuspend_residual_case_emits_message_and_webhook(client: AsyncClient, db_session, mocker):
+async def test_unsuspend_residual_case_emits_message_and_webhook(
+    client: AsyncClient, db_session, mocker
+):
     """POST /residual-cases/{fp}/unsuspend creates a ProjectMessage and fires the webhook."""
     dispatch_mock = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -5540,25 +6373,34 @@ async def test_unsuspend_residual_case_emits_message_and_webhook(client: AsyncCl
 
     # Verify a ProjectMessage with the correct event_type was created
     from app.models import ProjectMessage
+
     result = await db_session.execute(
         select(ProjectMessage).where(
             ProjectMessage.project_id == project.id,
         )
     )
     messages = result.scalars().all()
-    unsuspend_msgs = [m for m in messages if (m.context or {}).get("event_type") == "residual_fix_unsuspended"]
+    unsuspend_msgs = [
+        m
+        for m in messages
+        if (m.context or {}).get("event_type") == "residual_fix_unsuspended"
+    ]
     assert len(unsuspend_msgs) == 1
     assert fingerprint in unsuspend_msgs[0].content
 
     # Verify dispatch was called with RESIDUAL_FIX_UNSUSPENDED
     assert dispatch_mock.called
     call_args = dispatch_mock.call_args_list
-    event_types = [c.args[1] if c.args else c.kwargs.get("event_type") for c in call_args]
+    event_types = [
+        c.args[1] if c.args else c.kwargs.get("event_type") for c in call_args
+    ]
     assert "RESIDUAL_FIX_UNSUSPENDED" in event_types
 
 
 @pytest.mark.asyncio
-async def test_unsuspend_residual_case_requires_auth(unauthenticated_client: AsyncClient):
+async def test_unsuspend_residual_case_requires_auth(
+    unauthenticated_client: AsyncClient,
+):
     """Unsuspend endpoint requires admin auth."""
     response = await unauthenticated_client.post(
         "/api/admin/residual-cases/some-fp/unsuspend",
@@ -5571,7 +6413,9 @@ async def test_unsuspend_residual_case_requires_auth(unauthenticated_client: Asy
 
 
 @pytest.mark.asyncio
-async def test_list_residual_cases_default_returns_open_states(client: AsyncClient, db_session):
+async def test_list_residual_cases_default_returns_open_states(
+    client: AsyncClient, db_session
+):
     """Default response includes ACTIVE/REMEDIATING/SUSPENDED, excludes others."""
     project = make_project()
     db_session.add(project)
@@ -5585,9 +6429,13 @@ async def test_list_residual_cases_default_returns_open_states(client: AsyncClie
         ("ignored-fp", ResidualCaseStatus.IGNORED),
         ("resolved-fp", ResidualCaseStatus.RESOLVED),
     ]:
-        db_session.add(ResidualRemediationCase(
-            project_id=project.id, fingerprint=fp, status=status,
-        ))
+        db_session.add(
+            ResidualRemediationCase(
+                project_id=project.id,
+                fingerprint=fp,
+                status=status,
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/residual-cases")
@@ -5599,22 +6447,34 @@ async def test_list_residual_cases_default_returns_open_states(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_list_residual_cases_explicit_status_filter(client: AsyncClient, db_session):
+async def test_list_residual_cases_explicit_status_filter(
+    client: AsyncClient, db_session
+):
     """Passing ?status=IGNORED returns only IGNORED cases."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(ResidualRemediationCase(
-        project_id=project.id, fingerprint="ignored-only", status=ResidualCaseStatus.IGNORED,
-    ))
-    db_session.add(ResidualRemediationCase(
-        project_id=project.id, fingerprint="active-other", status=ResidualCaseStatus.ACTIVE,
-    ))
+    db_session.add(
+        ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint="ignored-only",
+            status=ResidualCaseStatus.IGNORED,
+        )
+    )
+    db_session.add(
+        ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint="active-other",
+            status=ResidualCaseStatus.ACTIVE,
+        )
+    )
     await db_session.commit()
 
-    response = await client.get("/api/admin/residual-cases", params={"status": "IGNORED"})
+    response = await client.get(
+        "/api/admin/residual-cases", params={"status": "IGNORED"}
+    )
     assert response.status_code == 200
     data = response.json()
     fps = {c["fingerprint"] for c in data["cases"]}
@@ -5624,12 +6484,16 @@ async def test_list_residual_cases_explicit_status_filter(client: AsyncClient, d
 @pytest.mark.asyncio
 async def test_list_residual_cases_rejects_invalid_status(client: AsyncClient):
     """Unknown status values must 400 — typos shouldn't silently return everything."""
-    response = await client.get("/api/admin/residual-cases", params={"status": "BOGUS_STATUS"})
+    response = await client.get(
+        "/api/admin/residual-cases", params={"status": "BOGUS_STATUS"}
+    )
     assert response.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_list_residual_cases_orders_by_last_seen_desc(client: AsyncClient, db_session):
+async def test_list_residual_cases_orders_by_last_seen_desc(
+    client: AsyncClient, db_session
+):
     """Most recently-seen cases should surface first so the operator sees pressure."""
     project = make_project()
     db_session.add(project)
@@ -5637,15 +6501,24 @@ async def test_list_residual_cases_orders_by_last_seen_desc(client: AsyncClient,
     await db_session.refresh(project)
 
     from datetime import datetime, timedelta
+
     now = datetime.utcnow()
-    db_session.add(ResidualRemediationCase(
-        project_id=project.id, fingerprint="older", status=ResidualCaseStatus.ACTIVE,
-        last_seen_at=now - timedelta(hours=12),
-    ))
-    db_session.add(ResidualRemediationCase(
-        project_id=project.id, fingerprint="newer", status=ResidualCaseStatus.ACTIVE,
-        last_seen_at=now - timedelta(minutes=5),
-    ))
+    db_session.add(
+        ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint="older",
+            status=ResidualCaseStatus.ACTIVE,
+            last_seen_at=now - timedelta(hours=12),
+        )
+    )
+    db_session.add(
+        ResidualRemediationCase(
+            project_id=project.id,
+            fingerprint="newer",
+            status=ResidualCaseStatus.ACTIVE,
+            last_seen_at=now - timedelta(minutes=5),
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/residual-cases")
@@ -5668,24 +6541,30 @@ async def test_list_residual_cases_requires_auth(unauthenticated_client: AsyncCl
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprints_case_status_no_case(client: AsyncClient, db_session):
+async def test_residual_fingerprints_case_status_no_case(
+    client: AsyncClient, db_session
+):
     """Cluster with no matching case row has no case_status field."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.FAILED,
-        # Use structural error shape per fc071105's tightened regex
-        # patterns (`^\s*(error|fail(ed)?)\s*:`); plain prose like
-        # "syntax error at token..." no longer matches.
-        latest_status_message="SyntaxError: unexpected end of file",
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            # Use structural error shape per fc071105's tightened regex
+            # patterns (`^\s*(error|fail(ed)?)\s*:`); plain prose like
+            # "syntax error at token..." no longer matches.
+            latest_status_message="SyntaxError: unexpected end of file",
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/residual-fingerprints?project_id={project.id}")
+    response = await client.get(
+        f"/api/admin/residual-fingerprints?project_id={project.id}"
+    )
     assert response.status_code == 200
     top = response.json()["top_residuals"]
     assert len(top) == 1
@@ -5693,7 +6572,9 @@ async def test_residual_fingerprints_case_status_no_case(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprints_case_status_branches(client: AsyncClient, db_session):
+async def test_residual_fingerprints_case_status_branches(
+    client: AsyncClient, db_session
+):
     """Each lifecycle status is surfaced in the corresponding cluster entry."""
     from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
 
@@ -5707,21 +6588,23 @@ async def test_residual_fingerprints_case_status_branches(client: AsyncClient, d
     # (`^\s*(error|fail(ed)?)\s*:` or exception-class line-start) — bare prose
     # like "test failure: active case assertion failed" no longer qualifies.
     messages = {
-        ResidualCaseStatus.ACTIVE:      "AssertionError: active case 1 == 2 failed",
+        ResidualCaseStatus.ACTIVE: "AssertionError: active case 1 == 2 failed",
         ResidualCaseStatus.REMEDIATING: "ImportError: remediating module not found",
-        ResidualCaseStatus.SUSPENDED:   "TypeError: suspended case got int, expected str",
-        ResidualCaseStatus.MERGED:      "ValueError: merged case got unexpected None",
-        ResidualCaseStatus.FAILED:      "KeyError: 'failed_case_lookup_key'",
-        ResidualCaseStatus.IGNORED:     "AttributeError: ignored case 'foo' missing 'bar'",
+        ResidualCaseStatus.SUSPENDED: "TypeError: suspended case got int, expected str",
+        ResidualCaseStatus.MERGED: "ValueError: merged case got unexpected None",
+        ResidualCaseStatus.FAILED: "KeyError: 'failed_case_lookup_key'",
+        ResidualCaseStatus.IGNORED: "AttributeError: ignored case 'foo' missing 'bar'",
     }
     fps = {status: _error_fingerprint(msg) for status, msg in messages.items()}
 
     for status, msg in messages.items():
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.FAILED,
-            latest_status_message=msg,
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                latest_status_message=msg,
+            )
+        )
     await db_session.commit()
 
     # Insert one case row per status
@@ -5730,8 +6613,12 @@ async def test_residual_fingerprints_case_status_branches(client: AsyncClient, d
             project_id=project.id,
             fingerprint=fp,
             status=status,
-            last_spawned_pr_number=42 if status == ResidualCaseStatus.REMEDIATING else None,
-            consecutive_failure_count=3 if status == ResidualCaseStatus.SUSPENDED else 0,
+            last_spawned_pr_number=42
+            if status == ResidualCaseStatus.REMEDIATING
+            else None,
+            consecutive_failure_count=3
+            if status == ResidualCaseStatus.SUSPENDED
+            else 0,
         )
         db_session.add(case)
     await db_session.commit()
@@ -5759,12 +6646,18 @@ async def test_residual_fingerprints_case_status_branches(client: AsyncClient, d
 
     # Entry with no case row should have no case_status — tested in separate test above
     # MERGED/FAILED/IGNORED entries should not carry PR or failure-count noise
-    for st in (ResidualCaseStatus.MERGED, ResidualCaseStatus.FAILED, ResidualCaseStatus.IGNORED):
+    for st in (
+        ResidualCaseStatus.MERGED,
+        ResidualCaseStatus.FAILED,
+        ResidualCaseStatus.IGNORED,
+    ):
         assert by_fp[fps[st]].get("last_spawned_pr_number") is None
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprints_case_status_project_scoped(client: AsyncClient, db_session):
+async def test_residual_fingerprints_case_status_project_scoped(
+    client: AsyncClient, db_session
+):
     """Case rows from a different project do not pollute the response."""
     from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
 
@@ -5779,11 +6672,13 @@ async def test_residual_fingerprints_case_status_project_scoped(client: AsyncCli
     msg = "TypeError: cross-project test got int, expected str"
     fp = _error_fingerprint(msg)
 
-    db_session.add(make_task(
-        project_id=project_a.id,
-        status=TaskStatus.FAILED,
-        latest_status_message=msg,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project_a.id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+        )
+    )
     # Case row belongs to project_b — should NOT be returned for project_a query
     case = ResidualRemediationCase(
         project_id=project_b.id,
@@ -5803,7 +6698,9 @@ async def test_residual_fingerprints_case_status_project_scoped(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_residual_fingerprints_includes_audit_deferral_fields(client: AsyncClient, db_session):
+async def test_residual_fingerprints_includes_audit_deferral_fields(
+    client: AsyncClient, db_session
+):
     """audit_defer_count and audit_deferred_system_id are included when a case exists."""
     from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
 
@@ -5814,11 +6711,13 @@ async def test_residual_fingerprints_includes_audit_deferral_fields(client: Asyn
 
     msg = "RuntimeError: nil pointer dereference in module core"
     fp = _error_fingerprint(msg)
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.FAILED,
-        latest_status_message=msg,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message=msg,
+        )
+    )
     case = ResidualRemediationCase(
         fingerprint=fp,
         project_id=project.id,
@@ -5829,7 +6728,9 @@ async def test_residual_fingerprints_includes_audit_deferral_fields(client: Asyn
     db_session.add(case)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/residual-fingerprints?project_id={project.id}")
+    response = await client.get(
+        f"/api/admin/residual-fingerprints?project_id={project.id}"
+    )
     assert response.status_code == 200
     top = response.json()["top_residuals"]
     assert len(top) == 1
@@ -5843,7 +6744,9 @@ async def test_residual_fingerprints_includes_audit_deferral_fields(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_digest_cpm_threshold_flags_expensive_direction(client: AsyncClient, db_session):
+async def test_digest_cpm_threshold_flags_expensive_direction(
+    client: AsyncClient, db_session
+):
     """Directions whose cost_per_merged_pr exceeds median×3 get cost_per_merge_exceeds_threshold=True."""
     from app.routers.admin_analytics import ON_DEMAND_RATE
 
@@ -5880,16 +6783,18 @@ async def test_digest_cpm_threshold_flags_expensive_direction(client: AsyncClien
     await db_session.refresh(project)
 
     for dir_id, hours in [("dir-cheap", 1), ("dir-med", 2), ("dir-pricey", 8)]:
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"task-{dir_id}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": dir_id},
-            vm_provisioned_at=now - timedelta(hours=hours + 1),
-            vm_stopped_at=now - timedelta(hours=1),
-            vm_spot=False,
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"task-{dir_id}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": dir_id},
+                vm_provisioned_at=now - timedelta(hours=hours + 1),
+                vm_stopped_at=now - timedelta(hours=1),
+                vm_spot=False,
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -5913,7 +6818,9 @@ async def test_digest_cpm_threshold_flags_expensive_direction(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_digest_cpm_threshold_false_when_no_merges(client: AsyncClient, db_session):
+async def test_digest_cpm_threshold_false_when_no_merges(
+    client: AsyncClient, db_session
+):
     """When no directions have merged PRs, median is None and threshold flag is False for all."""
     now = _utcnow()
     recent_ts = (now - timedelta(hours=1)).isoformat()
@@ -5932,16 +6839,18 @@ async def test_digest_cpm_threshold_false_when_no_merges(client: AsyncClient, db
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="task-1",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-        vm_provisioned_at=now - timedelta(hours=2),
-        vm_stopped_at=now - timedelta(hours=1),
-        vm_spot=False,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="task-1",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -5971,9 +6880,7 @@ async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_s
                 "id": did,
                 "text": did,
                 "status": "active",
-                "research_history": [
-                    {"timestamp": recent_ts, "prs_merged": 1}
-                ]
+                "research_history": [{"timestamp": recent_ts, "prs_merged": 1}],
             }
             for did, cost in dir_configs
         ]
@@ -5997,7 +6904,7 @@ async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_s
                 "direction_id": did,
                 "pr_merged": True,
             },
-            payloads=[{"type": "research"}]
+            payloads=[{"type": "research"}],
         )
         db_session.add(t)
 
@@ -6029,6 +6936,7 @@ async def test_digest_direction_progress_cpm_threshold(client: AsyncClient, db_s
 async def test_drift_snapshot_missing_project_returns_empty(client: AsyncClient):
     """Unknown project_id → empty snapshot with correct shape, not a 4xx."""
     import uuid as _uuid
+
     project_id = _uuid.uuid4()
     response = await client.get(f"/api/admin/drift-snapshot?project_id={project_id}")
     assert response.status_code == 200
@@ -6046,7 +6954,12 @@ async def test_drift_snapshot_no_flags_when_healthy(client: AsyncClient, db_sess
     """Project with directions but no drift activity → zero flagged directions."""
     project = make_project(
         directions=[
-            {"id": "d-healthy", "text": "Keep CI green", "status": "active", "priority": "high"},
+            {
+                "id": "d-healthy",
+                "text": "Keep CI green",
+                "status": "active",
+                "priority": "high",
+            },
         ]
     )
     db_session.add(project)
@@ -6062,7 +6975,9 @@ async def test_drift_snapshot_no_flags_when_healthy(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, db_session):
+async def test_drift_snapshot_over_claim_direction_flagged(
+    client: AsyncClient, db_session
+):
     """Direction with many claims but zero merges appears in flagged_directions."""
     from app.models import Task, TaskStatus
     from app.time_utils import _utcnow as _now
@@ -6070,7 +6985,14 @@ async def test_drift_snapshot_over_claim_direction_flagged(client: AsyncClient, 
 
     dir_id = "d-over-claim"
     project = make_project(
-        directions=[{"id": dir_id, "text": "Reduce flakiness", "status": "active", "priority": "high"}]
+        directions=[
+            {
+                "id": dir_id,
+                "text": "Reduce flakiness",
+                "status": "active",
+                "priority": "high",
+            }
+        ]
     )
     db_session.add(project)
     await db_session.commit()
@@ -6123,7 +7045,9 @@ async def test_drift_snapshot_history_series_returned(client: AsyncClient, db_se
 
     dir_id = "d-trend"
     project = make_project(
-        directions=[{"id": dir_id, "text": "Trend test", "status": "active", "priority": "high"}]
+        directions=[
+            {"id": dir_id, "text": "Trend test", "status": "active", "priority": "high"}
+        ]
     )
     db_session.add(project)
     await db_session.commit()
@@ -6194,7 +7118,9 @@ async def test_drift_snapshot_response_shape_pinned(client: AsyncClient, db_sess
 
     dir_id = "d-shape"
     project = make_project(
-        directions=[{"id": dir_id, "text": "Shape pin", "status": "active", "priority": "high"}]
+        directions=[
+            {"id": dir_id, "text": "Shape pin", "status": "active", "priority": "high"}
+        ]
     )
     db_session.add(project)
     await db_session.commit()
@@ -6240,7 +7166,9 @@ async def test_drift_snapshot_response_shape_pinned(client: AsyncClient, db_sess
         "claim_shipped_consistency",
         "drift_history",
     }
-    assert flagged["drift_history"], "expected at least one history entry from seeded snapshot"
+    assert flagged["drift_history"], (
+        "expected at least one history entry from seeded snapshot"
+    )
     # Mirrors DriftHistoryPoint in DriftSignalsCard.tsx.
     assert set(flagged["drift_history"][0].keys()) == {
         "snapshot_at",
@@ -6308,7 +7236,9 @@ async def test_cost_per_merge_by_type_aggregation(client: AsyncClient, db_sessio
     assert "research" in cpm_by_type
 
     assert cpm_by_type["create"]["merged_count"] == 1
-    assert abs(cpm_by_type["create"]["total_cost_usd"] - round(SPOT_RATE * 10, 4)) < 1e-6
+    assert (
+        abs(cpm_by_type["create"]["total_cost_usd"] - round(SPOT_RATE * 10, 4)) < 1e-6
+    )
     assert cpm_by_type["create"]["cost_per_merge"] is not None
 
     assert cpm_by_type["fix"]["merged_count"] == 1
@@ -6335,6 +7265,7 @@ async def test_digest_residual_remediation_funnel(client: AsyncClient, db_sessio
 
     def make_case(status, spawned_at):
         import uuid as _uuid
+
         return ResidualRemediationCase(
             project_id=project.id,
             fingerprint=str(_uuid.uuid4()),
@@ -6356,10 +7287,12 @@ async def test_digest_residual_remediation_funnel(client: AsyncClient, db_sessio
     assert response.status_code == 200
     rr = response.json()["remediation_funnel"]["residual_remediation_funnel"]
 
-    assert rr["spawned"] == 4         # 4 cases with last_spawned_at in 24h window
+    assert rr["spawned"] == 4  # 4 cases with last_spawned_at in 24h window
     assert rr["merged"] == 1
-    assert rr["failed"] == 2          # FAILED + SUSPENDED
-    assert rr["remediating"] == 2     # live count: both REMEDIATING cases regardless of window
+    assert rr["failed"] == 2  # FAILED + SUSPENDED
+    assert (
+        rr["remediating"] == 2
+    )  # live count: both REMEDIATING cases regardless of window
     groups = rr["open_cases_by_error_class"]
     assert groups and groups[0]["error_class"] == "CODE_ERROR"
     assert groups[0]["count"] == 4
@@ -6467,7 +7400,9 @@ async def test_cost_per_merge_by_type_threshold(client: AsyncClient, db_session)
 
 
 @pytest.mark.asyncio
-async def test_digest_calibration_fields_present_when_project_selected(client: AsyncClient, db_session):
+async def test_digest_calibration_fields_present_when_project_selected(
+    client: AsyncClient, db_session
+):
     """Digest includes prediction_calibration_* fields when project_id is provided.
 
     With no StrategicCycle rows the factor defaults to 1.0 and sample_count to 0.
@@ -6513,17 +7448,38 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
     assert response.status_code == 200
     data = response.json()
     required = {
-        "window_hours", "tasks_truncated", "completed_count", "failed_count",
-        "pending_approval_count", "research_cycles", "prs_opened",
-        "active_count", "running_count", "queued_count",
-        "active_tasks", "needs_attention", "recent_failures", "recent_completions",
-        "success_rate", "trend", "narrative_summary", "total_estimated_cost_usd",
-        "migration_health", "failure_groups", "recurring_error_clusters",
-        "recurring_patterns", "direction_progress", "retry_waste_by_direction",
-        "provision_waste_cost_usd", "provision_waste_by_direction",
-        "cost_by_failure_class", "analysis_overflow_summary",
-        "total_merge_retries_saved", "merge_early_exit_count",
-        "prediction_calibration_factor", "prediction_calibration_note",
+        "window_hours",
+        "tasks_truncated",
+        "completed_count",
+        "failed_count",
+        "pending_approval_count",
+        "research_cycles",
+        "prs_opened",
+        "active_count",
+        "running_count",
+        "queued_count",
+        "active_tasks",
+        "needs_attention",
+        "recent_failures",
+        "recent_completions",
+        "success_rate",
+        "trend",
+        "narrative_summary",
+        "total_estimated_cost_usd",
+        "migration_health",
+        "failure_groups",
+        "recurring_error_clusters",
+        "recurring_patterns",
+        "direction_progress",
+        "retry_waste_by_direction",
+        "provision_waste_cost_usd",
+        "provision_waste_by_direction",
+        "cost_by_failure_class",
+        "analysis_overflow_summary",
+        "total_merge_retries_saved",
+        "merge_early_exit_count",
+        "prediction_calibration_factor",
+        "prediction_calibration_note",
         "prediction_calibration_sample_count",
     }
     missing = required - data.keys()
@@ -6532,20 +7488,30 @@ async def test_digest_top_level_schema_keys(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_digest_needs_attention_approval_before_failed(client: AsyncClient, db_session):
+async def test_digest_needs_attention_approval_before_failed(
+    client: AsyncClient, db_session
+):
     """approval_required items precede failed items in needs_attention."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id, title="Failed Task", status=TaskStatus.FAILED,
-    ))
-    db_session.add(make_task(
-        project_id=project.id, title="Approval Task", status=TaskStatus.IN_PROGRESS,
-        requires_approval=True,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Failed Task",
+            status=TaskStatus.FAILED,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Approval Task",
+            status=TaskStatus.IN_PROGRESS,
+            requires_approval=True,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}")
@@ -6557,7 +7523,9 @@ async def test_digest_needs_attention_approval_before_failed(client: AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_operator_action_count(client: AsyncClient, db_session):
+async def test_digest_direction_progress_operator_action_count(
+    client: AsyncClient, db_session
+):
     """operator_action_count is summed from research_history entries within the window."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     old_ts = (_utcnow() - timedelta(hours=48)).isoformat()
@@ -6569,8 +7537,13 @@ async def test_digest_direction_progress_operator_action_count(client: AsyncClie
                 "text": "Direction A",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "prs_merged": 2, "autonomous_prs_merged": 1,
-                     "assisted_prs_merged": 1, "operator_action_count": 3},
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 2,
+                        "autonomous_prs_merged": 1,
+                        "assisted_prs_merged": 1,
+                        "operator_action_count": 3,
+                    },
                     {"timestamp": old_ts, "prs_merged": 5, "operator_action_count": 10},
                 ],
             }
@@ -6580,13 +7553,15 @@ async def test_digest_direction_progress_operator_action_count(client: AsyncClie
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-1"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-1"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -6612,8 +7587,13 @@ async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
                 "text": "Direction A",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "prs_merged": 2,
-                     "autonomous_prs_merged": 2, "assisted_prs_merged": 0, "operator_action_count": 1},
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 2,
+                        "autonomous_prs_merged": 2,
+                        "assisted_prs_merged": 0,
+                        "operator_action_count": 1,
+                    },
                 ],
             },
             {
@@ -6621,8 +7601,13 @@ async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
                 "text": "Direction B",
                 "status": "active",
                 "research_history": [
-                    {"timestamp": recent_ts, "prs_merged": 1,
-                     "autonomous_prs_merged": 0, "assisted_prs_merged": 1, "operator_action_count": 2},
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 1,
+                        "autonomous_prs_merged": 0,
+                        "assisted_prs_merged": 1,
+                        "operator_action_count": 2,
+                    },
                 ],
             },
         ]
@@ -6632,13 +7617,15 @@ async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
     await db_session.refresh(project)
 
     for did in ["dir-a", "dir-b"]:
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Task {did}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            context={"direction_id": did},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task {did}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": did},
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -6651,7 +7638,9 @@ async def test_digest_pipeline_autonomy_totals(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_digest_pipeline_autonomy_legacy_fallback(client: AsyncClient, db_session):
+async def test_digest_pipeline_autonomy_legacy_fallback(
+    client: AsyncClient, db_session
+):
     """Legacy entries lacking autonomous_prs_merged are counted as autonomous (fallback)."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
 
@@ -6672,13 +7661,15 @@ async def test_digest_pipeline_autonomy_legacy_fallback(client: AsyncClient, db_
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Legacy task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-legacy"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Legacy task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-legacy"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -6696,7 +7687,9 @@ async def test_digest_pipeline_autonomy_legacy_fallback(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_digest_active_tasks_ordered_oldest_first(client: AsyncClient, db_session):
+async def test_digest_active_tasks_ordered_oldest_first(
+    client: AsyncClient, db_session
+):
     """active_tasks are ordered oldest started_at first."""
     project = make_project()
     db_session.add(project)
@@ -6704,11 +7697,15 @@ async def test_digest_active_tasks_ordered_oldest_first(client: AsyncClient, db_
     await db_session.refresh(project)
 
     older = make_task(
-        project_id=project.id, title="Older Task", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        title="Older Task",
+        status=TaskStatus.IN_PROGRESS,
         started_at=_utcnow() - timedelta(hours=3),
     )
     newer = make_task(
-        project_id=project.id, title="Newer Task", status=TaskStatus.IN_PROGRESS,
+        project_id=project.id,
+        title="Newer Task",
+        status=TaskStatus.IN_PROGRESS,
         started_at=_utcnow() - timedelta(hours=1),
     )
     db_session.add_all([older, newer])
@@ -6722,7 +7719,9 @@ async def test_digest_active_tasks_ordered_oldest_first(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_legacy_autonomous_sum(client: AsyncClient, db_session):
+async def test_digest_direction_progress_legacy_autonomous_sum(
+    client: AsyncClient, db_session
+):
     """Multiple legacy research_history entries (prs_merged only, no autonomous_prs_merged)
     within the window: autonomous_prs_merged equals the sum of all prs_merged values."""
     recent_ts1 = (_utcnow() - timedelta(hours=2)).isoformat()
@@ -6745,13 +7744,15 @@ async def test_digest_direction_progress_legacy_autonomous_sum(client: AsyncClie
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-legacy-sum"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-legacy-sum"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -6764,7 +7765,9 @@ async def test_digest_direction_progress_legacy_autonomous_sum(client: AsyncClie
 
 
 @pytest.mark.asyncio
-async def test_digest_direction_progress_empty_history_sane_defaults(client: AsyncClient, db_session):
+async def test_digest_direction_progress_empty_history_sane_defaults(
+    client: AsyncClient, db_session
+):
     """Direction with a task created in the window but empty research_history appears in
     direction_progress with autonomous_prs_merged=0 and cost_per_merged_pr=None."""
     project = make_project(
@@ -6781,13 +7784,15 @@ async def test_digest_direction_progress_empty_history_sane_defaults(client: Asy
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Create task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"direction_id": "dir-empty"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Create task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-empty"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -6829,13 +7834,15 @@ async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Research task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"direction_id": "dir-op"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-op"},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
@@ -6887,7 +7894,9 @@ async def test_retirement_critiques_returns_critiques(client: AsyncClient, db_se
     db_session.add(cycle)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/retirement-critiques")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/retirement-critiques"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 2
@@ -6901,7 +7910,9 @@ async def test_retirement_critiques_returns_critiques(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_retirement_critiques_empty_when_no_cycles(client: AsyncClient, db_session):
+async def test_retirement_critiques_empty_when_no_cycles(
+    client: AsyncClient, db_session
+):
     """Project with no strategic cycles returns empty critiques list."""
     project = make_project()
     db_session.add(project)
@@ -6912,7 +7923,9 @@ async def test_retirement_critiques_empty_when_no_cycles(client: AsyncClient, db
     db_session.add(m)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/retirement-critiques")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/retirement-critiques"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 0
@@ -6920,7 +7933,9 @@ async def test_retirement_critiques_empty_when_no_cycles(client: AsyncClient, db
 
 
 @pytest.mark.asyncio
-async def test_retirement_critiques_skips_sentinel_entries(client: AsyncClient, db_session):
+async def test_retirement_critiques_skips_sentinel_entries(
+    client: AsyncClient, db_session
+):
     """Entries with no_eligible_retirements=True are excluded from results."""
     from app.models import StrategicCycle
 
@@ -6950,7 +7965,9 @@ async def test_retirement_critiques_skips_sentinel_entries(client: AsyncClient, 
     db_session.add(cycle)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/retirement-critiques")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/retirement-critiques"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 1
@@ -6963,7 +7980,9 @@ async def test_retirement_critiques_skips_sentinel_entries(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
-async def test_research_actionability_grade_distribution(client: AsyncClient, db_session):
+async def test_research_actionability_grade_distribution(
+    client: AsyncClient, db_session
+):
     """Grade distribution is computed from research task plan_output findings."""
     from app.models import StrategicCycle
 
@@ -6984,16 +8003,34 @@ async def test_research_actionability_grade_distribution(client: AsyncClient, db
         payloads=[{"type": "research"}],
         context={"_actionability_structural_downgrades": 2},
         plan_output=[
-            {"title": "Finding A", "actionability_grade": "HIGH", "direction_id": "dir-h1"},
-            {"title": "Finding B", "actionability_grade": "HIGH", "direction_id": "dir-h2"},
-            {"title": "Finding C", "actionability_grade": "MEDIUM", "direction_id": "dir-m1"},
-            {"title": "Finding D", "actionability_grade": "LOW", "direction_id": "dir-l1"},
+            {
+                "title": "Finding A",
+                "actionability_grade": "HIGH",
+                "direction_id": "dir-h1",
+            },
+            {
+                "title": "Finding B",
+                "actionability_grade": "HIGH",
+                "direction_id": "dir-h2",
+            },
+            {
+                "title": "Finding C",
+                "actionability_grade": "MEDIUM",
+                "direction_id": "dir-m1",
+            },
+            {
+                "title": "Finding D",
+                "actionability_grade": "LOW",
+                "direction_id": "dir-l1",
+            },
         ],
     )
     db_session.add(research_task)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["total_findings"] == 4
@@ -7015,7 +8052,9 @@ async def test_research_actionability_empty_project(client: AsyncClient, db_sess
     db_session.add(m)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["total_findings"] == 0
@@ -7038,35 +8077,59 @@ async def test_research_actionability_excludes_non_research_plan_output(
     db_session.add(StrategicCycle(id="cycle-action-typefilter", project_id=project.id))
 
     # Real research task — counted.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        plan_output=[
-            {"title": "Real finding", "actionability_grade": "HIGH", "direction_id": "dir-real"},
-        ],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            plan_output=[
+                {
+                    "title": "Real finding",
+                    "actionability_grade": "HIGH",
+                    "direction_id": "dir-real",
+                },
+            ],
+        )
+    )
     # Non-research task that also wrote plan_output — must be excluded.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        plan_output=[
-            {"title": "Bogus finding", "actionability_grade": "HIGH", "direction_id": "dir-bogus"},
-            {"title": "Bogus 2", "actionability_grade": "MEDIUM", "direction_id": "dir-bogus2"},
-        ],
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "planning"}],
-        plan_output=[
-            {"title": "Planner output", "actionability_grade": "LOW", "direction_id": "dir-plan"},
-        ],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            plan_output=[
+                {
+                    "title": "Bogus finding",
+                    "actionability_grade": "HIGH",
+                    "direction_id": "dir-bogus",
+                },
+                {
+                    "title": "Bogus 2",
+                    "actionability_grade": "MEDIUM",
+                    "direction_id": "dir-bogus2",
+                },
+            ],
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "planning"}],
+            plan_output=[
+                {
+                    "title": "Planner output",
+                    "actionability_grade": "LOW",
+                    "direction_id": "dir-plan",
+                },
+            ],
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["total_findings"] == 1
@@ -7098,14 +8161,19 @@ async def test_research_actionability_research_task_does_not_self_attribute(
         payloads=[{"type": "research"}],
         context={"direction_id": "dir-self", "pr_merged": True},
         plan_output=[
-            {"title": "Self-attribution probe", "actionability_grade": "HIGH",
-             "direction_id": "dir-self"},
+            {
+                "title": "Self-attribution probe",
+                "actionability_grade": "HIGH",
+                "direction_id": "dir-self",
+            },
         ],
     )
     db_session.add(research_task)
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     # Distribution still records the finding...
@@ -7130,50 +8198,73 @@ async def test_research_actionability_merge_requires_pr_merged_flag(
 
     db_session.add(make_membership(project.id))
     research_at = _utcnow() - _td(hours=2)
-    db_session.add(StrategicCycle(
-        id="cycle-action-merge", project_id=project.id, created_at=research_at - _td(hours=2),
-    ))
+    db_session.add(
+        StrategicCycle(
+            id="cycle-action-merge",
+            project_id=project.id,
+            created_at=research_at - _td(hours=2),
+        )
+    )
     research_task = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
         created_at=research_at,
         plan_output=[
-            {"title": "Merged path", "actionability_grade": "HIGH", "direction_id": "dir-merged"},
-            {"title": "Tasked-but-not-merged", "actionability_grade": "HIGH",
-             "direction_id": "dir-tasked"},
-            {"title": "Untouched", "actionability_grade": "MEDIUM", "direction_id": "dir-cold"},
+            {
+                "title": "Merged path",
+                "actionability_grade": "HIGH",
+                "direction_id": "dir-merged",
+            },
+            {
+                "title": "Tasked-but-not-merged",
+                "actionability_grade": "HIGH",
+                "direction_id": "dir-tasked",
+            },
+            {
+                "title": "Untouched",
+                "actionability_grade": "MEDIUM",
+                "direction_id": "dir-cold",
+            },
         ],
     )
     db_session.add(research_task)
 
     # Follow-on for dir-merged: COMPLETED + pr_merged=True → merged.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        created_at=research_at + _td(minutes=30),
-        context={"direction_id": "dir-merged", "pr_merged": True},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=research_at + _td(minutes=30),
+            context={"direction_id": "dir-merged", "pr_merged": True},
+        )
+    )
     # Follow-on for dir-tasked: COMPLETED but NO pr_merged → tasked only.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        created_at=research_at + _td(minutes=30),
-        context={"direction_id": "dir-tasked"},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=research_at + _td(minutes=30),
+            context={"direction_id": "dir-tasked"},
+        )
+    )
     # Follow-on for dir-merged created BEFORE the research task — must not count.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        created_at=research_at - _td(hours=1),
-        context={"direction_id": "dir-cold", "pr_merged": True},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=research_at - _td(hours=1),
+            context={"direction_id": "dir-cold", "pr_merged": True},
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["grade_tasked"]["HIGH"] == 2  # dir-merged + dir-tasked
@@ -7198,9 +8289,13 @@ async def test_research_actionability_grade_merge_rate_and_calibration(
 
     db_session.add(make_membership(project.id))
     research_at = _utcnow() - _td(hours=2)
-    db_session.add(StrategicCycle(
-        id="cycle-mr-1", project_id=project.id, created_at=research_at - _td(hours=1),
-    ))
+    db_session.add(
+        StrategicCycle(
+            id="cycle-mr-1",
+            project_id=project.id,
+            created_at=research_at - _td(hours=1),
+        )
+    )
     # 3 HIGH findings (2 will merge, 1 just tasked) → HIGH rate = 2/3
     # 2 MEDIUM findings (1 will merge) → MEDIUM rate = 1/2
     # 2 LOW findings (0 will merge) → LOW rate = 0/2 = 0.0
@@ -7213,33 +8308,41 @@ async def test_research_actionability_grade_merge_rate_and_calibration(
         {"title": "L1", "actionability_grade": "LOW", "direction_id": "dir-l1"},
         {"title": "L2", "actionability_grade": "LOW", "direction_id": "dir-l2"},
     ]
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        created_at=research_at,
-        plan_output=plan_output,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            created_at=research_at,
+            plan_output=plan_output,
+        )
+    )
     # Merged follow-ons.
     for d in ("dir-h1", "dir-h2", "dir-m1"):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                created_at=research_at + _td(minutes=10),
+                context={"direction_id": d, "pr_merged": True},
+            )
+        )
+    # Tasked-only follow-on for HIGH.
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "create"}],
             created_at=research_at + _td(minutes=10),
-            context={"direction_id": d, "pr_merged": True},
-        ))
-    # Tasked-only follow-on for HIGH.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        created_at=research_at + _td(minutes=10),
-        context={"direction_id": "dir-h3"},
-    ))
+            context={"direction_id": "dir-h3"},
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["grade_merge_rate"]["HIGH"] == pytest.approx(2 / 3)
@@ -7268,17 +8371,25 @@ async def test_research_actionability_calibration_null_when_no_findings(
     db_session.add(make_membership(project.id))
     db_session.add(StrategicCycle(id="cycle-mr-empty", project_id=project.id))
     # Only MEDIUM findings — both HIGH and LOW are absent.
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        plan_output=[
-            {"title": "M1", "actionability_grade": "MEDIUM", "direction_id": "dir-m1"},
-        ],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            plan_output=[
+                {
+                    "title": "M1",
+                    "actionability_grade": "MEDIUM",
+                    "direction_id": "dir-m1",
+                },
+            ],
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["grade_merge_rate"]["HIGH"] is None
@@ -7304,46 +8415,70 @@ async def test_research_actionability_cycle_history_chronological(
     now = _utcnow()
     cycle_old_at = now - _td(hours=10)
     cycle_new_at = now - _td(hours=4)
-    db_session.add(StrategicCycle(
-        id="cycle-old", project_id=project.id, created_at=cycle_old_at,
-    ))
-    db_session.add(StrategicCycle(
-        id="cycle-new", project_id=project.id, created_at=cycle_new_at,
-    ))
+    db_session.add(
+        StrategicCycle(
+            id="cycle-old",
+            project_id=project.id,
+            created_at=cycle_old_at,
+        )
+    )
+    db_session.add(
+        StrategicCycle(
+            id="cycle-new",
+            project_id=project.id,
+            created_at=cycle_new_at,
+        )
+    )
 
     # Research task in OLD cycle window: 1 HIGH (will merge).
     research_old_at = cycle_old_at + _td(minutes=30)
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        created_at=research_old_at,
-        plan_output=[
-            {"title": "Old HIGH", "actionability_grade": "HIGH", "direction_id": "dir-old-h"},
-        ],
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        created_at=research_old_at + _td(minutes=5),
-        context={"direction_id": "dir-old-h", "pr_merged": True},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            created_at=research_old_at,
+            plan_output=[
+                {
+                    "title": "Old HIGH",
+                    "actionability_grade": "HIGH",
+                    "direction_id": "dir-old-h",
+                },
+            ],
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=research_old_at + _td(minutes=5),
+            context={"direction_id": "dir-old-h", "pr_merged": True},
+        )
+    )
 
     # Research task in NEW cycle window: 1 LOW (no follow-on).
     research_new_at = cycle_new_at + _td(minutes=30)
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        created_at=research_new_at,
-        plan_output=[
-            {"title": "New LOW", "actionability_grade": "LOW", "direction_id": "dir-new-l"},
-        ],
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            created_at=research_new_at,
+            plan_output=[
+                {
+                    "title": "New LOW",
+                    "actionability_grade": "LOW",
+                    "direction_id": "dir-new-l",
+                },
+            ],
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert "cycle_history" in data
@@ -7382,21 +8517,33 @@ async def test_research_actionability_cycle_history_null_rate_for_zero_findings(
 
     db_session.add(make_membership(project.id))
     cyc_at = _utcnow() - _td(hours=2)
-    db_session.add(StrategicCycle(
-        id="cycle-only-medium", project_id=project.id, created_at=cyc_at,
-    ))
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        created_at=cyc_at + _td(minutes=10),
-        plan_output=[
-            {"title": "M-only", "actionability_grade": "MEDIUM", "direction_id": "dir-m-only"},
-        ],
-    ))
+    db_session.add(
+        StrategicCycle(
+            id="cycle-only-medium",
+            project_id=project.id,
+            created_at=cyc_at,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            created_at=cyc_at + _td(minutes=10),
+            plan_output=[
+                {
+                    "title": "M-only",
+                    "actionability_grade": "MEDIUM",
+                    "direction_id": "dir-m-only",
+                },
+            ],
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/research-actionability")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/research-actionability"
+    )
     assert response.status_code == 200
     data = response.json()
     assert len(data["cycle_history"]) == 1
@@ -7405,16 +8552,28 @@ async def test_research_actionability_cycle_history_null_rate_for_zero_findings(
     assert entry["grade_merge_rate"]["LOW"] is None
     assert entry["grade_merge_rate"]["MEDIUM"] == 0.0
     assert entry["calibration_score"] is None
+
+
 # Self-review skip-rate metric
 # ---------------------------------------------------------------------------
 
 
 def _sr_skipped_envelope_unknown_verdict() -> dict:
-    return {"verdict": "unknown", "fixes_applied": False, "check_results": {}, "blind_spots": []}
+    return {
+        "verdict": "unknown",
+        "fixes_applied": False,
+        "check_results": {},
+        "blind_spots": [],
+    }
 
 
 def _sr_skipped_envelope_blind_spot_marker(marker: str) -> dict:
-    return {"verdict": "unknown", "fixes_applied": False, "check_results": {}, "blind_spots": [marker]}
+    return {
+        "verdict": "unknown",
+        "fixes_applied": False,
+        "check_results": {},
+        "blind_spots": [marker],
+    }
 
 
 def _sr_valid_outcome() -> dict:
@@ -7427,7 +8586,9 @@ def _sr_valid_outcome() -> dict:
 
 
 @pytest.mark.asyncio
-async def test_digest_self_review_skip_rate_detects_skipped_envelope(client: AsyncClient, db_session):
+async def test_digest_self_review_skip_rate_detects_skipped_envelope(
+    client: AsyncClient, db_session
+):
     """An unknown-verdict outcome with empty check_results counts as a skip."""
     project = make_project()
     db_session.add(project)
@@ -7436,19 +8597,25 @@ async def test_digest_self_review_skip_rate_detects_skipped_envelope(client: Asy
 
     # 3 skipped (unknown verdict, empty check_results) + 2 valid → 5 code-change tasks
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            )
+        )
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix"}],
-            context={"_self_review_outcome": _sr_valid_outcome()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={"_self_review_outcome": _sr_valid_outcome()},
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7461,7 +8628,9 @@ async def test_digest_self_review_skip_rate_detects_skipped_envelope(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_digest_self_review_skip_rate_detects_blind_spot_marker(client: AsyncClient, db_session):
+async def test_digest_self_review_skip_rate_detects_blind_spot_marker(
+    client: AsyncClient, db_session
+):
     """blind_spots entries containing the fallback markers count as skips."""
     project = make_project()
     db_session.add(project)
@@ -7470,29 +8639,39 @@ async def test_digest_self_review_skip_rate_detects_blind_spot_marker(client: As
 
     # 2 parse-failure + 2 missing-file + 1 valid → 5 code-change tasks, 4 skipped
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "refactor"}],
-            context={"_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
-                "self-review JSON parsing failed"
-            )},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "refactor"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
+                        "self-review JSON parsing failed"
+                    )
+                },
+            )
+        )
     for _ in range(2):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "migrate"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
+                        "self-review skipped — investigate"
+                    )
+                },
+            )
+        )
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "migrate"}],
-            context={"_self_review_outcome": _sr_skipped_envelope_blind_spot_marker(
-                "self-review skipped — investigate"
-            )},
-        ))
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": _sr_valid_outcome()},
-    ))
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_valid_outcome()},
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7506,7 +8685,8 @@ async def test_digest_self_review_skip_rate_detects_blind_spot_marker(client: As
 
 @pytest.mark.asyncio
 async def test_digest_self_review_skip_rate_excludes_non_code_change_types(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     """Review/research tasks are excluded from the denominator."""
     project = make_project()
@@ -7515,33 +8695,43 @@ async def test_digest_self_review_skip_rate_excludes_non_code_change_types(
     await db_session.refresh(project)
 
     # 5 code-change tasks: 1 skipped, 4 valid
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-    ))
-    for _ in range(4):
-        db_session.add(make_task(
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix"}],
-            context={"_self_review_outcome": _sr_valid_outcome()},
-        ))
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        )
+    )
+    for _ in range(4):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={"_self_review_outcome": _sr_valid_outcome()},
+            )
+        )
     # Non-code-change tasks with skipped envelopes — must NOT affect the metric
     for _ in range(3):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            )
+        )
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "review"}],
+            payloads=[{"type": "research"}],
             context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-        ))
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "research"}],
-        context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-    ))
+        )
+    )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7555,7 +8745,8 @@ async def test_digest_self_review_skip_rate_excludes_non_code_change_types(
 
 @pytest.mark.asyncio
 async def test_digest_self_review_skip_rate_returns_none_below_min_sample(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     """Returns None when fewer than 5 code-change tasks are available."""
     project = make_project()
@@ -7565,12 +8756,16 @@ async def test_digest_self_review_skip_rate_returns_none_below_min_sample(
 
     # 4 code-change tasks total → below threshold
     for _ in range(4):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7580,7 +8775,8 @@ async def test_digest_self_review_skip_rate_returns_none_below_min_sample(
 
 @pytest.mark.asyncio
 async def test_digest_self_review_skip_rate_by_task_type_breakdown(
-    client: AsyncClient, db_session,
+    client: AsyncClient,
+    db_session,
 ):
     """by_task_type reports per-type rates only when that type has >=5 samples."""
     project = make_project()
@@ -7590,27 +8786,37 @@ async def test_digest_self_review_skip_rate_by_task_type_breakdown(
 
     # 5 create tasks: 2 skipped + 3 valid → eligible for by_task_type
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            )
+        )
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={"_self_review_outcome": _sr_valid_outcome()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={"_self_review_outcome": _sr_valid_outcome()},
+            )
+        )
     # 2 fix tasks → below per-type threshold; included in overall but not in by_task_type
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix"}],
-            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": _sr_skipped_envelope_unknown_verdict()
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7658,31 +8864,45 @@ async def test_digest_fresh_reviewer_effectiveness_approval_rate_lift(
 
     # 2 tasks with fresh-reviewer findings: both approved on first attempt
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={
-                "_first_attempt_succeeded": True,
-                "_self_review_outcome": {
-                    "verdict": "pass",
-                    "check_results": {},
-                    "blind_spots": [],
-                    "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "check_results": {},
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": "correctness",
+                                "severity": "HIGH",
+                                "description": "x",
+                            }
+                        ],
+                    },
                 },
-            },
-        ))
+            )
+        )
     # 2 tasks without fresh-reviewer: both rejected on first attempt
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix"}],
-            context={
-                "_first_attempt_succeeded": False,
-                "_self_review_outcome": {"verdict": "pass", "check_results": {}, "blind_spots": []},
-            },
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_first_attempt_succeeded": False,
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "check_results": {},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7707,21 +8927,29 @@ async def test_digest_fresh_reviewer_effectiveness_per_category_hit_rate(
     # 3 tasks where fresh-reviewer flagged "correctness" and human confirmed it too.
     # Agent self-review passed correctness (so it counts as added value).
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={
-                "_first_attempt_succeeded": False,
-                "_first_attempt_rejection_categories": ["correctness"],
-                "_self_review_outcome": {
-                    "verdict": "fail",
-                    "check_results": {"correctness": {"passed": True}},
-                    "blind_spots": [],
-                    "reviewer_findings": [{"category": "correctness", "severity": "CRITICAL", "description": "y"}],
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_succeeded": False,
+                    "_first_attempt_rejection_categories": ["correctness"],
+                    "_self_review_outcome": {
+                        "verdict": "fail",
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": "correctness",
+                                "severity": "CRITICAL",
+                                "description": "y",
+                            }
+                        ],
+                    },
                 },
-            },
-        ))
+            )
+        )
     await db_session.commit()
 
     response = await client.get("/api/admin/digest")
@@ -7750,39 +8978,53 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
 
     # 3 tasks with the same first-6-token theme (should merge into count=3)
     for i in range(3):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [
+                            f"did not verify file path number {i} thoroughly"
+                        ],
+                    }
+                },
+            )
+        )
+    # 1 task with a distinct blind-spot theme
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {},
+                    "blind_spots": ["async error propagation not checked"],
+                }
+            },
+        )
+    )
+    # 1 skipped envelope — must NOT contribute to themes
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "create"}],
-            context={"_self_review_outcome": {
-                "verdict": "pass",
-                "fixes_applied": False,
-                "check_results": {"correctness": {"passed": True}},
-                "blind_spots": [f"did not verify file path number {i} thoroughly"],
-            }},
-        ))
-    # 1 task with a distinct blind-spot theme
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix"}],
-        context={"_self_review_outcome": {
-            "verdict": "pass",
-            "fixes_applied": False,
-            "check_results": {},
-            "blind_spots": ["async error propagation not checked"],
-        }},
-    ))
-    # 1 skipped envelope — must NOT contribute to themes
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
-    ))
+            context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/sr-blind-spots?days=30")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-blind-spots?days=30"
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["window_days"] == 30
@@ -7792,6 +9034,205 @@ async def test_sr_blind_spots_aggregates_themes(client: AsyncClient, db_session)
     assert themes.get("async error propagation not checked") == 1
     # Skipped envelope contributes no entries
     assert body["total_distinct_themes"] == 2
+
+
+# ---------------------------------------------------------------------------
+# aggregate_sr_regression_risk_test_signal (synchronous helper)
+# ---------------------------------------------------------------------------
+
+
+def _make_rr_task(project_id, *, sr_passed, test_attempts, task_type="create"):
+    """Build a Task-like object with SR regression_risk + fix_loop_history.test."""
+    check_results: dict = {}
+    if sr_passed is not None:
+        check_results["regression_risk"] = {"passed": sr_passed}
+    history: dict = {}
+    if test_attempts is not None:
+        history["test"] = test_attempts
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context={"_self_review_outcome": {"check_results": check_results}},
+        fix_loop_history=history,
+    )
+
+
+def test_aggregate_sr_regression_risk_test_signal_below_min_sample_returns_none():
+    """Fewer than _SR_MIN_SAMPLE qualifying tasks → None."""
+    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [_make_rr_task(pid, sr_passed=True, test_attempts=[]) for _ in range(4)]
+    assert aggregate_sr_regression_risk_test_signal(tasks) is None
+
+
+def test_aggregate_sr_regression_risk_test_signal_passed_no_signal_is_not_a_miss():
+    """SR passed + no test loop activity → true-pass, miss_by_test_signal_rate == 0."""
+    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [_make_rr_task(pid, sr_passed=True, test_attempts=[]) for _ in range(5)]
+    result = aggregate_sr_regression_risk_test_signal(tasks)
+    assert result is not None
+    assert result["sr_passed_no_signal"] == 5
+    assert result["sr_passed_with_signal"] == 0
+    assert result["miss_by_test_signal_rate"] == 0.0
+    assert result["numerator"] == 0
+    assert result["denominator"] == 5
+
+
+def test_aggregate_sr_regression_risk_test_signal_passed_with_testfix_counts_as_miss():
+    """SR passed + testFix loop ran ≥1 non-trivial iteration → miss-by-test-signal."""
+    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
+    import uuid
+
+    pid = uuid.uuid4()
+    miss_attempts = [
+        {"iteration": 1, "exit_reason": "in_progress"},
+        {"iteration": 2, "exit_reason": "passed"},
+    ]
+    tasks = [
+        _make_rr_task(pid, sr_passed=True, test_attempts=miss_attempts)
+        for _ in range(3)
+    ] + [_make_rr_task(pid, sr_passed=True, test_attempts=[]) for _ in range(2)]
+    result = aggregate_sr_regression_risk_test_signal(tasks)
+    assert result is not None
+    assert result["sr_passed_with_signal"] == 3
+    assert result["sr_passed_no_signal"] == 2
+    assert result["miss_by_test_signal_rate"] == round(3 / 5, 3)
+
+
+def test_aggregate_sr_regression_risk_test_signal_failed_with_signal_counts_as_hit():
+    """SR failed regression_risk + testFix loop ran → hit-by-test-signal (not a miss)."""
+    from app.sr_blind_spots import aggregate_sr_regression_risk_test_signal
+    import uuid
+
+    pid = uuid.uuid4()
+    hit_attempts = [{"iteration": 1, "exit_reason": "divergence_detected"}]
+    tasks = [
+        _make_rr_task(pid, sr_passed=False, test_attempts=hit_attempts)
+        for _ in range(5)
+    ]
+    result = aggregate_sr_regression_risk_test_signal(tasks)
+    assert result is not None
+    assert result["sr_failed_with_signal"] == 5
+    assert result["sr_passed_with_signal"] == 0
+    # No SR-passed tasks → denominator is 0
+    assert result["denominator"] == 0
+    assert result["miss_by_test_signal_rate"] is None
+
+
+# ---------------------------------------------------------------------------
+# aggregate_sr_scope_drift_vs_expansion (synchronous helper)
+# ---------------------------------------------------------------------------
+
+
+def _make_sd_task(project_id, *, sr_passed, expansion_ratio, task_type="create"):
+    """Build a Task-like object with SR scope-drift check + expansion_ratio in context."""
+    ctx = {
+        "_self_review_outcome": {
+            "check_results": {"scope-drift": {"passed": sr_passed}}
+        },
+        "expansion_ratio": expansion_ratio,
+    }
+    return make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": task_type, "prompt": "x"}],
+        context=ctx,
+    )
+
+
+def test_aggregate_sr_scope_drift_vs_expansion_below_min_sample_returns_none():
+    """Fewer than _SR_MIN_SAMPLE qualifying tasks → None."""
+    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [_make_sd_task(pid, sr_passed=True, expansion_ratio=1.0) for _ in range(4)]
+    assert aggregate_sr_scope_drift_vs_expansion(tasks) is None
+
+
+def test_aggregate_sr_scope_drift_vs_expansion_consistent_bucket():
+    """SR passed + ratio ≤1.5 → consistent, miss rate == 0."""
+    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [_make_sd_task(pid, sr_passed=True, expansion_ratio=1.2) for _ in range(5)]
+    result = aggregate_sr_scope_drift_vs_expansion(tasks)
+    assert result is not None
+    assert result["consistent"] == 5
+    assert result["miss_by_expansion"] == 0
+    assert result["miss_by_expansion_rate"] == 0.0
+    assert result["numerator"] == 0
+    assert result["denominator"] == 5
+
+
+def test_aggregate_sr_scope_drift_vs_expansion_miss_bucket():
+    """SR passed + ratio ≥2.0 → miss_by_expansion; rate = misses / (consistent+misses)."""
+    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [
+        _make_sd_task(pid, sr_passed=True, expansion_ratio=2.5) for _ in range(3)
+    ] + [_make_sd_task(pid, sr_passed=True, expansion_ratio=1.0) for _ in range(2)]
+    result = aggregate_sr_scope_drift_vs_expansion(tasks)
+    assert result is not None
+    assert result["miss_by_expansion"] == 3
+    assert result["consistent"] == 2
+    assert result["miss_by_expansion_rate"] == round(3 / 5, 3)
+
+
+def test_aggregate_sr_scope_drift_vs_expansion_hit_bucket():
+    """SR failed scope-drift + ratio ≥1.5 → hit_by_expansion; denominator is 0."""
+    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [_make_sd_task(pid, sr_passed=False, expansion_ratio=2.0) for _ in range(5)]
+    result = aggregate_sr_scope_drift_vs_expansion(tasks)
+    assert result is not None
+    assert result["hit_by_expansion"] == 5
+    assert result["miss_by_expansion"] == 0
+    assert result["denominator"] == 0
+    assert result["miss_by_expansion_rate"] is None
+
+
+def test_aggregate_sr_scope_drift_vs_expansion_fp_candidate_bucket():
+    """SR failed scope-drift + ratio ≤1.0 → fp_candidate."""
+    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
+    import uuid
+
+    pid = uuid.uuid4()
+    tasks = [_make_sd_task(pid, sr_passed=False, expansion_ratio=1.0) for _ in range(5)]
+    result = aggregate_sr_scope_drift_vs_expansion(tasks)
+    assert result is not None
+    assert result["fp_candidate"] == 5
+    assert result["hit_by_expansion"] == 0
+    assert result["miss_by_expansion"] == 0
+    assert result["miss_by_expansion_rate"] is None
+
+
+def test_aggregate_sr_scope_drift_vs_expansion_skip_tasks_without_expansion_ratio():
+    """Tasks without expansion_ratio in context are excluded from qualification."""
+    from app.sr_blind_spots import aggregate_sr_scope_drift_vs_expansion
+    import uuid
+
+    pid = uuid.uuid4()
+    ctx = {"_self_review_outcome": {"check_results": {"scope-drift": {"passed": True}}}}
+    no_ratio_task = make_task(
+        project_id=pid,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context=ctx,
+    )
+    # 10 tasks but all lack expansion_ratio → fewer than min_sample qualify
+    assert aggregate_sr_scope_drift_vs_expansion([no_ratio_task] * 10) is None
 
 
 # ---------------------------------------------------------------------------
@@ -7812,36 +9253,45 @@ async def test_prompt_fingerprint_analytics_groups_by_fingerprint(
 
     # Fingerprint A: 3 tasks, 2 first-attempt successes, 0 SR skips
     for succ in (True, True, False):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            prompt_fingerprint="aaaaaaaaaaaa",
-            context={
-                "_first_attempt_succeeded": succ,
-                "_self_review_outcome": _sr_valid_outcome(),
-                **(
-                    {} if succ
-                    else {"_first_attempt_rejection_categories": ["correctness"]}
-                ),
-            },
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint="aaaaaaaaaaaa",
+                context={
+                    "_first_attempt_succeeded": succ,
+                    "_self_review_outcome": _sr_valid_outcome(),
+                    **(
+                        {}
+                        if succ
+                        else {"_first_attempt_rejection_categories": ["correctness"]}
+                    ),
+                },
+            )
+        )
     # Fingerprint B: 3 tasks, 0 first-attempt successes, 1 SR skip
     for i in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix"}],
-            prompt_fingerprint="bbbbbbbbbbbb",
-            context={
-                "_first_attempt_succeeded": False,
-                "_first_attempt_rejection_categories": ["correctness", "performance"],
-                "_self_review_outcome": (
-                    _sr_skipped_envelope_unknown_verdict() if i == 0
-                    else _sr_valid_outcome()
-                ),
-            },
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                prompt_fingerprint="bbbbbbbbbbbb",
+                context={
+                    "_first_attempt_succeeded": False,
+                    "_first_attempt_rejection_categories": [
+                        "correctness",
+                        "performance",
+                    ],
+                    "_self_review_outcome": (
+                        _sr_skipped_envelope_unknown_verdict()
+                        if i == 0
+                        else _sr_valid_outcome()
+                    ),
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get(
@@ -7886,13 +9336,18 @@ async def test_prompt_fingerprint_analytics_unknown_bucket_for_legacy_rows(
     db_session.add(make_membership(project.id))
 
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            prompt_fingerprint=None,
-            context={"_first_attempt_succeeded": True, "_self_review_outcome": _sr_valid_outcome()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint=None,
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_valid_outcome(),
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get(
@@ -7917,17 +9372,19 @@ async def test_prompt_fingerprint_analytics_falls_back_to_context_mirror(
     db_session.add(make_membership(project.id))
 
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            prompt_fingerprint=None,
-            context={
-                "prompt_fingerprint": "legacyfp12345",
-                "_first_attempt_succeeded": True,
-                "_self_review_outcome": _sr_valid_outcome(),
-            },
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint=None,
+                context={
+                    "prompt_fingerprint": "legacyfp12345",
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_valid_outcome(),
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get(
@@ -7953,13 +9410,18 @@ async def test_prompt_fingerprint_analytics_excludes_non_code_change(
 
     # 3 research tasks (excluded) sharing a fingerprint
     for _ in range(3):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "research"}],
-            prompt_fingerprint="cccccccccccc",
-            context={"_first_attempt_succeeded": True, "_self_review_outcome": _sr_valid_outcome()},
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                prompt_fingerprint="cccccccccccc",
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_valid_outcome(),
+                },
+            )
+        )
     await db_session.commit()
 
     response = await client.get(
@@ -7984,20 +9446,30 @@ async def test_prompt_fingerprint_analytics_filters_below_min_sample_size(
 
     # Fingerprint A has 3 tasks; B has 1 task — only A should survive a min of 2.
     for _ in range(3):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                prompt_fingerprint="aaaaaaaaaaaa",
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_valid_outcome(),
+                },
+            )
+        )
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "create"}],
-            prompt_fingerprint="aaaaaaaaaaaa",
-            context={"_first_attempt_succeeded": True, "_self_review_outcome": _sr_valid_outcome()},
-        ))
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        prompt_fingerprint="bbbbbbbbbbbb",
-        context={"_first_attempt_succeeded": False, "_self_review_outcome": _sr_valid_outcome()},
-    ))
+            prompt_fingerprint="bbbbbbbbbbbb",
+            context={
+                "_first_attempt_succeeded": False,
+                "_self_review_outcome": _sr_valid_outcome(),
+            },
+        )
+    )
     await db_session.commit()
 
     response = await client.get(
@@ -8027,7 +9499,6 @@ async def test_prompt_fingerprint_analytics_requires_project_membership(
     assert response.status_code == 404
 
 
-
 # ---------------------------------------------------------------------------
 # SR reviewer-disagreement aggregation
 # ---------------------------------------------------------------------------
@@ -8043,45 +9514,78 @@ async def test_sr_reviewer_disagreements_basic(db_session):
 
     # 3 create tasks: reviewer flags "correctness", self-review passed it
     for _ in range(3):
-        db_session.add(make_task(
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": "correctness",
+                                "severity": "HIGH",
+                                "description": "missed edge",
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+    # 1 fix task: reviewer flags "security", self-review omitted the category
+    db_session.add(
+        make_task(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={"_self_review_outcome": {
-                "verdict": "pass",
-                "check_results": {"correctness": {"passed": True}},
-                "blind_spots": [],
-                "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "missed edge"}],
-            }},
-        ))
-    # 1 fix task: reviewer flags "security", self-review omitted the category
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix"}],
-        context={"_self_review_outcome": {
-            "verdict": "pass",
-            "check_results": {},
-            "blind_spots": [],
-            "reviewer_findings": [{"category": "security", "severity": "CRITICAL", "description": "unvalidated input"}],
-        }},
-    ))
+            payloads=[{"type": "fix"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "security",
+                            "severity": "CRITICAL",
+                            "description": "unvalidated input",
+                        }
+                    ],
+                }
+            },
+        )
+    )
     # 1 task where self-review already FAILED the category — should NOT count as disagreement
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix"}],
-        context={"_self_review_outcome": {
-            "verdict": "fail",
-            "check_results": {"correctness": {"passed": False}},
-            "blind_spots": [],
-            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "logic bug"}],
-        }},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "fail",
+                    "check_results": {"correctness": {"passed": False}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "logic bug",
+                        }
+                    ],
+                }
+            },
+        )
+    )
     await db_session.commit()
 
     results = await aggregate_sr_reviewer_disagreements(
-        db_session, project.id, days=30, limit=10,
+        db_session,
+        project.id,
+        days=30,
+        limit=10,
     )
     by_key = {(r["category"], r["task_type"]): r["count"] for r in results}
     assert by_key[("correctness", "create")] == 3
@@ -8098,21 +9602,34 @@ async def test_sr_reviewer_disagreements_skipped_excluded(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": {
-            "verdict": "unknown",
-            "check_results": {},
-            "blind_spots": [],
-            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
-        }},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "unknown",
+                    "check_results": {},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "x",
+                        }
+                    ],
+                }
+            },
+        )
+    )
     await db_session.commit()
 
     results = await aggregate_sr_reviewer_disagreements(
-        db_session, project.id, days=30, limit=10,
+        db_session,
+        project.id,
+        days=30,
+        limit=10,
     )
     assert results == []
 
@@ -8125,20 +9642,27 @@ async def test_sr_reviewer_disagreements_no_reviewer_findings_excluded(db_sessio
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": {
-            "verdict": "pass",
-            "check_results": {"correctness": {"passed": True}},
-            "blind_spots": [],
-        }},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                }
+            },
+        )
+    )
     await db_session.commit()
 
     results = await aggregate_sr_reviewer_disagreements(
-        db_session, project.id, days=30, limit=10,
+        db_session,
+        project.id,
+        days=30,
+        limit=10,
     )
     assert results == []
 
@@ -8151,20 +9675,32 @@ async def test_sr_reviewer_disagreements_endpoint(client: AsyncClient, db_sessio
     await db_session.commit()
     await db_session.refresh(project)
 
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": {
-            "verdict": "pass",
-            "check_results": {"correctness": {"passed": True}},
-            "blind_spots": [],
-            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
-        }},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "x",
+                        }
+                    ],
+                }
+            },
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30"
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["window_days"] == 30
@@ -8183,35 +9719,55 @@ async def test_sr_reviewer_disagreements_fp_fields(client: AsyncClient, db_sessi
     await db_session.refresh(project)
 
     # miss: SR passed correctness, reviewer flagged it
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": {
-            "verdict": "pass",
-            "check_results": {"correctness": {"passed": True}},
-            "blind_spots": [],
-            "reviewer_findings": [{"category": "correctness", "severity": "HIGH", "description": "x"}],
-        }},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "x",
+                        }
+                    ],
+                }
+            },
+        )
+    )
     # fp: SR flagged correctness failed, reviewer didn't independently flag it
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": {
-            "verdict": "fail",
-            "check_results": {"correctness": {"passed": False}},
-            "blind_spots": [],
-            "reviewer_findings": [],
-        }},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "fail",
+                    "check_results": {"correctness": {"passed": False}},
+                    "blind_spots": [],
+                    "reviewer_findings": [],
+                }
+            },
+        )
+    )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30"
+    )
     assert response.status_code == 200
     body = response.json()
-    d = next(e for e in body["disagreements"] if e["category"] == "correctness" and e["task_type"] == "create")
+    d = next(
+        e
+        for e in body["disagreements"]
+        if e["category"] == "correctness" and e["task_type"] == "create"
+    )
     assert d["count"] == 1
     assert d["false_positive_count"] == 1
     assert d["true_positive_count"] == 0
@@ -8266,7 +9822,9 @@ async def test_direction_sr_breakdown_empty(client: AsyncClient, db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    response = await client.get(f"/api/admin/projects/{project.id}/direction-sr-breakdown")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["directions"] == []
@@ -8292,15 +9850,19 @@ async def test_direction_sr_breakdown_basic(client: AsyncClient, db_session):
         "_self_review_outcome": {"check_results": {"correctness": {"passed": True}}},
     }
     for ctx in [ctx_hit, ctx_hit, ctx_miss]:
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context=ctx,
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=ctx,
+            )
+        )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/direction-sr-breakdown")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
     assert response.status_code == 200
     body = response.json()
     assert len(body["directions"]) == 1
@@ -8314,7 +9876,9 @@ async def test_direction_sr_breakdown_basic(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_direction_sr_breakdown_excludes_insufficient_sample(client: AsyncClient, db_session):
+async def test_direction_sr_breakdown_excludes_insufficient_sample(
+    client: AsyncClient, db_session
+):
     """Directions with fewer than 3 qualifying tasks are omitted."""
     project = make_project()
     db_session.add(project)
@@ -8322,19 +9886,25 @@ async def test_direction_sr_breakdown_excludes_insufficient_sample(client: Async
     await db_session.refresh(project)
 
     for _ in range(2):
-        db_session.add(make_task(
-            project_id=project.id,
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={
-                "direction_id": "d-bbb",
-                "_first_attempt_rejection_categories": ["correctness"],
-                "_self_review_outcome": {"check_results": {"correctness": {"passed": False}}},
-            },
-        ))
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "direction_id": "d-bbb",
+                    "_first_attempt_rejection_categories": ["correctness"],
+                    "_self_review_outcome": {
+                        "check_results": {"correctness": {"passed": False}}
+                    },
+                },
+            )
+        )
     await db_session.commit()
 
-    response = await client.get(f"/api/admin/projects/{project.id}/direction-sr-breakdown")
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
     assert response.status_code == 200
     assert response.json()["directions"] == []
 
@@ -8414,20 +9984,22 @@ async def test_sr_recent_misses_excludes_fully_caught(client: AsyncClient, db_se
     await db_session.refresh(project)
 
     # SR failed "correctness" AND human flagged "correctness" → no miss
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix"}],
-        context={
-            "_first_attempt_rejection_categories": ["correctness"],
-            "_self_review_outcome": {
-                "verdict": "fail",
-                "fixes_applied": True,
-                "check_results": {"correctness": {"passed": False}},
-                "blind_spots": [],
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_rejection_categories": ["correctness"],
+                "_self_review_outcome": {
+                    "verdict": "fail",
+                    "fixes_applied": True,
+                    "check_results": {"correctness": {"passed": False}},
+                    "blind_spots": [],
+                },
             },
-        },
-    ))
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
@@ -8438,7 +10010,9 @@ async def test_sr_recent_misses_excludes_fully_caught(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_sr_recent_misses_excludes_tasks_without_sr_outcome(client: AsyncClient, db_session):
+async def test_sr_recent_misses_excludes_tasks_without_sr_outcome(
+    client: AsyncClient, db_session
+):
     """Tasks missing _self_review_outcome or _first_attempt_rejection_categories are skipped."""
     project = make_project()
     db_session.add(project)
@@ -8446,19 +10020,23 @@ async def test_sr_recent_misses_excludes_tasks_without_sr_outcome(client: AsyncC
     await db_session.refresh(project)
 
     # No SR outcome
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_first_attempt_rejection_categories": ["correctness"]},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_first_attempt_rejection_categories": ["correctness"]},
+        )
+    )
     # No rejection categories
-    db_session.add(make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={"_self_review_outcome": _sr_valid_outcome()},
-    ))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"_self_review_outcome": _sr_valid_outcome()},
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/projects/{project.id}/sr-recent-misses")
@@ -8475,37 +10053,41 @@ async def test_sr_recent_misses_category_filter(client: AsyncClient, db_session)
     await db_session.refresh(project)
 
     # Task 1: missed "correctness"
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Task A",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}],
-        context={
-            "_first_attempt_rejection_categories": ["correctness"],
-            "_self_review_outcome": {
-                "verdict": "pass",
-                "fixes_applied": False,
-                "check_results": {"correctness": {"passed": True}},
-                "blind_spots": [],
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Task A",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": ["correctness"],
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                },
             },
-        },
-    ))
+        )
+    )
     # Task 2: missed "security"
-    db_session.add(make_task(
-        project_id=project.id,
-        title="Task B",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "fix"}],
-        context={
-            "_first_attempt_rejection_categories": ["security"],
-            "_self_review_outcome": {
-                "verdict": "pass",
-                "fixes_applied": False,
-                "check_results": {"security": {"passed": True}},
-                "blind_spots": [],
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Task B",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_first_attempt_rejection_categories": ["security"],
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "fixes_applied": False,
+                    "check_results": {"security": {"passed": True}},
+                    "blind_spots": [],
+                },
             },
-        },
-    ))
+        )
+    )
     await db_session.commit()
 
     response = await client.get(
@@ -8526,21 +10108,23 @@ async def test_sr_recent_misses_limit_param(client: AsyncClient, db_session):
     await db_session.refresh(project)
 
     for i in range(5):
-        db_session.add(make_task(
-            project_id=project.id,
-            title=f"Task {i}",
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "create"}],
-            context={
-                "_first_attempt_rejection_categories": ["correctness"],
-                "_self_review_outcome": {
-                    "verdict": "pass",
-                    "fixes_applied": False,
-                    "check_results": {"correctness": {"passed": True}},
-                    "blind_spots": [],
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": ["correctness"],
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
                 },
-            },
-        ))
+            )
+        )
     await db_session.commit()
 
     response = await client.get(
@@ -8572,20 +10156,29 @@ async def test_sr_recent_misses_project_isolation(client: AsyncClient, db_sessio
             "blind_spots": [],
         },
     }
-    db_session.add(make_task(
-        project_id=project_a.id, status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}], context=miss_ctx,
-    ))
-    db_session.add(make_task(
-        project_id=project_b.id, status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create"}], context=miss_ctx,
-    ))
+    db_session.add(
+        make_task(
+            project_id=project_a.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context=miss_ctx,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project_b.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context=miss_ctx,
+        )
+    )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/projects/{project_a.id}/sr-recent-misses")
     assert response.status_code == 200
     body = response.json()
     assert body["total"] == 1
+
 
 # ── POST /regression-cases/{regression_class}/clear-manual-intervention ─────
 
@@ -8632,7 +10225,11 @@ async def test_clear_regression_manual_intervention_transitions_to_active(
     # Cooldown timestamps preserved so dispatcher does not immediately re-spawn.
     assert case.last_seen_at == last_seen_before
     # Snapshot preserved across the transition.
-    assert case.signal_snapshot_at_spawn == {"value": 0.42, "threshold": 0.6, "window": "24h"}
+    assert case.signal_snapshot_at_spawn == {
+        "value": 0.42,
+        "threshold": 0.6,
+        "window": "24h",
+    }
 
 
 @pytest.mark.asyncio
@@ -8697,7 +10294,11 @@ async def test_regression_remediation_case_persists_close_loop_fields(db_session
         signal_snapshot_at_spawn={"value": 0.55, "threshold": 0.7},
         signal_snapshot_at_merge={"value": 0.68, "threshold": 0.7},
         fingerprint_to_fix_log=[
-            {"fingerprint": "abc123", "fix_pr_number": 4242, "closed_at": "2026-05-05T00:00:00Z"},
+            {
+                "fingerprint": "abc123",
+                "fix_pr_number": 4242,
+                "closed_at": "2026-05-05T00:00:00Z",
+            },
         ],
     )
     db_session.add(case)
@@ -8746,12 +10347,22 @@ async def test_digest_fresh_reviewer_trend_surfaces_from_design_doc(
         "current_sample_size": 8,
         "previous_sample_size": 6,
         "per_category_hit_rate": {
-            "correctness": {"current": 0.75, "previous": 0.6, "delta": 0.15, "trend": "improving"},
+            "correctness": {
+                "current": 0.75,
+                "previous": 0.6,
+                "delta": 0.15,
+                "trend": "improving",
+            },
         },
         "added_value": {
             "correctness": {"current": 3, "previous": 2, "trend": "stable"},
         },
-        "approval_rate_lift": {"current": 0.12, "previous": 0.08, "delta": 0.04, "trend": "stable"},
+        "approval_rate_lift": {
+            "current": 0.12,
+            "previous": 0.08,
+            "delta": 0.04,
+            "trend": "stable",
+        },
     }
     project = make_project(design_doc={"fresh_reviewer_trend": stored_trend})
     db_session.add(project)
@@ -8788,10 +10399,20 @@ async def test_digest_fresh_reviewer_trend_regressing_classification(
         "current_sample_size": 7,
         "previous_sample_size": 5,
         "per_category_hit_rate": {
-            "style-conventions": {"current": 0.4, "previous": 0.7, "delta": -0.3, "trend": "regressing"},
+            "style-conventions": {
+                "current": 0.4,
+                "previous": 0.7,
+                "delta": -0.3,
+                "trend": "regressing",
+            },
         },
         "added_value": {},
-        "approval_rate_lift": {"current": 0.05, "previous": 0.15, "delta": -0.10, "trend": "regressing"},
+        "approval_rate_lift": {
+            "current": 0.05,
+            "previous": 0.15,
+            "delta": -0.10,
+            "trend": "regressing",
+        },
     }
     project = make_project(design_doc={"fresh_reviewer_trend": stored_trend})
     db_session.add(project)
@@ -8860,7 +10481,6 @@ async def test_list_regression_cases_response_shape(client: AsyncClient, db_sess
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
     case = RegressionRemediationCase(
         project_id=project.id,
         regression_class="sr_catch_rate:correctness",
@@ -8900,7 +10520,9 @@ async def test_list_regression_cases_response_shape(client: AsyncClient, db_sess
     assert c["last_remediation_result"] == "merged"
     assert c["signal_snapshot_at_spawn"] == {"value": 0.45, "threshold": 0.6}
     assert c["signal_snapshot_at_merge"] == {"value": 0.62, "threshold": 0.6}
-    assert c["fingerprint_to_fix_log"] == [{"fingerprint": "abc", "fix_pr_number": 1234}]
+    assert c["fingerprint_to_fix_log"] == [
+        {"fingerprint": "abc", "fix_pr_number": 1234}
+    ]
     assert c["needs_manual_intervention_at"] is None
     assert "first_seen_at" in c
     assert "last_seen_at" in c
@@ -8909,7 +10531,9 @@ async def test_list_regression_cases_response_shape(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
-async def test_list_regression_cases_summary_median_stats(client: AsyncClient, db_session):
+async def test_list_regression_cases_summary_median_stats(
+    client: AsyncClient, db_session
+):
     """GET /regression-cases includes per-class MTTR summary from CLOSED rows."""
     project = make_project()
     db_session.add(project)
@@ -8923,21 +10547,36 @@ async def test_list_regression_cases_summary_median_stats(client: AsyncClient, d
             regression_class="sr_catch_rate:correctness",
             status=RegressionCaseStatus.CLOSED,
             first_seen_at=first_seen,
-            fingerprint_to_fix_log=[{"merged_at": "2026-05-01T11:00:00Z", "recovered_at": "2026-05-01T12:00:00Z"}],
+            fingerprint_to_fix_log=[
+                {
+                    "merged_at": "2026-05-01T11:00:00Z",
+                    "recovered_at": "2026-05-01T12:00:00Z",
+                }
+            ],
         ),
         RegressionRemediationCase(
             project_id=project.id,
             regression_class="sr_catch_rate:latency",
             status=RegressionCaseStatus.CLOSED,
             first_seen_at=first_seen,
-            fingerprint_to_fix_log=[{"merged_at": "2026-05-01T10:00:00Z", "recovered_at": "2026-05-01T13:00:00Z"}],
+            fingerprint_to_fix_log=[
+                {
+                    "merged_at": "2026-05-01T10:00:00Z",
+                    "recovered_at": "2026-05-01T13:00:00Z",
+                }
+            ],
         ),
         RegressionRemediationCase(
             project_id=project.id,
             regression_class="fix_loop_divergence",
             status=RegressionCaseStatus.CLOSED,
             first_seen_at=first_seen,
-            fingerprint_to_fix_log=[{"merged_at": "2026-05-01T10:30:00Z", "recovered_at": "2026-05-01T11:30:00Z"}],
+            fingerprint_to_fix_log=[
+                {
+                    "merged_at": "2026-05-01T10:30:00Z",
+                    "recovered_at": "2026-05-01T11:30:00Z",
+                }
+            ],
         ),
     ]
     db_session.add_all(cases)
@@ -9044,7 +10683,9 @@ async def test_list_regression_cases_summary_uses_latest_merge_before_recovery(
 
 
 @pytest.mark.asyncio
-async def test_list_regression_cases_summary_includes_time_to_detect(client: AsyncClient, db_session):
+async def test_list_regression_cases_summary_includes_time_to_detect(
+    client: AsyncClient, db_session
+):
     """Summary median_time_to_detect_seconds is computed when signal_first_crossed_at is set."""
     project = make_project()
     db_session.add(project)
@@ -9052,14 +10693,21 @@ async def test_list_regression_cases_summary_includes_time_to_detect(client: Asy
     await db_session.refresh(project)
 
     first_seen = datetime(2026, 5, 1, 9, 0, 0)
-    signal_crossed = datetime(2026, 5, 1, 8, 55, 0)  # 5 minutes before first_seen → 300s
+    signal_crossed = datetime(
+        2026, 5, 1, 8, 55, 0
+    )  # 5 minutes before first_seen → 300s
     case = RegressionRemediationCase(
         project_id=project.id,
         regression_class="fix_loop_divergence",
         status=RegressionCaseStatus.CLOSED,
         first_seen_at=first_seen,
         signal_first_crossed_at=signal_crossed,
-        fingerprint_to_fix_log=[{"merged_at": "2026-05-01T10:00:00Z", "recovered_at": "2026-05-01T11:00:00Z"}],
+        fingerprint_to_fix_log=[
+            {
+                "merged_at": "2026-05-01T10:00:00Z",
+                "recovered_at": "2026-05-01T11:00:00Z",
+            }
+        ],
     )
     db_session.add(case)
     await db_session.commit()
@@ -9076,7 +10724,9 @@ async def test_list_regression_cases_summary_includes_time_to_detect(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_list_regression_cases_default_filter_excludes_closed(client: AsyncClient, db_session):
+async def test_list_regression_cases_default_filter_excludes_closed(
+    client: AsyncClient, db_session
+):
     """Default status filter includes ACTIVE/REMEDIATING/NEEDS_MANUAL_INTERVENTION; excludes CLOSED/MERGED."""
     project = make_project()
     db_session.add(project)
@@ -9107,7 +10757,9 @@ async def test_list_regression_cases_default_filter_excludes_closed(client: Asyn
 
 
 @pytest.mark.asyncio
-async def test_list_regression_cases_explicit_status_filter(client: AsyncClient, db_session):
+async def test_list_regression_cases_explicit_status_filter(
+    client: AsyncClient, db_session
+):
     """Explicit status= query param restricts results to only those statuses."""
     project = make_project()
     db_session.add(project)
@@ -9141,7 +10793,9 @@ async def test_list_regression_cases_explicit_status_filter(client: AsyncClient,
 
 
 @pytest.mark.asyncio
-async def test_list_regression_cases_invalid_status_returns_400(client: AsyncClient, db_session):
+async def test_list_regression_cases_invalid_status_returns_400(
+    client: AsyncClient, db_session
+):
     """Invalid status value returns 400 with a descriptive error."""
     project = make_project()
     db_session.add(project)
@@ -9160,7 +10814,9 @@ async def test_list_regression_cases_invalid_status_returns_400(client: AsyncCli
 
 
 @pytest.mark.asyncio
-async def test_list_regression_manual_intervention_response_shape(client: AsyncClient, db_session):
+async def test_list_regression_manual_intervention_response_shape(
+    client: AsyncClient, db_session
+):
     """GET /regression-cases/manual-intervention pins the response shape."""
     project = make_project()
     db_session.add(project)
@@ -9303,7 +10959,11 @@ async def test_list_recently_closed_extracts_fix_pr_and_recovered_at_and_time_to
         first_seen_at=first_seen,
         fingerprint_to_fix_log=[
             {"fingerprint": "abc", "fix_pr_number": 1111},
-            {"fingerprint": "def", "fix_pr_number": 2222, "recovered_at": recovered_at_str},
+            {
+                "fingerprint": "def",
+                "fix_pr_number": 2222,
+                "recovered_at": recovered_at_str,
+            },
         ],
     )
     db_session.add(case)

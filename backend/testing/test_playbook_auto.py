@@ -1,4 +1,5 @@
 """Tests for automatic playbook entry creation from recurring failure patterns."""
+
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -148,14 +149,22 @@ async def test_duplicate_detection_prevents_recreation(db_session: AsyncSession)
     doc2 = dict(project.design_doc or {})
     auto_keys_2 = [k for k in doc2 if k.startswith("playbook/auto-")]
     # Still only 1 entry (updated in place, not a new key created)
-    assert len(auto_keys_2) == 1, f"Expected 1 auto entry after duplicate check, got {auto_keys_2}"
+    assert len(auto_keys_2) == 1, (
+        f"Expected 1 auto entry after duplicate check, got {auto_keys_2}"
+    )
 
 
 @pytest.mark.asyncio
 async def test_cap_of_five_is_respected(db_session: AsyncSession):
     """Auto-playbook entries are capped at 5 per project; beyond that no new entries are created."""
     # Pre-populate design_doc with 5 existing auto-entries
-    prefilled = {f"playbook/auto-CODE_ERROR-abc{i:03d}": {"content": f"entry {i}", "confirmed_count": 0} for i in range(5)}
+    prefilled = {
+        f"playbook/auto-CODE_ERROR-abc{i:03d}": {
+            "content": f"entry {i}",
+            "confirmed_count": 0,
+        }
+        for i in range(5)
+    }
     project = await _make_project(db_session, design_doc=dict(prefilled))
 
     # 3 failures that would normally trigger a new entry
@@ -177,9 +186,15 @@ async def test_applicable_types_reflect_task_types(db_session: AsyncSession):
     project = await _make_project(db_session)
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
-    await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
-    await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="fix")
-    t3 = await _make_failed_task(db_session, project.id, status_message=common_msg, task_type="create")
+    await _make_failed_task(
+        db_session, project.id, status_message=common_msg, task_type="create"
+    )
+    await _make_failed_task(
+        db_session, project.id, status_message=common_msg, task_type="fix"
+    )
+    t3 = await _make_failed_task(
+        db_session, project.id, status_message=common_msg, task_type="create"
+    )
 
     await _check_recurring_failures(t3, db_session)
     await db_session.flush()
@@ -202,8 +217,12 @@ async def test_old_failures_outside_7_day_window_ignored(db_session: AsyncSessio
 
     common_msg = "CPUS_ALL_REGIONS quota exceeded in zone us-central1"
     # 2 old failures (> 7 days ago)
-    await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
-    await _make_failed_task(db_session, project.id, status_message=common_msg, age_days=8)
+    await _make_failed_task(
+        db_session, project.id, status_message=common_msg, age_days=8
+    )
+    await _make_failed_task(
+        db_session, project.id, status_message=common_msg, age_days=8
+    )
     # 1 recent failure (the current task)
     t3 = await _make_failed_task(db_session, project.id, status_message=common_msg)
 
@@ -227,9 +246,15 @@ async def test_capture_success_creates_entry_after_threshold(db_session: AsyncSe
 
     project = await _make_project(db_session, design_doc={})
     # 2 prior completions of the same type (makes total = 3 with current task)
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
@@ -254,8 +279,12 @@ async def test_capture_success_skips_below_threshold(db_session: AsyncSession):
 
     project = await _make_project(db_session, design_doc={})
     # Only 1 prior completion + current = 2 total (below threshold of 3)
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
@@ -266,7 +295,9 @@ async def test_capture_success_skips_below_threshold(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_capture_success_skips_with_no_prior_completions(db_session: AsyncSession):
+async def test_capture_success_skips_with_no_prior_completions(
+    db_session: AsyncSession,
+):
     """capture_success_pattern returns None when this is the very first task of the type."""
     from app.playbook_learning import capture_success_pattern
 
@@ -283,25 +314,30 @@ async def test_capture_success_updates_existing_entry(db_session: AsyncSession):
     and refreshes content on a second qualifying success of the same (type, scope)."""
     from app.playbook_learning import capture_success_pattern
 
-    project = await _make_project(db_session, design_doc={
-        "playbook/success-fix-medium": {
-            "content": "First-attempt success pattern for fix tasks (1 observation, scope: medium).",
-            "source": "success-pattern",
-            "success_count": 1,
-            "confirmed_count": 2,
-            "applicable_types": ["fix"],
-            "scope": "medium",
-            "scope_distribution": {"medium": 1},
-            "num_files_changed": 3,
-            "tests_added": False,
-            "first_attempt_success": True,
-            "updated_at": _utcnow().isoformat(),
+    project = await _make_project(
+        db_session,
+        design_doc={
+            "playbook/success-fix-medium": {
+                "content": "First-attempt success pattern for fix tasks (1 observation, scope: medium).",
+                "source": "success-pattern",
+                "success_count": 1,
+                "confirmed_count": 2,
+                "applicable_types": ["fix"],
+                "scope": "medium",
+                "scope_distribution": {"medium": 1},
+                "num_files_changed": 3,
+                "tests_added": False,
+                "first_attempt_success": True,
+                "updated_at": _utcnow().isoformat(),
+            },
         },
-    })
+    )
     # 2 prior completions to satisfy noise filter
     await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
     await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
-    task = await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
+    task = await _make_completed_task(
+        db_session, project.id, task_type="fix", scope="medium"
+    )
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
@@ -327,8 +363,10 @@ async def test_capture_success_includes_related_files(db_session: AsyncSession):
     await _make_completed_task(db_session, project.id, task_type="refactor")
     await _make_completed_task(db_session, project.id, task_type="refactor")
     task = await _make_completed_task(
-        db_session, project.id,
-        task_type="refactor", related_files=files,
+        db_session,
+        project.id,
+        task_type="refactor",
+        related_files=files,
     )
 
     key = await capture_success_pattern(task, db_session)
@@ -348,9 +386,15 @@ async def test_capture_success_new_type_without_failures(db_session: AsyncSessio
 
     project = await _make_project(db_session, design_doc={})
     # Simulate a brand-new task type ('migrate') with 3 completions, no failures
-    await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
-    task = await _make_completed_task(db_session, project.id, task_type="migrate", scope="small")
+    await _make_completed_task(
+        db_session, project.id, task_type="migrate", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="migrate", scope="small"
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="migrate", scope="small"
+    )
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
@@ -367,11 +411,18 @@ async def test_capture_success_metadata_fields(db_session: AsyncSession):
 
     project = await _make_project(db_session, design_doc={})
     files = ["backend/app/foo.py", "backend/testing/test_foo.py"]
-    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="medium"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="medium"
+    )
     task = await _make_completed_task(
-        db_session, project.id,
-        task_type="create", scope="medium", related_files=files,
+        db_session,
+        project.id,
+        task_type="create",
+        scope="medium",
+        related_files=files,
     )
 
     key = await capture_success_pattern(task, db_session)
@@ -393,8 +444,12 @@ async def test_capture_success_metadata_detects_tests_dir(db_session: AsyncSessi
 
     project = await _make_project(db_session, design_doc={})
     files = ["backend/tests/test_router.py", "backend/app/foo.py"]
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
     task = await _make_completed_task(
         db_session, project.id, task_type="create", scope="small", related_files=files
     )
@@ -415,15 +470,27 @@ async def test_capture_success_per_scope_key(db_session: AsyncSession):
 
     project = await _make_project(db_session, design_doc={})
     # 2 prior of each scope to satisfy threshold
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="medium"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="medium"
+    )
 
-    task_small = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    task_small = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
     key_small = await capture_success_pattern(task_small, db_session)
 
-    task_medium = await _make_completed_task(db_session, project.id, task_type="create", scope="medium")
+    task_medium = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="medium"
+    )
     key_medium = await capture_success_pattern(task_medium, db_session)
 
     await db_session.flush()
@@ -446,12 +513,16 @@ async def test_capture_success_scope_distribution_accumulates(db_session: AsyncS
     await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
 
     # First success: creates the entry
-    t1 = await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    t1 = await _make_completed_task(
+        db_session, project.id, task_type="fix", scope="small"
+    )
     await capture_success_pattern(t1, db_session)
     await db_session.flush()
 
     # Second success: updates scope_distribution
-    t2 = await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
+    t2 = await _make_completed_task(
+        db_session, project.id, task_type="fix", scope="small"
+    )
     await capture_success_pattern(t2, db_session)
     await db_session.flush()
 
@@ -469,12 +540,19 @@ async def test_capture_success_direction_affinity(db_session: AsyncSession):
     project = await _make_project(db_session, design_doc={})
     files = ["backend/app/foo.py", "backend/app/bar.py", "backend/testing/test_foo.py"]
     dir_id = "dir-abc"
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
     t1 = await _make_completed_task(
-        db_session, project.id,
-        task_type="create", scope="small",
-        related_files=files, direction_id=dir_id,
+        db_session,
+        project.id,
+        task_type="create",
+        scope="small",
+        related_files=files,
+        direction_id=dir_id,
     )
 
     await capture_success_pattern(t1, db_session)
@@ -487,9 +565,12 @@ async def test_capture_success_direction_affinity(db_session: AsyncSession):
 
     # Second success for the same direction increments its count
     t2 = await _make_completed_task(
-        db_session, project.id,
-        task_type="create", scope="small",
-        related_files=files, direction_id=dir_id,
+        db_session,
+        project.id,
+        task_type="create",
+        scope="small",
+        related_files=files,
+        direction_id=dir_id,
     )
     await capture_success_pattern(t2, db_session)
     await db_session.flush()
@@ -538,7 +619,9 @@ def test_summarize_recent_successes_omitted_when_only_singletons():
     from app.playbook_learning import summarize_recent_successes
 
     doc = {
-        "playbook/success-create-small": _make_success_entry(1, file_type_distribution={"py": 1}),
+        "playbook/success-create-small": _make_success_entry(
+            1, file_type_distribution={"py": 1}
+        ),
     }
     assert summarize_recent_successes(doc, "create", None, "small") is None
 
@@ -548,7 +631,9 @@ def test_summarize_recent_successes_omitted_for_other_task_type():
     from app.playbook_learning import summarize_recent_successes
 
     doc = {
-        "playbook/success-fix-small": _make_success_entry(5, file_type_distribution={"py": 5}),
+        "playbook/success-fix-small": _make_success_entry(
+            5, file_type_distribution={"py": 5}
+        ),
     }
     assert summarize_recent_successes(doc, "create", None, "small") is None
 
@@ -645,7 +730,9 @@ def test_summarize_recent_successes_enforces_char_budget():
     assert len(out) <= 200, f"Output exceeds budget: {len(out)} chars"
     # Every line must be either the header or a complete bullet — no partial lines.
     for ln in out.splitlines():
-        assert ln.startswith("## ") or ln.startswith("- "), f"Truncated mid-line: {ln!r}"
+        assert ln.startswith("## ") or ln.startswith("- "), (
+            f"Truncated mid-line: {ln!r}"
+        )
 
 
 def test_summarize_recent_successes_returns_none_when_budget_too_small():
@@ -658,12 +745,17 @@ def test_summarize_recent_successes_returns_none_when_budget_too_small():
         ),
     }
     # 10 chars cannot fit even the header
-    assert summarize_recent_successes(doc, "create", None, "small", char_budget=10) is None
+    assert (
+        summarize_recent_successes(doc, "create", None, "small", char_budget=10) is None
+    )
 
 
 def test_summarize_recent_successes_task_type_agnostic():
     """Helper itself does not gate by task_type — call sites enforce the allowlist."""
-    from app.playbook_learning import summarize_recent_successes, RECENT_SUCCESSES_TASK_TYPES
+    from app.playbook_learning import (
+        summarize_recent_successes,
+        RECENT_SUCCESSES_TASK_TYPES,
+    )
 
     # Non-allowlisted type 'qa'; helper still surfaces matching entries.
     doc = {
@@ -701,10 +793,18 @@ def test_old_unconfirmed_entry_gets_age_penalty():
         except (ValueError, TypeError):
             return 0
 
-    assert _age_penalty(old_date, confirmed=0) == 1, "Old entry with no confirmations should get penalty"
-    assert _age_penalty(old_date, confirmed=2) == 1, "Old entry with 2 confirmations should get penalty"
-    assert _age_penalty(old_date, confirmed=3) == 0, "Old entry with 3+ confirmations should NOT get penalty"
-    assert _age_penalty(recent_date, confirmed=0) == 0, "Recent entry should NOT get penalty"
+    assert _age_penalty(old_date, confirmed=0) == 1, (
+        "Old entry with no confirmations should get penalty"
+    )
+    assert _age_penalty(old_date, confirmed=2) == 1, (
+        "Old entry with 2 confirmations should get penalty"
+    )
+    assert _age_penalty(old_date, confirmed=3) == 0, (
+        "Old entry with 3+ confirmations should NOT get penalty"
+    )
+    assert _age_penalty(recent_date, confirmed=0) == 0, (
+        "Recent entry should NOT get penalty"
+    )
 
 
 def test_stale_file_refs_penalty():
@@ -715,6 +815,7 @@ def test_stale_file_refs_penalty():
 
     def stale_penalty(v):
         return 1 if v.get("stale_file_refs") else 0
+
     assert stale_penalty(stale_entry) == 1
     assert stale_penalty(clean_entry) == 0
     assert stale_penalty(no_flag_entry) == 0
@@ -821,7 +922,9 @@ def test_check_and_flag_stale_refs_no_file_paths_untouched(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _make_doc_with_size(num_entries: int, confirmed_counts: list[int] | None = None) -> dict:
+def _make_doc_with_size(
+    num_entries: int, confirmed_counts: list[int] | None = None
+) -> dict:
     """Build a doc dict whose playbook entries collectively approach *num_entries* * ~500 bytes."""
     confirmed_counts = confirmed_counts or [0] * num_entries
     doc: dict = {}
@@ -839,9 +942,21 @@ def test_archive_least_useful_entry_removes_and_archives():
     from app.playbook_learning import _archive_least_useful_entry
 
     doc = {
-        "playbook/a": {"content": "tip a", "confirmed_count": 5, "updated_at": _utcnow().isoformat()},
-        "playbook/b": {"content": "tip b", "confirmed_count": 0, "updated_at": _utcnow().isoformat()},
-        "playbook/c": {"content": "tip c", "confirmed_count": 3, "updated_at": _utcnow().isoformat()},
+        "playbook/a": {
+            "content": "tip a",
+            "confirmed_count": 5,
+            "updated_at": _utcnow().isoformat(),
+        },
+        "playbook/b": {
+            "content": "tip b",
+            "confirmed_count": 0,
+            "updated_at": _utcnow().isoformat(),
+        },
+        "playbook/c": {
+            "content": "tip c",
+            "confirmed_count": 3,
+            "updated_at": _utcnow().isoformat(),
+        },
     }
     result = _archive_least_useful_entry(doc)
 
@@ -860,12 +975,16 @@ def test_archive_prefers_stale_entries():
 
     doc = {
         "playbook/a": {
-            "content": "tip a", "confirmed_count": 0,
-            "stale_file_refs": False, "updated_at": _utcnow().isoformat()
+            "content": "tip a",
+            "confirmed_count": 0,
+            "stale_file_refs": False,
+            "updated_at": _utcnow().isoformat(),
         },
         "playbook/b": {
-            "content": "tip b", "confirmed_count": 5,
-            "stale_file_refs": True, "updated_at": _utcnow().isoformat()
+            "content": "tip b",
+            "confirmed_count": 5,
+            "stale_file_refs": True,
+            "updated_at": _utcnow().isoformat(),
         },
     }
     result = _archive_least_useful_entry(doc)
@@ -883,11 +1002,13 @@ def test_archive_prefers_older_entries_within_same_tier():
 
     doc = {
         "playbook/old": {
-            "content": "old tip", "confirmed_count": 0,
+            "content": "old tip",
+            "confirmed_count": 0,
             "updated_at": old_date,
         },
         "playbook/recent": {
-            "content": "recent tip", "confirmed_count": 0,
+            "content": "recent tip",
+            "confirmed_count": 0,
             "updated_at": recent_date,
         },
     }
@@ -903,7 +1024,10 @@ def test_archive_caps_playbook_archive_length():
     Without this cap the archive grows monotonically — a single project
     observed 517 entries / 351 KB of archive, which bloated the design_doc
     payload past the agent budget and caused silent pre-claim death."""
-    from app.playbook_learning import _archive_least_useful_entry, _PLAYBOOK_ARCHIVE_MAX_DEFAULT
+    from app.playbook_learning import (
+        _archive_least_useful_entry,
+        _PLAYBOOK_ARCHIVE_MAX_DEFAULT,
+    )
     from app.shared_state import runtime_config
 
     # Pre-populate archive with cap+5 entries so the next archival exceeds the cap
@@ -942,13 +1066,12 @@ def test_archive_cap_respects_runtime_config_override():
 
     runtime_config["playbook_archive_max"] = 3
     try:
-        existing_archive = [
-            {"_archived_key": f"old-{i}"} for i in range(5)
-        ]
+        existing_archive = [{"_archived_key": f"old-{i}"} for i in range(5)]
         doc = {
             "playbook_archive": existing_archive,
             "playbook/new": {
-                "content": "least useful", "confirmed_count": 0,
+                "content": "least useful",
+                "confirmed_count": 0,
                 "updated_at": _utcnow().isoformat(),
             },
         }
@@ -989,7 +1112,9 @@ def test_archive_uses_rate_over_raw_count_when_enough_observations():
     result = _archive_least_useful_entry(doc)
     # The low-performer (10% success rate on 10 follows) archives before the
     # 5-raw-confirmation entry, because -0.1 > -5 in the sort.
-    assert "playbook/low-performer" not in result, "Low-success-rate entry should be archived first"
+    assert "playbook/low-performer" not in result, (
+        "Low-success-rate entry should be archived first"
+    )
     assert "playbook/well-confirmed" in result
     archive = result.get("playbook_archive", [])
     assert archive[0]["_archived_key"] == "playbook/low-performer"
@@ -1311,7 +1436,10 @@ def test_count_idle_auto_retired_within_window():
 
 def test_maybe_archive_for_capacity_triggers_at_threshold():
     """maybe_archive_for_capacity archives when combined size exceeds 25KB."""
-    from app.playbook_learning import maybe_archive_for_capacity, _PLAYBOOK_CAPACITY_BYTES
+    from app.playbook_learning import (
+        maybe_archive_for_capacity,
+        _PLAYBOOK_CAPACITY_BYTES,
+    )
 
     # Build a doc just below capacity, then add a large entry estimate
     doc: dict = {}
@@ -1326,6 +1454,7 @@ def test_maybe_archive_for_capacity_triggers_at_threshold():
         }
 
     from app.playbook_learning import _playbook_size_bytes
+
     current_size = _playbook_size_bytes(doc)
 
     # If already over capacity, archiving should trigger
@@ -1380,13 +1509,22 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
 
     project = await _make_project(db_session, design_doc=dict(existing_doc))
     # Create 3 completed tasks of the same type to satisfy the noise filter (>= 3 completions).
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
 
     from app.playbook_learning import _playbook_size_bytes
+
     size_before = _playbook_size_bytes(project.design_doc)
-    assert size_before > _PLAYBOOK_CAPACITY_BYTES, "Doc must be over capacity before the test"
+    assert size_before > _PLAYBOOK_CAPACITY_BYTES, (
+        "Doc must be over capacity before the test"
+    )
 
     key = await capture_success_pattern(task, db_session)
     await db_session.flush()
@@ -1394,12 +1532,15 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
     assert key == "success-create-small", "New entry should have been created"
     doc = project.design_doc or {}
     archive = doc.get("playbook_archive", [])
-    assert len(archive) >= 1, "At least one entry should have been archived for capacity"
+    assert len(archive) >= 1, (
+        "At least one entry should have been archived for capacity"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests for compute_review_effectiveness
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_review_issue(desc: str, severity: str = "MAJOR") -> dict:
     return {"description": desc, "severity": severity}
@@ -1435,7 +1576,9 @@ async def _make_task_with_reviews(
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_returns_none_below_sample_size(db_session: AsyncSession):
+async def test_compute_review_effectiveness_returns_none_below_sample_size(
+    db_session: AsyncSession,
+):
     """Returns None when either window has fewer than 10 tasks with review history."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1458,7 +1601,9 @@ async def test_compute_review_effectiveness_returns_none_below_sample_size(db_se
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_detects_decreasing_trend(db_session: AsyncSession):
+async def test_compute_review_effectiveness_detects_decreasing_trend(
+    db_session: AsyncSession,
+):
     """Detects a decreasing trend when a category drops by >= 5pp between windows."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1468,8 +1613,10 @@ async def test_compute_review_effectiveness_detects_decreasing_trend(db_session:
     prev_tasks = []
     for _ in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function", "no error handling"]
+            db_session,
+            project.id,
+            age_days=20,
+            issue_descs=["missing test coverage for new function", "no error handling"],
         )
         prev_tasks.append(t)
 
@@ -1477,14 +1624,15 @@ async def test_compute_review_effectiveness_detects_decreasing_trend(db_session:
     curr_tasks = []
     for _ in range(2):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=5,
+            issue_descs=["missing test coverage for new function"],
         )
         curr_tasks.append(t)
     for _ in range(10):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["no error handling"]
+            db_session, project.id, age_days=5, issue_descs=["no error handling"]
         )
         curr_tasks.append(t)
 
@@ -1499,7 +1647,9 @@ async def test_compute_review_effectiveness_detects_decreasing_trend(db_session:
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_stores_in_design_doc(db_session: AsyncSession):
+async def test_compute_review_effectiveness_stores_in_design_doc(
+    db_session: AsyncSession,
+):
     """Result is persisted in project.design_doc['review_effectiveness']."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1509,14 +1659,18 @@ async def test_compute_review_effectiveness_stores_in_design_doc(db_session: Asy
     all_tasks = []
     for _ in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=20,
+            issue_descs=["missing test coverage for new function"],
         )
         all_tasks.append(t)
     for _ in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=5,
+            issue_descs=["missing test coverage for new function"],
         )
         all_tasks.append(t)
 
@@ -1532,7 +1686,9 @@ async def test_compute_review_effectiveness_stores_in_design_doc(db_session: Asy
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_rate_history_grows(db_session: AsyncSession):
+async def test_compute_review_effectiveness_rate_history_grows(
+    db_session: AsyncSession,
+):
     """rate_history accumulates a new entry on each new window computation."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1540,15 +1696,23 @@ async def test_compute_review_effectiveness_rate_history_grows(db_session: Async
 
     all_tasks = []
     for _ in range(12):
-        all_tasks.append(await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function"]
-        ))
+        all_tasks.append(
+            await _make_task_with_reviews(
+                db_session,
+                project.id,
+                age_days=20,
+                issue_descs=["missing test coverage for new function"],
+            )
+        )
     for _ in range(12):
-        all_tasks.append(await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
-        ))
+        all_tasks.append(
+            await _make_task_with_reviews(
+                db_session,
+                project.id,
+                age_days=5,
+                issue_descs=["missing test coverage for new function"],
+            )
+        )
 
     # First computation — creates the first history entry
     result1 = await compute_review_effectiveness(project.id, db_session, all_tasks)
@@ -1559,7 +1723,9 @@ async def test_compute_review_effectiveness_rate_history_grows(db_session: Async
 
     # Simulate a new window by clearing computed_at to force is_new_window=True
     doc = dict(project.design_doc or {})
-    doc["review_effectiveness"]["computed_at"] = (_utcnow() - timedelta(days=15)).isoformat()
+    doc["review_effectiveness"]["computed_at"] = (
+        _utcnow() - timedelta(days=15)
+    ).isoformat()
     project.design_doc = doc
     await db_session.flush()
 
@@ -1576,28 +1742,39 @@ async def test_compute_review_effectiveness_persistent_issues(db_session: AsyncS
     from app.playbook_learning import compute_review_effectiveness
 
     # Pre-seed two historical high-rate windows
-    project = await _make_project(db_session, design_doc={
-        "review_effectiveness": {
-            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
-            "categories": {
-                "test-coverage": {"rate_history": [0.35, 0.30]},
+    project = await _make_project(
+        db_session,
+        design_doc={
+            "review_effectiveness": {
+                "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+                "categories": {
+                    "test-coverage": {"rate_history": [0.35, 0.30]},
+                },
+                "persistent_issues": [],
             },
-            "persistent_issues": [],
         },
-    })
+    )
 
     # 12 tasks in each window, all with test-coverage issues (keeps rate high)
     all_tasks = []
     for _ in range(12):
-        all_tasks.append(await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function"]
-        ))
+        all_tasks.append(
+            await _make_task_with_reviews(
+                db_session,
+                project.id,
+                age_days=20,
+                issue_descs=["missing test coverage for new function"],
+            )
+        )
     for _ in range(12):
-        all_tasks.append(await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
-        ))
+        all_tasks.append(
+            await _make_task_with_reviews(
+                db_session,
+                project.id,
+                age_days=5,
+                issue_descs=["missing test coverage for new function"],
+            )
+        )
 
     result = await compute_review_effectiveness(project.id, db_session, all_tasks)
     await db_session.flush()
@@ -1611,7 +1788,9 @@ async def test_compute_review_effectiveness_persistent_issues(db_session: AsyncS
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_recurrence_rate_basic(db_session: AsyncSession):
+async def test_compute_review_effectiveness_recurrence_rate_basic(
+    db_session: AsyncSession,
+):
     """recurrence_rate measures fraction of rejected tasks with each category."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1623,22 +1802,32 @@ async def test_compute_review_effectiveness_recurrence_rate_basic(db_session: As
     all_tasks = []
     for i in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=20,
+            issue_descs=["missing test coverage for new function"],
         )
         if i < 6:
-            t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 2}}
+            t.context = {
+                **(t.context or {}),
+                "_first_attempt_rejection_categories": {"test-coverage": 2},
+            }
         all_tasks.append(t)
 
     # Current window (last 14 days): 12 tasks with review history.
     # Give 4 out of 12 a test-coverage rejection.
     for i in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=5,
+            issue_descs=["missing test coverage for new function"],
         )
         if i < 4:
-            t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 1}}
+            t.context = {
+                **(t.context or {}),
+                "_first_attempt_rejection_categories": {"test-coverage": 1},
+            }
         all_tasks.append(t)
 
     await db_session.flush()
@@ -1655,7 +1844,9 @@ async def test_compute_review_effectiveness_recurrence_rate_basic(db_session: As
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_recurrence_history_grows(db_session: AsyncSession):
+async def test_compute_review_effectiveness_recurrence_history_grows(
+    db_session: AsyncSession,
+):
     """recurrence_history accumulates a new entry on each new window, capped at 5."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1664,17 +1855,27 @@ async def test_compute_review_effectiveness_recurrence_history_grows(db_session:
     all_tasks = []
     for _ in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=20,
+            issue_descs=["missing test coverage for new function"],
         )
-        t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 1}}
+        t.context = {
+            **(t.context or {}),
+            "_first_attempt_rejection_categories": {"test-coverage": 1},
+        }
         all_tasks.append(t)
     for _ in range(12):
         t = await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
+            db_session,
+            project.id,
+            age_days=5,
+            issue_descs=["missing test coverage for new function"],
         )
-        t.context = {**(t.context or {}), "_first_attempt_rejection_categories": {"test-coverage": 1}}
+        t.context = {
+            **(t.context or {}),
+            "_first_attempt_rejection_categories": {"test-coverage": 1},
+        }
         all_tasks.append(t)
 
     await db_session.flush()
@@ -1688,7 +1889,9 @@ async def test_compute_review_effectiveness_recurrence_history_grows(db_session:
 
     # Simulate a new window by backdating computed_at
     doc = dict(project.design_doc or {})
-    doc["review_effectiveness"]["computed_at"] = (_utcnow() - timedelta(days=15)).isoformat()
+    doc["review_effectiveness"]["computed_at"] = (
+        _utcnow() - timedelta(days=15)
+    ).isoformat()
     project.design_doc = doc
     await db_session.flush()
 
@@ -1700,7 +1903,9 @@ async def test_compute_review_effectiveness_recurrence_history_grows(db_session:
 
 
 @pytest.mark.asyncio
-async def test_compute_review_effectiveness_recurrence_none_when_no_rejections(db_session: AsyncSession):
+async def test_compute_review_effectiveness_recurrence_none_when_no_rejections(
+    db_session: AsyncSession,
+):
     """recurrence_rate is None when no tasks have _first_attempt_rejection_categories."""
     from app.playbook_learning import compute_review_effectiveness
 
@@ -1709,15 +1914,23 @@ async def test_compute_review_effectiveness_recurrence_none_when_no_rejections(d
     # Tasks have review history (to pass sample threshold) but no rejection categories
     all_tasks = []
     for _ in range(12):
-        all_tasks.append(await _make_task_with_reviews(
-            db_session, project.id, age_days=20,
-            issue_descs=["missing test coverage for new function"]
-        ))
+        all_tasks.append(
+            await _make_task_with_reviews(
+                db_session,
+                project.id,
+                age_days=20,
+                issue_descs=["missing test coverage for new function"],
+            )
+        )
     for _ in range(12):
-        all_tasks.append(await _make_task_with_reviews(
-            db_session, project.id, age_days=5,
-            issue_descs=["missing test coverage for new function"]
-        ))
+        all_tasks.append(
+            await _make_task_with_reviews(
+                db_session,
+                project.id,
+                age_days=5,
+                issue_descs=["missing test coverage for new function"],
+            )
+        )
 
     result = await compute_review_effectiveness(project.id, db_session, all_tasks)
     assert result is not None
@@ -1741,7 +1954,9 @@ def test_update_module_feedback_profiles_creates_new_entries():
     doc: dict = {}
     related_files = ["backend/app/orchestrator.py", "backend/app/models.py"]
     buckets = {
-        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+        "test-coverage": [
+            {"desc": "missing test", "severity": "MAJOR", "iteration": 1}
+        ],
         "error-handling": [
             {"desc": "unhandled exception", "severity": "MINOR", "iteration": 2},
             {"desc": "no guard clause", "severity": "MINOR", "iteration": 2},
@@ -1777,7 +1992,9 @@ def test_update_module_feedback_profiles_accumulates_counts():
         }
     }
     buckets = {
-        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+        "test-coverage": [
+            {"desc": "missing test", "severity": "MAJOR", "iteration": 1}
+        ],
     }
 
     _update_module_feedback_profiles(doc, ["backend/app/orchestrator.py"], buckets)
@@ -1798,7 +2015,9 @@ def test_update_module_feedback_profiles_decays_stale_counts():
     # 14-day grace + 14-day half-life = 28 days → existing counts halve.
     stale = (
         _utcnow()
-        - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS)
+        - timedelta(
+            days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS
+        )
     ).isoformat()
     doc: dict = {
         "module_feedback": {
@@ -1811,7 +2030,9 @@ def test_update_module_feedback_profiles_decays_stale_counts():
         }
     }
     buckets = {
-        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+        "test-coverage": [
+            {"desc": "missing test", "severity": "MAJOR", "iteration": 1}
+        ],
     }
 
     _update_module_feedback_profiles(doc, ["backend/app/orchestrator.py"], buckets)
@@ -1840,7 +2061,9 @@ def test_update_module_feedback_profiles_drops_categories_that_decay_to_zero():
         }
     }
     buckets = {
-        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 1}],
+        "test-coverage": [
+            {"desc": "missing test", "severity": "MAJOR", "iteration": 1}
+        ],
     }
 
     _update_module_feedback_profiles(doc, ["backend/app/orchestrator.py"], buckets)
@@ -1854,7 +2077,10 @@ def test_update_module_feedback_profiles_drops_categories_that_decay_to_zero():
 
 def test_update_module_feedback_profiles_evicts_oldest_when_over_cap():
     """When the module cap is exceeded the oldest-updated entry is evicted."""
-    from app.playbook_learning import _update_module_feedback_profiles, _MODULE_FEEDBACK_MAX_ENTRIES
+    from app.playbook_learning import (
+        _update_module_feedback_profiles,
+        _MODULE_FEEDBACK_MAX_ENTRIES,
+    )
 
     # Fill up to the cap with stale entries
     existing = {
@@ -1878,7 +2104,9 @@ def test_update_module_feedback_profiles_noop_on_empty_inputs():
     from app.playbook_learning import _update_module_feedback_profiles
 
     doc: dict = {}
-    _update_module_feedback_profiles(doc, [], {"test-coverage": [{"desc": "x", "severity": "MINOR", "iteration": 0}]})
+    _update_module_feedback_profiles(
+        doc, [], {"test-coverage": [{"desc": "x", "severity": "MINOR", "iteration": 0}]}
+    )
     assert "module_feedback" not in doc
 
     _update_module_feedback_profiles(doc, ["backend/app/models.py"], {})
@@ -1886,7 +2114,9 @@ def test_update_module_feedback_profiles_noop_on_empty_inputs():
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_updates_module_profiles(db_session: AsyncSession):
+async def test_extract_review_feedback_updates_module_profiles(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook also persists per-module profiles in design_doc."""
     from app.playbook_learning import extract_review_feedback_to_playbook
 
@@ -1922,7 +2152,9 @@ async def test_extract_review_feedback_updates_module_profiles(db_session: Async
     db_session.add(task)
     await db_session.flush()
 
-    await extract_review_feedback_to_playbook(task, review_loop, pr_number=42, original_task_type="create", session=db_session)
+    await extract_review_feedback_to_playbook(
+        task, review_loop, pr_number=42, original_task_type="create", session=db_session
+    )
     await db_session.flush()
 
     doc = project.design_doc or {}
@@ -1977,8 +2209,8 @@ def test_extract_failure_signature_innermost_frame_wins():
         "AttributeError: 'NoneType' object has no attribute 'zone'\n"
     )
     sig = _extract_failure_signature("CODE_ERROR", error)
-    assert "compute" in sig       # innermost frame
-    assert "main" not in sig      # outer frame should not appear
+    assert "compute" in sig  # innermost frame
+    assert "main" not in sig  # outer frame should not appear
 
 
 def test_extract_failure_module_returns_none_when_no_frame():
@@ -2014,13 +2246,19 @@ async def test_auto_playbook_stores_failure_module_and_references_in_content(
 
     # Pre-seed t1 and t2 with the matching signature so the count reaches 3
     sig = _extract_failure_signature("CODE_ERROR", error_with_traceback)
-    t1 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t1 = await _make_failed_task(
+        db_session, project.id, status_message=error_with_traceback
+    )
     t1.context = {"_failure_signature": sig}
-    t2 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t2 = await _make_failed_task(
+        db_session, project.id, status_message=error_with_traceback
+    )
     t2.context = {"_failure_signature": sig}
     await db_session.flush()
 
-    t3 = await _make_failed_task(db_session, project.id, status_message=error_with_traceback)
+    t3 = await _make_failed_task(
+        db_session, project.id, status_message=error_with_traceback
+    )
     await _maybe_auto_playbook(t3, "CODE_ERROR", error_with_traceback, db_session)
     await db_session.flush()
 
@@ -2043,11 +2281,16 @@ async def test_auto_playbook_stores_failure_module_and_references_in_content(
 
 def test_accumulate_direction_first_attempt_creates_entry():
     """Creates a direction tally entry with counts from buckets."""
-    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+    from app.playbook_learning import (
+        _accumulate_direction_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
 
     doc: dict = {}
     buckets = {
-        "test-coverage": [{"desc": "missing test", "severity": "MAJOR", "iteration": 0}],
+        "test-coverage": [
+            {"desc": "missing test", "severity": "MAJOR", "iteration": 0}
+        ],
         "style-conventions": [
             {"desc": "wrong naming", "severity": "MINOR", "iteration": 0},
             {"desc": "bad indent", "severity": "MINOR", "iteration": 0},
@@ -2065,7 +2308,10 @@ def test_accumulate_direction_first_attempt_creates_entry():
 
 def test_accumulate_direction_first_attempt_accumulates_across_calls():
     """Repeated calls for the same direction accumulate counts."""
-    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+    from app.playbook_learning import (
+        _accumulate_direction_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
 
     doc: dict = {}
     buckets = {"test-coverage": [{"desc": "x", "severity": "MAJOR", "iteration": 0}]}
@@ -2080,7 +2326,10 @@ def test_accumulate_direction_first_attempt_accumulates_across_calls():
 
 def test_accumulate_direction_first_attempt_decays_old_counts():
     """Stale counts past the grace window decay exponentially before new counts accumulate."""
-    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+    from app.playbook_learning import (
+        _accumulate_direction_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
 
     stale_last = (_utcnow() - timedelta(days=60)).isoformat()
     doc: dict = {
@@ -2103,7 +2352,10 @@ def test_accumulate_direction_first_attempt_decays_old_counts():
 
 def test_accumulate_direction_first_attempt_noop_on_empty_buckets():
     """No changes when buckets are empty."""
-    from app.playbook_learning import _accumulate_direction_first_attempt, _DIRECTION_FIRST_ATTEMPT_KEY
+    from app.playbook_learning import (
+        _accumulate_direction_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
 
     doc: dict = {}
     _accumulate_direction_first_attempt(doc, "dir-xyz", {})
@@ -2133,7 +2385,9 @@ def test_maybe_auto_playbook_creates_entry_at_threshold():
             }
         }
     }
-    created = _maybe_auto_playbook_from_first_attempt(doc, "dir-abc123", "create", "task-id-1")
+    created = _maybe_auto_playbook_from_first_attempt(
+        doc, "dir-abc123", "create", "task-id-1"
+    )
 
     assert len(created) == 1
     key = created[0]
@@ -2163,7 +2417,9 @@ def test_maybe_auto_playbook_skips_below_threshold():
             }
         }
     }
-    created = _maybe_auto_playbook_from_first_attempt(doc, "dir-abc", "create", "task-id")
+    created = _maybe_auto_playbook_from_first_attempt(
+        doc, "dir-abc", "create", "task-id"
+    )
     assert created == []
 
 
@@ -2190,7 +2446,9 @@ def test_maybe_auto_playbook_deduplicates():
         },
         existing_key: {"content": "already exists", "source": "first-attempt-pattern"},
     }
-    created = _maybe_auto_playbook_from_first_attempt(doc, direction_key, "create", "task-id")
+    created = _maybe_auto_playbook_from_first_attempt(
+        doc, direction_key, "create", "task-id"
+    )
     assert created == []
 
 
@@ -2200,7 +2458,9 @@ def test_maybe_auto_playbook_deduplicates():
 
 
 @pytest.mark.asyncio
-async def test_maybe_auto_playbook_direction_scope_when_single_direction(db_session: AsyncSession):
+async def test_maybe_auto_playbook_direction_scope_when_single_direction(
+    db_session: AsyncSession,
+):
     """_maybe_auto_playbook marks scope=direction when all tasks in pattern share same direction."""
     from app.playbook_learning import _maybe_auto_playbook
 
@@ -2246,7 +2506,8 @@ async def test_maybe_auto_playbook_direction_scope_when_single_direction(db_sess
     await db_session.flush()
 
     key = await _maybe_auto_playbook(
-        t3, "PROVISION_FAILURE",
+        t3,
+        "PROVISION_FAILURE",
         "vm failed to start after provision attempt",
         db_session,
     )
@@ -2260,7 +2521,9 @@ async def test_maybe_auto_playbook_direction_scope_when_single_direction(db_sess
 
 
 @pytest.mark.asyncio
-async def test_maybe_auto_playbook_universal_scope_when_multiple_directions(db_session: AsyncSession):
+async def test_maybe_auto_playbook_universal_scope_when_multiple_directions(
+    db_session: AsyncSession,
+):
     """_maybe_auto_playbook marks scope=universal when tasks span multiple directions."""
     from app.playbook_learning import _maybe_auto_playbook
 
@@ -2302,7 +2565,8 @@ async def test_maybe_auto_playbook_universal_scope_when_multiple_directions(db_s
     await db_session.flush()
 
     key = await _maybe_auto_playbook(
-        t3, "PROVISION_FAILURE",
+        t3,
+        "PROVISION_FAILURE",
         "vm failed to start after provision attempt",
         db_session,
     )
@@ -2321,16 +2585,24 @@ async def test_maybe_auto_playbook_universal_scope_when_multiple_directions(db_s
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_accumulates_on_first_iteration(db_session: AsyncSession):
+async def test_extract_review_feedback_accumulates_on_first_iteration(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook accumulates direction data on iteration == 1."""
-    from app.playbook_learning import extract_review_feedback_to_playbook, _DIRECTION_FIRST_ATTEMPT_KEY
+    from app.playbook_learning import (
+        extract_review_feedback_to_playbook,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
 
     project = await _make_project(db_session, design_doc={})
     review_history = [
         {
             "iteration": 0,
             "issues": [
-                {"description": "missing unit tests for the handler", "severity": "MAJOR"},
+                {
+                    "description": "missing unit tests for the handler",
+                    "severity": "MAJOR",
+                },
                 {"description": "no test coverage for edge cases", "severity": "MINOR"},
             ],
         },
@@ -2357,10 +2629,14 @@ async def test_extract_review_feedback_accumulates_on_first_iteration(db_session
 
     # No full playbook entry created for iteration < 3
     review_keys = [k for k in doc if k.startswith("playbook/review-")]
-    assert review_keys == [], f"Should not create review-extracted entries at iteration 1, got {review_keys}"
+    assert review_keys == [], (
+        f"Should not create review-extracted entries at iteration 1, got {review_keys}"
+    )
 
     # Direction tally was accumulated
-    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc, "direction_first_attempt_feedback should be written"
+    assert _DIRECTION_FIRST_ATTEMPT_KEY in doc, (
+        "direction_first_attempt_feedback should be written"
+    )
     tally = doc[_DIRECTION_FIRST_ATTEMPT_KEY].get("dir-cafebabe-1234")
     assert tally is not None
     assert tally.get("test-coverage", 0) >= 1
@@ -2368,9 +2644,14 @@ async def test_extract_review_feedback_accumulates_on_first_iteration(db_session
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_no_first_attempt_on_empty_history(db_session: AsyncSession):
+async def test_extract_review_feedback_no_first_attempt_on_empty_history(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook returns [] with no review_history."""
-    from app.playbook_learning import extract_review_feedback_to_playbook, _DIRECTION_FIRST_ATTEMPT_KEY
+    from app.playbook_learning import (
+        extract_review_feedback_to_playbook,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+    )
 
     project = await _make_project(db_session, design_doc={})
     review_loop = {"iteration": 1, "review_history": []}
@@ -2393,7 +2674,9 @@ async def test_extract_review_feedback_no_first_attempt_on_empty_history(db_sess
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: AsyncSession):
+async def test_extract_review_feedback_auto_playbook_at_threshold(
+    db_session: AsyncSession,
+):
     """Auto-generates a first-attempt-pattern entry when direction tally hits the threshold."""
     from app.playbook_learning import (
         extract_review_feedback_to_playbook,
@@ -2404,15 +2687,18 @@ async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: As
     direction_id = "dir-deadbeef-5678"
     # Pre-populate the tally so the next call pushes test-coverage over the threshold
     pre_count = _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD - 1
-    project = await _make_project(db_session, design_doc={
-        _DIRECTION_FIRST_ATTEMPT_KEY: {
-            direction_id: {
-                "test-coverage": pre_count,
-                "total": pre_count,
-                "last_updated": _utcnow().isoformat(),
+    project = await _make_project(
+        db_session,
+        design_doc={
+            _DIRECTION_FIRST_ATTEMPT_KEY: {
+                direction_id: {
+                    "test-coverage": pre_count,
+                    "total": pre_count,
+                    "last_updated": _utcnow().isoformat(),
+                }
             }
-        }
-    })
+        },
+    )
     review_history = [
         {
             "iteration": 0,
@@ -2433,7 +2719,11 @@ async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: As
     await db_session.flush()
 
     keys = await extract_review_feedback_to_playbook(
-        task, review_loop, pr_number=100, original_task_type="create", session=db_session
+        task,
+        review_loop,
+        pr_number=100,
+        original_task_type="create",
+        session=db_session,
     )
     await db_session.flush()
 
@@ -2449,7 +2739,9 @@ async def test_extract_review_feedback_auto_playbook_at_threshold(db_session: As
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_session: AsyncSession):
+async def test_extract_review_feedback_still_creates_entries_at_3_plus(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook still creates review-extracted entries at iteration >= 3."""
     from app.playbook_learning import extract_review_feedback_to_playbook
 
@@ -2490,7 +2782,9 @@ async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_sessio
 
     doc = project.design_doc or {}
     review_keys = [k for k in doc if k.startswith("playbook/review-")]
-    assert len(review_keys) >= 1, "Should create at least 1 review-extracted entry at iteration 3"
+    assert len(review_keys) >= 1, (
+        "Should create at least 1 review-extracted entry at iteration 3"
+    )
     assert any("review-test-coverage" in k for k in review_keys)
 
 
@@ -2500,7 +2794,9 @@ async def test_extract_review_feedback_still_creates_entries_at_3_plus(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_module_scope_when_related_files_present(db_session: AsyncSession):
+async def test_extract_review_feedback_module_scope_when_related_files_present(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook sets scope=module and stores related_files when present."""
     from app.playbook_learning import extract_review_feedback_to_playbook
 
@@ -2510,12 +2806,18 @@ async def test_extract_review_feedback_module_scope_when_related_files_present(d
         {
             "iteration": 1,
             "issues": [
-                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {
+                    "description": "missing test coverage for new function",
+                    "severity": "MAJOR",
+                },
                 {"description": "no unit test for edge case", "severity": "MINOR"},
                 {"description": "add test for error path", "severity": "MAJOR"},
             ],
         },
-        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {
+            "iteration": 2,
+            "issues": [{"description": "still missing tests", "severity": "MAJOR"}],
+        },
         {"iteration": 3, "issues": []},
     ]
     review_loop = {"iteration": 3, "review_history": review_history}
@@ -2543,13 +2845,17 @@ async def test_extract_review_feedback_module_scope_when_related_files_present(d
         if not key.startswith("review-"):
             continue  # skip first-attempt-pattern keys; scope only applies to review-extracted
         entry = doc[f"playbook/{key}"]
-        assert entry.get("scope") == "module", f"Expected module scope, got {entry.get('scope')}"
+        assert entry.get("scope") == "module", (
+            f"Expected module scope, got {entry.get('scope')}"
+        )
         assert "backend/app/routes.py" in entry.get("related_files", [])
         assert entry.get("learned_from_direction") == direction_id
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_universal_scope_when_no_related_files(db_session: AsyncSession):
+async def test_extract_review_feedback_universal_scope_when_no_related_files(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook sets scope=universal when no related_files."""
     from app.playbook_learning import extract_review_feedback_to_playbook
 
@@ -2558,12 +2864,18 @@ async def test_extract_review_feedback_universal_scope_when_no_related_files(db_
         {
             "iteration": 1,
             "issues": [
-                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {
+                    "description": "missing test coverage for new function",
+                    "severity": "MAJOR",
+                },
                 {"description": "no unit test for edge case", "severity": "MINOR"},
                 {"description": "add test for error path", "severity": "MAJOR"},
             ],
         },
-        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {
+            "iteration": 2,
+            "issues": [{"description": "still missing tests", "severity": "MAJOR"}],
+        },
         {"iteration": 3, "issues": []},
     ]
     review_loop = {"iteration": 3, "review_history": review_history}
@@ -2578,7 +2890,11 @@ async def test_extract_review_feedback_universal_scope_when_no_related_files(db_
     await db_session.flush()
 
     keys = await extract_review_feedback_to_playbook(
-        task, review_loop, pr_number=100, original_task_type="create", session=db_session
+        task,
+        review_loop,
+        pr_number=100,
+        original_task_type="create",
+        session=db_session,
     )
     await db_session.flush()
 
@@ -2588,12 +2904,16 @@ async def test_extract_review_feedback_universal_scope_when_no_related_files(db_
         if not key.startswith("review-"):
             continue  # skip first-attempt-pattern keys
         entry = doc[f"playbook/{key}"]
-        assert entry.get("scope") == "universal", f"Expected universal scope, got {entry.get('scope')}"
+        assert entry.get("scope") == "universal", (
+            f"Expected universal scope, got {entry.get('scope')}"
+        )
         assert "related_files" not in entry
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_stores_learned_from_direction(db_session: AsyncSession):
+async def test_extract_review_feedback_stores_learned_from_direction(
+    db_session: AsyncSession,
+):
     """extract_review_feedback_to_playbook stores learned_from_direction from task context."""
     from app.playbook_learning import extract_review_feedback_to_playbook
 
@@ -2603,12 +2923,18 @@ async def test_extract_review_feedback_stores_learned_from_direction(db_session:
         {
             "iteration": 1,
             "issues": [
-                {"description": "missing test coverage for new function", "severity": "MAJOR"},
+                {
+                    "description": "missing test coverage for new function",
+                    "severity": "MAJOR",
+                },
                 {"description": "no unit test for edge case", "severity": "MINOR"},
                 {"description": "add test for error path", "severity": "MAJOR"},
             ],
         },
-        {"iteration": 2, "issues": [{"description": "still missing tests", "severity": "MAJOR"}]},
+        {
+            "iteration": 2,
+            "issues": [{"description": "still missing tests", "severity": "MAJOR"}],
+        },
         {"iteration": 3, "issues": []},
     ]
     review_loop = {"iteration": 3, "review_history": review_history}
@@ -2672,8 +2998,11 @@ async def test_extract_review_feedback_increments_hit_count_when_pattern_recurs(
         db_session.add(task)
         await db_session.flush()
         await extract_review_feedback_to_playbook(
-            task, _make_multi_iter_review_loop(), pr_number=pr,
-            original_task_type="create", session=db_session,
+            task,
+            _make_multi_iter_review_loop(),
+            pr_number=pr,
+            original_task_type="create",
+            session=db_session,
         )
         await db_session.flush()
         return task
@@ -2686,7 +3015,9 @@ async def test_extract_review_feedback_increments_hit_count_when_pattern_recurs(
     await _run(2)
     await _run(3)
     entry = (project.design_doc or {})["playbook/review-test-coverage"]
-    assert entry["hit_count"] == 3, f"hit_count should accumulate, got {entry['hit_count']}"
+    assert entry["hit_count"] == 3, (
+        f"hit_count should accumulate, got {entry['hit_count']}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2722,8 +3053,11 @@ async def test_extract_review_feedback_refreshes_stale_entry(db_session: AsyncSe
     await db_session.flush()
 
     await extract_review_feedback_to_playbook(
-        task, _make_multi_iter_review_loop("missing unit tests for new module"),
-        pr_number=99, original_task_type="create", session=db_session,
+        task,
+        _make_multi_iter_review_loop("missing unit tests for new module"),
+        pr_number=99,
+        original_task_type="create",
+        session=db_session,
     )
     await db_session.flush()
 
@@ -2739,7 +3073,9 @@ async def test_extract_review_feedback_refreshes_stale_entry(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_extract_review_feedback_keeps_fresh_entry_content(db_session: AsyncSession):
+async def test_extract_review_feedback_keeps_fresh_entry_content(
+    db_session: AsyncSession,
+):
     """Entry younger than 30 days has hit_count bumped but content/timestamp untouched."""
     from app.playbook_learning import extract_review_feedback_to_playbook
 
@@ -2770,8 +3106,11 @@ async def test_extract_review_feedback_keeps_fresh_entry_content(db_session: Asy
     await db_session.flush()
 
     await extract_review_feedback_to_playbook(
-        task, _make_multi_iter_review_loop(),
-        pr_number=200, original_task_type="create", session=db_session,
+        task,
+        _make_multi_iter_review_loop(),
+        pr_number=200,
+        original_task_type="create",
+        session=db_session,
     )
     await db_session.flush()
 
@@ -2816,14 +3155,19 @@ async def test_extract_review_feedback_marks_unobserved_entry_potentially_stale(
     await db_session.flush()
 
     await extract_review_feedback_to_playbook(
-        task, _make_multi_iter_review_loop(),
-        pr_number=300, original_task_type="create", session=db_session,
+        task,
+        _make_multi_iter_review_loop(),
+        pr_number=300,
+        original_task_type="create",
+        session=db_session,
     )
     await db_session.flush()
 
     entry = (project.design_doc or {})["playbook/review-error-handling"]
     assert entry.get("potentially_stale") is True
-    assert entry["updated_at"] == very_old_iso, "stale entry timestamp should not change"
+    assert entry["updated_at"] == very_old_iso, (
+        "stale entry timestamp should not change"
+    )
     assert entry["hit_count"] == 1
 
 
@@ -2966,8 +3310,7 @@ def test_recurring_descriptions_min_tasks_threshold():
         _FakeRow("t1", [_entry(0, "repeat", "repeat")], created_at=now),
     ]
     assert (
-        compute_recurring_first_review_descriptions(rows, cutoff, min_tasks=5)
-        is None
+        compute_recurring_first_review_descriptions(rows, cutoff, min_tasks=5) is None
     )
 
 
@@ -2978,7 +3321,11 @@ def test_recurring_descriptions_count_unique_tasks_mode():
     now = datetime(2026, 2, 1, tzinfo=timezone.utc)
     # "solo" appears 5 times but all in one task; "shared" appears twice across two tasks.
     rows = [
-        _FakeRow("t1", [_entry(0, "solo", "solo", "solo", "solo", "solo", "shared")], created_at=now),
+        _FakeRow(
+            "t1",
+            [_entry(0, "solo", "solo", "solo", "solo", "solo", "shared")],
+            created_at=now,
+        ),
         _FakeRow("t2", [_entry(0, "shared")], created_at=now),
     ]
     out = compute_recurring_first_review_descriptions(
@@ -3034,7 +3381,9 @@ def test_decay_module_feedback_entry_past_grace_decays_counts():
     )
 
     now = datetime(2026, 4, 18)
-    overage_days = _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS  # exactly one half-life past grace
+    overage_days = (
+        _MODULE_FEEDBACK_DECAY_HALF_LIFE_DAYS  # exactly one half-life past grace
+    )
     last = now - timedelta(days=_MODULE_FEEDBACK_DECAY_AGE_DAYS + overage_days)
     entry = {
         "review_quality": 10,
@@ -3267,26 +3616,39 @@ def test_summarize_decomposition_outcomes_only_last_three_productive():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds increment_playbook_applied_counts to playbook_learning.py")
+@pytest.mark.xfail(
+    strict=False,
+    reason="Sibling cluster 1/4 adds increment_playbook_applied_counts to playbook_learning.py",
+)
 @pytest.mark.asyncio
-async def test_confirmed_count_increments_on_applied_entry_success(db_session: AsyncSession):
+async def test_confirmed_count_increments_on_applied_entry_success(
+    db_session: AsyncSession,
+):
     """When a completed task has _applied_playbook_entries in its context, the referenced
     entry's confirmed_count and followed_count both increment."""
     from app.playbook_learning import increment_playbook_applied_counts
 
     key = "playbook/success-create-small"
-    project = await _make_project(db_session, design_doc={
-        key: {
-            "content": "First-attempt success pattern for create tasks.",
-            "source": "success-pattern",
-            "confirmed_count": 1,
-            "followed_count": 3,
-            "applicable_types": ["create"],
-            "updated_at": _utcnow().isoformat(),
-        }
-    })
-    task = await _make_completed_task(db_session, project.id, task_type="create", scope="small")
-    task.context = {**(task.context or {}), "_applied_playbook_entries": ["success-create-small"]}
+    project = await _make_project(
+        db_session,
+        design_doc={
+            key: {
+                "content": "First-attempt success pattern for create tasks.",
+                "source": "success-pattern",
+                "confirmed_count": 1,
+                "followed_count": 3,
+                "applicable_types": ["create"],
+                "updated_at": _utcnow().isoformat(),
+            }
+        },
+    )
+    task = await _make_completed_task(
+        db_session, project.id, task_type="create", scope="small"
+    )
+    task.context = {
+        **(task.context or {}),
+        "_applied_playbook_entries": ["success-create-small"],
+    }
     await db_session.flush()
 
     await increment_playbook_applied_counts(task, db_session, success=True)
@@ -3294,33 +3656,46 @@ async def test_confirmed_count_increments_on_applied_entry_success(db_session: A
 
     entry = (project.design_doc or {})[key]
     assert entry["confirmed_count"] == 2, "confirmed_count must increment on success"
-    assert entry["followed_count"] == 4, "followed_count must increment on any application"
+    assert entry["followed_count"] == 4, (
+        "followed_count must increment on any application"
+    )
 
 
-@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds increment_playbook_applied_counts to playbook_learning.py")
+@pytest.mark.xfail(
+    strict=False,
+    reason="Sibling cluster 1/4 adds increment_playbook_applied_counts to playbook_learning.py",
+)
 @pytest.mark.asyncio
-async def test_followed_count_increments_without_confirmed_on_failure(db_session: AsyncSession):
+async def test_followed_count_increments_without_confirmed_on_failure(
+    db_session: AsyncSession,
+):
     """When an applied task fails, followed_count grows (denominator) but confirmed_count
     stays fixed — causing the success rate to drop as expected."""
     from app.playbook_learning import increment_playbook_applied_counts
 
     key = "playbook/success-create-small"
-    project = await _make_project(db_session, design_doc={
-        key: {
-            "content": "First-attempt success pattern for create tasks.",
-            "source": "success-pattern",
-            "confirmed_count": 2,
-            "followed_count": 3,
-            "applicable_types": ["create"],
-            "updated_at": _utcnow().isoformat(),
-        }
-    })
+    project = await _make_project(
+        db_session,
+        design_doc={
+            key: {
+                "content": "First-attempt success pattern for create tasks.",
+                "source": "success-pattern",
+                "confirmed_count": 2,
+                "followed_count": 3,
+                "applicable_types": ["create"],
+                "updated_at": _utcnow().isoformat(),
+            }
+        },
+    )
     task = Task(
         project_id=project.id,
         title="Failed task",
         payloads=[{"type": "create", "prompt": "do something"}],
         status=TaskStatus.FAILED,
-        context={"scope": "small", "_applied_playbook_entries": ["success-create-small"]},
+        context={
+            "scope": "small",
+            "_applied_playbook_entries": ["success-create-small"],
+        },
     )
     db_session.add(task)
     await db_session.flush()
@@ -3330,10 +3705,15 @@ async def test_followed_count_increments_without_confirmed_on_failure(db_session
 
     entry = (project.design_doc or {})[key]
     assert entry["confirmed_count"] == 2, "confirmed_count must not change on failure"
-    assert entry["followed_count"] == 4, "followed_count must grow regardless of outcome"
+    assert entry["followed_count"] == 4, (
+        "followed_count must grow regardless of outcome"
+    )
 
 
-@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds auto_retire_low_effectiveness_entries to playbook_learning.py")
+@pytest.mark.xfail(
+    strict=False,
+    reason="Sibling cluster 1/4 adds auto_retire_low_effectiveness_entries to playbook_learning.py",
+)
 def test_auto_retire_archives_low_success_rate_entry():
     """auto_retire_low_effectiveness_entries moves entries with followed_count >= min and
     confirmed/followed ratio below threshold into playbook_archive with an _archived_reason."""
@@ -3362,10 +3742,15 @@ def test_auto_retire_archives_low_success_rate_entry():
     assert "playbook/good-pattern" in doc, "High-rate entry should remain"
     archive = doc.get("playbook_archive", [])
     assert any(e.get("_archived_key") == "playbook/stale-pattern" for e in archive)
-    assert any("_archived_reason" in e for e in archive), "Must include explanatory reason tag"
+    assert any("_archived_reason" in e for e in archive), (
+        "Must include explanatory reason tag"
+    )
 
 
-@pytest.mark.xfail(strict=False, reason="Sibling cluster 1/4 adds auto_retire_low_effectiveness_entries to playbook_learning.py")
+@pytest.mark.xfail(
+    strict=False,
+    reason="Sibling cluster 1/4 adds auto_retire_low_effectiveness_entries to playbook_learning.py",
+)
 def test_auto_retire_skips_entries_below_min_observations():
     """Entries with too few followed_count observations are not retired — insufficient data
     to judge effectiveness, so the rate is statistically meaningless."""
@@ -3383,8 +3768,12 @@ def test_auto_retire_skips_entries_below_min_observations():
 
     auto_retire_low_effectiveness_entries(doc)
 
-    assert "playbook/new-pattern" in doc, "Under-observed entry must not be auto-retired"
-    assert not doc.get("playbook_archive"), "No archive entries should be created for under-observed patterns"
+    assert "playbook/new-pattern" in doc, (
+        "Under-observed entry must not be auto-retired"
+    )
+    assert not doc.get("playbook_archive"), (
+        "No archive entries should be created for under-observed patterns"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3466,7 +3855,9 @@ async def test_finalize_pending_playbook_entries_promotes_on_success(db_session)
 
     assert n == 1
     entry = project.design_doc["playbook/proven"]
-    assert "pending_source" not in entry, "Successful task's pending flag must be cleared"
+    assert "pending_source" not in entry, (
+        "Successful task's pending flag must be cleared"
+    )
     assert entry["content"] == "Real finding from completed task"
 
 
@@ -3500,18 +3891,30 @@ def _make_sr_task(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(
+    db_session: AsyncSession,
+):
     """Returns None when either window has fewer than 5 tasks with both fields."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
     tasks = []
     for i in range(4):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(4):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3522,7 +3925,9 @@ async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(db_se
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(
+    db_session: AsyncSession,
+):
     """Computes correct per-category hit_rate and miss_rate."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -3530,16 +3935,28 @@ async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(db_session
     tasks = []
     # Current window (5 tasks): 3 hits, 2 misses on test-coverage
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     # Previous window (5 tasks): all hits
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3554,7 +3971,9 @@ async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(db_session
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_trend_classification(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_trend_classification(
+    db_session: AsyncSession,
+):
     """Hit rate drops >= 5pp → trend='decreasing'."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -3562,16 +3981,28 @@ async def test_compute_sr_catch_rate_trends_trend_classification(db_session: Asy
     tasks = []
     # Current window: 3/5 = 0.6
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     # Previous window: 5/5 = 1.0 (delta = -0.4, well below -5pp threshold)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3583,7 +4014,9 @@ async def test_compute_sr_catch_rate_trends_trend_classification(db_session: Asy
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_rate_history_grows(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_rate_history_grows(
+    db_session: AsyncSession,
+):
     """rate_history grows on each new window call and caps at 5."""
     from app.playbook_learning import compute_sr_catch_rate_trends
     from sqlalchemy.orm.attributes import flag_modified
@@ -3604,16 +4037,28 @@ async def test_compute_sr_catch_rate_trends_rate_history_grows(db_session: Async
     tasks = []
     # Current window: 3/5 hits
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     # Previous window: 5/5 hits
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3628,18 +4073,30 @@ async def test_compute_sr_catch_rate_trends_rate_history_grows(db_session: Async
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_persists_to_design_doc(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_persists_to_design_doc(
+    db_session: AsyncSession,
+):
     """Writes sr_catch_rate_trends key to project.design_doc."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
     tasks = []
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3755,14 +4212,17 @@ def test_categorize_review_issues_regression_risk_keyword_routes_correctly():
     assert result["regression_risk"][0]["severity"] == "MAJOR"
 
 
-@pytest.mark.parametrize("phrasing", [
-    "this regresses test_foo",
-    "broke test_foo in this diff",
-    "now failing assertion that was passing before",
-    "the build no longer works after these changes",
-    "this is a regression in the auth flow",
-    "breaks test_serializer",
-])
+@pytest.mark.parametrize(
+    "phrasing",
+    [
+        "this regresses test_foo",
+        "broke test_foo in this diff",
+        "now failing assertion that was passing before",
+        "the build no longer works after these changes",
+        "this is a regression in the auth flow",
+        "breaks test_serializer",
+    ],
+)
 def test_categorize_review_issues_regression_risk_phrasings(phrasing):
     """A variety of regression-flavored phrasings all route to regression_risk."""
     from app.playbook_learning import _categorize_review_issues
@@ -3841,7 +4301,9 @@ def test_categorize_review_issues_regression_risk_in_valid_categories():
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(
+    db_session: AsyncSession,
+):
     """When tasks carry regression_risk in both human_cats and sr_failed, the dashboard
     surfaces a non-zero hit_rate on the regression_risk axis."""
     from app.playbook_learning import compute_sr_catch_rate_trends
@@ -3851,7 +4313,8 @@ async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(db_sess
     # Current window (5 tasks): 3 hits, 2 misses on regression_risk
     for i in range(3):
         t = _make_sr_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"regression_risk": 1},
             sr_failed_cats=["regression_risk"],
         )
@@ -3859,7 +4322,8 @@ async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(db_sess
         tasks.append(t)
     for i in range(2):
         t = _make_sr_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"regression_risk": 1},
             sr_failed_cats=[],
         )
@@ -3868,7 +4332,8 @@ async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(db_sess
     # Previous window (5 tasks): all hits
     for i in range(5):
         t = _make_sr_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             human_cats={"regression_risk": 1},
             sr_failed_cats=["regression_risk"],
         )
@@ -3889,7 +4354,9 @@ async def test_compute_sr_catch_rate_trends_regression_risk_hit_and_miss(db_sess
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_per_task_type_breakdown(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_per_task_type_breakdown(
+    db_session: AsyncSession,
+):
     """by_task_type contains correct hit/miss rates per (task_type, category)."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -3897,24 +4364,53 @@ async def test_compute_sr_catch_rate_trends_per_task_type_breakdown(db_session: 
     tasks = []
     # Current window: 5 'create' tasks — 4 hits on test-coverage
     for i in range(4):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"], task_type="create")
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+            task_type="create",
+        )
         db_session.add(t)
         tasks.append(t)
-    t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[], task_type="create")
+    t = _make_sr_task(
+        project.id,
+        age_days=2,
+        human_cats={"test-coverage": 1},
+        sr_failed_cats=[],
+        task_type="create",
+    )
     db_session.add(t)
     tasks.append(t)
     # Current window: 5 'fix' tasks — 2 hits on test-coverage
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"], task_type="fix")
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+            task_type="fix",
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[], task_type="fix")
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+            task_type="fix",
+        )
         db_session.add(t)
         tasks.append(t)
     # Previous window: 5 tasks needed for overall threshold
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3935,7 +4431,9 @@ async def test_compute_sr_catch_rate_trends_per_task_type_breakdown(db_session: 
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sample(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sample(
+    db_session: AsyncSession,
+):
     """Cells with fewer than 5 samples per (task_type, category) are omitted from by_task_type."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -3943,16 +4441,33 @@ async def test_compute_sr_catch_rate_trends_by_task_type_threshold_omits_low_sam
     tasks = []
     # Current window: 5 'create' tasks (meets threshold), 4 'fix' tasks (below threshold)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"], task_type="create")
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            task_type="create",
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(4):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"], task_type="fix")
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            task_type="fix",
+        )
         db_session.add(t)
         tasks.append(t)
     # Previous window
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -3990,9 +4505,7 @@ def _make_sr_task_with_review(
             "_self_review_outcome": {"check_results": check_results},
             "_first_attempt_rejection_categories": human_cats,
             "review_loop": {
-                "review_history": [
-                    {"iteration": 1, "issues": review_issues}
-                ]
+                "review_history": [{"iteration": 1, "issues": review_issues}]
             },
         },
     )
@@ -4001,7 +4514,9 @@ def _make_sr_task_with_review(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_example_issues_populated(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_example_issues_populated(
+    db_session: AsyncSession,
+):
     """Examples are collected from review_history for missed categories."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4021,7 +4536,12 @@ async def test_compute_sr_catch_rate_trends_example_issues_populated(db_session:
         tasks.append(t)
     # 5 previous tasks
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4033,41 +4553,62 @@ async def test_compute_sr_catch_rate_trends_example_issues_populated(db_session:
     assert "examples" in cat
     assert len(cat["examples"]) >= 1
     assert any("null check" in ex["desc"] for ex in cat["examples"])
-    assert all(ex["severity"] in ("CRITICAL", "MAJOR", "MINOR") for ex in cat["examples"])
+    assert all(
+        ex["severity"] in ("CRITICAL", "MAJOR", "MINOR") for ex in cat["examples"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_examples_by_task_type_scoped(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_examples_by_task_type_scoped(
+    db_session: AsyncSession,
+):
     """Examples in by_task_type are drawn only from matching task types."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
     tasks = []
     # "null check" is in error-handling keywords; "fallback" is also in error-handling
-    create_issue = {"description": "Missing null check in create handler", "severity": "MAJOR"}
-    fix_issue = {"description": "Unhandled exception in fix scenario", "severity": "MAJOR"}
+    create_issue = {
+        "description": "Missing null check in create handler",
+        "severity": "MAJOR",
+    }
+    fix_issue = {
+        "description": "Unhandled exception in fix scenario",
+        "severity": "MAJOR",
+    }
 
     # 5 'create' tasks missing error-handling
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
-            human_cats={"error-handling": 1}, sr_failed_cats=[],
-            review_issues=[create_issue], task_type="create",
+            project.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+            review_issues=[create_issue],
+            task_type="create",
         )
         db_session.add(t)
         tasks.append(t)
     # 5 'fix' tasks missing error-handling
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
-            human_cats={"error-handling": 1}, sr_failed_cats=[],
-            review_issues=[fix_issue], task_type="fix",
+            project.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+            review_issues=[fix_issue],
+            task_type="fix",
         )
         db_session.add(t)
         tasks.append(t)
     # Previous window
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4090,7 +4631,9 @@ async def test_compute_sr_catch_rate_trends_examples_by_task_type_scoped(db_sess
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_sensitive_examples_dropped(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_sensitive_examples_dropped(
+    db_session: AsyncSession,
+):
     """Descriptions containing sensitive tokens are excluded from examples."""
     from app.playbook_learning import compute_sr_catch_rate_trends, _SENSITIVE_TOKENS
 
@@ -4104,14 +4647,21 @@ async def test_compute_sr_catch_rate_trends_sensitive_examples_dropped(db_sessio
     ]
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
-            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            project.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
             review_issues=review_issues,
         )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4126,7 +4676,9 @@ async def test_compute_sr_catch_rate_trends_sensitive_examples_dropped(db_sessio
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_descriptions_truncated_and_pr_stripped(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_descriptions_truncated_and_pr_stripped(
+    db_session: AsyncSession,
+):
     """Descriptions are truncated to <=100 chars and PR refs / URLs are stripped."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4142,14 +4694,21 @@ async def test_compute_sr_catch_rate_trends_descriptions_truncated_and_pr_stripp
     ]
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
-            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            project.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
             review_issues=review_issues,
         )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4170,7 +4729,9 @@ async def test_compute_sr_catch_rate_trends_descriptions_truncated_and_pr_stripp
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_example_cap_per_category(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_example_cap_per_category(
+    db_session: AsyncSession,
+):
     """At most _EXAMPLE_MAX_PER_CAT examples are stored per category."""
     from app.playbook_learning import compute_sr_catch_rate_trends, _EXAMPLE_MAX_PER_CAT
 
@@ -4178,19 +4739,25 @@ async def test_compute_sr_catch_rate_trends_example_cap_per_category(db_session:
     tasks = []
     # Provide many distinct review issues per task
     review_issues = [
-        {"description": f"Issue number {i}", "severity": "MAJOR"}
-        for i in range(10)
+        {"description": f"Issue number {i}", "severity": "MAJOR"} for i in range(10)
     ]
     for _ in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
-            human_cats={"error-handling": 1}, sr_failed_cats=[],
+            project.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
             review_issues=review_issues,
         )
         db_session.add(t)
         tasks.append(t)
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"error-handling": 1}, sr_failed_cats=["error-handling"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4210,21 +4777,35 @@ async def test_compute_sr_catch_rate_trends_example_cap_per_category(db_session:
 def _make_decreasing_task_set(project_id, db_session, tasks):
     """Helper: 5 current tasks (3/5 hit) + 5 previous tasks (5/5 hit) → decreasing."""
     for i in range(3):
-        t = _make_sr_task(project_id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project_id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project_id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project_id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project_id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project_id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
 
 
 @pytest.mark.asyncio
-async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_session: AsyncSession):
+async def test_sr_catch_rate_regression_fires_notification_on_decreasing(
+    db_session: AsyncSession,
+):
     """A decreasing trend triggers post_failure_alert_message and dispatch_external_notification."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4233,9 +4814,17 @@ async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_sess
     _make_decreasing_task_set(project.id, db_session, tasks)
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is not None
@@ -4243,14 +4832,21 @@ async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_sess
 
     mock_post.assert_called_once()
     call_kwargs = mock_post.call_args
-    description = call_kwargs.args[2] if len(call_kwargs.args) >= 3 else call_kwargs.kwargs.get("description", "")
+    description = (
+        call_kwargs.args[2]
+        if len(call_kwargs.args) >= 3
+        else call_kwargs.kwargs.get("description", "")
+    )
     assert "test-coverage" in description
     assert "→" in description
 
     mock_dispatch.assert_called_once()
     dispatch_kwargs = mock_dispatch.call_args
     payload = dispatch_kwargs.kwargs.get("payload") or dispatch_kwargs.args[2]
-    assert dispatch_kwargs.kwargs.get("event_type") == "sr_catch_rate_regression" or dispatch_kwargs.args[1] == "sr_catch_rate_regression"
+    assert (
+        dispatch_kwargs.kwargs.get("event_type") == "sr_catch_rate_regression"
+        or dispatch_kwargs.args[1] == "sr_catch_rate_regression"
+    )
     assert "regressing_categories" in payload
     cats = payload["regressing_categories"]
     assert len(cats) == 1
@@ -4262,14 +4858,23 @@ async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_sess
     # AlertsBanner surfacing: the same firing path must insert an
     # undismissed WARNING Alert row keyed on the regression title prefix.
     from app.playbook_learning import _SR_REGRESSION_ALERT_TITLE_PREFIX
+
     await db_session.commit()
-    alert_rows = (await db_session.execute(
-        _sql_select(Alert).where(
-            Alert.project_id == project.id,
-            Alert.dismissed_at.is_(None),
+    alert_rows = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
         )
-    )).scalars().all()
-    reg_rows = [r for r in alert_rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        .scalars()
+        .all()
+    )
+    reg_rows = [
+        r for r in alert_rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
+    ]
     assert len(reg_rows) == 1
     assert reg_rows[0].severity == AlertSeverity.WARNING
     assert "test-coverage" in reg_rows[0].title
@@ -4278,19 +4883,28 @@ async def test_sr_catch_rate_regression_fires_notification_on_decreasing(db_sess
 
 
 @pytest.mark.asyncio
-async def test_sr_catch_rate_regression_no_duplicate_in_same_window(db_session: AsyncSession):
+async def test_sr_catch_rate_regression_no_duplicate_in_same_window(
+    db_session: AsyncSession,
+):
     """A second call with the same regressing categories in the same window does NOT re-post."""
     from app.playbook_learning import compute_sr_catch_rate_trends
-    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
     project = await _make_project(db_session)
     tasks = []
     _make_decreasing_task_set(project.id, db_session, tasks)
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     # Verify alert state was persisted
@@ -4299,28 +4913,47 @@ async def test_sr_catch_rate_regression_no_duplicate_in_same_window(db_session: 
     assert mock_post.call_count == 1
 
     # Second call in the same window — should be deduped
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post2, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post2,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     mock_post2.assert_not_called()
 
     # The dedup contract also covers the in-app Alert row: still exactly one.
     from app.playbook_learning import _SR_REGRESSION_ALERT_TITLE_PREFIX
+
     await db_session.commit()
-    alert_rows = (await db_session.execute(
-        _sql_select(Alert).where(
-            Alert.project_id == project.id,
-            Alert.dismissed_at.is_(None),
+    alert_rows = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
         )
-    )).scalars().all()
-    reg_rows = [r for r in alert_rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)]
+        .scalars()
+        .all()
+    )
+    reg_rows = [
+        r for r in alert_rows if r.title.startswith(_SR_REGRESSION_ALERT_TITLE_PREFIX)
+    ]
     assert len(reg_rows) == 1
 
 
 @pytest.mark.asyncio
-async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_increasing(db_session: AsyncSession):
+async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_increasing(
+    db_session: AsyncSession,
+):
     """No notification fires when no category is decreasing."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4328,22 +4961,42 @@ async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_incre
     tasks = []
     # Current window: 5/5 hit (stable/increasing vs previous 3/5)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is not None
@@ -4359,7 +5012,9 @@ async def test_sr_catch_rate_regression_no_notification_when_all_stable_or_incre
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_attempt(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_attempt(
+    db_session: AsyncSession,
+):
     """A category flagged only in iteration 2+ appears in all_iterations_catch_rate as a miss
     but current_hit_rate (first-attempt) is None for that category — the two metrics diverge."""
     from app.playbook_learning import compute_sr_catch_rate_trends
@@ -4378,7 +5033,10 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
             context={
                 "_self_review_outcome": {"check_results": {}},
                 "_first_attempt_rejection_categories": {"test-coverage": 1},
-                "_all_iterations_rejection_categories": {"test-coverage": 1, "correctness": 1},
+                "_all_iterations_rejection_categories": {
+                    "test-coverage": 1,
+                    "correctness": 1,
+                },
             },
         )
         task.created_at = _utcnow() - timedelta(days=2)
@@ -4394,7 +5052,10 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
             context={
                 "_self_review_outcome": {"check_results": {}},
                 "_first_attempt_rejection_categories": {"test-coverage": 1},
-                "_all_iterations_rejection_categories": {"test-coverage": 1, "correctness": 1},
+                "_all_iterations_rejection_categories": {
+                    "test-coverage": 1,
+                    "correctness": 1,
+                },
             },
         )
         task.created_at = _utcnow() - timedelta(days=20)
@@ -4413,7 +5074,9 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
 
     # correctness: flagged only in iteration 2 — invisible to the first-attempt metric
     # but the all-iterations metric counts it as a miss (catch_rate == 0)
-    assert "correctness" in cats, "iteration-2 category must surface in all_iterations_catch_rate"
+    assert "correctness" in cats, (
+        "iteration-2 category must surface in all_iterations_catch_rate"
+    )
     assert cats["correctness"]["current_hit_rate"] is None, (
         "correctness must be absent from first-attempt metric"
     )
@@ -4422,7 +5085,9 @@ async def test_compute_sr_catch_rate_trends_all_iterations_catch_rate_vs_first_a
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(
+    db_session: AsyncSession,
+):
     """When _all_iterations_rejection_categories is absent and review_history is empty,
     all_iterations_catch_rate falls back to the first-attempt categories so existing
     tasks continue to produce a non-None all_iterations value."""
@@ -4433,7 +5098,8 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(db_se
     # 5 current tasks: only _first_attempt_rejection_categories, no all-iterations field
     for _ in range(5):
         t = _make_sr_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"test-coverage": 1},
             sr_failed_cats=["test-coverage"],
         )
@@ -4442,7 +5108,8 @@ async def test_compute_sr_catch_rate_trends_all_iterations_backward_compat(db_se
     # 5 previous tasks: same
     for _ in range(5):
         t = _make_sr_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             human_cats={"test-coverage": 1},
             sr_failed_cats=["test-coverage"],
         )
@@ -4475,14 +5142,22 @@ async def test_sr_false_positive_rate_no_human_confirmation(db_session: AsyncSes
     tasks = []
     # 5 current: SR fails 'correctness', human flags only 'test-coverage' (unrelated)
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=2,
-                          human_cats={"test-coverage": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     # 5 previous: same
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=20,
-                          human_cats={"test-coverage": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4491,7 +5166,9 @@ async def test_sr_false_positive_rate_no_human_confirmation(db_session: AsyncSes
 
     assert result is not None
     cat = result["categories"]["correctness"]
-    assert cat["false_positive_rate"] == 1.0, "all SR failures unconfirmed → FP rate must be 1.0"
+    assert cat["false_positive_rate"] == 1.0, (
+        "all SR failures unconfirmed → FP rate must be 1.0"
+    )
     assert cat["precision"] == 0.0, "zero confirmed failures → precision must be 0.0"
 
 
@@ -4503,13 +5180,21 @@ async def test_sr_false_positive_rate_human_confirms_is_zero(db_session: AsyncSe
     project = await _make_project(db_session)
     tasks = []
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=2,
-                          human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=20,
-                          human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4518,12 +5203,16 @@ async def test_sr_false_positive_rate_human_confirms_is_zero(db_session: AsyncSe
 
     assert result is not None
     cat = result["categories"]["correctness"]
-    assert cat["false_positive_rate"] == 0.0, "all SR failures confirmed by human → FP rate 0"
+    assert cat["false_positive_rate"] == 0.0, (
+        "all SR failures confirmed by human → FP rate 0"
+    )
     assert cat["precision"] == 1.0, "all SR failures confirmed → precision must be 1.0"
 
 
 @pytest.mark.asyncio
-async def test_sr_false_positive_rate_review_history_confirms_not_fp(db_session: AsyncSession):
+async def test_sr_false_positive_rate_review_history_confirms_not_fp(
+    db_session: AsyncSession,
+):
     """SR fails test-coverage; review_history (iter 2) contains a 'missing test' issue
     that keyword-matches test-coverage → not counted as a false positive."""
     from app.playbook_learning import compute_sr_catch_rate_trends
@@ -4544,9 +5233,15 @@ async def test_sr_false_positive_rate_review_history_confirms_not_fp(db_session:
                 "_first_attempt_rejection_categories": {"style-conventions": 1},
                 "review_loop": {
                     "review_history": [
-                        {"iteration": 2, "issues": [
-                            {"description": "missing test for edge case", "severity": "MAJOR"}
-                        ]}
+                        {
+                            "iteration": 2,
+                            "issues": [
+                                {
+                                    "description": "missing test for edge case",
+                                    "severity": "MAJOR",
+                                }
+                            ],
+                        }
                     ]
                 },
             },
@@ -4583,13 +5278,15 @@ async def test_sr_passes_do_not_affect_false_positive_metric(db_session: AsyncSe
     tasks = []
     # SR passes everything; human flags 'correctness'
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=2,
-                          human_cats={"correctness": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=20,
-                          human_cats={"correctness": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4612,7 +5309,9 @@ async def test_sr_passes_do_not_affect_false_positive_metric(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_by_severity_counts(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_by_severity_counts(
+    db_session: AsyncSession,
+):
     """by_severity accumulates correct hit_count and human_count per severity."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4621,10 +5320,14 @@ async def test_compute_sr_catch_rate_trends_by_severity_counts(db_session: Async
 
     # Current window: 5 tasks with CRITICAL issue in "error-handling"; SR catches 2 of them
     # "exception" keyword → categorised as error-handling
-    review_issue_critical = {"description": "Unhandled exception in request path", "severity": "CRITICAL"}
+    review_issue_critical = {
+        "description": "Unhandled exception in request path",
+        "severity": "CRITICAL",
+    }
     for i in range(2):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness", "error-handling"],
             review_issues=[review_issue_critical],
@@ -4633,7 +5336,8 @@ async def test_compute_sr_catch_rate_trends_by_severity_counts(db_session: Async
         tasks.append(t)
     for i in range(3):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness"],  # SR did NOT catch error-handling
             review_issues=[review_issue_critical],
@@ -4642,10 +5346,14 @@ async def test_compute_sr_catch_rate_trends_by_severity_counts(db_session: Async
         tasks.append(t)
 
     # Previous window: 5 tasks with MAJOR issue in "error-handling"; SR catches all
-    review_issue_major = {"description": "Missing error handling for null input", "severity": "MAJOR"}
+    review_issue_major = {
+        "description": "Missing error handling for null input",
+        "severity": "MAJOR",
+    }
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness", "error-handling"],
             review_issues=[review_issue_major],
@@ -4672,7 +5380,9 @@ async def test_compute_sr_catch_rate_trends_by_severity_counts(db_session: Async
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(
+    db_session: AsyncSession,
+):
     """CRITICAL regression (>=3pp delta) fires the alert even when category trend is stable."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4680,13 +5390,17 @@ async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_
     tasks = []
 
     # Review issue that categorises to error-handling (keyword "exception")
-    review_crit = {"description": "Unhandled exception bypasses auth guard", "severity": "CRITICAL"}
+    review_crit = {
+        "description": "Unhandled exception bypasses auth guard",
+        "severity": "CRITICAL",
+    }
 
     # Current window: 5 tasks; SR misses error-handling (sr_failed only has "correctness")
     # → CRITICAL miss_rate = 5/5 = 1.0
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness"],
             review_issues=[review_crit],
@@ -4698,7 +5412,8 @@ async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_
     # → CRITICAL miss_rate = 1/5 = 0.2
     for i in range(4):
         t = _make_sr_task_with_review(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness", "error-handling"],
             review_issues=[review_crit],
@@ -4706,7 +5421,8 @@ async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_
         db_session.add(t)
         tasks.append(t)
     t = _make_sr_task_with_review(
-        project.id, age_days=20,
+        project.id,
+        age_days=20,
         human_cats={"correctness": 1},
         sr_failed_cats=["correctness"],
         review_issues=[review_crit],
@@ -4716,9 +5432,17 @@ async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_
 
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock) as mock_dispatch, \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is not None
@@ -4728,17 +5452,25 @@ async def test_compute_sr_catch_rate_trends_critical_alert_tighter_threshold(db_
     assert result["by_severity"]["CRITICAL"]["trend"] == "regressing"
     # Alert must fire due to severity regression
     mock_post.assert_called_once()
-    call_desc = mock_post.call_args.args[2] if len(mock_post.call_args.args) >= 3 else mock_post.call_args.kwargs.get("description", "")
+    call_desc = (
+        mock_post.call_args.args[2]
+        if len(mock_post.call_args.args) >= 3
+        else mock_post.call_args.kwargs.get("description", "")
+    )
     assert "CRITICAL" in call_desc
     mock_dispatch.assert_called_once()
-    payload = mock_dispatch.call_args.kwargs.get("payload") or mock_dispatch.call_args.args[2]
+    payload = (
+        mock_dispatch.call_args.kwargs.get("payload") or mock_dispatch.call_args.args[2]
+    )
     assert "regressing_severities" in payload
     sevs = payload["regressing_severities"]
     assert any(s["severity"] == "CRITICAL" for s in sevs)
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(
+    db_session: AsyncSession,
+):
     """A new regressing severity not in the prior alert state breaks dedup and re-fires."""
     from app.playbook_learning import compute_sr_catch_rate_trends
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
@@ -4746,10 +5478,14 @@ async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_sess
     project = await _make_project(db_session)
     tasks = []
 
-    review_crit = {"description": "Unhandled exception on auth path", "severity": "CRITICAL"}
+    review_crit = {
+        "description": "Unhandled exception on auth path",
+        "severity": "CRITICAL",
+    }
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness"],
             review_issues=[review_crit],
@@ -4758,7 +5494,8 @@ async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_sess
         tasks.append(t)
     for i in range(4):
         t = _make_sr_task_with_review(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness", "error-handling"],
             review_issues=[review_crit],
@@ -4766,7 +5503,8 @@ async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_sess
         db_session.add(t)
         tasks.append(t)
     t = _make_sr_task_with_review(
-        project.id, age_days=20,
+        project.id,
+        age_days=20,
         human_cats={"correctness": 1},
         sr_failed_cats=["correctness"],
         review_issues=[review_crit],
@@ -4789,9 +5527,17 @@ async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_sess
     db_session.add(project)
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     # CRITICAL is regressing, so alert fires despite prior alert existing (different severity set)
@@ -4801,18 +5547,30 @@ async def test_compute_sr_catch_rate_trends_severity_dedup_includes_sevs(db_sess
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_by_severity_absent_when_no_rev_hist(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_by_severity_absent_when_no_rev_hist(
+    db_session: AsyncSession,
+):
     """by_severity has zero samples when tasks have no review_history."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
     tasks = []
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -4831,7 +5589,9 @@ async def test_compute_sr_catch_rate_trends_by_severity_absent_when_no_rev_hist(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(db_session: AsyncSession):
+async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
+    db_session: AsyncSession,
+):
     """by_severity is persisted to project.design_doc['sr_catch_rate_trends']."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -4840,7 +5600,8 @@ async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
     review_issue = {"description": "Logic bug in edge case", "severity": "MAJOR"}
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness"],
             review_issues=[review_issue],
@@ -4849,7 +5610,8 @@ async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
         tasks.append(t)
     for i in range(5):
         t = _make_sr_task_with_review(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             human_cats={"correctness": 1},
             sr_failed_cats=["correctness"],
             review_issues=[review_issue],
@@ -4882,7 +5644,10 @@ def test_categorize_review_issues_keyword_scope_drift():
         {
             "iteration": 1,
             "issues": [
-                {"description": "changes are too large for declared scope", "severity": "MAJOR"},
+                {
+                    "description": "changes are too large for declared scope",
+                    "severity": "MAJOR",
+                },
             ],
         }
     ]
@@ -4899,9 +5664,16 @@ def test_categorize_review_issues_with_cached_returns_verbatim():
 
     # Nonsense review_history that would produce different buckets if scanned.
     review_history = [
-        {"iteration": 1, "issues": [{"description": "test coverage missing", "severity": "MAJOR"}]}
+        {
+            "iteration": 1,
+            "issues": [{"description": "test coverage missing", "severity": "MAJOR"}],
+        }
     ]
-    sentinel = {"correctness": [{"desc": "pre-computed", "severity": "CRITICAL", "iteration": 0}]}
+    sentinel = {
+        "correctness": [
+            {"desc": "pre-computed", "severity": "CRITICAL", "iteration": 0}
+        ]
+    }
 
     result = _categorize_review_issues(review_history, cached=sentinel)
     assert result is sentinel
@@ -4918,7 +5690,12 @@ async def test_categorize_review_issues_llm_returns_correct_buckets():
         {"description": "SQL injection risk", "severity": "CRITICAL", "iteration": 1},
     ]
     fake_text = json.dumps(
-        {"classifications": [{"index": 0, "category": "test-coverage"}, {"index": 1, "category": "security"}]}
+        {
+            "classifications": [
+                {"index": 0, "category": "test-coverage"},
+                {"index": 1, "category": "security"},
+            ]
+        }
     )
 
     mock_content_item = MagicMock()
@@ -4934,7 +5711,11 @@ async def test_categorize_review_issues_llm_returns_correct_buckets():
     mock_client_cls = MagicMock(return_value=mock_client)
 
     import os
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""}):
+
+    with patch.dict(
+        os.environ,
+        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+    ):
         with patch("anthropic.AsyncAnthropic", mock_client_cls):
             result = await categorize_review_issues_llm(issues)
 
@@ -4955,8 +5736,15 @@ async def test_categorize_review_issues_llm_falls_back_on_api_error():
     ]
 
     import os
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""}):
-        with patch("anthropic.AsyncAnthropic", MagicMock(side_effect=Exception("network error"))):
+
+    with patch.dict(
+        os.environ,
+        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+    ):
+        with patch(
+            "anthropic.AsyncAnthropic",
+            MagicMock(side_effect=Exception("network error")),
+        ):
             result = await categorize_review_issues_llm(issues)
 
     expected = _keyword_from_flat(issues)
@@ -4966,7 +5754,6 @@ async def test_categorize_review_issues_llm_falls_back_on_api_error():
 @pytest.mark.asyncio
 async def test_categorize_review_issues_llm_kill_switch():
     """When DISABLE_LLM_REVIEW_CATEGORIZATION=1, no Anthropic client is constructed."""
-    from unittest.mock import MagicMock
     from app.playbook_learning import categorize_review_issues_llm
 
     issues = [
@@ -4974,6 +5761,7 @@ async def test_categorize_review_issues_llm_kill_switch():
     ]
 
     import os
+
     with patch.dict(os.environ, {"DISABLE_LLM_REVIEW_CATEGORIZATION": "1"}):
         with patch("anthropic.AsyncAnthropic") as mock_cls:
             result = await categorize_review_issues_llm(issues)
@@ -4987,10 +5775,13 @@ async def test_cache_first_attempt_classification_writes_buckets_and_method():
     """cache_first_attempt_classification writes buckets + _classification_method to context."""
     from app.playbook_learning import cache_first_attempt_classification
 
-    issues = [{"description": "missing unit tests", "severity": "MAJOR", "iteration": 1}]
+    issues = [
+        {"description": "missing unit tests", "severity": "MAJOR", "iteration": 1}
+    ]
     ctx: dict = {}
 
     import os
+
     with patch.dict(os.environ, {"DISABLE_LLM_REVIEW_CATEGORIZATION": "1"}):
         buckets = await cache_first_attempt_classification(ctx, issues)
 
@@ -5028,14 +5819,21 @@ def test_compute_sr_prediction_accuracy_uses_cached_categories():
                 },
                 "review_loop": {
                     "review_history": [
-                        {"iteration": 1, "issues": [{"description": "logic error", "severity": "MAJOR"}]}
+                        {
+                            "iteration": 1,
+                            "issues": [
+                                {"description": "logic error", "severity": "MAJOR"}
+                            ],
+                        }
                     ]
                 },
             },
         )
         return t
 
-    cached = {"test-coverage": [{"desc": "from cache", "severity": "MAJOR", "iteration": 1}]}
+    cached = {
+        "test-coverage": [{"desc": "from cache", "severity": "MAJOR", "iteration": 1}]
+    }
     tasks = [_make_task_with_cache(cached) for _ in range(5)]
 
     call_count = {"n": 0}
@@ -5059,8 +5857,9 @@ def test_compute_sr_prediction_accuracy_uses_cached_categories():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _make_cycle(project_id, *, age_days: float, outcome: str = "completed") -> "StrategicCycle":
+def _make_cycle(project_id, *, age_days: float, outcome: str = "completed"):
     from app.models import StrategicCycle
+
     cycle = StrategicCycle(
         id=uuid.uuid4().hex,
         project_id=project_id,
@@ -5085,18 +5884,30 @@ async def test_cycle_bucketing_uses_strategic_cycle_id(db_session: AsyncSession)
     tasks = []
     # Current cycle: 3/5 hit
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=1,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = c_cycle.id
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
         t.strategic_cycle_id = c_cycle.id
         db_session.add(t)
         tasks.append(t)
     # Previous cycle: 5/5 hit
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=19, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=19,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = p_cycle.id
         db_session.add(t)
         tasks.append(t)
@@ -5115,14 +5926,16 @@ async def test_cycle_bucketing_uses_strategic_cycle_id(db_session: AsyncSession)
 
 
 @pytest.mark.asyncio
-async def test_cycle_bucketing_skips_underpopulated_cycle_rolls_further_back(db_session: AsyncSession):
+async def test_cycle_bucketing_skips_underpopulated_cycle_rolls_further_back(
+    db_session: AsyncSession,
+):
     """Skips a cycle pair where current bucket has < _MIN_SR_SAMPLE and uses N-1 / N-2."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
-    newest_cycle = _make_cycle(project.id, age_days=2)   # only 2 tasks — below threshold
-    mid_cycle = _make_cycle(project.id, age_days=20)     # 5 tasks
-    old_cycle = _make_cycle(project.id, age_days=40)     # 5 tasks
+    newest_cycle = _make_cycle(project.id, age_days=2)  # only 2 tasks — below threshold
+    mid_cycle = _make_cycle(project.id, age_days=20)  # 5 tasks
+    old_cycle = _make_cycle(project.id, age_days=40)  # 5 tasks
     db_session.add(newest_cycle)
     db_session.add(mid_cycle)
     db_session.add(old_cycle)
@@ -5130,17 +5943,32 @@ async def test_cycle_bucketing_skips_underpopulated_cycle_rolls_further_back(db_
 
     tasks = []
     for i in range(2):  # newest: below threshold
-        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=1,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = newest_cycle.id
         db_session.add(t)
         tasks.append(t)
     for i in range(5):  # mid: 5 tasks (should become "current")
-        t = _make_sr_task(project.id, age_days=19, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=19,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = mid_cycle.id
         db_session.add(t)
         tasks.append(t)
     for i in range(5):  # old: 5 tasks (should become "previous")
-        t = _make_sr_task(project.id, age_days=39, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=39,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = old_cycle.id
         db_session.add(t)
         tasks.append(t)
@@ -5155,7 +5983,9 @@ async def test_cycle_bucketing_skips_underpopulated_cycle_rolls_further_back(db_
 
 
 @pytest.mark.asyncio
-async def test_fallback_to_calendar_windows_when_no_completed_cycles(db_session: AsyncSession):
+async def test_fallback_to_calendar_windows_when_no_completed_cycles(
+    db_session: AsyncSession,
+):
     """Falls back to 14-day calendar windows when no completed cycles exist."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
@@ -5167,11 +5997,21 @@ async def test_fallback_to_calendar_windows_when_no_completed_cycles(db_session:
 
     tasks = []
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=["test-coverage"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -5197,33 +6037,61 @@ async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession)
 
     tasks = []
     for i in range(3):
-        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=1,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = c_cycle.id
         db_session.add(t)
         tasks.append(t)
     for i in range(2):
-        t = _make_sr_task(project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[])
+        t = _make_sr_task(
+            project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
         t.strategic_cycle_id = c_cycle.id
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
-        t = _make_sr_task(project.id, age_days=19, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=19,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         t.strategic_cycle_id = p_cycle.id
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
 
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert mock_post.call_count == 1
 
     # Second call same cycle — dedup should suppress.
-    with patch("app.notification_dispatch.post_failure_alert_message", new_callable=AsyncMock) as mock_post2, \
-         patch("app.notification_dispatch.dispatch_external_notification", new_callable=AsyncMock), \
-         patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None):
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post2,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ),
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
         await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     mock_post2.assert_not_called()
@@ -5234,14 +6102,22 @@ async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _make_recovery_task(project_id, *, use_top_level_origin: bool = True, use_check_results_origin: bool = False) -> Task:
+def _make_recovery_task(
+    project_id,
+    *,
+    use_top_level_origin: bool = True,
+    use_check_results_origin: bool = False,
+) -> Task:
     """Build a Task whose _self_review_outcome marks a recovery pass."""
     sro: dict = {}
     if use_top_level_origin:
         sro["reviewer_recovery_origin"] = "reviewer_recovery_after_incomplete_sr"
     if use_check_results_origin:
         sro["check_results"] = {
-            "correctness": {"passed": False, "origin": "reviewer_recovery_after_incomplete_sr"},
+            "correctness": {
+                "passed": False,
+                "origin": "reviewer_recovery_after_incomplete_sr",
+            },
         }
     return Task(
         project_id=project_id,
@@ -5255,14 +6131,20 @@ def _make_recovery_task(project_id, *, use_top_level_origin: bool = True, use_ch
 def _count_recovery_tasks(tasks: list) -> int:
     """Mirror the counting expression used in agent.py for reviewer_recovery_after_incomplete_sr_count."""
     return sum(
-        1 for t in tasks
+        1
+        for t in tasks
         if (
-            (t.context or {}).get("_self_review_outcome", {}).get("reviewer_recovery_origin")
+            (t.context or {})
+            .get("_self_review_outcome", {})
+            .get("reviewer_recovery_origin")
             == "reviewer_recovery_after_incomplete_sr"
-        ) or any(
-            isinstance(v, dict) and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
+        )
+        or any(
+            isinstance(v, dict)
+            and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
             for v in (
-                (t.context or {}).get("_self_review_outcome", {}).get("check_results") or {}
+                (t.context or {}).get("_self_review_outcome", {}).get("check_results")
+                or {}
             ).values()
         )
     )
@@ -5279,7 +6161,11 @@ def test_reviewer_recovery_count_via_top_level_origin():
             title="Normal task",
             payloads=[{"type": "create", "prompt": "x"}],
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"check_results": {"correctness": {"passed": True}}}},
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": True}}
+                }
+            },
         ),
     ]
     assert _count_recovery_tasks(tasks) == 2
@@ -5289,13 +6175,19 @@ def test_reviewer_recovery_count_via_check_results_origin():
     """Tasks with origin on a check_results entry (no top-level field) are counted."""
     project_id = uuid.uuid4()
     tasks = [
-        _make_recovery_task(project_id, use_top_level_origin=False, use_check_results_origin=True),
+        _make_recovery_task(
+            project_id, use_top_level_origin=False, use_check_results_origin=True
+        ),
         Task(
             project_id=project_id,
             title="Normal task",
             payloads=[{"type": "create", "prompt": "x"}],
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"check_results": {"correctness": {"passed": False}}}},
+            context={
+                "_self_review_outcome": {
+                    "check_results": {"correctness": {"passed": False}}
+                }
+            },
         ),
     ]
     assert _count_recovery_tasks(tasks) == 1
@@ -5331,7 +6223,10 @@ async def test_reviewer_recovery_count_written_to_design_doc(db_session: AsyncSe
     project = await _make_project(db_session)
     # Simulate: sr_catch_rate_trends already exists from compute_sr_catch_rate_trends
     doc = dict(project.design_doc or {})
-    doc["sr_catch_rate_trends"] = {"computed_at": "2026-01-01T00:00:00", "categories": {}}
+    doc["sr_catch_rate_trends"] = {
+        "computed_at": "2026-01-01T00:00:00",
+        "categories": {},
+    }
     project.design_doc = doc
     flag_modified(project, "design_doc")
     db_session.add(project)
@@ -5374,10 +6269,16 @@ async def test_reviewer_recovery_count_written_to_design_doc(db_session: AsyncSe
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _make_skip_task(project_id, *, age_days: float, skip_reason: str | None = None) -> Task:
+def _make_skip_task(
+    project_id, *, age_days: float, skip_reason: str | None = None
+) -> Task:
     """Build a Task whose _self_review_outcome is a fallback/skip envelope."""
     if skip_reason:
-        outcome: dict = {"verdict": "unknown", "check_results": {}, "skip_reason": skip_reason}
+        outcome: dict = {
+            "verdict": "unknown",
+            "check_results": {},
+            "skip_reason": skip_reason,
+        }
     else:
         # Legacy: verdict unknown + empty check_results, no skip_reason field
         outcome = {"verdict": "unknown", "check_results": {}}
@@ -5443,7 +6344,12 @@ async def test_sr_skip_rate_and_distribution(db_session: AsyncSession):
 
     # Current window (0-14 days): 5 normal SR tasks + 3 skip tasks (2 structured, 1 legacy)
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     t1 = _make_skip_task(project.id, age_days=2, skip_reason="diff_too_small")
@@ -5455,7 +6361,12 @@ async def test_sr_skip_rate_and_distribution(db_session: AsyncSession):
 
     # Previous window (14-28 days): 5 normal SR tasks
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
 
@@ -5484,11 +6395,21 @@ async def test_sr_skip_rate_omitted_below_min_sample(db_session: AsyncSession):
 
     # 4 tasks in current window (below _MIN_SR_SAMPLE=5 for skip stats)
     for _ in range(4):
-        t = _make_sr_task(project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
     for _ in range(5):
-        t = _make_sr_task(project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=["correctness"])
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
         db_session.add(t)
         tasks.append(t)
 
@@ -5502,18 +6423,24 @@ async def test_sr_skip_rate_omitted_below_min_sample(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_returns_none_below_sample_size(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_returns_none_below_sample_size(
+    db_session: AsyncSession,
+):
     """Returns None when either window has fewer than _MIN_SR_SAMPLE tasks with reviewer_findings."""
     from app.playbook_learning import compute_fresh_reviewer_trend
 
     project = await _make_project(db_session)
     tasks = []
     for _ in range(3):
-        t = _make_fr_task(project.id, age_days=2, reviewer_findings=[{"category": "correctness"}])
+        t = _make_fr_task(
+            project.id, age_days=2, reviewer_findings=[{"category": "correctness"}]
+        )
         db_session.add(t)
         tasks.append(t)
     for _ in range(3):
-        t = _make_fr_task(project.id, age_days=20, reviewer_findings=[{"category": "correctness"}])
+        t = _make_fr_task(
+            project.id, age_days=20, reviewer_findings=[{"category": "correctness"}]
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -5524,7 +6451,9 @@ async def test_compute_fresh_reviewer_trend_returns_none_below_sample_size(db_se
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_per_category_hit_rate(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_per_category_hit_rate(
+    db_session: AsyncSession,
+):
     """per_category_hit_rate reflects confirmed / flagged per category."""
     from app.playbook_learning import compute_fresh_reviewer_trend
 
@@ -5534,7 +6463,8 @@ async def test_compute_fresh_reviewer_trend_per_category_hit_rate(db_session: As
     for i in range(5):
         confirmed = i < 3
         t = _make_fr_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             reviewer_findings=[{"category": "correctness"}],
             human_cats=["correctness"] if confirmed else [],
         )
@@ -5543,7 +6473,8 @@ async def test_compute_fresh_reviewer_trend_per_category_hit_rate(db_session: As
     # Previous: 5 flag correctness, all confirmed
     for _ in range(5):
         t = _make_fr_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             reviewer_findings=[{"category": "correctness"}],
             human_cats=["correctness"],
         )
@@ -5572,7 +6503,8 @@ async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession
     for i in range(5):
         agent_caught = i < 2
         t = _make_fr_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             reviewer_findings=[{"category": "correctness"}],
             human_cats=["correctness"],
             sr_failed_cats=["correctness"] if agent_caught else [],
@@ -5582,7 +6514,8 @@ async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession
     # Previous: reviewer flags correctness, agent also caught all → added_value=0
     for _ in range(5):
         t = _make_fr_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             reviewer_findings=[{"category": "correctness"}],
             human_cats=["correctness"],
             sr_failed_cats=["correctness"],
@@ -5600,7 +6533,9 @@ async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_approval_rate_lift(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_approval_rate_lift(
+    db_session: AsyncSession,
+):
     """approval_rate_lift is fa_rate_with_reviewer minus fa_rate_without."""
     from app.playbook_learning import compute_fresh_reviewer_trend
 
@@ -5608,9 +6543,12 @@ async def test_compute_fresh_reviewer_trend_approval_rate_lift(db_session: Async
     tasks = []
     # Current: 5 with reviewer (all succeed), 5 without (3/5 succeed)
     for _ in range(5):
-        t = _make_fr_task(project.id, age_days=2,
-                          reviewer_findings=[{"category": "style-conventions"}],
-                          first_attempt_succeeded=True)
+        t = _make_fr_task(
+            project.id,
+            age_days=2,
+            reviewer_findings=[{"category": "style-conventions"}],
+            first_attempt_succeeded=True,
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
@@ -5619,9 +6557,12 @@ async def test_compute_fresh_reviewer_trend_approval_rate_lift(db_session: Async
         tasks.append(t)
     # Previous: 5 with reviewer (4/5 succeed), 5 without (4/5 succeed)
     for i in range(5):
-        t = _make_fr_task(project.id, age_days=20,
-                          reviewer_findings=[{"category": "style-conventions"}],
-                          first_attempt_succeeded=(i < 4))
+        t = _make_fr_task(
+            project.id,
+            age_days=20,
+            reviewer_findings=[{"category": "style-conventions"}],
+            first_attempt_succeeded=(i < 4),
+        )
         db_session.add(t)
         tasks.append(t)
     for i in range(5):
@@ -5641,7 +6582,9 @@ async def test_compute_fresh_reviewer_trend_approval_rate_lift(db_session: Async
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_stable_classification(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_stable_classification(
+    db_session: AsyncSession,
+):
     """Hit rate delta < 5pp → trend='stable'."""
     from app.playbook_learning import compute_fresh_reviewer_trend
 
@@ -5650,7 +6593,8 @@ async def test_compute_fresh_reviewer_trend_stable_classification(db_session: As
     for window_age in (2, 20):
         for i in range(5):
             t = _make_fr_task(
-                project.id, age_days=window_age,
+                project.id,
+                age_days=window_age,
                 reviewer_findings=[{"category": "security"}],
                 human_cats=["security"] if i < 4 else [],
             )
@@ -5665,7 +6609,9 @@ async def test_compute_fresh_reviewer_trend_stable_classification(db_session: As
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_persists_to_design_doc(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_persists_to_design_doc(
+    db_session: AsyncSession,
+):
     """Writes fresh_reviewer_trend to project.design_doc."""
     from app.playbook_learning import compute_fresh_reviewer_trend
 
@@ -5673,8 +6619,11 @@ async def test_compute_fresh_reviewer_trend_persists_to_design_doc(db_session: A
     tasks = []
     for window_age in (2, 20):
         for _ in range(5):
-            t = _make_fr_task(project.id, age_days=window_age,
-                              reviewer_findings=[{"category": "correctness"}])
+            t = _make_fr_task(
+                project.id,
+                age_days=window_age,
+                reviewer_findings=[{"category": "correctness"}],
+            )
             db_session.add(t)
             tasks.append(t)
     await db_session.flush()
@@ -5685,13 +6634,19 @@ async def test_compute_fresh_reviewer_trend_persists_to_design_doc(db_session: A
 
     assert result is not None
     assert project.design_doc.get("fresh_reviewer_trend") is not None
-    assert project.design_doc["fresh_reviewer_trend"]["computed_at"] == result["computed_at"]
+    assert (
+        project.design_doc["fresh_reviewer_trend"]["computed_at"]
+        == result["computed_at"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(
+    db_session: AsyncSession,
+):
     """Cycle bucketing: tasks without reviewer_findings don't count toward sample size."""
     from app.playbook_learning import compute_fresh_reviewer_trend
+
     project = await _make_project(db_session)
     c1 = _make_cycle(project.id, age_days=10)
     c2 = _make_cycle(project.id, age_days=30)
@@ -5701,9 +6656,12 @@ async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(db_s
     tasks = []
     # c1: 5 with reviewer, 10 without
     for _ in range(5):
-        t = _make_fr_task(project.id, age_days=5,
-                          reviewer_findings=[{"category": "correctness"}],
-                          cycle_id=str(c1.id))
+        t = _make_fr_task(
+            project.id,
+            age_days=5,
+            reviewer_findings=[{"category": "correctness"}],
+            cycle_id=str(c1.id),
+        )
         db_session.add(t)
         tasks.append(t)
     for _ in range(10):
@@ -5712,9 +6670,12 @@ async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(db_s
         tasks.append(t)
     # c2: 5 with reviewer
     for _ in range(5):
-        t = _make_fr_task(project.id, age_days=25,
-                          reviewer_findings=[{"category": "correctness"}],
-                          cycle_id=str(c2.id))
+        t = _make_fr_task(
+            project.id,
+            age_days=25,
+            reviewer_findings=[{"category": "correctness"}],
+            cycle_id=str(c2.id),
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -5728,7 +6689,9 @@ async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(db_s
 
 
 @pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_improving_classification(db_session: AsyncSession):
+async def test_compute_fresh_reviewer_trend_improving_classification(
+    db_session: AsyncSession,
+):
     """Hit rate delta >= 5pp → trend='improving' for per_category_hit_rate."""
     from app.playbook_learning import compute_fresh_reviewer_trend
 
@@ -5737,7 +6700,8 @@ async def test_compute_fresh_reviewer_trend_improving_classification(db_session:
     # Current: 5 flag correctness, all 5 confirmed → rate=1.0
     for _ in range(5):
         t = _make_fr_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             reviewer_findings=[{"category": "correctness"}],
             human_cats=["correctness"],
         )
@@ -5746,7 +6710,8 @@ async def test_compute_fresh_reviewer_trend_improving_classification(db_session:
     # Previous: 5 flag correctness, only 3 confirmed → rate=0.6
     for i in range(5):
         t = _make_fr_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             reviewer_findings=[{"category": "correctness"}],
             human_cats=["correctness"] if i < 3 else [],
         )
@@ -5772,14 +6737,16 @@ async def test_compute_fresh_reviewer_trend_calendar_fallback(db_session: AsyncS
     tasks = []
     # No cycles → calendar mode; 5 tasks in 0-14d window
     for _ in range(5):
-        t = _make_fr_task(project.id, age_days=7,
-                          reviewer_findings=[{"category": "correctness"}])
+        t = _make_fr_task(
+            project.id, age_days=7, reviewer_findings=[{"category": "correctness"}]
+        )
         db_session.add(t)
         tasks.append(t)
     # 5 tasks in 14-28d window
     for _ in range(5):
-        t = _make_fr_task(project.id, age_days=21,
-                          reviewer_findings=[{"category": "correctness"}])
+        t = _make_fr_task(
+            project.id, age_days=21, reviewer_findings=[{"category": "correctness"}]
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -5821,7 +6788,9 @@ def _make_sr_reviewer_task(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_returns_none_when_no_findings(db_session: AsyncSession):
+async def test_compute_sr_reviewer_disagreements_returns_none_when_no_findings(
+    db_session: AsyncSession,
+):
     """Returns None when no tasks have reviewer_findings."""
     from app.playbook_learning import compute_sr_reviewer_disagreements
 
@@ -5839,7 +6808,9 @@ async def test_compute_sr_reviewer_disagreements_returns_none_when_no_findings(d
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_counts_disagreements(db_session: AsyncSession):
+async def test_compute_sr_reviewer_disagreements_counts_disagreements(
+    db_session: AsyncSession,
+):
     """Counts disagreements where reviewer flagged but SR passed/omitted the category."""
     from app.playbook_learning import compute_sr_reviewer_disagreements
 
@@ -5852,7 +6823,9 @@ async def test_compute_sr_reviewer_disagreements_counts_disagreements(db_session
             age_days=1,
             task_type="fix",
             check_results={},
-            reviewer_findings=[{"category": "correctness", "severity": "HIGH", "description": "bug"}],
+            reviewer_findings=[
+                {"category": "correctness", "severity": "HIGH", "description": "bug"}
+            ],
         )
         db_session.add(t)
         tasks.append(t)
@@ -5862,7 +6835,9 @@ async def test_compute_sr_reviewer_disagreements_counts_disagreements(db_session
         age_days=2,
         task_type="fix",
         check_results={"correctness": {"passed": False, "issue": "x"}},
-        reviewer_findings=[{"category": "correctness", "severity": "HIGH", "description": "bug"}],
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": "bug"}
+        ],
     )
     db_session.add(t2)
     tasks.append(t2)
@@ -5880,7 +6855,9 @@ async def test_compute_sr_reviewer_disagreements_counts_disagreements(db_session
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(db_session: AsyncSession):
+async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(
+    db_session: AsyncSession,
+):
     """Result is written to project.design_doc['sr_reviewer_disagreements']."""
     from app.playbook_learning import compute_sr_reviewer_disagreements
 
@@ -5890,7 +6867,13 @@ async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(db_sessi
         project.id,
         age_days=1,
         check_results={},
-        reviewer_findings=[{"category": "test-coverage", "severity": "MEDIUM", "description": "missing test"}],
+        reviewer_findings=[
+            {
+                "category": "test-coverage",
+                "severity": "MEDIUM",
+                "description": "missing test",
+            }
+        ],
     )
     db_session.add(t)
     tasks.append(t)
@@ -5904,7 +6887,9 @@ async def test_compute_sr_reviewer_disagreements_persists_to_design_doc(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_excludes_old_tasks(db_session: AsyncSession):
+async def test_compute_sr_reviewer_disagreements_excludes_old_tasks(
+    db_session: AsyncSession,
+):
     """Tasks older than window_days are excluded."""
     from app.playbook_learning import compute_sr_reviewer_disagreements
 
@@ -5914,7 +6899,9 @@ async def test_compute_sr_reviewer_disagreements_excludes_old_tasks(db_session: 
         project.id,
         age_days=35,  # outside 30-day default window
         check_results={},
-        reviewer_findings=[{"category": "security", "severity": "HIGH", "description": "x"}],
+        reviewer_findings=[
+            {"category": "security", "severity": "HIGH", "description": "x"}
+        ],
     )
     db_session.add(t)
     tasks.append(t)
@@ -5926,7 +6913,9 @@ async def test_compute_sr_reviewer_disagreements_excludes_old_tasks(db_session: 
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_excludes_non_code_types(db_session: AsyncSession):
+async def test_compute_sr_reviewer_disagreements_excludes_non_code_types(
+    db_session: AsyncSession,
+):
     """Only code-change task types (create/fix/refactor/migrate) are counted."""
     from app.playbook_learning import compute_sr_reviewer_disagreements
 
@@ -5938,7 +6927,9 @@ async def test_compute_sr_reviewer_disagreements_excludes_non_code_types(db_sess
             age_days=1,
             task_type=ttype,
             check_results={},
-            reviewer_findings=[{"category": "correctness", "severity": "HIGH", "description": "bug"}],
+            reviewer_findings=[
+                {"category": "correctness", "severity": "HIGH", "description": "bug"}
+            ],
         )
         db_session.add(t)
         tasks.append(t)
@@ -5966,7 +6957,8 @@ def _make_fp_task(
     sro: dict = {
         "check_results": check_results,
         "reviewer_findings": [
-            {"category": cat, "severity": "HIGH", "description": "found"} for cat in reviewer_cats
+            {"category": cat, "severity": "HIGH", "description": "found"}
+            for cat in reviewer_cats
         ],
     }
     task = Task(
@@ -5986,11 +6978,15 @@ def test_compute_cat_fp_stats_fp_and_tp_counts():
     project_id = uuid.uuid4()
     tasks = [
         # correctness: SR flagged, reviewer also flagged → TP
-        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]),
+        _make_fp_task(
+            project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
+        ),
         # correctness: SR flagged, reviewer missed → FP
         _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
         # security: SR flagged, reviewer missed → FP
-        _make_fp_task(project_id, sr_failed_cats=["security"], reviewer_cats=["correctness"]),
+        _make_fp_task(
+            project_id, sr_failed_cats=["security"], reviewer_cats=["correctness"]
+        ),
     ]
 
     cat_fp, type_cat_fp = _compute_cat_fp_stats(tasks)
@@ -6011,8 +7007,15 @@ def test_compute_cat_fp_stats_skips_non_code_types():
 
     project_id = uuid.uuid4()
     tasks = [
-        _make_fp_task(project_id, task_type="research", sr_failed_cats=["correctness"], reviewer_cats=[]),
-        _make_fp_task(project_id, task_type="plan", sr_failed_cats=["security"], reviewer_cats=[]),
+        _make_fp_task(
+            project_id,
+            task_type="research",
+            sr_failed_cats=["correctness"],
+            reviewer_cats=[],
+        ),
+        _make_fp_task(
+            project_id, task_type="plan", sr_failed_cats=["security"], reviewer_cats=[]
+        ),
     ]
 
     cat_fp, type_cat_fp = _compute_cat_fp_stats(tasks)
@@ -6047,7 +7050,9 @@ def test_compute_cat_fp_stats_false_positive_rate_formula():
     tasks = [
         _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
         _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
-        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]),
+        _make_fp_task(
+            project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
+        ),
     ]
 
     cat_fp, _ = _compute_cat_fp_stats(tasks)
@@ -6076,7 +7081,9 @@ def _make_edges_task(
     """Build a Task for edges-trend tests with _self_review_outcome.edges_considered."""
     ctx: dict = {
         "_self_review_outcome": {
-            "edges_considered": edges_considered if edges_considered is not None else [],
+            "edges_considered": edges_considered
+            if edges_considered is not None
+            else [],
         }
     }
     task = Task(
@@ -6093,7 +7100,9 @@ def _make_edges_task(
 
 
 @pytest.mark.asyncio
-async def test_compute_edges_trend_returns_none_below_sample_size(db_session: AsyncSession):
+async def test_compute_edges_trend_returns_none_below_sample_size(
+    db_session: AsyncSession,
+):
     """Returns None when either window has fewer than _MIN_SR_SAMPLE qualifying tasks."""
     from app.playbook_learning import compute_edges_trend
 
@@ -6124,7 +7133,8 @@ async def test_compute_edges_trend_calendar_fallback(db_session: AsyncSession):
     # Current window (0-14d): 5 tasks, 3 with edges
     for i in range(5):
         t = _make_edges_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             edges_considered=[{"id": "e1"}] if i < 3 else [],
         )
         db_session.add(t)
@@ -6161,7 +7171,8 @@ async def test_compute_edges_trend_cycle_mode_happy_path(db_session: AsyncSessio
     # c1 (current): 5 tasks, 4 with edges → rate=0.8
     for i in range(5):
         t = _make_edges_task(
-            project.id, age_days=3,
+            project.id,
+            age_days=3,
             edges_considered=[{"id": "e1"}] if i < 4 else [],
             cycle_id=str(c1.id),
         )
@@ -6170,7 +7181,8 @@ async def test_compute_edges_trend_cycle_mode_happy_path(db_session: AsyncSessio
     # c2 (previous): 5 tasks, 1 with edges → rate=0.2
     for i in range(5):
         t = _make_edges_task(
-            project.id, age_days=25,
+            project.id,
+            age_days=25,
             edges_considered=[{"id": "e1"}] if i < 1 else [],
             cycle_id=str(c2.id),
         )
@@ -6200,7 +7212,8 @@ async def test_compute_edges_trend_stable_classification(db_session: AsyncSessio
     # Current: 5 tasks, 4/5 with edges → 0.8
     for i in range(5):
         t = _make_edges_task(
-            project.id, age_days=2,
+            project.id,
+            age_days=2,
             edges_considered=[{"id": "e1"}] if i < 4 else [],
         )
         db_session.add(t)
@@ -6208,7 +7221,8 @@ async def test_compute_edges_trend_stable_classification(db_session: AsyncSessio
     # Previous: 5 tasks, 4/5 with edges → 0.8 (delta=0 → stable)
     for i in range(5):
         t = _make_edges_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             edges_considered=[{"id": "e1"}] if i < 4 else [],
         )
         db_session.add(t)
@@ -6230,7 +7244,9 @@ async def test_compute_edges_trend_persists_to_design_doc(db_session: AsyncSessi
     tasks = []
     for window_age in (2, 20):
         for _ in range(5):
-            t = _make_edges_task(project.id, age_days=window_age, edges_considered=[{"id": "e1"}])
+            t = _make_edges_task(
+                project.id, age_days=window_age, edges_considered=[{"id": "e1"}]
+            )
             db_session.add(t)
             tasks.append(t)
     await db_session.flush()
@@ -6261,7 +7277,8 @@ async def test_compute_edges_trend_history_capped_at_5(db_session: AsyncSession)
         tasks = []
         for _ in range(5):
             t = _make_edges_task(
-                project.id, age_days=call_idx * 10 + 0.5,
+                project.id,
+                age_days=call_idx * 10 + 0.5,
                 edges_considered=[{"id": "e1"}],
                 cycle_id=str(c_cycle.id),
             )
@@ -6269,7 +7286,8 @@ async def test_compute_edges_trend_history_capped_at_5(db_session: AsyncSession)
             tasks.append(t)
         for _ in range(5):
             t = _make_edges_task(
-                project.id, age_days=call_idx * 10 + 15,
+                project.id,
+                age_days=call_idx * 10 + 15,
                 edges_considered=[{"id": "e1"}],
                 cycle_id=str(p_cycle.id),
             )
@@ -6286,7 +7304,9 @@ async def test_compute_edges_trend_history_capped_at_5(db_session: AsyncSession)
 
 
 @pytest.mark.asyncio
-async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(db_session: AsyncSession):
+async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(
+    db_session: AsyncSession,
+):
     """When both functions run on the same tasks, they pick the same cycle pair."""
     from app.playbook_learning import compute_edges_trend, compute_sr_catch_rate_trends
 
@@ -6300,27 +7320,38 @@ async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(db_session: A
     # c1: 5 SR tasks + 5 edges tasks
     for _ in range(5):
         t = _make_sr_task(
-            project.id, age_days=3,
-            human_cats={"correctness": 1}, sr_failed_cats=["correctness"],
+            project.id,
+            age_days=3,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
         )
         t.strategic_cycle_id = c1.id
         db_session.add(t)
         tasks.append(t)
     for _ in range(5):
-        t = _make_edges_task(project.id, age_days=3, edges_considered=[{"id": "e1"}], cycle_id=str(c1.id))
+        t = _make_edges_task(
+            project.id, age_days=3, edges_considered=[{"id": "e1"}], cycle_id=str(c1.id)
+        )
         db_session.add(t)
         tasks.append(t)
     # c2: 5 SR tasks + 5 edges tasks
     for _ in range(5):
         t = _make_sr_task(
-            project.id, age_days=25,
-            human_cats={"correctness": 1}, sr_failed_cats=["correctness"],
+            project.id,
+            age_days=25,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
         )
         t.strategic_cycle_id = c2.id
         db_session.add(t)
         tasks.append(t)
     for _ in range(5):
-        t = _make_edges_task(project.id, age_days=25, edges_considered=[{"id": "e1"}], cycle_id=str(c2.id))
+        t = _make_edges_task(
+            project.id,
+            age_days=25,
+            edges_considered=[{"id": "e1"}],
+            cycle_id=str(c2.id),
+        )
         db_session.add(t)
         tasks.append(t)
     await db_session.flush()
@@ -6337,7 +7368,9 @@ async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(db_session: A
 
 
 @pytest.mark.asyncio
-async def test_compute_edges_trend_author_vs_reviewer_breakdown(db_session: AsyncSession):
+async def test_compute_edges_trend_author_vs_reviewer_breakdown(
+    db_session: AsyncSession,
+):
     """Per-origin breakdown surfaces author vs reviewer counts and the
     reviewer_caught signal in the trend dict's `current` stats block."""
     from app.playbook_learning import compute_edges_trend
@@ -6366,7 +7399,8 @@ async def test_compute_edges_trend_author_vs_reviewer_breakdown(db_session: Asyn
     # Previous window: 5 tasks, no reviewer edges at all.
     for i in range(5):
         t = _make_edges_task(
-            project.id, age_days=20,
+            project.id,
+            age_days=20,
             edges_considered=[{"case": f"prev-{i}", "handled": True}] if i < 3 else [],
         )
         db_session.add(t)
@@ -6390,3 +7424,308 @@ async def test_compute_edges_trend_author_vs_reviewer_breakdown(db_session: Asyn
 
     assert result["reviewer_caught_rate_delta"] == round(2 / 5 - 0, 3)
     assert result["reviewer_caught_trend"] == "improving"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for compute_sr_regression_risk_test_signal_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_rr_task(
+    project_id,
+    *,
+    age_days: float,
+    sr_passed,
+    test_attempts,
+    task_type: str = "create",
+    blind_spots=None,
+) -> Task:
+    """Build a Task with SR regression_risk verdict + fix_loop_history.test bucket.
+
+    ``sr_passed`` of ``None`` omits the regression_risk entry so the task
+    fails the qualifies-predicate.  ``test_attempts`` of ``None`` defaults
+    to no test loop activity.
+    """
+    check_results: dict = {}
+    if sr_passed is not None:
+        check_results["regression_risk"] = {"passed": sr_passed, "issue": "x"}
+    sro: dict = {"check_results": check_results}
+    if blind_spots is not None:
+        sro["blind_spots"] = blind_spots
+    history: dict = {}
+    if test_attempts is not None:
+        history["test"] = test_attempts
+    task = Task(
+        project_id=project_id,
+        title="SR-RR task",
+        payloads=[{"type": task_type, "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context={"_self_review_outcome": sro},
+        fix_loop_history=history,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_returns_none_below_sample(
+    db_session: AsyncSession,
+):
+    """Below _MIN_SR_SAMPLE qualifying tasks → None (not zero)."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(4):
+        t = _make_sr_rr_task(project.id, age_days=2, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(4):
+        t = _make_sr_rr_task(project.id, age_days=20, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_passed_no_signal_is_true_pass(
+    db_session: AsyncSession,
+):
+    """SR passed + no/trivial test loop is a true-pass, not a miss."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=2, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=20, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is not None
+    cur = result["current"]
+    assert cur["sr_passed_no_signal"] == 5
+    assert cur["sr_passed_with_signal"] == 0
+    assert cur["miss_by_test_signal_rate"] == 0.0
+    assert cur["numerator"] == 0
+    assert cur["denominator"] == 5
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_passed_with_signal_counts_as_miss(
+    db_session: AsyncSession,
+):
+    """SR passed + test loop ran non-trivially → miss-by-test-signal."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(3):
+        t = _make_sr_rr_task(
+            project.id,
+            age_days=2,
+            sr_passed=True,
+            test_attempts=[
+                {"iteration": 1, "exit_reason": "in_progress"},
+                {"iteration": 2, "exit_reason": "passed"},
+            ],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_rr_task(project.id, age_days=2, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=20, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is not None
+    cur = result["current"]
+    assert cur["sr_passed_with_signal"] == 3
+    assert cur["sr_passed_no_signal"] == 2
+    assert cur["miss_by_test_signal_rate"] == round(3 / 5, 3)
+    assert cur["numerator"] == 3
+    assert cur["denominator"] == 5
+    assert result["miss_by_test_signal_rate_delta"] == round(3 / 5, 3)
+    assert result["trend"] == "regressing"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_failed_with_signal_is_hit(
+    db_session: AsyncSession,
+):
+    """SR failed regression_risk + test loop ran → hit-by-test-signal counted."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(4):
+        t = _make_sr_rr_task(
+            project.id,
+            age_days=2,
+            sr_passed=False,
+            test_attempts=[
+                {"iteration": 1, "exit_reason": "divergence_detected"},
+            ],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(1):
+        t = _make_sr_rr_task(project.id, age_days=2, sr_passed=False, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=20, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is not None
+    cur = result["current"]
+    assert cur["sr_failed_with_signal"] == 4
+    assert cur["sr_failed_no_signal"] == 1
+    assert cur["denominator"] == 0
+    assert cur["miss_by_test_signal_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_skip_envelope_excluded(
+    db_session: AsyncSession,
+):
+    """Skip-fallback SR envelopes are excluded from numerator and denominator."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=2, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_rr_task(
+            project.id,
+            age_days=2,
+            sr_passed=None,
+            test_attempts=[{"iteration": 1, "exit_reason": "passed"}],
+            blind_spots=["self-review skipped: diff below threshold"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=20, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is not None
+    cur = result["current"]
+    assert cur["sample_size"] == 5
+    assert (
+        cur["sr_passed_no_signal"]
+        + cur["sr_passed_with_signal"]
+        + cur["sr_failed_no_signal"]
+        + cur["sr_failed_with_signal"]
+    ) == 5
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_persists_to_design_doc(
+    db_session: AsyncSession,
+):
+    """Result is written to project.design_doc under the new key."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=2, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=20, sr_passed=True, test_attempts=[])
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is not None
+
+    await db_session.refresh(project)
+    assert project.design_doc is not None
+    persisted = project.design_doc.get("sr_regression_risk_test_signal_trends")
+    assert persisted is not None
+    assert persisted["computed_at"] == result["computed_at"]
+    assert persisted["current"]["sample_size"] == 5
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_regression_risk_test_signal_trends_cycle_bucketing(
+    db_session: AsyncSession,
+):
+    """Two completed StrategicCycle rows form current/previous buckets."""
+    from app.playbook_learning import compute_sr_regression_risk_test_signal_trends
+
+    project = await _make_project(db_session)
+    c_cycle = _make_cycle(project.id, age_days=2)
+    p_cycle = _make_cycle(project.id, age_days=20)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+    await db_session.flush()
+
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_rr_task(
+            project.id,
+            age_days=1,
+            sr_passed=True,
+            test_attempts=[
+                {"iteration": 1, "exit_reason": "in_progress"},
+                {"iteration": 2, "exit_reason": "passed"},
+            ],
+        )
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_rr_task(project.id, age_days=19, sr_passed=True, test_attempts=[])
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_regression_risk_test_signal_trends(
+        project.id, db_session, tasks
+    )
+    assert result is not None
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_cycle_id"] == c_cycle.id
+    assert result["previous_cycle_id"] == p_cycle.id
+    assert result["current"]["sr_passed_with_signal"] == 5
+    assert result["previous"]["sr_passed_with_signal"] == 0
+    assert result["trend"] == "regressing"

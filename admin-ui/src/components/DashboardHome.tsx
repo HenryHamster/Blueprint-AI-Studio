@@ -235,6 +235,24 @@ interface DigestData {
     sample_size?: number | null;
   } | null;
   self_review_prediction_accuracy_trends?: SrTrendData | null;
+  sr_regression_risk_test_signal_trends?: {
+    computed_at?: string | null;
+    bucket_mode?: string | null;
+    trend?: string | null;
+    miss_by_test_signal_rate_delta?: number | null;
+    current?: {
+      miss_by_test_signal_rate?: number | null;
+      numerator?: number | null;
+      denominator?: number | null;
+      sample_size?: number | null;
+    } | null;
+    previous?: {
+      miss_by_test_signal_rate?: number | null;
+      numerator?: number | null;
+      denominator?: number | null;
+      sample_size?: number | null;
+    } | null;
+  } | null;
   self_review_skip_rate?: {
     overall_rate: number;
     skipped_count: number;
@@ -1033,6 +1051,37 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                     )}
                   </div>
                 )}
+                {digest?.sr_regression_risk_test_signal_trends?.current?.miss_by_test_signal_rate != null && (() => {
+                  const rrts = digest.sr_regression_risk_test_signal_trends!;
+                  const missRate = rrts.current!.miss_by_test_signal_rate!;
+                  const numer = rrts.current!.numerator ?? 0;
+                  const denom = rrts.current!.denominator ?? 0;
+                  const trend = rrts.trend;
+                  const delta = rrts.miss_by_test_signal_rate_delta;
+                  const color = missRate <= 0.15 ? 'text-emerald-400' : missRate <= 0.35 ? 'text-amber-400' : 'text-red-400';
+                  const trendIcon = trend === 'improving' ? '↓' : trend === 'regressing' ? '↑' : '→';
+                  const trendColor = trend === 'improving' ? 'text-emerald-500' : trend === 'regressing' ? 'text-red-500' : 'text-neutral-500';
+                  const tooltip = [
+                    'SR regression_risk catch vs test-failure signal',
+                    `Miss rate: SR passed but testFix loop ran (${numer}/${denom})`,
+                    'A miss = SR said regression_risk:passed yet the task\'s testFix loop subsequently ran ≥1 iteration.',
+                    delta != null ? `Δ vs previous period: ${delta >= 0 ? '+' : ''}${Math.round(delta * 100)}pp` : null,
+                  ].filter(Boolean).join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
+                      title={tooltip}
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">RR vs Test Signal</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {Math.round(missRate * 100)}%
+                      </p>
+                      <p className="text-[9px] text-neutral-600 mt-0.5">
+                        {numer}/{denom} miss <span className={trendColor}>{trendIcon}</span>
+                      </p>
+                    </div>
+                  );
+                })()}
                 {digest?.self_review_skip_rate != null && (() => {
                   const skip = digest.self_review_skip_rate;
                   const rate = skip.overall_rate;

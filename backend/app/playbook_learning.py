@@ -13,6 +13,7 @@ Threshold and window are configurable via runtime_config:
 first-review-rejection time by the lifecycle pipeline (sibling cluster wires it
 in) so subsequent reads from admin_digest can skip the keyword scan.
 """
+
 import json
 import logging
 import os
@@ -31,7 +32,15 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Alert, AlertSeverity, Task, Project, StrategicCycle, TaskStatus, _utcnow
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Task,
+    Project,
+    StrategicCycle,
+    TaskStatus,
+    _utcnow,
+)
 
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
 # powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
@@ -53,6 +62,7 @@ def _format_sr_alert_title(prefix: str, parts: list[str]) -> str:
     else:
         joined = ", ".join(parts)
     return f"{prefix}: {joined}"
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle constants
@@ -100,7 +110,7 @@ _REVIEW_PLAYBOOK_STALE_DAYS = 60
 # Regex patterns that match source-file paths embedded in playbook entry content.
 # Used to detect references to files that may have been renamed or removed.
 _FILE_PATH_RE = re.compile(
-    r'\b((?:backend|agent|admin-ui)/(?:[\w.-]+/)*[\w.-]+\.\w+)\b'
+    r"\b((?:backend|agent|admin-ui)/(?:[\w.-]+/)*[\w.-]+\.\w+)\b"
 )
 
 # ---------------------------------------------------------------------------
@@ -115,53 +125,149 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
     # assertion now fails". The key spelling matches the agent's self-review
     # check_results category in agent/src/prompt.ts (underscore form).
     "regression_risk": [
-        "regress", "regression", "regresses", "regressed",
-        "previously passing", "previously-passing", "was passing",
-        "broke the test", "breaks the test", "broke test", "breaks test",
-        "broken test", "broke a test", "breaks a test",
-        "now failing", "no longer passes", "no longer works",
+        "regress",
+        "regression",
+        "regresses",
+        "regressed",
+        "previously passing",
+        "previously-passing",
+        "was passing",
+        "broke the test",
+        "breaks the test",
+        "broke test",
+        "breaks test",
+        "broken test",
+        "broke a test",
+        "breaks a test",
+        "now failing",
+        "no longer passes",
+        "no longer works",
     ],
     "test-coverage": [
-        "test", "coverage", "assert", "unit test", "integration test",
-        "spec", "test case", "test suite", "missing test", "untested",
+        "test",
+        "coverage",
+        "assert",
+        "unit test",
+        "integration test",
+        "spec",
+        "test case",
+        "test suite",
+        "missing test",
+        "untested",
     ],
     "error-handling": [
-        "error handling", "exception", "try/catch", "try except", "fallback",
-        "guard", "null check", "none check", "unhandled", "raise",
+        "error handling",
+        "exception",
+        "try/catch",
+        "try except",
+        "fallback",
+        "guard",
+        "null check",
+        "none check",
+        "unhandled",
+        "raise",
     ],
     "security": [
-        "security", "injection", "xss", "csrf", "sanitize", "validate input",
-        "auth", "permission", "secret", "credential", "escape",
+        "security",
+        "injection",
+        "xss",
+        "csrf",
+        "sanitize",
+        "validate input",
+        "auth",
+        "permission",
+        "secret",
+        "credential",
+        "escape",
     ],
     "style-conventions": [
-        "style", "format", "naming", "convention", "whitespace", "indentation",
-        "pep8", "lint", "camelcase", "snake_case", "consistent",
+        "style",
+        "format",
+        "naming",
+        "convention",
+        "whitespace",
+        "indentation",
+        "pep8",
+        "lint",
+        "camelcase",
+        "snake_case",
+        "consistent",
     ],
     "type-safety": [
-        "type hint", "type annotation", "typing", "typevar", "optional",
-        "union", "cast", "mypy", "type error", "untyped",
+        "type hint",
+        "type annotation",
+        "typing",
+        "typevar",
+        "optional",
+        "union",
+        "cast",
+        "mypy",
+        "type error",
+        "untyped",
     ],
     "documentation": [
-        "docstring", "documentation", "comment", "readme", "inline comment",
-        "missing doc", "undocumented",
+        "docstring",
+        "documentation",
+        "comment",
+        "readme",
+        "inline comment",
+        "missing doc",
+        "undocumented",
     ],
     "performance": [
-        "performance", "optimize", "cache", "slow", "n+1", "index", "memory",
-        "efficiency", "bottleneck",
+        "performance",
+        "optimize",
+        "cache",
+        "slow",
+        "n+1",
+        "index",
+        "memory",
+        "efficiency",
+        "bottleneck",
     ],
     "architecture": [
-        "refactor", "separation of concerns", "coupling", "dependency",
-        "abstraction", "pattern", "interface", "modularity", "cohesion",
+        "refactor",
+        "separation of concerns",
+        "coupling",
+        "dependency",
+        "abstraction",
+        "pattern",
+        "interface",
+        "modularity",
+        "cohesion",
     ],
     "correctness": [
-        "logic", "bug", "incorrect", "wrong", "off-by-one", "return value",
-        "edge case", "boundary", "race condition", "deadlock", "missing import",
-        "undefined", "null reference", "assertion", "invariant", "constraint",
+        "logic",
+        "bug",
+        "incorrect",
+        "wrong",
+        "off-by-one",
+        "return value",
+        "edge case",
+        "boundary",
+        "race condition",
+        "deadlock",
+        "missing import",
+        "undefined",
+        "null reference",
+        "assertion",
+        "invariant",
+        "constraint",
     ],
     "scope-drift": [
-        "scope", "scope drift", "diff size", "too large", "too many files",
-        "bloat", "beyond scope", "out of scope", "unrelated changes",
-        "exceeds scope", "scope creep", "too broad", "unrelated files",
+        "scope",
+        "scope drift",
+        "diff size",
+        "too large",
+        "too many files",
+        "bloat",
+        "beyond scope",
+        "out of scope",
+        "unrelated changes",
+        "exceeds scope",
+        "scope creep",
+        "too broad",
+        "unrelated files",
     ],
 }
 
@@ -171,6 +277,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Lifecycle helpers
 # ---------------------------------------------------------------------------
+
 
 def _extract_file_paths(content: str) -> list[str]:
     """Return unique source-file paths found in *content*.
@@ -204,9 +311,7 @@ def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
         paths = _extract_file_paths(content)
         if not paths:
             continue
-        any_missing = any(
-            not os.path.isfile(os.path.join(repo_root, p)) for p in paths
-        )
+        any_missing = any(not os.path.isfile(os.path.join(repo_root, p)) for p in paths)
         if any_missing and not v.get("stale_file_refs"):
             entry = dict(v)
             entry["stale_file_refs"] = True
@@ -214,7 +319,8 @@ def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
             updated = True
             logger.debug(
                 "[PLAYBOOK] Flagged '%s' as stale_file_refs (missing paths: %s)",
-                k, [p for p in paths if not os.path.isfile(os.path.join(repo_root, p))],
+                k,
+                [p for p in paths if not os.path.isfile(os.path.join(repo_root, p))],
             )
         elif not any_missing and v.get("stale_file_refs"):
             # All referenced files now exist — clear the flag
@@ -240,7 +346,10 @@ def _playbook_size_bytes(doc: dict) -> int:
 
 
 async def finalize_pending_playbook_entries(
-    task: Task, session: AsyncSession, *, succeeded: bool,
+    task: Task,
+    session: AsyncSession,
+    *,
+    succeeded: bool,
 ) -> int:
     """Resolve playbook entries left ``pending_source=<task.id>`` by *task*.
 
@@ -297,7 +406,10 @@ async def finalize_pending_playbook_entries(
         logger.info(
             "[PLAYBOOK] %s %d pending entr%s for terminal task %s (succeeded=%s)",
             "Finalised" if succeeded else "Removed",
-            changed, "y" if changed == 1 else "ies", task.id, succeeded,
+            changed,
+            "y" if changed == 1 else "ies",
+            task.id,
+            succeeded,
         )
     return changed
 
@@ -350,7 +462,9 @@ def _archive_least_useful_entry(doc: dict) -> dict:
     if not candidates:
         return doc
 
-    candidates.sort(reverse=True)  # highest (stale, -confirmed, age) first — oldest first within same tier
+    candidates.sort(
+        reverse=True
+    )  # highest (stale, -confirmed, age) first — oldest first within same tier
     _, _, _, victim_key = candidates[0]
     victim_entry = dict(doc.pop(victim_key))
     victim_entry["_archived_key"] = victim_key
@@ -361,13 +475,15 @@ def _archive_least_useful_entry(doc: dict) -> dict:
     # Trim oldest entries past the cap so the archive can't grow without
     # bound — see the payload budget rationale at _PLAYBOOK_ARCHIVE_MAX_DEFAULT.
     from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
     archive_max = _rc.get("playbook_archive_max", _PLAYBOOK_ARCHIVE_MAX_DEFAULT)
     if archive_max > 0 and len(archive) > archive_max:
         dropped = len(archive) - archive_max
         archive = archive[-archive_max:]
         logger.info(
             "[PLAYBOOK] Dropped %d oldest archive entries to stay within cap of %d",
-            dropped, archive_max,
+            dropped,
+            archive_max,
         )
     doc["playbook_archive"] = archive
 
@@ -492,7 +608,10 @@ def retire_ineffective_patterns(
         retired.append(k)
         logger.info(
             "[PLAYBOOK] Retired '%s' success_rate=%.2f followed=%d confirmed=%d",
-            k, success_rate, followed, confirmed,
+            k,
+            success_rate,
+            followed,
+            confirmed,
         )
 
     return retired
@@ -562,7 +681,8 @@ def retire_idle_auto_entries(
         retired.append(k)
         logger.info(
             "[PLAYBOOK] Retired idle auto-entry '%s' (idle >= %dd)",
-            k, idle_days,
+            k,
+            idle_days,
         )
 
     return retired
@@ -605,6 +725,7 @@ def count_idle_auto_retired_within(doc: dict, *, hours: int = 24) -> int:
 # Signature extraction
 # ---------------------------------------------------------------------------
 
+
 def _extract_failure_module(error_lower: str) -> Optional[str]:
     """Return the base module name from the innermost traceback frame, if present.
 
@@ -615,8 +736,8 @@ def _extract_failure_module(error_lower: str) -> Optional[str]:
     if not frame_matches:
         return None
     innermost = frame_matches[-1]
-    base = re.sub(r'.*/', '', innermost)       # strip directory prefix
-    return re.sub(r'\.py$', '', base) or None  # strip .py extension
+    base = re.sub(r".*/", "", innermost)  # strip directory prefix
+    return re.sub(r"\.py$", "", base) or None  # strip .py extension
 
 
 def _extract_failure_signature(
@@ -648,39 +769,39 @@ def _extract_failure_signature(
 
         # Well-known Python exception names give stable signatures
         python_exc = re.search(
-            r'(modulenotfounderror|importerror|typeerror|attributeerror|'
-            r'valueerror|nameerror|keyerror|syntaxerror|assertionerror)'
-            r'[:\s][^\n]{0,60}',
+            r"(modulenotfounderror|importerror|typeerror|attributeerror|"
+            r"valueerror|nameerror|keyerror|syntaxerror|assertionerror)"
+            r"[:\s][^\n]{0,60}",
             error_lower,
         )
         if python_exc:
             raw = python_exc.group(0)
             # Drop file-path tokens (contain /) and line-number suffixes
-            raw = re.sub(r'\S*/\S+', '', raw)
-            raw = re.sub(r':\d+', ':', raw)
-            clean = re.sub(r'\s+', ' ', raw).strip()
+            raw = re.sub(r"\S*/\S+", "", raw)
+            raw = re.sub(r":\d+", ":", raw)
+            clean = re.sub(r"\s+", " ", raw).strip()
             if module_name:
                 # Inject module context: "importerror: auth: cannot import name foo"
-                colon_idx = clean.find(':')
+                colon_idx = clean.find(":")
                 if colon_idx >= 0:
                     exc_type = clean[:colon_idx].strip()
-                    rest = clean[colon_idx + 1:].strip()
+                    rest = clean[colon_idx + 1 :].strip()
                     clean = f"{exc_type}: {module_name}: {rest}"
             return clean[:80]
 
         # Test-runner failure lines: "FAILED backend/testing/test_foo.py"
-        fail_match = re.search(r'fail(?:ed)?[\s:]+[\w/_.-]+\.py', error_lower)
+        fail_match = re.search(r"fail(?:ed)?[\s:]+[\w/_.-]+\.py", error_lower)
         if fail_match:
             raw = fail_match.group(0)
-            raw = re.sub(r'\S+/', '', raw)  # keep filename only
+            raw = re.sub(r"\S+/", "", raw)  # keep filename only
             return raw.strip()[:60]
 
     # Generic fallback: first meaningful line, stripped of paths/numbers
-    for line in error_lower.split('\n'):
+    for line in error_lower.split("\n"):
         line = line.strip()
         if line:
-            line = re.sub(r'\S+/', '', line)   # strip path prefixes
-            line = re.sub(r':\d+', ':', line)  # strip line numbers
+            line = re.sub(r"\S+/", "", line)  # strip path prefixes
+            line = re.sub(r":\d+", ":", line)  # strip line numbers
             return line[:80]
 
     return f"{failure_class.lower()}-unknown"
@@ -688,13 +809,13 @@ def _extract_failure_signature(
 
 def _signature_to_key(signature: str) -> str:
     """Convert a signature string to a valid playbook key (1-50 alphanumeric/hyphen chars)."""
-    normalized = re.sub(r'[^a-zA-Z0-9]+', '-', signature.lower())
-    normalized = normalized.strip('-')
-    normalized = re.sub(r'-+', '-', normalized)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "-", signature.lower())
+    normalized = normalized.strip("-")
+    normalized = re.sub(r"-+", "-", normalized)
     if not normalized:
         normalized = "unknown"
     # Prefix with "auto" so the key always starts with an alphanumeric char
-    key = ("auto-" + normalized)[:50].rstrip('-')
+    key = ("auto-" + normalized)[:50].rstrip("-")
     return key
 
 
@@ -702,24 +823,20 @@ def _hint_for_failure_class(failure_class: str) -> str:
     """Return a short actionable hint for the given failure class."""
     return {
         "CODE_ERROR": (
-            "Check imports, syntax, and test assertions. "
-            "Run lint before committing."
+            "Check imports, syntax, and test assertions. Run lint before committing."
         ),
         "AGENT_TIMEOUT": (
-            "Reduce scope. Focus on one critical change. "
-            "Commit working changes early."
+            "Reduce scope. Focus on one critical change. Commit working changes early."
         ),
         "PROVISION_FAILURE": (
-            "Infrastructure issue. "
-            "Check GCP quota and zone availability."
+            "Infrastructure issue. Check GCP quota and zone availability."
         ),
         "EXTERNAL_API": (
             "External service failure. "
             "May be transient — retry after checking API status."
         ),
         "RATE_LIMIT": (
-            "API rate limit hit. "
-            "Reduce call frequency or add exponential backoff."
+            "API rate limit hit. Reduce call frequency or add exponential backoff."
         ),
     }.get(failure_class, "Check the error log for details and reduce scope.")
 
@@ -727,6 +844,7 @@ def _hint_for_failure_class(failure_class: str) -> str:
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 async def _maybe_auto_playbook(
     task: Task,
@@ -757,7 +875,8 @@ async def _maybe_auto_playbook(
     # Store module context for cross-referencing with module_feedback_profiles
     module_name = (
         _extract_failure_module((error_summary or "").lower())
-        if failure_class == "CODE_ERROR" else None
+        if failure_class == "CODE_ERROR"
+        else None
     )
 
     ctx = dict(task.context or {})
@@ -782,14 +901,14 @@ async def _maybe_auto_playbook(
     # async sessions. Limit caps the per-project scan; a project that hit
     # the cap had >200 same-signature failures in window and the playbook
     # entry already triggers well below that threshold.
-    dialect_name = session.bind.dialect.name if session.bind else 'postgresql'
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
     where_clauses = [
         Task.project_id == task.project_id,
         Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
         Task.created_at >= window_start,
         Task.id != task.id,
     ]
-    if dialect_name != 'sqlite':
+    if dialect_name != "sqlite":
         # Postgres path: GIN containment via ``ix_task_context_gin``.
         where_clauses.append(
             Task.context.op("@>")(cast({"_failure_signature": signature}, JSONB))
@@ -799,9 +918,15 @@ async def _maybe_auto_playbook(
     result = await session.execute(
         select(Task)
         .where(*where_clauses)
-        .options(load_only(
-            Task.id, Task.status, Task.context, Task.created_at, Task.status_log,
-        ))
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+                Task.status_log,
+            )
+        )
         .limit(200)
     )
     recent_tasks = result.scalars().all()
@@ -810,7 +935,8 @@ async def _maybe_auto_playbook(
     # the actual filter. Either way the Python re-check is the source of
     # truth for ``matching``.
     matching = [
-        t for t in recent_tasks
+        t
+        for t in recent_tasks
         if (t.context or {}).get("_failure_signature") == signature
     ]
     total_count = len(matching) + 1  # +1 for the current task
@@ -818,7 +944,10 @@ async def _maybe_auto_playbook(
     if total_count < threshold:
         logger.debug(
             "[AUTO_PLAYBOOK] project=%s signature='%s' seen %d/%d — no entry yet",
-            task.project_id, signature, total_count, threshold,
+            task.project_id,
+            signature,
+            total_count,
+            threshold,
         )
         return None
 
@@ -834,14 +963,17 @@ async def _maybe_auto_playbook(
     if playbook_full_key in doc:
         logger.debug(
             "[AUTO_PLAYBOOK] project=%s key='%s' already exists — skipping",
-            task.project_id, key,
+            task.project_id,
+            key,
         )
         return None
 
     # ── 4. Create auto-generated playbook entry ─────────────────────────────
     recent_ids = [str(t.id) for t in matching[-2:]] + [str(task.id)]
     hint = _hint_for_failure_class(failure_class)
-    module_note = f" Repeated failures in module '{module_name}'." if module_name else ""
+    module_note = (
+        f" Repeated failures in module '{module_name}'." if module_name else ""
+    )
     content = (
         f"Repeated failure pattern ({total_count}x in {window_days}d): {signature}. "
         f"Recent tasks: {', '.join(recent_ids)}. "
@@ -853,7 +985,9 @@ async def _maybe_auto_playbook(
     # share the same one, mark as direction-scoped.  Tasks without a direction_id
     # must NOT be silently dropped — their presence means the pattern is universal.
     all_pattern_tasks = matching + [task]
-    all_have_direction = all((t.context or {}).get("direction_id") for t in all_pattern_tasks)
+    all_have_direction = all(
+        (t.context or {}).get("direction_id") for t in all_pattern_tasks
+    )
     direction_ids = {
         (t.context or {}).get("direction_id")
         for t in all_pattern_tasks
@@ -896,7 +1030,10 @@ async def _maybe_auto_playbook(
 
     logger.info(
         "[AUTO_PLAYBOOK] project=%s created entry '%s' for pattern '%s' (seen %dx)",
-        task.project_id, key, signature, total_count,
+        task.project_id,
+        key,
+        signature,
+        total_count,
     )
     return key
 
@@ -904,6 +1041,7 @@ async def _maybe_auto_playbook(
 # ---------------------------------------------------------------------------
 # Review-feedback extraction
 # ---------------------------------------------------------------------------
+
 
 def _categorize_review_issues_keyword(review_history: list) -> dict[str, list[dict]]:
     """Keyword-match implementation of review issue categorization (always offline)."""
@@ -919,19 +1057,23 @@ def _categorize_review_issues_keyword(review_history: list) -> dict[str, list[di
             matched = False
             for cat_name, keywords in _REVIEW_CATEGORIES.items():
                 if any(kw in desc_lower for kw in keywords):
-                    buckets.setdefault(cat_name, []).append({
-                        "desc": desc,
-                        "severity": severity,
-                        "iteration": entry.get("iteration", 0),
-                    })
+                    buckets.setdefault(cat_name, []).append(
+                        {
+                            "desc": desc,
+                            "severity": severity,
+                            "iteration": entry.get("iteration", 0),
+                        }
+                    )
                     matched = True
                     break
             if not matched:
-                buckets.setdefault("other", []).append({
-                    "desc": desc,
-                    "severity": severity,
-                    "iteration": entry.get("iteration", 0),
-                })
+                buckets.setdefault("other", []).append(
+                    {
+                        "desc": desc,
+                        "severity": severity,
+                        "iteration": entry.get("iteration", 0),
+                    }
+                )
     return buckets
 
 
@@ -967,13 +1109,25 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
     if os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1":
         # Build synthetic review_history from flat issue list so keyword helper can scan it.
         return _categorize_review_issues_keyword(
-            [{"iteration": i.get("iteration", 0), "issues": [{"description": i.get("description", ""), "severity": i.get("severity", "")}]}
-             for i in issues]
+            [
+                {
+                    "iteration": i.get("iteration", 0),
+                    "issues": [
+                        {
+                            "description": i.get("description", ""),
+                            "severity": i.get("severity", ""),
+                        }
+                    ],
+                }
+                for i in issues
+            ]
         )
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        logger.info("categorize_review_issues_llm: no ANTHROPIC_API_KEY, using keyword fallback")
+        logger.info(
+            "categorize_review_issues_llm: no ANTHROPIC_API_KEY, using keyword fallback"
+        )
         return _keyword_from_flat(issues)
 
     valid_cats = sorted(_VALID_CATEGORIES)
@@ -983,8 +1137,10 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
         "Respond with ONLY valid JSON in this exact shape (no markdown, no commentary):\n"
         '{"classifications": [{"index": 0, "category": "..."}]}\n\n'
         "Issues (0-indexed):\n"
-        + "\n".join(f"{i}. [{item.get('severity','')}] {item.get('description','')}"
-                   for i, item in enumerate(issues))
+        + "\n".join(
+            f"{i}. [{item.get('severity', '')}] {item.get('description', '')}"
+            for i, item in enumerate(issues)
+        )
     )
 
     for attempt in range(2):
@@ -1016,20 +1172,29 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
                 if severity not in ("CRITICAL", "MAJOR", "MINOR"):
                     continue
                 cat = c["category"]
-                buckets.setdefault(cat, []).append({
-                    "desc": (item.get("description") or "").strip(),
-                    "severity": severity,
-                    "iteration": item.get("iteration", 0),
-                })
+                buckets.setdefault(cat, []).append(
+                    {
+                        "desc": (item.get("description") or "").strip(),
+                        "severity": severity,
+                        "iteration": item.get("iteration", 0),
+                    }
+                )
             return buckets
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             if attempt == 0:
-                logger.info("categorize_review_issues_llm: parse error %s, retrying once", exc)
+                logger.info(
+                    "categorize_review_issues_llm: parse error %s, retrying once", exc
+                )
                 continue
-            logger.info("categorize_review_issues_llm: parse error on retry, using keyword fallback")
+            logger.info(
+                "categorize_review_issues_llm: parse error on retry, using keyword fallback"
+            )
             break
         except Exception as exc:  # network, auth, timeout, import error
-            logger.info("categorize_review_issues_llm: exception %s, using keyword fallback", exc)
+            logger.info(
+                "categorize_review_issues_llm: exception %s, using keyword fallback",
+                exc,
+            )
             break
 
     return _keyword_from_flat(issues)
@@ -1040,7 +1205,12 @@ def _keyword_from_flat(issues: list[dict]) -> dict[str, list[dict]]:
     synthetic = [
         {
             "iteration": item.get("iteration", 0),
-            "issues": [{"description": item.get("description", ""), "severity": item.get("severity", "")}],
+            "issues": [
+                {
+                    "description": item.get("description", ""),
+                    "severity": item.get("severity", ""),
+                }
+            ],
         }
         for item in issues
     ]
@@ -1108,13 +1278,15 @@ def summarize_decomposition_outcomes(direction: dict) -> Optional[dict]:
     max_files_vals = _nums("max_files_in_subtask", int)
     dep_depths = _nums("dependency_depth", int)
     high_xmod = [
-        float(e["subtask_merge_rate"]) for e in flat
+        float(e["subtask_merge_rate"])
+        for e in flat
         if isinstance(e.get("subtask_merge_rate"), (int, float))
         and isinstance(e.get("cross_module_count"), (int, float))
         and int(e["cross_module_count"]) >= 2
     ]
     low_xmod = [
-        float(e["subtask_merge_rate"]) for e in flat
+        float(e["subtask_merge_rate"])
+        for e in flat
         if isinstance(e.get("subtask_merge_rate"), (int, float))
         and isinstance(e.get("cross_module_count"), (int, float))
         and int(e["cross_module_count"]) < 2
@@ -1159,11 +1331,13 @@ def compute_recurring_first_review_descriptions(
     filtered task count is below ``min_tasks`` or no description repeats.
     """
     from collections import Counter
+
     desc_counter: Counter = Counter()
     desc_to_cat: dict = {}
     desc_task_ids: dict = {}
     filtered_task_count = 0
     from app.time_utils import _to_naive_utc
+
     cutoff_naive = _to_naive_utc(cutoff)
     for ht in rows:
         ht_created = _to_naive_utc(ht.created_at)
@@ -1194,7 +1368,9 @@ def compute_recurring_first_review_descriptions(
     if filtered_task_count < min_tasks:
         return None
     if count_unique_tasks:
-        pairs = [(desc, len(tids)) for desc, tids in desc_task_ids.items() if len(tids) >= 2]
+        pairs = [
+            (desc, len(tids)) for desc, tids in desc_task_ids.items() if len(tids) >= 2
+        ]
     else:
         pairs = [(desc, cnt) for desc, cnt in desc_counter.items() if cnt >= 2]
     if not pairs:
@@ -1202,7 +1378,11 @@ def compute_recurring_first_review_descriptions(
     pairs.sort(key=lambda x: -x[1])
     out = []
     for desc, cnt in pairs[:3]:
-        entry = {"description": desc, "count": cnt, "category": desc_to_cat.get(desc, "other")}
+        entry = {
+            "description": desc,
+            "count": cnt,
+            "category": desc_to_cat.get(desc, "other"),
+        }
         if extra_fields:
             entry.update(extra_fields)
         out.append(entry)
@@ -1212,6 +1392,7 @@ def compute_recurring_first_review_descriptions(
 # ---------------------------------------------------------------------------
 # Success-pattern capture
 # ---------------------------------------------------------------------------
+
 
 async def capture_success_pattern(
     task: Task,
@@ -1266,20 +1447,26 @@ async def capture_success_pattern(
     # Noise filter: require at least 3 total completions (success or failure) for
     # this task type before capturing a success pattern.  Use a COUNT query with
     # JSONB type filter to avoid loading all project tasks into memory.
-    prior_count = (await session.execute(
-        select(func.count()).select_from(Task).where(
-            Task.project_id == task.project_id,
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            Task.id != task.id,
-            Task.payloads[0]["type"].as_string() == task_type,
+    prior_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == task.project_id,
+                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                Task.id != task.id,
+                Task.payloads[0]["type"].as_string() == task_type,
+            )
         )
-    )).scalar_one()
+    ).scalar_one()
     same_type_count = prior_count + 1  # +1 for the current task
 
     if same_type_count < 3:
         logger.debug(
             "[SUCCESS_PLAYBOOK] project=%s type=%s: only %d completion(s) — noise filter not met",
-            task.project_id, task_type, same_type_count,
+            task.project_id,
+            task_type,
+            same_type_count,
         )
         return None
 
@@ -1355,7 +1542,11 @@ async def capture_success_pattern(
 
     logger.info(
         "[SUCCESS_PLAYBOOK] project=%s %s entry '%s' for task_type=%s scope=%s",
-        task.project_id, action, key, task_type, scope,
+        task.project_id,
+        action,
+        key,
+        task_type,
+        scope,
     )
     return key
 
@@ -1406,15 +1597,24 @@ def summarize_recent_successes(
     def _rank(item: tuple[str, dict]) -> tuple:
         k, v = item
         dir_succ = v.get("direction_successes") or {}
-        affinity = int(dir_succ.get(direction_id, 0)) if direction_id and isinstance(dir_succ, dict) else 0
+        affinity = (
+            int(dir_succ.get(direction_id, 0))
+            if direction_id and isinstance(dir_succ, dict)
+            else 0
+        )
         scope_match = 1 if exact_key and k == exact_key else 0
-        return (affinity, scope_match, int(v.get("success_count") or 0), v.get("updated_at") or "")
+        return (
+            affinity,
+            scope_match,
+            int(v.get("success_count") or 0),
+            v.get("updated_at") or "",
+        )
 
     candidates.sort(key=_rank, reverse=True)
 
     bullets: list[str] = []
     for k, v in candidates[:max_bullets]:
-        scope_label = k[len(prefix):] or "unspecified"
+        scope_label = k[len(prefix) :] or "unspecified"
         sc = int(v.get("success_count") or 0)
         parts = [f"{task_type}-{scope_label} ({sc}x)"]
         ftd = v.get("file_type_distribution")
@@ -1534,7 +1734,9 @@ def _update_module_feedback_profiles(
     profiles: dict = dict(doc.get(_MODULE_FEEDBACK_KEY) or {})
 
     # Flatten bucket issue counts: {category: count}
-    cat_counts: dict[str, int] = {cat: len(issues) for cat, issues in buckets.items() if issues}
+    cat_counts: dict[str, int] = {
+        cat: len(issues) for cat, issues in buckets.items() if issues
+    }
     if not cat_counts:
         return
 
@@ -1555,7 +1757,9 @@ def _update_module_feedback_profiles(
             profiles.items(),
             key=lambda kv: kv[1].get("last_updated", ""),
         )
-        for evict_key, _ in sorted_by_age[: len(profiles) - _MODULE_FEEDBACK_MAX_ENTRIES]:
+        for evict_key, _ in sorted_by_age[
+            : len(profiles) - _MODULE_FEEDBACK_MAX_ENTRIES
+        ]:
             del profiles[evict_key]
 
     doc[_MODULE_FEEDBACK_KEY] = profiles
@@ -1692,7 +1896,9 @@ async def extract_review_feedback_to_playbook(
     if first_review_entries:
         first_attempt_buckets = _categorize_review_issues(first_review_entries)
         if first_attempt_buckets:
-            _accumulate_direction_first_attempt(doc, direction_key, first_attempt_buckets)
+            _accumulate_direction_first_attempt(
+                doc, direction_key, first_attempt_buckets
+            )
             direction_tally_updated = True
             first_attempt_keys = _maybe_auto_playbook_from_first_attempt(
                 doc, direction_key, original_task_type, str(task.id)
@@ -1723,7 +1929,9 @@ async def extract_review_feedback_to_playbook(
 
             # Surface up to 3 highest-severity examples
             severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2}
-            top_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))[:3]
+            top_issues = sorted(
+                issues, key=lambda x: severity_order.get(x["severity"], 3)
+            )[:3]
             examples = "; ".join(i["desc"] for i in top_issues if i.get("desc"))
 
             content = (
@@ -1781,7 +1989,12 @@ async def extract_review_feedback_to_playbook(
             doc[playbook_full_key] = entry
             created_keys.append(f"review-{cat_name}")
 
-    if created_keys or module_profiles_updated or direction_tally_updated or review_entries_touched:
+    if (
+        created_keys
+        or module_profiles_updated
+        or direction_tally_updated
+        or review_entries_touched
+    ):
         meta = dict(doc.get("_meta", {"revision": 0}))
         meta["revision"] = meta.get("revision", 0) + 1
         meta["last_updated"] = _utcnow().isoformat()
@@ -1795,7 +2008,10 @@ async def extract_review_feedback_to_playbook(
         if created_keys:
             logger.info(
                 "[REVIEW_PLAYBOOK] project=%s PR #%d iteration=%d created entries: %s",
-                task.project_id, pr_number, iteration, created_keys,
+                task.project_id,
+                pr_number,
+                iteration,
+                created_keys,
             )
 
     return created_keys
@@ -1866,7 +2082,11 @@ async def compute_review_effectiveness(
             if not t.created_at:
                 continue
             # Normalise to naive for comparison regardless of DB driver timezone handling.
-            ts = t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
+            ts = (
+                t.created_at.replace(tzinfo=None)
+                if t.created_at.tzinfo
+                else t.created_at
+            )
             if not (start <= ts < end):
                 continue
             review_loop = (t.context or {}).get("review_loop") or {}
@@ -1891,10 +2111,16 @@ async def compute_review_effectiveness(
         for t in tasks:
             if not t.created_at:
                 continue
-            ts = t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
+            ts = (
+                t.created_at.replace(tzinfo=None)
+                if t.created_at.tzinfo
+                else t.created_at
+            )
             if not (start <= ts < end):
                 continue
-            rejection_cats = (t.context or {}).get("_first_attempt_rejection_categories") or {}
+            rejection_cats = (t.context or {}).get(
+                "_first_attempt_rejection_categories"
+            ) or {}
             if not rejection_cats:
                 continue
             total_with_rejection += 1
@@ -1913,7 +2139,9 @@ async def compute_review_effectiveness(
     sentinel_n = datetime(9999, 12, 31)
 
     current_count, current_history = _split_history(all_tasks, cutoff_14d_n, sentinel_n)
-    previous_count, previous_history = _split_history(all_tasks, cutoff_28d_n, cutoff_14d_n)
+    previous_count, previous_history = _split_history(
+        all_tasks, cutoff_28d_n, cutoff_14d_n
+    )
 
     if current_count < _MIN_REVIEW_SAMPLE or previous_count < _MIN_REVIEW_SAMPLE:
         return None
@@ -1929,8 +2157,12 @@ async def compute_review_effectiveness(
 
     # Recurrence: fraction of tasks (with any first-attempt rejection) that had
     # each category flagged.  Computed across the same two windows independently.
-    curr_rejection_total, curr_cat_counts = _split_recurrence(all_tasks, cutoff_14d_n, sentinel_n)
-    prev_rejection_total, prev_cat_counts = _split_recurrence(all_tasks, cutoff_28d_n, cutoff_14d_n)
+    curr_rejection_total, curr_cat_counts = _split_recurrence(
+        all_tasks, cutoff_14d_n, sentinel_n
+    )
+    prev_rejection_total, prev_cat_counts = _split_recurrence(
+        all_tasks, cutoff_28d_n, cutoff_14d_n
+    )
 
     all_cats = set(current_buckets.keys()) | set(previous_buckets.keys())
     categories: dict[str, Any] = {}
@@ -1948,11 +2180,13 @@ async def compute_review_effectiveness(
 
         recurrence_rate: Optional[float] = (
             round(curr_cat_counts.get(cat, 0) / curr_rejection_total, 3)
-            if curr_rejection_total > 0 else None
+            if curr_rejection_total > 0
+            else None
         )
         previous_recurrence_rate: Optional[float] = (
             round(prev_cat_counts.get(cat, 0) / prev_rejection_total, 3)
-            if prev_rejection_total > 0 else None
+            if prev_rejection_total > 0
+            else None
         )
 
         categories[cat] = {
@@ -1992,7 +2226,9 @@ async def compute_review_effectiveness(
         data["rate_history"] = rate_history
 
         recurrence_history: list = list(prev_cat.get("recurrence_history") or [])
-        if (is_new_window or not recurrence_history) and data["recurrence_rate"] is not None:
+        if (is_new_window or not recurrence_history) and data[
+            "recurrence_rate"
+        ] is not None:
             recurrence_history.append(data["recurrence_rate"])
             recurrence_history = recurrence_history[-5:]
         data["recurrence_history"] = recurrence_history
@@ -2001,7 +2237,8 @@ async def compute_review_effectiveness(
     # persistent — a signal that structural changes may be needed rather than
     # relying on agent-level awareness.
     persistent_issues = [
-        cat for cat, data in categories.items()
+        cat
+        for cat, data in categories.items()
         if len(data["rate_history"]) >= 3
         and all(r > 0.20 for r in data["rate_history"][-3:])
     ]
@@ -2019,7 +2256,9 @@ async def compute_review_effectiveness(
 
     logger.info(
         "[REVIEW_EFFECTIVENESS] project=%s categories=%d persistent=%s",
-        project_id, len(categories), persistent_issues,
+        project_id,
+        len(categories),
+        persistent_issues,
     )
     return result
 
@@ -2042,12 +2281,20 @@ _EXAMPLE_MAX_DESC_LEN = 100
 # Tokens that indicate a description may contain sensitive material.
 # Case-insensitive substring match; keep as tuple for fast `in` checks.
 _SENSITIVE_TOKENS: tuple[str, ...] = (
-    "password", "secret", "credential", "api_key", "apikey",
-    "bearer", "authorization:", "private_key", "sk-ant-", "eyJ",
+    "password",
+    "secret",
+    "credential",
+    "api_key",
+    "apikey",
+    "bearer",
+    "authorization:",
+    "private_key",
+    "sk-ant-",
+    "eyJ",
 )
 
-_URL_RE = re.compile(r'https?://\S+')
-_PR_REF_RE = re.compile(r'\b(?:PR|pr)\s*#?\s*\d+\b|#\s*\d+\b')
+_URL_RE = re.compile(r"https?://\S+")
+_PR_REF_RE = re.compile(r"\b(?:PR|pr)\s*#?\s*\d+\b|#\s*\d+\b")
 
 
 def _is_sensitive_desc(desc: str) -> bool:
@@ -2117,6 +2364,7 @@ def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -
     ``handled: false`` for a case the author had marked ``handled: true``.
     Entries with missing/non-string ``case`` are skipped.
     """
+
     def _norm(c: Any) -> Optional[str]:
         return c.strip().lower() if isinstance(c, str) and c.strip() else None
 
@@ -2159,7 +2407,8 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
     enabling validation that edges_considered actually improves catch rate.
     """
     code_tasks = [
-        t for t in tasks
+        t
+        for t in tasks
         if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
         and "_self_review_outcome" in (t.context or {})
     ]
@@ -2176,7 +2425,9 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
     n_with_reviewer = 0
     reviewer_caught = 0
     for t in code_tasks:
-        edges = (t.context or {}).get("_self_review_outcome", {}).get("edges_considered") or []
+        edges = (t.context or {}).get("_self_review_outcome", {}).get(
+            "edges_considered"
+        ) or []
         if not isinstance(edges, list):
             edges = []
         author_e, reviewer_e = _partition_edges_by_origin(edges)
@@ -2197,12 +2448,18 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
             without_edges.append(t)
 
     def _rejection_rate(task_list: list) -> Optional[float]:
-        measured = [t for t in task_list if "_first_attempt_rejection_categories" in (t.context or {})]
+        measured = [
+            t
+            for t in task_list
+            if "_first_attempt_rejection_categories" in (t.context or {})
+        ]
         if not measured:
             return None
         flagged = sum(
-            1 for t in measured
-            if _EDGE_CATS & set(t.context.get("_first_attempt_rejection_categories") or [])
+            1
+            for t in measured
+            if _EDGE_CATS
+            & set(t.context.get("_first_attempt_rejection_categories") or [])
         )
         return round(flagged / len(measured), 3)
 
@@ -2212,11 +2469,17 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
         "sample_size": n_total,
         "tasks_with_edges_rate": round(n_with / n_total, 3),
         "avg_edges_per_task": round(total_edges / n_with, 2) if n_with else None,
-        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3) if n_with else None,
+        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3)
+        if n_with
+        else None,
         "correctness_rejection_rate_with_edges": _rejection_rate(with_edges),
         "correctness_rejection_rate_without_edges": _rejection_rate(without_edges),
-        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2) if n_with_author else None,
-        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2) if n_with_reviewer else None,
+        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
+        if n_with_author
+        else None,
+        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2)
+        if n_with_reviewer
+        else None,
         "tasks_with_reviewer_edges_count": n_with_reviewer,
         "tasks_with_reviewer_edges_rate": round(n_with_reviewer / n_total, 3),
         "reviewer_caught_count": reviewer_caught,
@@ -2226,7 +2489,9 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
 
 def _stats_for_tasks(
     tasks: list,
-) -> tuple[int, dict[str, dict], dict[str, dict[str, dict]], dict[str, dict], dict[str, dict]]:
+) -> tuple[
+    int, dict[str, dict], dict[str, dict[str, dict]], dict[str, dict], dict[str, dict]
+]:
     """Compute SR stats for a pre-filtered task list (no date filtering).
 
     Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats).
@@ -2265,10 +2530,13 @@ def _stats_for_tasks(
         for cat in sr_failed:
             if cat not in cat_stats:
                 cat_stats[cat] = {
-                    "hit_count": 0, "human_count": 0,
-                    "w_hit": 0.0, "w_total": 0.0,
+                    "hit_count": 0,
+                    "human_count": 0,
+                    "w_hit": 0.0,
+                    "w_total": 0.0,
                     "miss_examples": [],
-                    "sr_failed_count": 0, "fp_count": 0,
+                    "sr_failed_count": 0,
+                    "fp_count": 0,
                 }
             cat_stats[cat].setdefault("sr_failed_count", 0)
             cat_stats[cat].setdefault("fp_count", 0)
@@ -2293,10 +2561,13 @@ def _stats_for_tasks(
         for cat in human_cats:
             if cat not in cat_stats:
                 cat_stats[cat] = {
-                    "hit_count": 0, "human_count": 0,
-                    "w_hit": 0.0, "w_total": 0.0,
+                    "hit_count": 0,
+                    "human_count": 0,
+                    "w_hit": 0.0,
+                    "w_total": 0.0,
                     "miss_examples": [],
-                    "sr_failed_count": 0, "fp_count": 0,
+                    "sr_failed_count": 0,
+                    "fp_count": 0,
                 }
             cat_stats[cat]["human_count"] += 1
             w = cat_weights.get(cat, 1)
@@ -2314,7 +2585,9 @@ def _stats_for_tasks(
                     type_cat_stats[task_type] = {}
                 if cat not in type_cat_stats[task_type]:
                     type_cat_stats[task_type][cat] = {
-                        "hit_count": 0, "human_count": 0, "miss_examples": [],
+                        "hit_count": 0,
+                        "human_count": 0,
+                        "miss_examples": [],
                     }
                 type_cat_stats[task_type][cat]["human_count"] += 1
                 if cat in sr_failed:
@@ -2364,7 +2637,9 @@ def _sr_skip_stats(
         reason = outcome.get("skip_reason")
         if reason:
             dist[str(reason)] = dist.get(str(reason), 0) + 1
-        elif outcome.get("verdict") == "unknown" and not (outcome.get("check_results") or {}):
+        elif outcome.get("verdict") == "unknown" and not (
+            outcome.get("check_results") or {}
+        ):
             dist["legacy_unknown"] = dist.get("legacy_unknown", 0) + 1
     if total < _MIN_SR_SAMPLE:
         return None, None
@@ -2443,7 +2718,8 @@ def compute_sr_catch_rate_by_direction(
                     sum(
                         entry["miss_rate"] * entry["sample_count"]
                         for entry in categories.values()
-                    ) / total_samples,
+                    )
+                    / total_samples,
                     3,
                 )
                 if total_samples
@@ -2454,7 +2730,9 @@ def compute_sr_catch_rate_by_direction(
                 "miss_rate": weighted_miss_rate,
                 "categories": categories,
             }
-    return dict(sorted(result.items(), key=lambda item: (-item[1]["miss_rate"], item[0])))
+    return dict(
+        sorted(result.items(), key=lambda item: (-item[1]["miss_rate"], item[0]))
+    )
 
 
 def _compute_cat_fp_stats(
@@ -2494,7 +2772,9 @@ def _compute_cat_fp_stats(
         confirmed = reviewer_cats | human_cats | rev_hist_cats
         for cat in sr_failed:
             bucket = cat_fp.setdefault(cat, {"fp": 0, "tp": 0})
-            tbucket = type_cat_fp.setdefault(task_type, {}).setdefault(cat, {"fp": 0, "tp": 0})
+            tbucket = type_cat_fp.setdefault(task_type, {}).setdefault(
+                cat, {"fp": 0, "tp": 0}
+            )
             if cat in confirmed:
                 bucket["tp"] += 1
                 tbucket["tp"] += 1
@@ -2563,8 +2843,12 @@ async def compute_sr_catch_rate_trends(
         for i in range(len(cycle_rows) - 1):
             c_cycle = cycle_rows[i]
             p_cycle = cycle_rows[i + 1]
-            c_count, c_stats, c_type_stats, c_all_iter, c_sev = _stats_for_tasks(task_by_cycle.get(c_cycle.id, []))
-            p_count, p_stats, _, p_all_iter, p_sev = _stats_for_tasks(task_by_cycle.get(p_cycle.id, []))
+            c_count, c_stats, c_type_stats, c_all_iter, c_sev = _stats_for_tasks(
+                task_by_cycle.get(c_cycle.id, [])
+            )
+            p_count, p_stats, _, p_all_iter, p_sev = _stats_for_tasks(
+                task_by_cycle.get(p_cycle.id, [])
+            )
             if c_count >= _MIN_SR_SAMPLE and p_count >= _MIN_SR_SAMPLE:
                 use_cycle_mode = True
                 current_cycle_id = c_cycle.id
@@ -2586,22 +2870,50 @@ async def compute_sr_catch_rate_trends(
         cutoff_14d_n = _naive(now - timedelta(days=14))
         cutoff_28d_n = _naive(now - timedelta(days=28))
         sentinel_n = datetime(9999, 12, 31)
-        cal_current = [t for t in all_tasks if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n]
-        cal_previous = [t for t in all_tasks if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n]
-        current_count, current_stats, current_type_stats, current_all_iter_stats, current_sev_stats = _stats_for_tasks(cal_current)
-        previous_count, previous_stats, _, previous_all_iter_stats, previous_sev_stats = _stats_for_tasks(cal_previous)
+        cal_current = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
+        ]
+        cal_previous = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
+        ]
+        (
+            current_count,
+            current_stats,
+            current_type_stats,
+            current_all_iter_stats,
+            current_sev_stats,
+        ) = _stats_for_tasks(cal_current)
+        (
+            previous_count,
+            previous_stats,
+            _,
+            previous_all_iter_stats,
+            previous_sev_stats,
+        ) = _stats_for_tasks(cal_previous)
         current_window_tasks = cal_current
 
     if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
         return None
 
-    all_cats = set(current_stats.keys()) | set(previous_stats.keys()) | set(current_all_iter_stats.keys())
+    all_cats = (
+        set(current_stats.keys())
+        | set(previous_stats.keys())
+        | set(current_all_iter_stats.keys())
+    )
     if not all_cats:
         return None
 
     _empty_cat: dict[str, Any] = {
-        "hit_count": 0, "human_count": 0, "w_hit": 0.0, "w_total": 0.0,
-        "sr_failed_count": 0, "fp_count": 0,
+        "hit_count": 0,
+        "human_count": 0,
+        "w_hit": 0.0,
+        "w_total": 0.0,
+        "sr_failed_count": 0,
+        "fp_count": 0,
     }
     categories: dict[str, Any] = {}
     for cat in all_cats:
@@ -2609,11 +2921,13 @@ async def compute_sr_catch_rate_trends(
         prev = previous_stats.get(cat, _empty_cat)
         current_hit_rate = (
             round(curr["hit_count"] / curr["human_count"], 3)
-            if curr["human_count"] > 0 else None
+            if curr["human_count"] > 0
+            else None
         )
         previous_hit_rate = (
             round(prev["hit_count"] / prev["human_count"], 3)
-            if prev["human_count"] > 0 else None
+            if prev["human_count"] > 0
+            else None
         )
         miss_rate = (
             round(1 - current_hit_rate, 3) if current_hit_rate is not None else None
@@ -2657,13 +2971,15 @@ async def compute_sr_catch_rate_trends(
             fp_trend = "stable"
         precision = (
             round((curr_sr_failed - curr_fp) / curr_sr_failed, 3)
-            if curr_sr_failed > 0 else None
+            if curr_sr_failed > 0
+            else None
         )
 
         curr_all = current_all_iter_stats.get(cat, {"hit_count": 0, "human_count": 0})
         all_iter_hit_rate = (
             round(curr_all["hit_count"] / curr_all["human_count"], 3)
-            if curr_all["human_count"] > 0 else None
+            if curr_all["human_count"] > 0
+            else None
         )
         all_iter_miss_rate = (
             round(1 - all_iter_hit_rate, 3) if all_iter_hit_rate is not None else None
@@ -2687,11 +3003,9 @@ async def compute_sr_catch_rate_trends(
     # Attach miss examples to top-_EXAMPLE_MAX_CATS categories by weighted_miss_rate.
     top_cats_for_examples = sorted(
         all_cats,
-        key=lambda c: (
-            categories[c].get("weighted_miss_rate") or 0.0
-        ),
+        key=lambda c: categories[c].get("weighted_miss_rate") or 0.0,
         reverse=True,
-    )[: _EXAMPLE_MAX_CATS]
+    )[:_EXAMPLE_MAX_CATS]
     for cat in top_cats_for_examples:
         raw = (current_stats.get(cat) or {}).get("miss_examples", [])
         examples = _finalize_examples(raw)
@@ -2728,12 +3042,13 @@ async def compute_sr_catch_rate_trends(
 
     # Mark categories currently below the baseline floor so the UI can surface them.
     _floor_thresh: float = float(doc.get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD)
-    _floor_min_win: int = int(doc.get("sr_floor_min_windows") or _FLOOR_MIN_CONSECUTIVE_WINDOWS)
+    _floor_min_win: int = int(
+        doc.get("sr_floor_min_windows") or _FLOOR_MIN_CONSECUTIVE_WINDOWS
+    )
     for cat, data in categories.items():
         history = data.get("rate_history") or []
-        data["below_floor"] = (
-            len(history) >= _floor_min_win
-            and all(r < _floor_thresh for r in history[-_floor_min_win:])
+        data["below_floor"] = len(history) >= _floor_min_win and all(
+            r < _floor_thresh for r in history[-_floor_min_win:]
         )
 
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
@@ -2744,7 +3059,9 @@ async def compute_sr_catch_rate_trends(
         tp = fp_data.get("tp", 0)
         data["fp_count"] = fp
         data["tp_count"] = tp
-        data["false_positive_rate"] = round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+        data["false_positive_rate"] = (
+            round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+        )
 
     # Compute per-task-type category breakdown from current window only.
     # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
@@ -2769,7 +3086,9 @@ async def compute_sr_catch_rate_trends(
             tp_t = tfp.get("tp", 0)
             entry["fp_count"] = fp_t
             entry["tp_count"] = tp_t
-            entry["false_positive_rate"] = round(fp_t / (fp_t + tp_t), 3) if (fp_t + tp_t) > 0 else None
+            entry["false_positive_rate"] = (
+                round(fp_t / (fp_t + tp_t), 3) if (fp_t + tp_t) > 0 else None
+            )
             type_cats[cat] = entry
         if type_cats:
             by_task_type[ttype] = type_cats
@@ -2783,11 +3102,13 @@ async def compute_sr_catch_rate_trends(
         prev_s = previous_sev_stats.get(sev, {"hit_count": 0, "human_count": 0})
         curr_hit = (
             round(curr_s["hit_count"] / curr_s["human_count"], 3)
-            if curr_s["human_count"] > 0 else None
+            if curr_s["human_count"] > 0
+            else None
         )
         prev_hit = (
             round(prev_s["hit_count"] / prev_s["human_count"], 3)
-            if prev_s["human_count"] > 0 else None
+            if prev_s["human_count"] > 0
+            else None
         )
         curr_miss = round(1.0 - curr_hit, 3) if curr_hit is not None else None
         prev_miss = round(1.0 - prev_hit, 3) if prev_hit is not None else None
@@ -2795,8 +3116,10 @@ async def compute_sr_catch_rate_trends(
             sev_delta = curr_miss - prev_miss
             thr = _SR_SEVERITY_DELTA_THRESHOLDS[sev]
             sev_trend = (
-                "regressing" if sev_delta >= thr
-                else "improving" if sev_delta <= -thr
+                "regressing"
+                if sev_delta >= thr
+                else "improving"
+                if sev_delta <= -thr
                 else "stable"
             )
         else:
@@ -2833,7 +3156,8 @@ async def compute_sr_catch_rate_trends(
 
     logger.info(
         "[SR_CATCH_RATE_TRENDS] project=%s categories=%d",
-        project_id, len(categories),
+        project_id,
+        len(categories),
     )
 
     # Fire notification when categories or severity buckets are regressing.
@@ -2845,15 +3169,18 @@ async def compute_sr_catch_rate_trends(
         )
 
         regressing = {
-            cat: data for cat, data in categories.items()
+            cat: data
+            for cat, data in categories.items()
             if data.get("trend") == "decreasing"
         }
         regressing_severities = {
-            sev: data for sev, data in by_severity.items()
+            sev: data
+            for sev, data in by_severity.items()
             if data.get("trend") == "regressing"
         }
         fp_spiking = {
-            cat: data for cat, data in categories.items()
+            cat: data
+            for cat, data in categories.items()
             if data.get("fp_trend") == "increasing"
         }
         alertable = {**regressing, **fp_spiking}
@@ -2895,15 +3222,21 @@ async def compute_sr_catch_rate_trends(
                         curr_rate = data.get("current_hit_rate")
                         sample = current_stats.get(cat, {}).get("human_count", 0)
                         prev_str = f"{prev:.0%}" if prev is not None else "N/A"
-                        curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
-                        lines.append(f"  • {cat}: hit-rate {prev_str} → {curr_str} (n={sample})")
+                        curr_str = (
+                            f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
+                        )
+                        lines.append(
+                            f"  • {cat}: hit-rate {prev_str} → {curr_str} (n={sample})"
+                        )
                     else:
                         prev_fp = data.get("previous_fp_rate")
                         curr_fp = data.get("false_positive_rate")
                         sample = current_stats.get(cat, {}).get("sr_failed_count", 0)
                         prev_str = f"{prev_fp:.0%}" if prev_fp is not None else "N/A"
                         curr_str = f"{curr_fp:.0%}" if curr_fp is not None else "N/A"
-                        lines.append(f"  • {cat}: FP-rate {prev_str} → {curr_str} (n={sample})")
+                        lines.append(
+                            f"  • {cat}: FP-rate {prev_str} → {curr_str} (n={sample})"
+                        )
                 if current_regressing_sevs:
                     lines.append("Severity regressions:")
                     for sev in current_regressing_sevs:
@@ -2911,9 +3244,15 @@ async def compute_sr_catch_rate_trends(
                         prev_miss = data_sev.get("previous_miss_rate")
                         curr_miss = data_sev.get("current_miss_rate")
                         sample_n = data_sev.get("current_sample", 0)
-                        prev_str = f"{prev_miss:.0%}" if prev_miss is not None else "N/A"
-                        curr_str = f"{curr_miss:.0%}" if curr_miss is not None else "N/A"
-                        lines.append(f"  • {sev}: {prev_str} → {curr_str} (n={sample_n})")
+                        prev_str = (
+                            f"{prev_miss:.0%}" if prev_miss is not None else "N/A"
+                        )
+                        curr_str = (
+                            f"{curr_miss:.0%}" if curr_miss is not None else "N/A"
+                        )
+                        lines.append(
+                            f"  • {sev}: {prev_str} → {curr_str} (n={sample_n})"
+                        )
                 description = "\n".join(lines)
 
                 await post_failure_alert_message(session, project_id, description)
@@ -2929,25 +3268,35 @@ async def compute_sr_catch_rate_trends(
                 new_alert_title = _format_sr_alert_title(
                     _SR_REGRESSION_ALERT_TITLE_PREFIX, title_parts
                 )
-                existing_reg_alerts = (await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title.like(f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"),
+                existing_reg_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(
+                                    f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"
+                                ),
+                            )
+                        )
                     )
-                )).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 if not any(a.title == new_alert_title for a in existing_reg_alerts):
                     for a in existing_reg_alerts:
                         a.dismissed_at = now
                         session.add(a)
-                    session.add(Alert(
-                        project_id=project_id,
-                        severity=AlertSeverity.WARNING,
-                        title=new_alert_title,
-                        message=description,
-                    ))
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=new_alert_title,
+                            message=description,
+                        )
+                    )
 
                 webhook_payload: dict[str, Any] = {
                     "project_id": str(project_id),
@@ -2955,20 +3304,32 @@ async def compute_sr_catch_rate_trends(
                     "regressing_categories": [
                         {
                             "category": cat,
-                            "previous_hit_rate": alertable[cat].get("previous_hit_rate"),
+                            "previous_hit_rate": alertable[cat].get(
+                                "previous_hit_rate"
+                            ),
                             "current_hit_rate": alertable[cat].get("current_hit_rate"),
-                            "false_positive_rate": alertable[cat].get("false_positive_rate"),
+                            "false_positive_rate": alertable[cat].get(
+                                "false_positive_rate"
+                            ),
                             "fp_trend": alertable[cat].get("fp_trend"),
-                            "sample_size": current_stats.get(cat, {}).get("human_count", 0),
+                            "sample_size": current_stats.get(cat, {}).get(
+                                "human_count", 0
+                            ),
                         }
                         for cat in current_regressing_cats
                     ],
                     "regressing_severities": [
                         {
                             "severity": sev,
-                            "previous_miss_rate": regressing_severities[sev].get("previous_miss_rate"),
-                            "current_miss_rate": regressing_severities[sev].get("current_miss_rate"),
-                            "sample_size": regressing_severities[sev].get("current_sample", 0),
+                            "previous_miss_rate": regressing_severities[sev].get(
+                                "previous_miss_rate"
+                            ),
+                            "current_miss_rate": regressing_severities[sev].get(
+                                "current_miss_rate"
+                            ),
+                            "sample_size": regressing_severities[sev].get(
+                                "current_sample", 0
+                            ),
                         }
                         for sev in current_regressing_sevs
                     ],
@@ -2993,20 +3354,28 @@ async def compute_sr_catch_rate_trends(
 
                 logger.info(
                     "[SR_CATCH_RATE_TRENDS] project=%s regression_alert categories=%s severities=%s",
-                    project_id, current_regressing_cats, current_regressing_sevs,
+                    project_id,
+                    current_regressing_cats,
+                    current_regressing_sevs,
                 )
         elif doc.get("sr_catch_rate_trends_alert"):
             # Clear transition: previously firing, no longer firing this cycle.
             # Dismiss any matching undismissed Alert rows + clear design_doc state.
-            stale_alerts = (await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.task_id.is_(None),
-                    Alert.severity == AlertSeverity.WARNING,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title.like(f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"),
+            stale_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"),
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
             for a in stale_alerts:
                 a.dismissed_at = now
                 session.add(a)
@@ -3062,21 +3431,29 @@ async def compute_sr_catch_rate_trends(
                 if floor_alert_at:
                     try:
                         last_floor_dt = datetime.fromisoformat(floor_alert_at)
-                        if (now - last_floor_dt).days < 14 and floor_alerted_cats == current_floor_cats:
+                        if (
+                            now - last_floor_dt
+                        ).days < 14 and floor_alerted_cats == current_floor_cats:
                             floor_already_alerted = True
                     except (ValueError, TypeError):
                         pass
 
             if not floor_already_alerted:
-                lines = [f"SR catch-rate below floor ({floor_threshold:.0%}) for {floor_min_windows}+ windows:"]
+                lines = [
+                    f"SR catch-rate below floor ({floor_threshold:.0%}) for {floor_min_windows}+ windows:"
+                ]
                 for cat in current_floor_cats:
                     data = below_floor[cat]
                     curr_rate = data.get("current_hit_rate")
                     sample = current_stats.get(cat, {}).get("human_count", 0)
                     curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
                     history = data.get("rate_history") or []
-                    history_str = ", ".join(f"{r:.0%}" for r in history[-floor_min_windows:])
-                    lines.append(f"  • {cat}: {curr_str} (last {floor_min_windows} windows: {history_str}, n={sample})")
+                    history_str = ", ".join(
+                        f"{r:.0%}" for r in history[-floor_min_windows:]
+                    )
+                    lines.append(
+                        f"  • {cat}: {curr_str} (last {floor_min_windows} windows: {history_str}, n={sample})"
+                    )
                 description = "\n".join(lines)
 
                 await post_failure_alert_message(session, project_id, description)
@@ -3088,25 +3465,33 @@ async def compute_sr_catch_rate_trends(
                 new_floor_title = _format_sr_alert_title(
                     _SR_FLOOR_ALERT_TITLE_PREFIX, current_floor_cats
                 )
-                existing_floor_alerts = (await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.ERROR,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                existing_floor_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.ERROR,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                            )
+                        )
                     )
-                )).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 if not any(a.title == new_floor_title for a in existing_floor_alerts):
                     for a in existing_floor_alerts:
                         a.dismissed_at = now
                         session.add(a)
-                    session.add(Alert(
-                        project_id=project_id,
-                        severity=AlertSeverity.ERROR,
-                        title=new_floor_title,
-                        message=description,
-                    ))
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.ERROR,
+                            title=new_floor_title,
+                            message=description,
+                        )
+                    )
 
                 floor_payload: dict[str, Any] = {
                     "project_id": str(project_id),
@@ -3115,9 +3500,13 @@ async def compute_sr_catch_rate_trends(
                     "below_floor_categories": [
                         {
                             "category": cat,
-                            "current_hit_rate": below_floor[cat].get("current_hit_rate"),
+                            "current_hit_rate": below_floor[cat].get(
+                                "current_hit_rate"
+                            ),
                             "rate_history": below_floor[cat].get("rate_history"),
-                            "sample_size": current_stats.get(cat, {}).get("human_count", 0),
+                            "sample_size": current_stats.get(cat, {}).get(
+                                "human_count", 0
+                            ),
                         }
                         for cat in current_floor_cats
                     ],
@@ -3141,19 +3530,26 @@ async def compute_sr_catch_rate_trends(
 
                 logger.info(
                     "[SR_CATCH_RATE_TRENDS] project=%s floor_alert categories=%s",
-                    project_id, current_floor_cats,
+                    project_id,
+                    current_floor_cats,
                 )
         elif doc.get("sr_catch_rate_floor_alert"):
             # Clear transition: previously firing, no longer firing this cycle.
-            stale_floor_alerts = (await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.task_id.is_(None),
-                    Alert.severity == AlertSeverity.ERROR,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+            stale_floor_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.ERROR,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                        )
+                    )
                 )
-            )).scalars().all()
+                .scalars()
+                .all()
+            )
             for a in stale_floor_alerts:
                 a.dismissed_at = now
                 session.add(a)
@@ -3162,7 +3558,9 @@ async def compute_sr_catch_rate_trends(
             flag_modified(project, "design_doc")
             session.add(project)
     except Exception:
-        logger.exception("[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing")
+        logger.exception(
+            "[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing"
+        )
 
     return result
 
@@ -3170,6 +3568,7 @@ async def compute_sr_catch_rate_trends(
 # ---------------------------------------------------------------------------
 # Fix-loop divergence regression alert
 # ---------------------------------------------------------------------------
+
 
 async def check_fix_loop_divergence_regression(
     project_id: uuid.UUID,
@@ -3196,15 +3595,21 @@ async def check_fix_loop_divergence_regression(
     if doc.get("fix_loop_divergence_alerted_window") == window_key:
         return None
 
-    tasks = (await session.execute(
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-            Task.created_at >= now - timedelta(days=14),
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                    Task.created_at >= now - timedelta(days=14),
+                )
+                .options(load_only(Task.id, Task.fix_loop_history, Task.created_at))
+            )
         )
-        .options(load_only(Task.id, Task.fix_loop_history, Task.created_at))
-    )).scalars().all()
+        .scalars()
+        .all()
+    )
 
     def _naive(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None) if dt.tzinfo else dt
@@ -3214,7 +3619,7 @@ async def check_fix_loop_divergence_regression(
     loops = ("lint", "test", "check")
 
     def _divergence_stats(start: datetime, end: datetime) -> dict[str, dict]:
-        s: dict[str, dict] = {l: {"n": 0, "d": 0} for l in loops}
+        s: dict[str, dict] = {loop: {"n": 0, "d": 0} for loop in loops}
         for t in tasks:
             ts = _naive(t.created_at) if t.created_at else None
             if ts is None or not (start <= ts < end):
@@ -3230,7 +3635,11 @@ async def check_fix_loop_divergence_regression(
                         last_exit = reason
                         break
                 if last_exit is None:
-                    last_exit = bucket[-1].get("exit_reason") if isinstance(bucket[-1], dict) else None
+                    last_exit = (
+                        bucket[-1].get("exit_reason")
+                        if isinstance(bucket[-1], dict)
+                        else None
+                    )
                 s[loop]["n"] += 1
                 if last_exit and last_exit.startswith("divergence_"):
                     s[loop]["d"] += 1
@@ -3246,13 +3655,15 @@ async def check_fix_loop_divergence_regression(
         if cn < _MIN_SR_SAMPLE or pn < _MIN_SR_SAMPLE:
             continue
         if cd / cn - pd / pn >= _TREND_DELTA_THRESHOLD:
-            regressions.append({
-                "loop": loop,
-                "prior_rate": round(pd / pn, 3),
-                "current_rate": round(cd / cn, 3),
-                "prior_count": pn,
-                "current_count": cn,
-            })
+            regressions.append(
+                {
+                    "loop": loop,
+                    "prior_rate": round(pd / pn, 3),
+                    "current_rate": round(cd / cn, 3),
+                    "prior_count": pn,
+                    "current_count": cn,
+                }
+            )
 
     if not regressions:
         return None
@@ -3267,7 +3678,8 @@ async def check_fix_loop_divergence_regression(
     await session.commit()
     logger.info(
         "[FIX_LOOP_DIVERGENCE] project=%s loops=%s",
-        project_id, [r["loop"] for r in regressions],
+        project_id,
+        [r["loop"] for r in regressions],
     )
     return {"regressions": regressions}
 
@@ -3302,36 +3714,55 @@ async def compute_fresh_reviewer_trend(
         return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
     _code_tasks = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if (t.first_payload or {}).get("type") in _FR_CODE_CHANGE_TYPES
     ]
 
     def _bucket_stats(tasks: list) -> dict[str, Any]:
         """Compute fresh-reviewer stats for a pre-filtered task list."""
         with_reviewer = [
-            t for t in tasks
-            if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+            t
+            for t in tasks
+            if (t.context or {})
+            .get("_self_review_outcome", {})
+            .get("reviewer_findings")
         ]
         without_reviewer = [
-            t for t in tasks
-            if not (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
+            t
+            for t in tasks
+            if not (t.context or {})
+            .get("_self_review_outcome", {})
+            .get("reviewer_findings")
         ]
 
         def _fa_rate(ts: list) -> Optional[float]:
-            measured = [t for t in ts if "_first_attempt_succeeded" in (t.context or {})]
+            measured = [
+                t for t in ts if "_first_attempt_succeeded" in (t.context or {})
+            ]
             if not measured:
                 return None
-            return round(sum(1 for t in measured if t.context["_first_attempt_succeeded"]) / len(measured), 3)
+            return round(
+                sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+                / len(measured),
+                3,
+            )
 
         cat_flagged: dict[str, int] = {}
         cat_confirmed: dict[str, int] = {}
         cat_added_value: dict[str, int] = {}
         for t in with_reviewer:
             ctx = t.context or {}
-            findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
+            findings = (
+                ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
+            )
             human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
-            check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
-            agent_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+            check_results = (
+                ctx.get("_self_review_outcome", {}).get("check_results") or {}
+            )
+            agent_failed = {
+                c for c, r in check_results.items() if not r.get("passed", True)
+            }
             for finding in findings:
                 cat = finding.get("category") if isinstance(finding, dict) else None
                 if not cat:
@@ -3378,7 +3809,10 @@ async def compute_fresh_reviewer_trend(
             p_cycle = cycle_rows[i + 1]
             c_stats = _bucket_stats(task_by_cycle.get(c_cycle.id, []))
             p_stats = _bucket_stats(task_by_cycle.get(p_cycle.id, []))
-            if c_stats["sample_size"] >= _MIN_SR_SAMPLE and p_stats["sample_size"] >= _MIN_SR_SAMPLE:
+            if (
+                c_stats["sample_size"] >= _MIN_SR_SAMPLE
+                and p_stats["sample_size"] >= _MIN_SR_SAMPLE
+            ):
                 use_cycle_mode = True
                 current_cycle_id = c_cycle.id
                 previous_cycle_id = p_cycle.id
@@ -3390,12 +3824,23 @@ async def compute_fresh_reviewer_trend(
         cutoff_14d_n = _naive(now - timedelta(days=14))
         cutoff_28d_n = _naive(now - timedelta(days=28))
         sentinel_n = datetime(9999, 12, 31)
-        cal_current = [t for t in _code_tasks if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n]
-        cal_previous = [t for t in _code_tasks if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n]
+        cal_current = [
+            t
+            for t in _code_tasks
+            if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
+        ]
+        cal_previous = [
+            t
+            for t in _code_tasks
+            if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
+        ]
         current_stats = _bucket_stats(cal_current)
         previous_stats = _bucket_stats(cal_previous)
 
-    if current_stats.get("sample_size", 0) < _MIN_SR_SAMPLE or previous_stats.get("sample_size", 0) < _MIN_SR_SAMPLE:
+    if (
+        current_stats.get("sample_size", 0) < _MIN_SR_SAMPLE
+        or previous_stats.get("sample_size", 0) < _MIN_SR_SAMPLE
+    ):
         return None
 
     def _classify(curr: Optional[float], prev: Optional[float]) -> str:
@@ -3417,12 +3862,22 @@ async def compute_fresh_reviewer_trend(
     for cat in all_cats:
         c_total = c_flagged.get(cat, 0)
         p_total = p_flagged.get(cat, 0)
-        c_rate = round(current_stats["cat_confirmed"].get(cat, 0) / c_total, 3) if c_total >= 2 else None
-        p_rate = round(previous_stats["cat_confirmed"].get(cat, 0) / p_total, 3) if p_total >= 2 else None
+        c_rate = (
+            round(current_stats["cat_confirmed"].get(cat, 0) / c_total, 3)
+            if c_total >= 2
+            else None
+        )
+        p_rate = (
+            round(previous_stats["cat_confirmed"].get(cat, 0) / p_total, 3)
+            if p_total >= 2
+            else None
+        )
         per_category_hit_rate[cat] = {
             "current": c_rate,
             "previous": p_rate,
-            "delta": round(c_rate - p_rate, 3) if c_rate is not None and p_rate is not None else None,
+            "delta": round(c_rate - p_rate, 3)
+            if c_rate is not None and p_rate is not None
+            else None,
             "trend": _classify(c_rate, p_rate),
         }
 
@@ -3445,12 +3900,22 @@ async def compute_fresh_reviewer_trend(
     c_without = current_stats["fa_rate_without"]
     p_with = previous_stats["fa_rate_with"]
     p_without = previous_stats["fa_rate_without"]
-    c_lift = round(c_with - c_without, 3) if c_with is not None and c_without is not None else None
-    p_lift = round(p_with - p_without, 3) if p_with is not None and p_without is not None else None
+    c_lift = (
+        round(c_with - c_without, 3)
+        if c_with is not None and c_without is not None
+        else None
+    )
+    p_lift = (
+        round(p_with - p_without, 3)
+        if p_with is not None and p_without is not None
+        else None
+    )
     approval_rate_lift: dict[str, Any] = {
         "current": c_lift,
         "previous": p_lift,
-        "delta": round(c_lift - p_lift, 3) if c_lift is not None and p_lift is not None else None,
+        "delta": round(c_lift - p_lift, 3)
+        if c_lift is not None and p_lift is not None
+        else None,
         "trend": _classify(c_lift, p_lift),
     }
 
@@ -3478,7 +3943,9 @@ async def compute_fresh_reviewer_trend(
 
     logger.info(
         "[FRESH_REVIEWER_TREND] project=%s categories=%d bucket_mode=%s",
-        project_id, len(per_category_hit_rate), result["bucket_mode"],
+        project_id,
+        len(per_category_hit_rate),
+        result["bucket_mode"],
     )
 
     return result
@@ -3519,7 +3986,8 @@ async def compute_sr_reviewer_disagreements(
     cutoff_naive = _naive(cutoff)
 
     eligible = [
-        t for t in all_tasks
+        t
+        for t in all_tasks
         if t.status == TaskStatus.COMPLETED
         and (not t.created_at or _naive(t.created_at) >= cutoff_naive)
     ]
@@ -3530,8 +3998,7 @@ async def compute_sr_reviewer_disagreements(
 
     top = sorted(disagreement_counts.items(), key=lambda x: -x[1])[:limit]
     entries = [
-        {"category": cat, "task_type": ttype, "count": cnt}
-        for (cat, ttype), cnt in top
+        {"category": cat, "task_type": ttype, "count": cnt} for (cat, ttype), cnt in top
     ]
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
@@ -3549,7 +4016,8 @@ async def compute_sr_reviewer_disagreements(
 
     logger.info(
         "[SR_REVIEWER_DISAGREEMENTS] project=%s entries=%d",
-        project_id, len(entries),
+        project_id,
+        len(entries),
     )
     return result
 
@@ -3588,7 +4056,8 @@ async def compute_edges_trend(
 
     def _qualifying_count(tasks: list) -> int:
         return sum(
-            1 for t in tasks
+            1
+            for t in tasks
             if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
             and "_self_review_outcome" in (t.context or {})
         )
@@ -3620,7 +4089,10 @@ async def compute_edges_trend(
             p_cycle = cycle_rows[i + 1]
             c_tasks = task_by_cycle.get(c_cycle.id, [])
             p_tasks = task_by_cycle.get(p_cycle.id, [])
-            if _qualifying_count(c_tasks) >= _MIN_SR_SAMPLE and _qualifying_count(p_tasks) >= _MIN_SR_SAMPLE:
+            if (
+                _qualifying_count(c_tasks) >= _MIN_SR_SAMPLE
+                and _qualifying_count(p_tasks) >= _MIN_SR_SAMPLE
+            ):
                 use_cycle_mode = True
                 current_cycle_id = c_cycle.id
                 previous_cycle_id = p_cycle.id
@@ -3633,15 +4105,20 @@ async def compute_edges_trend(
         cutoff_28d_n = _naive(now - timedelta(days=28))
         sentinel_n = datetime(9999, 12, 31)
         current_bucket = [
-            t for t in all_tasks
+            t
+            for t in all_tasks
             if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
         ]
         previous_bucket = [
-            t for t in all_tasks
+            t
+            for t in all_tasks
             if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
         ]
 
-    if _qualifying_count(current_bucket) < _MIN_SR_SAMPLE or _qualifying_count(previous_bucket) < _MIN_SR_SAMPLE:
+    if (
+        _qualifying_count(current_bucket) < _MIN_SR_SAMPLE
+        or _qualifying_count(previous_bucket) < _MIN_SR_SAMPLE
+    ):
         return None
 
     current_stats = _compute_edges_stats(current_bucket)
@@ -3718,7 +4195,228 @@ async def compute_edges_trend(
 
     logger.info(
         "[EDGES_TREND] project=%s trend=%s bucket_mode=%s",
-        project_id, trend, result["bucket_mode"],
+        project_id,
+        trend,
+        result["bucket_mode"],
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SR regression_risk vs testFix-loop signal cross-validation
+# ---------------------------------------------------------------------------
+
+
+async def compute_sr_regression_risk_test_signal_trends(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> Optional[dict[str, Any]]:
+    """Cross-validate SR ``regression_risk.passed`` verdicts against testFix-loop signal.
+
+    Companion metric to ``compute_sr_catch_rate_trends`` — that one counts a
+    miss only when a human reviewer raised the ``regression_risk`` category.
+    This one uses the agent's own testFix loop as an objective signal: when the
+    test loop ran non-trivially, real regression surface existed regardless of
+    whether any human reviewer flagged it.
+
+    Per-task classification (qualifying = code-change task with a non-skip
+    self-review outcome that includes ``check_results.regression_risk.passed``)::
+
+      sr_passed_no_signal   (true-pass)             — SR ok, test loop quiet
+      sr_passed_with_signal (miss-by-test-signal)   — SR ok, test loop ran
+      sr_failed_with_signal (hit-by-test-signal)    — SR flagged, test loop ran
+      sr_failed_no_signal   (false-flag)            — SR flagged, test loop quiet
+
+    Test-signal predicate: ``len(history.get("test") or []) >= 2`` OR the last
+    test attempt's ``exit_reason`` is non-``passed`` (covers single-iteration
+    runs that diverged or maxed out attempts).
+
+    Mirrors :func:`compute_sr_catch_rate_trends` cycle-vs-calendar bucketing
+    and the :data:`_MIN_SR_SAMPLE` floor.
+
+    **Side effect**: writes the result to
+    ``project.design_doc["sr_regression_risk_test_signal_trends"]``.
+    """
+    from app.sr_blind_spots import is_skipped_sr_outcome
+
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    def _qualifies(task) -> bool:
+        if (task.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            return False
+        ctx = task.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            return False
+        rr = (sro.get("check_results") or {}).get("regression_risk")
+        return isinstance(rr, dict) and "passed" in rr
+
+    def _has_test_signal(task) -> bool:
+        history = getattr(task, "fix_loop_history", None) or {}
+        test_attempts = history.get("test") or []
+        if len(test_attempts) >= 2:
+            return True
+        if test_attempts:
+            last = test_attempts[-1]
+            if isinstance(last, dict):
+                reason = last.get("exit_reason")
+                if reason and reason != "passed":
+                    return True
+        return False
+
+    def _aggregate(tasks: list) -> dict[str, int]:
+        stats = {
+            "sr_passed_no_signal": 0,
+            "sr_passed_with_signal": 0,
+            "sr_failed_with_signal": 0,
+            "sr_failed_no_signal": 0,
+        }
+        for t in tasks:
+            if not _qualifies(t):
+                continue
+            sro = (t.context or {}).get("_self_review_outcome") or {}
+            rr = (sro.get("check_results") or {}).get("regression_risk") or {}
+            sr_passed = bool(rr.get("passed"))
+            signal = _has_test_signal(t)
+            if sr_passed and signal:
+                stats["sr_passed_with_signal"] += 1
+            elif sr_passed:
+                stats["sr_passed_no_signal"] += 1
+            elif signal:
+                stats["sr_failed_with_signal"] += 1
+            else:
+                stats["sr_failed_no_signal"] += 1
+        return stats
+
+    def _qualifying_count(tasks: list) -> int:
+        return sum(1 for t in tasks if _qualifies(t))
+
+    use_cycle_mode = False
+    current_cycle_id: Optional[str] = None
+    previous_cycle_id: Optional[str] = None
+    current_bucket: list = []
+    previous_bucket: list = []
+
+    cycle_stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+
+    if len(cycle_rows) >= 2:
+        task_by_cycle: dict[str, list] = {}
+        for t in all_tasks:
+            cid = getattr(t, "strategic_cycle_id", None)
+            if cid:
+                task_by_cycle.setdefault(cid, []).append(t)
+        for i in range(len(cycle_rows) - 1):
+            c_cycle = cycle_rows[i]
+            p_cycle = cycle_rows[i + 1]
+            c_tasks = task_by_cycle.get(c_cycle.id, [])
+            p_tasks = task_by_cycle.get(p_cycle.id, [])
+            if (
+                _qualifying_count(c_tasks) >= _MIN_SR_SAMPLE
+                and _qualifying_count(p_tasks) >= _MIN_SR_SAMPLE
+            ):
+                use_cycle_mode = True
+                current_cycle_id = c_cycle.id
+                previous_cycle_id = p_cycle.id
+                current_bucket = c_tasks
+                previous_bucket = p_tasks
+                break
+
+    if not use_cycle_mode:
+        cutoff_14d_n = _naive(now - timedelta(days=14))
+        cutoff_28d_n = _naive(now - timedelta(days=28))
+        sentinel_n = datetime(9999, 12, 31)
+        current_bucket = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
+        ]
+        previous_bucket = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
+        ]
+
+    current_qual = _qualifying_count(current_bucket)
+    previous_qual = _qualifying_count(previous_bucket)
+    if current_qual < _MIN_SR_SAMPLE or previous_qual < _MIN_SR_SAMPLE:
+        return None
+
+    current_counts = _aggregate(current_bucket)
+    previous_counts = _aggregate(previous_bucket)
+
+    def _miss_rate(stats: dict[str, int]) -> tuple[Optional[float], int, int]:
+        numerator = stats["sr_passed_with_signal"]
+        denominator = stats["sr_passed_no_signal"] + stats["sr_passed_with_signal"]
+        if denominator == 0:
+            return None, numerator, denominator
+        return round(numerator / denominator, 3), numerator, denominator
+
+    current_rate, current_numer, current_denom = _miss_rate(current_counts)
+    previous_rate, previous_numer, previous_denom = _miss_rate(previous_counts)
+
+    if current_rate is not None and previous_rate is not None:
+        delta = round(current_rate - previous_rate, 3)
+        if delta >= _TREND_DELTA_THRESHOLD:
+            trend = "regressing"
+        elif delta <= -_TREND_DELTA_THRESHOLD:
+            trend = "improving"
+        else:
+            trend = "stable"
+    else:
+        delta = None
+        trend = "stable"
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "bucket_mode": "cycle" if use_cycle_mode else "calendar",
+        "current_cycle_id": current_cycle_id,
+        "previous_cycle_id": previous_cycle_id,
+        "current": {
+            **current_counts,
+            "miss_by_test_signal_rate": current_rate,
+            "numerator": current_numer,
+            "denominator": current_denom,
+            "sample_size": current_qual,
+        },
+        "previous": {
+            **previous_counts,
+            "miss_by_test_signal_rate": previous_rate,
+            "numerator": previous_numer,
+            "denominator": previous_denom,
+            "sample_size": previous_qual,
+        },
+        "miss_by_test_signal_rate_delta": delta,
+        "trend": trend,
+    }
+
+    project = await session.get(Project, project_id)
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    doc["sr_regression_risk_test_signal_trends"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[SR_REGRESSION_RISK_TEST_SIGNAL] project=%s trend=%s miss_rate=%s n=%d",
+        project_id,
+        trend,
+        current_rate,
+        current_qual,
     )
 
     return result

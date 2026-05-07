@@ -6,13 +6,18 @@ The pipeline-event monitor block at the bottom exercises the in-memory
 rolling buffer in `app.shared_state` plus the /api/health/detailed endpoint.
 Run with: bash scripts/test-backend.sh testing/test_pipeline_health.py
 """
+
 import uuid
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 from app.routers.admin_digest import compute_pipeline_health_summary
-from app.routers.admin_scope_measurement import _compute_scope_baselines, _compute_medium_scope_measurement, _compute_first_attempt_measurement
+from app.routers.admin_scope_measurement import (
+    _compute_scope_baselines,
+    _compute_medium_scope_measurement,
+    _compute_first_attempt_measurement,
+)
 from app.models import TaskStatus
 from testing.factories import make_task, make_project, _utcnow
 
@@ -34,6 +39,7 @@ def _make_mock_session(tasks=None, project=None):
 
 # ── Empty project ────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_empty_project_returns_sensible_defaults():
     """Empty project (no tasks, no directions) → null success_rate, empty distribution."""
@@ -51,6 +57,7 @@ async def test_empty_project_returns_sensible_defaults():
 
 # ── Success rate ─────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_success_rate_computed_correctly():
     """3 completed + 1 failed → success_rate = 0.75."""
@@ -59,11 +66,27 @@ async def test_success_rate_computed_correctly():
     project = make_project(directions=[])
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=1)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=2)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=3)),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  latest_status_message="ImportError: missing module"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=3),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=4),
+            latest_status_message="ImportError: missing module",
+        ),
     ]
     # status_log is empty so _derive_completed_at falls back to created_at (within window)
     session = _make_mock_session(tasks=tasks, project=project)
@@ -79,8 +102,16 @@ async def test_success_rate_all_completed():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=1)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=2)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -95,8 +126,12 @@ async def test_success_rate_all_failed():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
-                  latest_status_message="timeout"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            latest_status_message="timeout",
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -107,6 +142,7 @@ async def test_success_rate_all_failed():
 
 # ── Failure distribution ──────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_failure_distribution_uses_classify_failure_categories():
     """Failure distribution maps to the correct classify_failure classes."""
@@ -115,16 +151,32 @@ async def test_failure_distribution_uses_classify_failure_categories():
 
     tasks = [
         # CODE_ERROR (default)
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
-                  latest_status_message="SyntaxError: invalid syntax"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
-                  latest_status_message="AttributeError: NoneType has no attribute"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            latest_status_message="SyntaxError: invalid syntax",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            latest_status_message="AttributeError: NoneType has no attribute",
+        ),
         # PROVISION_FAILURE
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  latest_status_message="CPUS_ALL_REGIONS quota exceeded for zone us-central1"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=3),
+            latest_status_message="CPUS_ALL_REGIONS quota exceeded for zone us-central1",
+        ),
         # RATE_LIMIT
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  latest_status_message="API Error: Rate limit reached"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=4),
+            latest_status_message="API Error: Rate limit reached",
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -143,20 +195,40 @@ async def test_failure_taxonomy_distribution_mixed():
     project_id = uuid.uuid4()
     tasks = [
         # review_quality (test/lint keywords)
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
-                  latest_status_message="pytest tests failed"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
-                  latest_status_message="ruff lint error"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            latest_status_message="pytest tests failed",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            latest_status_message="ruff lint error",
+        ),
         # scope_related (positive scope evidence: status-msg scope keyword)
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  latest_status_message="too many files changed",
-                  context={"scope": "large", "scope_calibrated_from": "medium"}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=3),
+            latest_status_message="too many files changed",
+            context={"scope": "large", "scope_calibrated_from": "medium"},
+        ),
         # infra_related
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  latest_status_message="API Error: Rate limit reached"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=4),
+            latest_status_message="API Error: Rate limit reached",
+        ),
         # code_defect (no scope, no keywords)
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
-                  latest_status_message="SyntaxError: unexpected"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=5),
+            latest_status_message="SyntaxError: unexpected",
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -191,20 +263,48 @@ async def test_failure_distribution_top_3_only():
 
     # 4 distinct failure classes — only top 3 should appear
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
-                  latest_status_message="SyntaxError"),  # CODE_ERROR x3
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
-                  latest_status_message="ImportError"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  latest_status_message="NameError"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  latest_status_message="CPUS_ALL_REGIONS quota exceeded"),  # PROVISION_FAILURE x2
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
-                  latest_status_message="vm startup failed network"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=6),
-                  latest_status_message="API Error: Rate limit reached"),  # RATE_LIMIT x1 (should be cut)
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=7),
-                  latest_status_message="heartbeat lost timeout oom"),  # AGENT_TIMEOUT x1 (should be cut)
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            latest_status_message="SyntaxError",
+        ),  # CODE_ERROR x3
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            latest_status_message="ImportError",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=3),
+            latest_status_message="NameError",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=4),
+            latest_status_message="CPUS_ALL_REGIONS quota exceeded",
+        ),  # PROVISION_FAILURE x2
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=5),
+            latest_status_message="vm startup failed network",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=6),
+            latest_status_message="API Error: Rate limit reached",
+        ),  # RATE_LIMIT x1 (should be cut)
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=7),
+            latest_status_message="heartbeat lost timeout oom",
+        ),  # AGENT_TIMEOUT x1 (should be cut)
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -218,6 +318,7 @@ async def test_failure_distribution_top_3_only():
 
 # ── Trend ────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_trend_improving_when_success_rate_increased():
     """success_rate 0.5 → 0.8 (delta +0.3 > 0.05) → trend = improving."""
@@ -225,19 +326,45 @@ async def test_trend_improving_when_success_rate_increased():
     project_id = uuid.uuid4()
 
     # Previous window (24–48h ago): 1 completed, 1 failed → 50%
-    prev_completed = make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                                created_at=now - timedelta(hours=36))
-    prev_failed = make_task(project_id=project_id, status=TaskStatus.FAILED,
-                             created_at=now - timedelta(hours=36),
-                             latest_status_message="error")
+    prev_completed = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=36),
+    )
+    prev_failed = make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        created_at=now - timedelta(hours=36),
+        latest_status_message="error",
+    )
     # Current window (0–24h ago): 4 completed, 1 failed → 80%
     curr_tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=5)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=6)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=7)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=8)),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=9),
-                  latest_status_message="error"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=5),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=6),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=7),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=8),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=9),
+            latest_status_message="error",
+        ),
     ]
     tasks = [prev_completed, prev_failed] + curr_tasks
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
@@ -254,7 +381,11 @@ async def test_trend_none_when_no_previous_window_data():
     project_id = uuid.uuid4()
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=2)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -265,6 +396,7 @@ async def test_trend_none_when_no_previous_window_data():
 
 # ── Direction stats ───────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_direction_stats_conversion_rate():
     """Direction with 2 research cycles and 1 PR merged from 4 tasks created → conversion_rate = 0.25, no merge_rate key."""
@@ -272,28 +404,43 @@ async def test_direction_stats_conversion_rate():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Improve test coverage",
-        "possibly_saturated": False,
-        "completion_criteria": "Coverage > 80%",
-        "possibly_complete": True,
-        "category": "structural",
-        "research_history": [
-            {"timestamp": (now - timedelta(hours=5)).isoformat(), "prs_merged": 1, "tasks_created": 4, "prs_rejected": 3},
-        ],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Improve test coverage",
+                "possibly_saturated": False,
+                "completion_criteria": "Coverage > 80%",
+                "possibly_complete": True,
+                "category": "structural",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 4,
+                        "prs_rejected": 3,
+                    },
+                ],
+            }
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=6)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=6),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -319,21 +466,28 @@ async def test_direction_with_zero_cycles_excluded():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Direction with no cycles",
-        "possibly_saturated": False,
-        "research_history": [],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Direction with no cycles",
+                "possibly_saturated": False,
+                "research_history": [],
+            }
+        ]
+    )
 
     # Task exists but is FAILED, not COMPLETED
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4),
-                  latest_status_message="error"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+            latest_status_message="error",
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -344,6 +498,7 @@ async def test_direction_with_zero_cycles_excluded():
 
 # ── Dominant dropout stage ────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_dominant_dropout_stage_surfaces_highest_count():
     """dominant_dropout_stage picks the stage_dropout key with the highest total."""
@@ -351,31 +506,38 @@ async def test_dominant_dropout_stage_surfaces_highest_count():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Stage dropout direction",
-        "possibly_saturated": False,
-        "research_history": [
+    project = make_project(
+        directions=[
             {
-                "timestamp": (now - timedelta(hours=5)).isoformat(),
-                "prs_merged": 1,
-                "tasks_created": 4,
-                "stage_dropout": {
-                    "tasks_failed_code_error": 2,
-                    "tasks_failed_infra": 1,
-                    "tasks_required_approval": 0,
-                    "tasks_merged_staging_only": 0,
-                },
+                "id": direction_id,
+                "status": "active",
+                "text": "Stage dropout direction",
+                "possibly_saturated": False,
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 4,
+                        "stage_dropout": {
+                            "tasks_failed_code_error": 2,
+                            "tasks_failed_infra": 1,
+                            "tasks_required_approval": 0,
+                            "tasks_merged_staging_only": 0,
+                        },
+                    }
+                ],
             }
-        ],
-    }])
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -393,25 +555,32 @@ async def test_dominant_dropout_stage_none_when_no_stage_dropout_data():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "No dropout data direction",
-        "possibly_saturated": False,
-        "research_history": [
+    project = make_project(
+        directions=[
             {
-                "timestamp": (now - timedelta(hours=5)).isoformat(),
-                "prs_merged": 1,
-                "tasks_created": 2,
+                "id": direction_id,
+                "status": "active",
+                "text": "No dropout data direction",
+                "possibly_saturated": False,
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                    }
+                ],
             }
-        ],
-    }])
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -429,31 +598,38 @@ async def test_dominant_dropout_stage_none_when_all_zeros():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Perfect cycle direction",
-        "possibly_saturated": False,
-        "research_history": [
+    project = make_project(
+        directions=[
             {
-                "timestamp": (now - timedelta(hours=5)).isoformat(),
-                "prs_merged": 2,
-                "tasks_created": 2,
-                "stage_dropout": {
-                    "tasks_failed_code_error": 0,
-                    "tasks_failed_infra": 0,
-                    "tasks_required_approval": 0,
-                    "tasks_merged_staging_only": 0,
-                },
+                "id": direction_id,
+                "status": "active",
+                "text": "Perfect cycle direction",
+                "possibly_saturated": False,
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 2,
+                        "tasks_created": 2,
+                        "stage_dropout": {
+                            "tasks_failed_code_error": 0,
+                            "tasks_failed_infra": 0,
+                            "tasks_required_approval": 0,
+                            "tasks_merged_staging_only": 0,
+                        },
+                    }
+                ],
             }
-        ],
-    }])
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -474,27 +650,63 @@ async def test_direction_stats_sorted_by_cycles_descending():
     dir_a = str(uuid.uuid4())
     dir_b = str(uuid.uuid4())
 
-    project = make_project(directions=[
-        {
-            "id": dir_a, "status": "active",
-            "research_history": [{"timestamp": (now - timedelta(hours=3)).isoformat(), "prs_merged": 1, "tasks_created": 3}],
-        },
-        {
-            "id": dir_b, "status": "active",
-            "research_history": [{"timestamp": (now - timedelta(hours=3)).isoformat(), "prs_merged": 0, "tasks_created": 1}],
-        },
-    ])
+    project = make_project(
+        directions=[
+            {
+                "id": dir_a,
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=3)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 3,
+                    }
+                ],
+            },
+            {
+                "id": dir_b,
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=3)).isoformat(),
+                        "prs_merged": 0,
+                        "tasks_created": 1,
+                    }
+                ],
+            },
+        ]
+    )
     tasks = [
         # dir_a: 3 completed research cycles
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
-                  context={"direction_id": dir_a}, created_at=now - timedelta(hours=2)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
-                  context={"direction_id": dir_a}, created_at=now - timedelta(hours=4)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
-                  context={"direction_id": dir_a}, created_at=now - timedelta(hours=6)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_a},
+            created_at=now - timedelta(hours=2),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_a},
+            created_at=now - timedelta(hours=4),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_a},
+            created_at=now - timedelta(hours=6),
+        ),
         # dir_b: 1 completed research cycle
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
-                  context={"direction_id": dir_b}, created_at=now - timedelta(hours=5)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": dir_b},
+            created_at=now - timedelta(hours=5),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -502,7 +714,9 @@ async def test_direction_stats_sorted_by_cycles_descending():
 
     stats = result["direction_stats"]
     assert len(stats) == 2
-    assert stats[0]["direction_id"] == dir_a, "Direction with more cycles should be first"
+    assert stats[0]["direction_id"] == dir_a, (
+        "Direction with more cycles should be first"
+    )
     assert stats[0]["cycles"] == 3
     assert stats[1]["direction_id"] == dir_b
     assert stats[1]["cycles"] == 1
@@ -515,15 +729,34 @@ async def test_direction_stats_entry_shape_pinned():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id, "status": "active",
-        "possibly_saturated": True, "possibly_complete": False,
-        "completion_criteria": "done", "category": "reliability",
-        "research_history": [{"timestamp": (now - timedelta(hours=2)).isoformat(), "prs_merged": 1, "tasks_created": 2, "prs_rejected": 1}],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "possibly_saturated": True,
+                "possibly_complete": False,
+                "completion_criteria": "done",
+                "category": "reliability",
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=2)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        "prs_rejected": 1,
+                    }
+                ],
+            }
+        ]
+    )
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id}, created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=1),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -531,15 +764,22 @@ async def test_direction_stats_entry_shape_pinned():
 
     entry = result["direction_stats"][0]
     expected_keys = {
-        "direction_id", "cycles", "possibly_saturated", "conversion_rate",
-        "dominant_dropout_stage", "completion_criteria", "possibly_complete",
-        "category", "acceptance_rate",
+        "direction_id",
+        "cycles",
+        "possibly_saturated",
+        "conversion_rate",
+        "dominant_dropout_stage",
+        "completion_criteria",
+        "possibly_complete",
+        "category",
+        "acceptance_rate",
     }
     missing = expected_keys - entry.keys()
     assert not missing, f"direction_stats entry missing keys: {missing}"
 
 
 # ── First-review approval rate ────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_first_review_approval_rate_computes_correctly():
@@ -548,29 +788,47 @@ async def test_first_review_approval_rate_computes_correctly():
     now = _utcnow()
     tasks = [
         # Approved on first review (no _first_attempt_rejection_categories)
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "create"}],
-                  context={"pr_merged": True},
-                  created_at=now - timedelta(hours=1)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "refactor"}],
-                  context={"pr_merged": True},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"pr_merged": True},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "refactor"}],
+            context={"pr_merged": True},
+            created_at=now - timedelta(hours=1),
+        ),
         # Rejected on first review (has _first_attempt_rejection_categories)
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "create"}],
-                  context={"pr_merged": True, "_first_attempt_rejection_categories": ["test-coverage"]},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "pr_merged": True,
+                "_first_attempt_rejection_categories": ["test-coverage"],
+            },
+            created_at=now - timedelta(hours=1),
+        ),
         # review-type task — excluded from eligible set
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"pr_merged": True},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"pr_merged": True},
+            created_at=now - timedelta(hours=1),
+        ),
         # Not merged — excluded
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "create"}],
-                  context={"pr_merged": False},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"pr_merged": False},
+            created_at=now - timedelta(hours=1),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -591,10 +849,13 @@ async def test_first_review_approval_rate_none_when_no_eligible_tasks():
     project_id = uuid.uuid4()
     now = _utcnow()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"pr_merged": True},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"pr_merged": True},
+            created_at=now - timedelta(hours=1),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -614,15 +875,21 @@ async def test_first_review_approval_rate_shape_pinned():
 
     fra = result["first_review_approval_rate"]
     expected_keys = {
-        "overall", "sample_size", "by_type", "by_scope",
-        "with_playbook", "without_playbook",
-        "with_measurements", "without_measurements",
+        "overall",
+        "sample_size",
+        "by_type",
+        "by_scope",
+        "with_playbook",
+        "without_playbook",
+        "with_measurements",
+        "without_measurements",
     }
     missing = expected_keys - fra.keys()
     assert not missing, f"first_review_approval_rate missing keys: {missing}"
 
 
 # ── Return structure ──────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_return_structure_has_all_required_keys():
@@ -631,7 +898,34 @@ async def test_return_structure_has_all_required_keys():
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
 
-    assert set(result.keys()) == {"success_rate", "trend", "failure_distribution", "failure_taxonomy", "failure_taxonomy_by_scope", "direction_stats", "first_attempt_success_rate", "first_review_approval_rate", "pipeline_conversion_rate", "self_review_effectiveness", "self_review_prediction_accuracy", "self_review_prediction_accuracy_trends", "fresh_reviewer_trend", "edges_trend", "edges_considered_metrics", "review_accuracy", "persistent_review_issues", "review_effectiveness_trends", "review_recurrence_by_category", "scope_conversion_rates", "scope_file_budgets", "medium_scope_review_iterations", "direction_first_attempt_feedback", "medium_scope_measurement", "auto_playbook_idle_retired_24h"}
+    assert set(result.keys()) == {
+        "success_rate",
+        "trend",
+        "failure_distribution",
+        "failure_taxonomy",
+        "failure_taxonomy_by_scope",
+        "direction_stats",
+        "first_attempt_success_rate",
+        "first_review_approval_rate",
+        "pipeline_conversion_rate",
+        "self_review_effectiveness",
+        "self_review_prediction_accuracy",
+        "self_review_prediction_accuracy_trends",
+        "fresh_reviewer_trend",
+        "edges_trend",
+        "edges_considered_metrics",
+        "review_accuracy",
+        "persistent_review_issues",
+        "review_effectiveness_trends",
+        "review_recurrence_by_category",
+        "scope_conversion_rates",
+        "scope_file_budgets",
+        "medium_scope_review_iterations",
+        "direction_first_attempt_feedback",
+        "medium_scope_measurement",
+        "auto_playbook_idle_retired_24h",
+        "sr_regression_risk_test_signal_trends",
+    }
     fa = result["first_attempt_success_rate"]
     assert "first_attempt_by_review_category" in fa
     assert "with_arch_context" in fa
@@ -649,17 +943,37 @@ async def test_arch_context_first_attempt_rate_computed_correctly():
 
     tasks = [
         # With arch context: 2 succeed, 1 fails → rate 0.67
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=1),
-                  context={"_had_arch_context": True, "_first_attempt_succeeded": True}),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=2),
-                  context={"_had_arch_context": True, "_first_attempt_succeeded": True}),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  context={"_had_arch_context": True, "_first_attempt_succeeded": False}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_had_arch_context": True, "_first_attempt_succeeded": True},
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+            context={"_had_arch_context": True, "_first_attempt_succeeded": True},
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=3),
+            context={"_had_arch_context": True, "_first_attempt_succeeded": False},
+        ),
         # Without arch context: 1 succeeds, 1 fails → rate 0.5
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED, created_at=now - timedelta(hours=4),
-                  context={"_had_arch_context": False, "_first_attempt_succeeded": True}),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=5),
-                  context={"_had_arch_context": False, "_first_attempt_succeeded": False}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=4),
+            context={"_had_arch_context": False, "_first_attempt_succeeded": True},
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=5),
+            context={"_had_arch_context": False, "_first_attempt_succeeded": False},
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -680,19 +994,47 @@ async def test_arch_rejection_rate_computed_correctly():
 
     tasks = [
         # With arch context: 2 failures with rejection categories; 1 has 'architecture'
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=1),
-                  context={"_had_arch_context": True, "_first_attempt_succeeded": False,
-                           "_first_attempt_rejection_categories": {"architecture": 1, "style": 1}}),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=2),
-                  context={"_had_arch_context": True, "_first_attempt_succeeded": False,
-                           "_first_attempt_rejection_categories": {"style": 1}}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            context={
+                "_had_arch_context": True,
+                "_first_attempt_succeeded": False,
+                "_first_attempt_rejection_categories": {"architecture": 1, "style": 1},
+            },
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            context={
+                "_had_arch_context": True,
+                "_first_attempt_succeeded": False,
+                "_first_attempt_rejection_categories": {"style": 1},
+            },
+        ),
         # Without arch context: 2 failures; both have 'architecture'
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=3),
-                  context={"_had_arch_context": False, "_first_attempt_succeeded": False,
-                           "_first_attempt_rejection_categories": {"architecture": 1}}),
-        make_task(project_id=project_id, status=TaskStatus.FAILED, created_at=now - timedelta(hours=4),
-                  context={"_had_arch_context": False, "_first_attempt_succeeded": False,
-                           "_first_attempt_rejection_categories": {"architecture": 1, "tests": 1}}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=3),
+            context={
+                "_had_arch_context": False,
+                "_first_attempt_succeeded": False,
+                "_first_attempt_rejection_categories": {"architecture": 1},
+            },
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=4),
+            context={
+                "_had_arch_context": False,
+                "_first_attempt_succeeded": False,
+                "_first_attempt_rejection_categories": {"architecture": 1, "tests": 1},
+            },
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -712,16 +1054,34 @@ async def test_first_attempt_review_measurements_split():
     now = _utcnow()
     tasks = [
         # With review measurements — succeeded
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  created_at=now - timedelta(hours=1),
-                  context={"_had_review_measurements": True, "_first_attempt_succeeded": True}),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  created_at=now - timedelta(hours=2),
-                  context={"_had_review_measurements": True, "_first_attempt_succeeded": False}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={
+                "_had_review_measurements": True,
+                "_first_attempt_succeeded": True,
+            },
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=2),
+            context={
+                "_had_review_measurements": True,
+                "_first_attempt_succeeded": False,
+            },
+        ),
         # Without review measurements — all failed
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  created_at=now - timedelta(hours=3),
-                  context={"_had_review_measurements": False, "_first_attempt_succeeded": False}),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=3),
+            context={
+                "_had_review_measurements": False,
+                "_first_attempt_succeeded": False,
+            },
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
     result = await compute_pipeline_health_summary(session, project_id)
@@ -741,6 +1101,7 @@ async def test_first_attempt_review_measurements_none_when_no_data():
 
 
 # ── Review accuracy ───────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_review_accuracy_none_when_fewer_than_5_reviews():
@@ -772,33 +1133,57 @@ async def test_review_accuracy_computes_precision_and_recall():
     # 6 reviews: 5 APPROVE (1 overridden, 1 dismissed), 1 REQUEST_CHANGES (1 miss)
     tasks = [
         # Plain approve — correct
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "APPROVE"},
-                  created_at=now - timedelta(hours=1)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "APPROVE"},
-                  created_at=now - timedelta(hours=1)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "APPROVE"},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE"},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE"},
+            created_at=now - timedelta(hours=1),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE"},
+            created_at=now - timedelta(hours=1),
+        ),
         # Approve overridden by user (too lenient)
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "APPROVE", "user_overrode_review": True},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": "APPROVE",
+                "user_overrode_review": True,
+            },
+            created_at=now - timedelta(hours=1),
+        ),
         # Review dismissed
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "REQUEST_CHANGES", "review_dismissed": True},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": "REQUEST_CHANGES",
+                "review_dismissed": True,
+            },
+            created_at=now - timedelta(hours=1),
+        ),
         # Approve but user caught an issue Blueprint missed (recall hit)
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "APPROVE", "user_caught_issues": True},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE", "user_caught_issues": True},
+            created_at=now - timedelta(hours=1),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -810,7 +1195,9 @@ async def test_review_accuracy_computes_precision_and_recall():
     assert ra["overrides"] == 1
     assert ra["dismissals"] == 1
     assert ra["misses"] == 1
-    assert ra["total_approvals"] == 5  # 3 plain + 1 overridden + 1 user_caught (all APPROVE verdicts)
+    assert (
+        ra["total_approvals"] == 5
+    )  # 3 plain + 1 overridden + 1 user_caught (all APPROVE verdicts)
     # precision = 1 - (1 override + 1 dismissal) / 6 = 1 - 2/6 = 0.67
     assert ra["precision"] == round(1 - 2 / 6, 2)
     # recall = 1 - 1 miss / 5 approvals = 0.8
@@ -824,17 +1211,23 @@ async def test_review_accuracy_skips_tasks_without_verdict():
     now = _utcnow()
     # 5 tasks with verdict + 2 without — only 5 should count
     tasks_with_verdict = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={"blueprint_review_verdict": "APPROVE"},
-                  created_at=now - timedelta(hours=1))
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE"},
+            created_at=now - timedelta(hours=1),
+        )
         for _ in range(5)
     ]
     tasks_without_verdict = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "review"}],
-                  context={},
-                  created_at=now - timedelta(hours=1))
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={},
+            created_at=now - timedelta(hours=1),
+        )
         for _ in range(2)
     ]
     session = _make_mock_session(
@@ -850,6 +1243,7 @@ async def test_review_accuracy_skips_tasks_without_verdict():
 
 
 # ── Review effectiveness trends ───────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_review_effectiveness_trends_none_when_no_design_doc():
@@ -897,7 +1291,9 @@ async def test_review_effectiveness_trends_returned_when_present():
             },
         },
     }
-    project = make_project(directions=[], design_doc={"review_effectiveness": review_effectiveness})
+    project = make_project(
+        directions=[], design_doc={"review_effectiveness": review_effectiveness}
+    )
     session = _make_mock_session(tasks=[], project=project)
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
@@ -928,6 +1324,7 @@ async def test_return_structure_includes_review_effectiveness_trends():
 
 # ── SR prediction accuracy trends ────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_self_review_prediction_accuracy_trends_none_when_no_design_doc():
     """self_review_prediction_accuracy_trends is None when project has no design_doc."""
@@ -953,7 +1350,9 @@ async def test_self_review_prediction_accuracy_trends_returned_when_present():
             },
         },
     }
-    project = make_project(directions=[], design_doc={"sr_catch_rate_trends": sr_trends})
+    project = make_project(
+        directions=[], design_doc={"sr_catch_rate_trends": sr_trends}
+    )
     session = _make_mock_session(tasks=[], project=project)
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
@@ -982,7 +1381,9 @@ async def test_self_review_prediction_accuracy_trends_surfaces_regression_risk()
             },
         },
     }
-    project = make_project(directions=[], design_doc={"sr_catch_rate_trends": sr_trends})
+    project = make_project(
+        directions=[], design_doc={"sr_catch_rate_trends": sr_trends}
+    )
     session = _make_mock_session(tasks=[], project=project)
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
@@ -1008,6 +1409,7 @@ async def test_return_structure_includes_self_review_prediction_accuracy_trends(
 
 # ── Direction first-attempt feedback ─────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_direction_first_attempt_feedback_absent_when_no_design_doc():
     """direction_first_attempt_feedback is None when design_doc has no entry."""
@@ -1023,10 +1425,17 @@ async def test_direction_first_attempt_feedback_absent_when_no_design_doc():
 async def test_direction_first_attempt_feedback_returned_when_present():
     """direction_first_attempt_feedback exposes per-direction rejection tallies."""
     dfa = {
-        "dir-abc": {"style": 3, "logic": 1, "total": 4, "last_updated": "2026-04-01T00:00:00"},
+        "dir-abc": {
+            "style": 3,
+            "logic": 1,
+            "total": 4,
+            "last_updated": "2026-04-01T00:00:00",
+        },
         "dir-xyz": {"tests": 2, "total": 2, "last_updated": "2026-04-02T00:00:00"},
     }
-    project = make_project(directions=[], design_doc={"direction_first_attempt_feedback": dfa})
+    project = make_project(
+        directions=[], design_doc={"direction_first_attempt_feedback": dfa}
+    )
     session = _make_mock_session(tasks=[], project=project)
 
     result = await compute_pipeline_health_summary(session, uuid.uuid4())
@@ -1042,6 +1451,7 @@ async def test_direction_first_attempt_feedback_returned_when_present():
 
 # ── Scope conversion rates ───────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_scope_conversion_rates_computed_from_research_history():
     """scope_conversion_rates aggregates scope_breakdown across directions for the 24h window."""
@@ -1049,29 +1459,36 @@ async def test_scope_conversion_rates_computed_from_research_history():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Medium scope direction",
-        "possibly_saturated": False,
-        "research_history": [
+    project = make_project(
+        directions=[
             {
-                "timestamp": (now - timedelta(hours=5)).isoformat(),
-                "prs_merged": 2,
-                "tasks_created": 4,
-                "scope_breakdown": {
-                    "small": {"created": 2, "merged": 2, "failed": 0},
-                    "medium": {"created": 2, "merged": 1, "failed": 1},
-                },
+                "id": direction_id,
+                "status": "active",
+                "text": "Medium scope direction",
+                "possibly_saturated": False,
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 2,
+                        "tasks_created": 4,
+                        "scope_breakdown": {
+                            "small": {"created": 2, "merged": 2, "failed": 0},
+                            "medium": {"created": 2, "merged": 1, "failed": 1},
+                        },
+                    }
+                ],
             }
-        ],
-    }])
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -1092,38 +1509,45 @@ async def test_scope_conversion_rates_trend_improving():
     project_id = uuid.uuid4()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Trending direction",
-        "possibly_saturated": False,
-        "research_history": [
-            # Previous window entry (25-49h ago)
+    project = make_project(
+        directions=[
             {
-                "timestamp": (now - timedelta(hours=30)).isoformat(),
-                "prs_merged": 1,
-                "tasks_created": 4,
-                "scope_breakdown": {
-                    "medium": {"created": 4, "merged": 1, "failed": 3},
-                },
-            },
-            # Current window entry (within 24h)
-            {
-                "timestamp": (now - timedelta(hours=5)).isoformat(),
-                "prs_merged": 3,
-                "tasks_created": 4,
-                "scope_breakdown": {
-                    "medium": {"created": 4, "merged": 3, "failed": 1},
-                },
-            },
-        ],
-    }])
+                "id": direction_id,
+                "status": "active",
+                "text": "Trending direction",
+                "possibly_saturated": False,
+                "research_history": [
+                    # Previous window entry (25-49h ago)
+                    {
+                        "timestamp": (now - timedelta(hours=30)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 4,
+                        "scope_breakdown": {
+                            "medium": {"created": 4, "merged": 1, "failed": 3},
+                        },
+                    },
+                    # Current window entry (within 24h)
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 3,
+                        "tasks_created": 4,
+                        "scope_breakdown": {
+                            "medium": {"created": 4, "merged": 3, "failed": 1},
+                        },
+                    },
+                ],
+            }
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -1144,26 +1568,33 @@ async def test_scope_conversion_rates_no_data_returns_empty_dict():
     now = _utcnow()
     direction_id = str(uuid.uuid4())
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "No scope breakdown",
-        "possibly_saturated": False,
-        "research_history": [
+    project = make_project(
+        directions=[
             {
-                "timestamp": (now - timedelta(hours=5)).isoformat(),
-                "prs_merged": 1,
-                "tasks_created": 2,
-                # no scope_breakdown key
+                "id": direction_id,
+                "status": "active",
+                "text": "No scope breakdown",
+                "possibly_saturated": False,
+                "research_history": [
+                    {
+                        "timestamp": (now - timedelta(hours=5)).isoformat(),
+                        "prs_merged": 1,
+                        "tasks_created": 2,
+                        # no scope_breakdown key
+                    }
+                ],
             }
-        ],
-    }])
+        ]
+    )
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  payloads=[{"type": "research"}],
-                  context={"direction_id": direction_id},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=project)
 
@@ -1193,21 +1624,33 @@ async def test_medium_scope_review_iterations_averages_correctly():
 
     tasks = [
         # medium scope, 2 iterations
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "review_loop": {"iteration": 2}},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "review_loop": {"iteration": 2}},
+            created_at=now - timedelta(hours=1),
+        ),
         # medium scope, 4 iterations
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "review_loop": {"iteration": 4}},
-                  created_at=now - timedelta(hours=2)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "review_loop": {"iteration": 4}},
+            created_at=now - timedelta(hours=2),
+        ),
         # small scope — should be excluded
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small", "review_loop": {"iteration": 1}},
-                  created_at=now - timedelta(hours=3)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small", "review_loop": {"iteration": 1}},
+            created_at=now - timedelta(hours=3),
+        ),
         # medium scope but no review_loop — excluded
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium"},
-                  created_at=now - timedelta(hours=4)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium"},
+            created_at=now - timedelta(hours=4),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -1223,9 +1666,12 @@ async def test_medium_scope_review_iterations_none_when_no_medium_tasks():
     project_id = uuid.uuid4()
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small", "review_loop": {"iteration": 1}},
-                  created_at=now - timedelta(hours=1)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small", "review_loop": {"iteration": 1}},
+            created_at=now - timedelta(hours=1),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -1236,6 +1682,7 @@ async def test_medium_scope_review_iterations_none_when_no_medium_tasks():
 
 # ── Self-review effectiveness ─────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_self_review_effectiveness_none_when_fewer_than_3():
     """self_review_effectiveness is None when fewer than 3 tasks have self-review outcomes."""
@@ -1245,13 +1692,27 @@ async def test_self_review_effectiveness_none_when_fewer_than_3():
         make_task(
             project_id=project_id,
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}, "_first_attempt_succeeded": True},
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                },
+                "_first_attempt_succeeded": True,
+            },
             created_at=now - timedelta(hours=1),
         ),
         make_task(
             project_id=project_id,
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}, "_first_attempt_succeeded": True},
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                },
+                "_first_attempt_succeeded": True,
+            },
             created_at=now - timedelta(hours=2),
         ),
     ]
@@ -1273,7 +1734,11 @@ async def test_self_review_effectiveness_computes_approval_rates():
             project_id=project_id,
             status=TaskStatus.COMPLETED,
             context={
-                "_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}},
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                },
                 "_first_attempt_succeeded": True,
             },
             created_at=now - timedelta(hours=1),
@@ -1282,7 +1747,11 @@ async def test_self_review_effectiveness_computes_approval_rates():
             project_id=project_id,
             status=TaskStatus.COMPLETED,
             context={
-                "_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}},
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                },
                 "_first_attempt_succeeded": True,
             },
             created_at=now - timedelta(hours=2),
@@ -1291,7 +1760,11 @@ async def test_self_review_effectiveness_computes_approval_rates():
             project_id=project_id,
             status=TaskStatus.COMPLETED,
             context={
-                "_self_review_outcome": {"verdict": "PASS", "fixes_applied": True, "check_results": {}},
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": True,
+                    "check_results": {},
+                },
                 "_first_attempt_succeeded": False,
             },
             created_at=now - timedelta(hours=3),
@@ -1337,7 +1810,9 @@ async def test_self_review_effectiveness_category_correlation():
                 "_self_review_outcome": {
                     "verdict": "PASS",
                     "fixes_applied": True,
-                    "check_results": {"style": {"passed": False, "issue": "style problems"}},
+                    "check_results": {
+                        "style": {"passed": False, "issue": "style problems"}
+                    },
                 },
                 "_first_attempt_succeeded": False,
             },
@@ -1395,19 +1870,37 @@ async def test_self_review_effectiveness_none_when_no_first_attempt_data():
         make_task(
             project_id=project_id,
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}},
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                }
+            },
             created_at=now - timedelta(hours=1),
         ),
         make_task(
             project_id=project_id,
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}},
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                }
+            },
             created_at=now - timedelta(hours=2),
         ),
         make_task(
             project_id=project_id,
             status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"verdict": "PASS", "fixes_applied": False, "check_results": {}}},
+            context={
+                "_self_review_outcome": {
+                    "verdict": "PASS",
+                    "fixes_applied": False,
+                    "check_results": {},
+                }
+            },
             created_at=now - timedelta(hours=3),
         ),
     ]
@@ -1424,6 +1917,7 @@ async def test_self_review_effectiveness_none_when_no_first_attempt_data():
 
 
 # ── Self-review prediction accuracy ──────────────────────────────────────────
+
 
 def _make_sr_task(project_id, check_results, human_cats, hours_ago=1):
     """Helper to build a task with both self-review and human rejection data."""
@@ -1444,7 +1938,12 @@ async def test_self_review_prediction_accuracy_null_when_sample_too_small():
     """Returns None when fewer than 5 tasks have both fields."""
     project_id = uuid.uuid4()
     tasks = [
-        _make_sr_task(project_id, {"test-coverage": {"passed": False}}, {"test-coverage": 1}, hours_ago=i)
+        _make_sr_task(
+            project_id,
+            {"test-coverage": {"passed": False}},
+            {"test-coverage": 1},
+            hours_ago=i,
+        )
         for i in range(1, 5)  # only 4 tasks
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
@@ -1544,6 +2043,7 @@ async def test_self_review_prediction_accuracy_snake_case_sr_does_not_match_keba
 
 # ── _compute_scope_baselines ─────────────────────────────────────────────────
 
+
 def test_scope_baselines_empty_tasks_returns_empty():
     """No tasks → empty series and summary."""
     result = _compute_scope_baselines([], 30)
@@ -1560,13 +2060,25 @@ def test_scope_baselines_single_scope_bucketed_correctly():
     base = now.replace(hour=12)
     # Create 3 terminal tasks: 2 COMPLETED+pr_merged (merged) + 1 FAILED
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small", "pr_merged": True}, created_at=base),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small", "pr_merged": True}, created_at=base),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "small"}, created_at=base,
-                  latest_status_message="error"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small", "pr_merged": True},
+            created_at=base,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small", "pr_merged": True},
+            created_at=base,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "small"},
+            created_at=base,
+            latest_status_message="error",
+        ),
     ]
     result = _compute_scope_baselines(tasks, 30)
 
@@ -1588,13 +2100,25 @@ def test_scope_baselines_multiple_scopes_bucketed_independently():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small", "pr_merged": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=now,
-                  latest_status_message="error"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small", "pr_merged": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=now,
+            latest_status_message="error",
+        ),
     ]
     result = _compute_scope_baselines(tasks, 30)
 
@@ -1610,11 +2134,19 @@ def test_scope_baselines_unknown_scope_for_tasks_without_scope():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={}, created_at=now,
-                  latest_status_message="error"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={},
+            created_at=now,
+            latest_status_message="error",
+        ),
     ]
     result = _compute_scope_baselines(tasks, 30)
 
@@ -1627,15 +2159,25 @@ def test_scope_baselines_weekly_bucketing_splits_across_weeks():
     now = _utcnow()
     project_id = uuid.uuid4()
     # Place tasks in different weeks (15 days apart guarantees a different ISO week)
-    week1_task = make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                           context={"scope": "medium"}, created_at=now - timedelta(days=15))
-    week2_task = make_task(project_id=project_id, status=TaskStatus.FAILED,
-                           context={"scope": "medium"}, created_at=now - timedelta(days=1),
-                           latest_status_message="error")
+    week1_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"scope": "medium"},
+        created_at=now - timedelta(days=15),
+    )
+    week2_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.FAILED,
+        context={"scope": "medium"},
+        created_at=now - timedelta(days=1),
+        latest_status_message="error",
+    )
     result = _compute_scope_baselines([week1_task, week2_task], 30)
 
     medium_series = [e for e in result["series"] if e["scope"] == "medium"]
-    assert len(medium_series) == 2, "Expected two distinct weekly buckets for medium scope"
+    assert len(medium_series) == 2, (
+        "Expected two distinct weekly buckets for medium scope"
+    )
     assert medium_series[0]["created"] == 1
     assert medium_series[1]["created"] == 1
 
@@ -1647,30 +2189,62 @@ def test_scope_baselines_trend_improving_from_first_to_last_week():
     # First week: 1/4 = 0.25
     week_a = now - timedelta(days=21)
     tasks_week_a = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=week_a),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=week_a,
-                  latest_status_message="e"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=week_a,
-                  latest_status_message="e"),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=week_a,
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=week_a,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=week_a,
+            latest_status_message="e",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=week_a,
+            latest_status_message="e",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=week_a,
+            latest_status_message="e",
+        ),
     ]
     # Last week: 3/4 = 0.75 (delta +0.5 > 0.05)
     week_b = now - timedelta(days=1)
     tasks_week_b = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=week_b),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=week_b),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=week_b),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=week_b,
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=week_b,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=week_b,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=week_b,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=week_b,
+            latest_status_message="e",
+        ),
     ]
     result = _compute_scope_baselines(tasks_week_a + tasks_week_b, 30)
 
@@ -1682,11 +2256,19 @@ def test_scope_baselines_trend_none_when_only_one_week():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small"}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "small"}, created_at=now,
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small"},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "small"},
+            created_at=now,
+            latest_status_message="e",
+        ),
     ]
     result = _compute_scope_baselines(tasks, 30)
 
@@ -1698,10 +2280,18 @@ def test_scope_baselines_cancelled_counts_as_created_not_merged():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "large", "pr_merged": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.CANCELLED,
-                  context={"scope": "large"}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "large", "pr_merged": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.CANCELLED,
+            context={"scope": "large"},
+            created_at=now,
+        ),
     ]
     result = _compute_scope_baselines(tasks, 30)
 
@@ -1725,8 +2315,12 @@ def test_scope_baselines_week_key_is_monday():
     monday = today - timedelta(days=today.weekday())
 
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "small"}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small"},
+            created_at=now,
+        ),
     ]
     result = _compute_scope_baselines(tasks, 30)
 
@@ -1735,6 +2329,7 @@ def test_scope_baselines_week_key_is_monday():
 
 
 # ── _compute_medium_scope_measurement ────────────────────────────────────────
+
 
 def test_medium_scope_no_tasks_returns_null_rates():
     """No medium-scope tasks → null merge rate, zero counts, empty series."""
@@ -1761,22 +2356,38 @@ def test_medium_scope_recent_windows_filter_by_resolved_at():
     project_id = uuid.uuid4()
     tasks = [
         # Resolved within 7d: merged
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=4), updated_at=now - timedelta(days=2)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now - timedelta(days=4),
+            updated_at=now - timedelta(days=2),
+        ),
         # Resolved within 30d but outside 7d: failed
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"},
-                  created_at=now - timedelta(days=18), updated_at=now - timedelta(days=15),
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=now - timedelta(days=18),
+            updated_at=now - timedelta(days=15),
+            latest_status_message="e",
+        ),
         # Resolved within 30d but outside 7d: merged
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=22), updated_at=now - timedelta(days=20)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now - timedelta(days=22),
+            updated_at=now - timedelta(days=20),
+        ),
         # Resolved outside 30d: merged — excluded from both recent windows
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=65), updated_at=now - timedelta(days=60)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now - timedelta(days=65),
+            updated_at=now - timedelta(days=60),
+        ),
     ]
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     r30 = result["recent_30d"]
@@ -1797,13 +2408,21 @@ async def test_pipeline_health_summary_exposes_recent_medium_windows():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=5), updated_at=now - timedelta(days=3)),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"},
-                  created_at=now - timedelta(days=22), updated_at=now - timedelta(days=20),
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now - timedelta(days=5),
+            updated_at=now - timedelta(days=3),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=now - timedelta(days=22),
+            updated_at=now - timedelta(days=20),
+            latest_status_message="e",
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
@@ -1824,9 +2443,13 @@ def test_medium_scope_recent_windows_null_when_no_recent_tasks():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=now - timedelta(days=125), updated_at=now - timedelta(days=120)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now - timedelta(days=125),
+            updated_at=now - timedelta(days=120),
+        ),
     ]
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     assert result["recent_30d"] is None
@@ -1838,15 +2461,31 @@ def test_medium_scope_headline_rate_computed_correctly():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=now,
-                  latest_status_message="error"),
-        make_task(project_id=project_id, status=TaskStatus.CANCELLED,
-                  context={"scope": "medium"}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=now,
+            latest_status_message="error",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.CANCELLED,
+            context={"scope": "medium"},
+            created_at=now,
+        ),
     ]
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     assert result["total_created"] == 4
@@ -1861,38 +2500,64 @@ def test_medium_scope_pre_post_split_from_research_history():
     direction_id = str(uuid.uuid4())
     investment_ts = now - timedelta(days=30)
 
-    project = make_project(directions=[{
-        "id": direction_id,
-        "status": "active",
-        "text": "Reliable medium-scope execution",
-        "research_history": [
-            {"timestamp": (investment_ts + timedelta(days=5)).isoformat(), "prs_merged": 1},
-            {"timestamp": investment_ts.isoformat(), "prs_merged": 2},
-        ],
-    }])
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Reliable medium-scope execution",
+                "research_history": [
+                    {
+                        "timestamp": (investment_ts + timedelta(days=5)).isoformat(),
+                        "prs_merged": 1,
+                    },
+                    {"timestamp": investment_ts.isoformat(), "prs_merged": 2},
+                ],
+            }
+        ]
+    )
 
     # 2 tasks before investment start, 3 after
     pre_tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=investment_ts - timedelta(days=10)),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=investment_ts - timedelta(days=5),
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=investment_ts - timedelta(days=10),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=investment_ts - timedelta(days=5),
+            latest_status_message="e",
+        ),
     ]
     post_tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=investment_ts + timedelta(days=10)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=investment_ts + timedelta(days=15)),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium"}, created_at=investment_ts + timedelta(days=20),
-                  latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=investment_ts + timedelta(days=10),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=investment_ts + timedelta(days=15),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium"},
+            created_at=investment_ts + timedelta(days=20),
+            latest_status_message="e",
+        ),
     ]
 
-    result = _compute_medium_scope_measurement(pre_tasks + post_tasks, project, direction_id, 365)
+    result = _compute_medium_scope_measurement(
+        pre_tasks + post_tasks, project, direction_id, 365
+    )
 
     assert result["investment_start"] is not None
     pre = result["pre_investment"]
@@ -1917,20 +2582,45 @@ def test_medium_scope_direction_merges_in_weekly_series():
     # All tasks in the same week
     tasks = [
         # Direction-associated merged
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True, "direction_id": direction_id},
-                  created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True, "direction_id": direction_id},
-                  created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "scope": "medium",
+                "pr_merged": True,
+                "direction_id": direction_id,
+            },
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "scope": "medium",
+                "pr_merged": True,
+                "direction_id": direction_id,
+            },
+            created_at=now,
+        ),
         # Merged but different direction — should NOT count in direction_merges
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True, "direction_id": other_direction_id},
-                  created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "scope": "medium",
+                "pr_merged": True,
+                "direction_id": other_direction_id,
+            },
+            created_at=now,
+        ),
         # Direction-associated but not merged
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"scope": "medium", "direction_id": direction_id},
-                  created_at=now, latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"scope": "medium", "direction_id": direction_id},
+            created_at=now,
+            latest_status_message="e",
+        ),
     ]
 
     result = _compute_medium_scope_measurement(tasks, None, direction_id, 365)
@@ -1950,20 +2640,34 @@ def test_medium_scope_correlated_changes_only_direction_merged():
 
     tasks = [
         # Direction-associated merged — should appear in correlated_changes
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  title="Add retry logic",
-                  context={"scope": "medium", "pr_merged": True, "direction_id": direction_id},
-                  created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            title="Add retry logic",
+            context={
+                "scope": "medium",
+                "pr_merged": True,
+                "direction_id": direction_id,
+            },
+            created_at=now,
+        ),
         # Merged but no direction — should NOT appear
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  title="Unrelated task",
-                  context={"scope": "medium", "pr_merged": True},
-                  created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            title="Unrelated task",
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now,
+        ),
         # Direction-associated but not merged — should NOT appear
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  title="Failed direction task",
-                  context={"scope": "medium", "direction_id": direction_id},
-                  created_at=now, latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            title="Failed direction task",
+            context={"scope": "medium", "direction_id": direction_id},
+            created_at=now,
+            latest_status_message="e",
+        ),
     ]
 
     result = _compute_medium_scope_measurement(tasks, None, direction_id, 365)
@@ -1981,8 +2685,12 @@ def test_medium_scope_no_direction_returns_empty_correlated_changes():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"scope": "medium", "pr_merged": True}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "medium", "pr_merged": True},
+            created_at=now,
+        ),
     ]
     result = _compute_medium_scope_measurement(tasks, None, None, 365)
     assert result["correlated_changes"] == []
@@ -2009,15 +2717,31 @@ def test_first_attempt_measurement_basic_rate():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": False}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": False},
+            created_at=now,
+        ),
         # No key — excluded from measurement
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            created_at=now,
+        ),
     ]
     result = _compute_first_attempt_measurement(tasks, None, 90)
     assert result["sample_size"] == 3
@@ -2034,24 +2758,40 @@ def test_first_attempt_measurement_pre_post_split():
 
     # 2 pre-split tasks: 1 success, 1 failure
     pre_tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True},
-                  created_at=split - timedelta(days=10)),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"_first_attempt_succeeded": False},
-                  created_at=split - timedelta(days=5), latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=split - timedelta(days=10),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"_first_attempt_succeeded": False},
+            created_at=split - timedelta(days=5),
+            latest_status_message="e",
+        ),
     ]
     # 3 post-split tasks: 3 successes
     post_tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True},
-                  created_at=split + timedelta(days=5)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True},
-                  created_at=split + timedelta(days=10)),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True},
-                  created_at=split + timedelta(days=20)),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=split + timedelta(days=5),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=split + timedelta(days=10),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=split + timedelta(days=20),
+        ),
     ]
     result = _compute_first_attempt_measurement(pre_tasks + post_tasks, split, 90)
 
@@ -2071,15 +2811,27 @@ def test_first_attempt_measurement_by_category_breakdown():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_rejection_categories": {"test-coverage": 1, "style": 1}},
-                  created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_rejection_categories": {"test-coverage": 1}},
-                  created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "_first_attempt_rejection_categories": {"test-coverage": 1, "style": 1}
+            },
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_rejection_categories": {"test-coverage": 1}},
+            created_at=now,
+        ),
         # No rejection category key — excluded from by_category
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True}, created_at=now),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=now,
+        ),
     ]
     result = _compute_first_attempt_measurement(tasks, None, 90)
     by_cat = result["by_category"]
@@ -2094,10 +2846,19 @@ def test_first_attempt_measurement_no_measured_tasks():
     now = _utcnow()
     project_id = uuid.uuid4()
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={}, created_at=now),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={}, created_at=now, latest_status_message="e"),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={},
+            created_at=now,
+            latest_status_message="e",
+        ),
     ]
     result = _compute_first_attempt_measurement(tasks, None, 90)
     assert result["first_attempt_approval_rate"] is None
@@ -2112,15 +2873,31 @@ def test_first_attempt_measurement_weekly_series_delta():
     week1_date = _utcnow() - timedelta(days=14)
     week2_date = _utcnow() - timedelta(days=7)
     tasks = [
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True}, created_at=week1_date),
-        make_task(project_id=project_id, status=TaskStatus.FAILED,
-                  context={"_first_attempt_succeeded": False},
-                  created_at=week1_date, latest_status_message="e"),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True}, created_at=week2_date),
-        make_task(project_id=project_id, status=TaskStatus.COMPLETED,
-                  context={"_first_attempt_succeeded": True}, created_at=week2_date),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=week1_date,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            context={"_first_attempt_succeeded": False},
+            created_at=week1_date,
+            latest_status_message="e",
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=week2_date,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"_first_attempt_succeeded": True},
+            created_at=week2_date,
+        ),
     ]
     result = _compute_first_attempt_measurement(tasks, None, 90)
     series = result["weekly_series"]
@@ -2192,14 +2969,18 @@ def test_threshold_cross_fires_alert_exactly_once(clean_pipeline_events, mocker)
             account_id=f"acct-{i}",
         )
 
-    blacklist_calls = [c for c in spy.call_args_list if c.args[0] == "account_blacklisted"]
+    blacklist_calls = [
+        c for c in spy.call_args_list if c.args[0] == "account_blacklisted"
+    ]
     assert len(blacklist_calls) == 1
     assert blacklist_calls[0].args == ("account_blacklisted", threshold, threshold)
     snapshot = get_pipeline_health_snapshot()
     assert "account_blacklisted" in snapshot["alerts_active"]
 
 
-def test_threshold_cross_twice_within_dedup_window_fires_once(clean_pipeline_events, mocker):
+def test_threshold_cross_twice_within_dedup_window_fires_once(
+    clean_pipeline_events, mocker
+):
     """Hitting threshold a second time inside the dedup window must NOT
     trigger a second alert."""
     spy = mocker.patch("app.shared_state._post_pipeline_alert")
@@ -2213,7 +2994,9 @@ def test_threshold_cross_twice_within_dedup_window_fires_once(clean_pipeline_eve
             zone="us-central1-a",
         )
 
-    pre_calls = [c for c in spy.call_args_list if c.args[0] == "provision_timeout_pre_claim"]
+    pre_calls = [
+        c for c in spy.call_args_list if c.args[0] == "provision_timeout_pre_claim"
+    ]
     assert len(pre_calls) == 1
 
 
@@ -2224,7 +3007,9 @@ def test_alert_fires_again_after_dedup_window_elapses(clean_pipeline_events, moc
     threshold = PIPELINE_ALERT_THRESHOLDS["account_blacklisted"]
 
     for i in range(threshold):
-        record_pipeline_event("account_blacklisted", task_id=f"t{i}", account_id=f"a{i}")
+        record_pipeline_event(
+            "account_blacklisted", task_id=f"t{i}", account_id=f"a{i}"
+        )
     pre_calls = [c for c in spy.call_args_list if c.args[0] == "account_blacklisted"]
     assert len(pre_calls) == 1
 
@@ -2242,14 +3027,16 @@ def test_events_older_than_one_hour_excluded_from_counts(clean_pipeline_events):
     """Stale events older than the rolling 1h window must not be counted."""
     stale_ts = datetime.utcnow() - timedelta(hours=2)
     for i in range(20):
-        _ss.deploy_monitoring["pipeline_events"].append({
-            "type": "heartbeat_timeout_post_claim",
-            "ts": stale_ts,
-            "task_id": f"old-{i}",
-            "vm_id": f"vm-{i}",
-            "zone": None,
-            "account_id": None,
-        })
+        _ss.deploy_monitoring["pipeline_events"].append(
+            {
+                "type": "heartbeat_timeout_post_claim",
+                "ts": stale_ts,
+                "task_id": f"old-{i}",
+                "vm_id": f"vm-{i}",
+                "zone": None,
+                "account_id": None,
+            }
+        )
     record_pipeline_event(
         "heartbeat_timeout_post_claim",
         task_id="fresh",
@@ -2289,7 +3076,13 @@ def test_snapshot_shape_matches_contract(clean_pipeline_events):
     """get_pipeline_health_snapshot returns the documented keys regardless
     of whether any events were recorded."""
     snapshot = get_pipeline_health_snapshot()
-    assert set(snapshot.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active", "held_directions"}
+    assert set(snapshot.keys()) == {
+        "counts_1h",
+        "last_event_ts",
+        "thresholds",
+        "alerts_active",
+        "held_directions",
+    }
     for et in PIPELINE_ALERT_THRESHOLDS:
         assert et in snapshot["thresholds"]
     assert snapshot["alerts_active"] == []
@@ -2310,7 +3103,13 @@ async def test_health_detailed_endpoint_includes_pipeline_health(
 
     assert "pipeline_health" in data
     ph = data["pipeline_health"]
-    assert set(ph.keys()) == {"counts_1h", "last_event_ts", "thresholds", "alerts_active", "held_directions"}
+    assert set(ph.keys()) == {
+        "counts_1h",
+        "last_event_ts",
+        "thresholds",
+        "alerts_active",
+        "held_directions",
+    }
     assert ph["counts_1h"]["never_started"] == 1
     assert ph["counts_1h"]["heartbeat_timeout_post_claim"] == 1
 
@@ -2320,6 +3119,7 @@ async def test_health_detailed_endpoint_includes_pipeline_health(
 
 
 # ── Review measurement attribution split ─────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_with_measurements_split_computes_approval_rate():
@@ -2331,13 +3131,19 @@ async def test_with_measurements_split_computes_approval_rate():
             project_id=project_id,
             status=TaskStatus.COMPLETED,
             created_at=now - timedelta(hours=1),
-            context={"_had_review_measurements": True, "_first_attempt_succeeded": True},
+            context={
+                "_had_review_measurements": True,
+                "_first_attempt_succeeded": True,
+            },
         ),
         make_task(
             project_id=project_id,
             status=TaskStatus.COMPLETED,
             created_at=now - timedelta(hours=2),
-            context={"_had_review_measurements": True, "_first_attempt_succeeded": False},
+            context={
+                "_had_review_measurements": True,
+                "_first_attempt_succeeded": False,
+            },
         ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
@@ -2371,7 +3177,10 @@ async def test_without_measurements_includes_missing_field():
             project_id=project_id,
             status=TaskStatus.FAILED,
             created_at=now - timedelta(hours=3),
-            context={"_had_review_measurements": False, "_first_attempt_succeeded": False},
+            context={
+                "_had_review_measurements": False,
+                "_first_attempt_succeeded": False,
+            },
         ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
@@ -2408,6 +3217,7 @@ async def test_measurements_split_null_when_sample_too_small():
 
 # ── lookback_hours parameter ──────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_lookback_hours_excludes_tasks_outside_window():
     """Tasks older than lookback_hours window are excluded from success_rate."""
@@ -2421,27 +3231,36 @@ async def test_lookback_hours_excludes_tasks_outside_window():
             project_id=project_id,
             status=TaskStatus.COMPLETED,
             created_at=now - timedelta(hours=2),
-            status_log=[{"t": (now - timedelta(hours=2)).isoformat(), "s": "COMPLETED"}],
+            status_log=[
+                {"t": (now - timedelta(hours=2)).isoformat(), "s": "COMPLETED"}
+            ],
         ),
         make_task(
             project_id=project_id,
             status=TaskStatus.FAILED,
             created_at=now - timedelta(minutes=30),
-            status_log=[{"t": (now - timedelta(minutes=30)).isoformat(), "s": "FAILED"}],
+            status_log=[
+                {"t": (now - timedelta(minutes=30)).isoformat(), "s": "FAILED"}
+            ],
         ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
     # With 1h lookback: only the 30-min-old FAILED task is in window → success_rate = 0.0
-    result_1h = await compute_pipeline_health_summary(session, project_id, lookback_hours=1)
+    result_1h = await compute_pipeline_health_summary(
+        session, project_id, lookback_hours=1
+    )
     assert result_1h["success_rate"] == 0.0
 
     # With 3h lookback: both tasks in window → 1 completed, 1 failed → success_rate = 0.5
-    result_3h = await compute_pipeline_health_summary(session, project_id, lookback_hours=3)
+    result_3h = await compute_pipeline_health_summary(
+        session, project_id, lookback_hours=3
+    )
     assert result_3h["success_rate"] == 0.5
 
 
 # ── All-accounts-blocked stall detection ─────────────────────────────────────
+
 
 def test_all_accounts_blocked_action_fires_once_per_episode():
     """Every eligible task blocked, nothing dispatched → fire, then debounce."""
@@ -2472,6 +3291,7 @@ def test_all_accounts_blocked_action_noop_when_no_signal():
 
 # ── stall alert title/body formatting ────────────────────────────────────────
 
+
 def test_format_stall_alert_falls_back_when_no_reasons():
     """No reasons captured → keep the original rate-limit copy. Preserves
     dedup keys and existing operator expectations for legacy callers."""
@@ -2492,7 +3312,9 @@ def test_format_stall_alert_rate_limit_only_includes_recovery():
     from app.orchestrator import _format_stall_alert
 
     earliest = datetime(2026, 4, 25, 12, 30, tzinfo=timezone.utc)
-    reasons = {"all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T12:30:00+00:00)"}
+    reasons = {
+        "all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T12:30:00+00:00)"
+    }
     title, body = _format_stall_alert(reasons, earliest)
     assert title == "Pipeline stalled — eligible Max plan accounts rate-limited"
     assert "Earliest recovery: 2026-04-25T12:30:00+00:00." in body
@@ -2522,7 +3344,10 @@ def test_format_stall_alert_mixed_rate_limit_and_capacity():
         "no eligible accounts or slot contention",
     }
     title, body = _format_stall_alert(reasons, earliest)
-    assert title == "Pipeline stalled — eligible Max plan accounts unavailable (rate limits + capacity)"
+    assert (
+        title
+        == "Pipeline stalled — eligible Max plan accounts unavailable (rate limits + capacity)"
+    )
     # Both reasons must be reflected in the body so operators see what's
     # actually wrong rather than only one half of the truth.
     assert "rate-limit cooldown" in body
@@ -2551,7 +3376,9 @@ def test_format_stall_alert_no_ready_accounts():
     assert "rate-limited" not in title.lower()
     assert "cooldown" not in body.lower()
 
-    title, body = _format_stall_alert({"no accounts configured for provider gemini"}, None)
+    title, body = _format_stall_alert(
+        {"no accounts configured for provider gemini"}, None
+    )
     assert title == "Pipeline stalled — no Max plan accounts ready"
     assert "cooldown" not in body.lower()
 
@@ -2559,24 +3386,33 @@ def test_format_stall_alert_no_ready_accounts():
 def test_missing_runtime_credentials_stall_reason_distinguishes_no_pool_and_no_ready():
     from app.orchestrator import _missing_runtime_credentials_stall_reason as reason
 
-    assert reason(
-        user_pool_count=0,
-        provider_account_count=0,
-        ready_provider_account_count=0,
-        runtime_provider="gemini",
-    ) == "no accounts configured"
-    assert reason(
-        user_pool_count=2,
-        provider_account_count=2,
-        ready_provider_account_count=0,
-        runtime_provider="gemini",
-    ) == "no ready accounts for provider gemini"
-    assert reason(
-        user_pool_count=2,
-        provider_account_count=0,
-        ready_provider_account_count=0,
-        runtime_provider="gemini",
-    ) == "no accounts configured for provider gemini"
+    assert (
+        reason(
+            user_pool_count=0,
+            provider_account_count=0,
+            ready_provider_account_count=0,
+            runtime_provider="gemini",
+        )
+        == "no accounts configured"
+    )
+    assert (
+        reason(
+            user_pool_count=2,
+            provider_account_count=2,
+            ready_provider_account_count=0,
+            runtime_provider="gemini",
+        )
+        == "no ready accounts for provider gemini"
+    )
+    assert (
+        reason(
+            user_pool_count=2,
+            provider_account_count=0,
+            ready_provider_account_count=0,
+            runtime_provider="gemini",
+        )
+        == "no accounts configured for provider gemini"
+    )
 
 
 def test_format_stall_alert_partial_rate_limit_string_still_classifies():
@@ -2587,7 +3423,10 @@ def test_format_stall_alert_partial_rate_limit_string_still_classifies():
 
     reasons = {"3 of 5 accounts rate-limited, remaining accounts at capacity"}
     title, _body = _format_stall_alert(reasons, None)
-    assert title == "Pipeline stalled — eligible Max plan accounts unavailable (rate limits + capacity)"
+    assert (
+        title
+        == "Pipeline stalled — eligible Max plan accounts unavailable (rate limits + capacity)"
+    )
 
 
 def test_format_stall_alert_title_never_claims_pool_wide_when_per_task():
@@ -2599,7 +3438,9 @@ def test_format_stall_alert_title_never_claims_pool_wide_when_per_task():
 
     for reasons in (
         None,
-        {"all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T12:30:00+00:00)"},
+        {
+            "all accounts in rate-limit cooldown (earliest recovery: 2026-04-25T12:30:00+00:00)"
+        },
         {"no eligible accounts or slot contention"},
         {"no accounts configured"},
         {"no ready accounts for provider gemini"},
@@ -2614,6 +3455,7 @@ def test_format_stall_alert_title_never_claims_pool_wide_when_per_task():
 
 
 # ── retry_after escalation thresholds ────────────────────────────────────────
+
 
 def test_retry_after_escalation_below_alert_returns_none():
     """Resets below the alert threshold leave the task alone."""
@@ -2686,6 +3528,7 @@ async def test_all_accounts_blocked_emits_broadcast_and_alert(monkeypatch):
         proj_events.append((pid, event, payload))
 
     import app.broadcast as _broadcast_mod
+
     monkeypatch.setattr(_broadcast_mod, "manager", ws_mock, raising=False)
     monkeypatch.setattr(_broadcast_mod, "broadcast_to_project", _bp, raising=False)
 
@@ -2695,19 +3538,28 @@ async def test_all_accounts_blocked_emits_broadcast_and_alert(monkeypatch):
         notifications.append((pid, kind, payload))
 
     import app.notification_dispatch as _nd_mod
+
     monkeypatch.setattr(_nd_mod, "dispatch_external_notification", _dispatch)
 
     earliest = datetime.now(timezone.utc) + timedelta(minutes=10)
     await orch._emit_all_accounts_blocked_stall(session, earliest)
 
-    assert any(event == "pipeline_throttle" and payload.get("reason") == "all_accounts_blocked"
-               for event, payload in broadcasts), broadcasts
-    stall_alerts = [a for a in added if isinstance(a, Alert) and a.severity == AlertSeverity.ERROR]
+    assert any(
+        event == "pipeline_throttle" and payload.get("reason") == "all_accounts_blocked"
+        for event, payload in broadcasts
+    ), broadcasts
+    stall_alerts = [
+        a for a in added if isinstance(a, Alert) and a.severity == AlertSeverity.ERROR
+    ]
     assert len(stall_alerts) == 1
-    assert "all Max plan accounts" in stall_alerts[0].message.lower() or "rate-limited" in stall_alerts[0].title.lower()
+    assert (
+        "all Max plan accounts" in stall_alerts[0].message.lower()
+        or "rate-limited" in stall_alerts[0].title.lower()
+    )
 
 
 # ── rate_limit_retry_minutes helper ──────────────────────────────────────────
+
 
 def test_rate_limit_retry_minutes_uses_earliest_recovery():
     """When a recovery time is known, delay scales with time-to-recovery."""

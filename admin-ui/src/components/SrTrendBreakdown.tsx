@@ -941,6 +941,64 @@ export function SrReviewerDisagreementsPanel({ data }: { data: SrReviewerDisagre
   );
 }
 
+export interface SrScopeDriftVsExpansion {
+  consistent?: number | null;
+  miss_by_expansion?: number | null;
+  hit_by_expansion?: number | null;
+  fp_candidate?: number | null;
+  gray_zone?: number | null;
+  miss_by_expansion_rate?: number | null;
+  numerator?: number | null;
+  denominator?: number | null;
+  sample_size?: number | null;
+}
+
+export function SrScopeDriftVsExpansionCard({ data }: { data: SrScopeDriftVsExpansion | null | undefined }) {
+  if (!data) return null;
+  const rate = data.miss_by_expansion_rate;
+  const rateColor =
+    rate == null ? 'text-neutral-500' :
+    rate >= 0.3 ? 'text-red-400' :
+    rate >= 0.15 ? 'text-amber-400' :
+    'text-emerald-400';
+  return (
+    <div data-testid="sr-scope-drift-vs-expansion" className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[220px]">
+      <div className="flex items-baseline gap-2 mb-1">
+        <p className="text-[9px] text-neutral-500 uppercase tracking-wide">SR Scope-Drift vs Expansion</p>
+        {data.sample_size != null && (
+          <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={data.sample_size}</span>
+        )}
+      </div>
+      <div className="flex items-center gap-2 text-[10px] mb-0.5">
+        <span className="text-neutral-400 flex-1">miss-by-expansion rate</span>
+        <span className={`font-mono font-bold tabular-nums ${rateColor}`}>
+          {rate != null ? `${Math.round(rate * 100)}%` : '–'}
+        </span>
+        {data.numerator != null && data.denominator != null && (
+          <span className="text-neutral-600 font-mono text-[9px]">{data.numerator}/{data.denominator}</span>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0 text-[9px] text-neutral-500">
+        {data.consistent != null && (
+          <span title="SR passed + ratio ≤ 1.5 (true-pass)">consistent: {data.consistent}</span>
+        )}
+        {data.miss_by_expansion != null && (
+          <span title="SR passed + ratio ≥ 2.0 (scope-drift miss)" className="text-red-400/70">miss: {data.miss_by_expansion}</span>
+        )}
+        {data.hit_by_expansion != null && (
+          <span title="SR failed scope-drift + ratio ≥ 1.5 (SR caught it)" className="text-emerald-400/70">hit: {data.hit_by_expansion}</span>
+        )}
+        {data.fp_candidate != null && (
+          <span title="SR failed scope-drift + ratio ≤ 1.0 (likely false positive)">fp: {data.fp_candidate}</span>
+        )}
+        {(data.gray_zone ?? 0) > 0 && (
+          <span title="SR passed + 1.5 < ratio < 2.0 (ambiguous)">gray: {data.gray_zone}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const WINDOW_OPTIONS: { label: string; days: number }[] = [
   { label: '7d', days: 7 },
   { label: '14d', days: 14 },

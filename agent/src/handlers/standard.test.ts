@@ -1939,6 +1939,162 @@ describe('runFreshReviewerPass reviewer_edges_considered', () => {
   });
 });
 
+// ── Phantom file ref filtering (hallucinated findings) ─────────────────────────
+// Tests that fresh-reviewer findings mentioning non-existent files are filtered
+// before merging into check_results, but kept in reviewer_findings for transparency.
+describe('runFreshReviewerPass phantom file ref filtering', () => {
+  const BIG_DIFF = 'diff --git a/src/app.ts b/src/app.ts\n+export function foo() {}\n'
+    + 'diff --git a/src/utils.ts b/src/utils.ts\n+export function bar() {}\n';
+  let fsModule: typeof import('fs');
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    fsModule = (await import('fs')).default;
+  });
+
+  it('keeps findings with no file path references', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Off-by-one error in loop logic' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('filter-1', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, unknown>;
+    expect(checkResults.correctness).toBeDefined();
+    expect((checkResults.correctness as Record<string, unknown>).passed).toBe(false);
+  });
+
+  it('keeps findings that mention files in the diff', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'regression_risk', severity: 'HIGH', description: 'Removed export from src/app.ts' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('filter-2', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, unknown>;
+    expect(checkResults.regression_risk).toBeDefined();
+    expect((checkResults.regression_risk as Record<string, unknown>).passed).toBe(false);
+  });
+
+  it('filters findings mentioning only files not in the diff', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'scope-drift', severity: 'MEDIUM', description: 'Modified backend/models.py which is off-scope' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('filter-3', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, unknown>;
+    // Hallucinated finding should NOT flip check_results
+    expect(checkResults['scope-drift']).toBeUndefined();
+  });
+
+  it('keeps findings with at least one matching file path', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Logic bug in src/app.ts and src/missing.ts' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('filter-4', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const checkResults = json.check_results as Record<string, unknown>;
+    // Should keep because at least one path (src/app.ts) is in diff
+    expect(checkResults.correctness).toBeDefined();
+    expect((checkResults.correctness as Record<string, unknown>).passed).toBe(false);
+  });
+
+  it('preserves all findings (including filtered) in reviewer_findings array for transparency', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    let captured: Record<string, unknown> | null = null;
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, data: unknown) => {
+      captured = JSON.parse(data as string) as Record<string, unknown>;
+    });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Off-by-one error' },
+          { category: 'scope-drift', severity: 'MEDIUM', description: 'Modified backend/models.py which is off-scope' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('filter-5', 'Title', 'Desc', [], null, { value: '' });
+    const json = captured as unknown as Record<string, unknown>;
+    const reviewerFindings = json.reviewer_findings as Array<Record<string, unknown>>;
+    // Both findings should still be in reviewer_findings for transparency
+    expect(reviewerFindings.length).toBe(2);
+  });
+
+  it('logs filtered count when hallucinated findings are detected', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(fsModule.writeFileSync).mockImplementation((_p: unknown, _data: unknown) => {
+      // noop - just tracking that write was called
+    });
+    const sendLogMock = vi.fn();
+    vi.mocked(idx.sendLog).mockImplementation(sendLogMock);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({
+      exitCode: 0, allOutput: '',
+      lastResultText: JSON.stringify({
+        reviewer_findings: [
+          { category: 'correctness', severity: 'HIGH', description: 'Real issue' },
+          { category: 'scope-drift', severity: 'MEDIUM', description: 'Modified backend/models.py which is off-scope' },
+          { category: 'architecture', severity: 'MEDIUM', description: 'Bad pattern in frontend/config.ts' },
+        ],
+      }),
+    });
+
+    await runFreshReviewerPass('filter-6', 'Title', 'Desc', [], null, { value: '' });
+    // Should log: 1 grounded, 2 filtered
+    const logs = sendLogMock.mock.calls.map(c => c[1] as string).join('\n');
+    expect(logs).toContain('1 grounded finding(s), 2 filtered (phantom file refs)');
+  });
+});
+
 // ── Structural prompt invariants (regression-detection) ───────────────────────
 // Pins the cross-cutting guidance blocks that every code-change handler MUST
 // assemble into its prompt. A future PR that drops one of these constants from

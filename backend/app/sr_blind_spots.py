@@ -11,6 +11,7 @@ endpoint and the per-task agent fetch in current volumes, but a future
 optimization could mirror the ``sr_catch_rate_trends`` cache pattern in
 ``playbook_learning.compute_sr_catch_rate_trends``.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -38,7 +39,9 @@ def is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
         return False
     blind_spots = sro.get("blind_spots") or []
     for entry in blind_spots:
-        if isinstance(entry, str) and any(m in entry for m in _SR_SKIP_BLIND_SPOT_MARKERS):
+        if isinstance(entry, str) and any(
+            m in entry for m in _SR_SKIP_BLIND_SPOT_MARKERS
+        ):
             return True
     if sro.get("verdict") == "unknown" and not (sro.get("check_results") or {}):
         return True
@@ -72,7 +75,7 @@ async def _scan_blind_spot_counts(
         sro = ctx.get("_self_review_outcome")
         if not sro or is_skipped_sr_outcome(sro):
             continue
-        for entry in (sro.get("blind_spots") or []):
+        for entry in sro.get("blind_spots") or []:
             if not isinstance(entry, str) or not entry.strip():
                 continue
             theme = " ".join(entry.lower().split()[:6])
@@ -175,7 +178,9 @@ async def aggregate_sr_fp_rates(
             continue
         fp_count = stats["fp_count"]
         hit_count = stats["hit_count"]
-        precision = hit_count / (hit_count + fp_count) if (hit_count + fp_count) > 0 else None
+        precision = (
+            hit_count / (hit_count + fp_count) if (hit_count + fp_count) > 0 else None
+        )
         result[cat] = {
             "sr_failed_count": sr_failed,
             "fp_count": fp_count,
@@ -212,9 +217,175 @@ async def aggregate_sr_blind_spot_envelope(
 
 _SR_CODE_CHANGE_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
 
+# Mirror playbook_learning._MIN_SR_SAMPLE — update both if the threshold changes.
+_SR_MIN_SAMPLE = 5
+
+
+def has_test_loop_signal(task) -> bool:
+    """Return True when the task's test fix-loop ran non-trivially.
+
+    'Non-trivial' means ≥2 test attempts, or a single attempt whose
+    exit_reason is not 'passed' (divergence, max-attempts, etc.).
+    """
+    history = getattr(task, "fix_loop_history", None) or {}
+    test_attempts = history.get("test") or []
+    if len(test_attempts) >= 2:
+        return True
+    if test_attempts:
+        last = test_attempts[-1]
+        if isinstance(last, dict):
+            reason = last.get("exit_reason")
+            if reason and reason != "passed":
+                return True
+    return False
+
+
+def aggregate_sr_regression_risk_test_signal(
+    tasks,
+    *,
+    min_sample: int = _SR_MIN_SAMPLE,
+) -> Dict[str, Any] | None:
+    """Synchronous aggregation of regression_risk vs test-signal for a task list.
+
+    Classifies each qualifying code-change task (non-skip SR outcome with
+    ``check_results.regression_risk.passed`` present) into one of four buckets:
+
+    - ``sr_passed_no_signal``   — true-pass: SR ok, test loop quiet
+    - ``sr_passed_with_signal`` — miss-by-test-signal: SR ok, test loop ran
+    - ``sr_failed_with_signal`` — hit-by-test-signal: SR flagged, test loop ran
+    - ``sr_failed_no_signal``   — false-flag: SR flagged, test loop quiet
+
+    Returns ``None`` when fewer than *min_sample* tasks qualify.
+    """
+    qualifying = []
+    for t in tasks:
+        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        rr = (sro.get("check_results") or {}).get("regression_risk")
+        if not isinstance(rr, dict) or "passed" not in rr:
+            continue
+        qualifying.append(t)
+
+    if len(qualifying) < min_sample:
+        return None
+
+    stats: Dict[str, int] = {
+        "sr_passed_no_signal": 0,
+        "sr_passed_with_signal": 0,
+        "sr_failed_with_signal": 0,
+        "sr_failed_no_signal": 0,
+    }
+    for t in qualifying:
+        sro = (t.context or {}).get("_self_review_outcome") or {}
+        rr = (sro.get("check_results") or {}).get("regression_risk") or {}
+        sr_passed = bool(rr.get("passed"))
+        signal = has_test_loop_signal(t)
+        if sr_passed and signal:
+            stats["sr_passed_with_signal"] += 1
+        elif sr_passed:
+            stats["sr_passed_no_signal"] += 1
+        elif signal:
+            stats["sr_failed_with_signal"] += 1
+        else:
+            stats["sr_failed_no_signal"] += 1
+
+    numer = stats["sr_passed_with_signal"]
+    denom = stats["sr_passed_no_signal"] + stats["sr_passed_with_signal"]
+    rate = round(numer / denom, 3) if denom > 0 else None
+    return {
+        **stats,
+        "miss_by_test_signal_rate": rate,
+        "numerator": numer,
+        "denominator": denom,
+        "sample_size": len(qualifying),
+    }
+
+
+def aggregate_sr_scope_drift_vs_expansion(
+    tasks,
+    *,
+    min_sample: int = _SR_MIN_SAMPLE,
+) -> Dict[str, Any] | None:
+    """Cross-validate SR scope-drift verdict against the objective expansion_ratio signal.
+
+    Qualifying tasks: code-change type, non-skip SR outcome with a
+    ``check_results["scope-drift"]`` entry, and a pre-computed
+    ``expansion_ratio`` in task.context (set by the agent status router when
+    changed_files and related_files are both present on PR submission).
+
+    Four buckets:
+
+    - ``consistent``        — SR passed + ratio ≤ 1.5 (true-pass, not a miss)
+    - ``miss_by_expansion`` — SR passed + ratio ≥ 2.0 (SR missed scope drift)
+    - ``hit_by_expansion``  — SR failed scope-drift + ratio ≥ 1.5 (SR caught it)
+    - ``fp_candidate``      — SR failed scope-drift + ratio ≤ 1.0 (likely false positive)
+    - ``gray_zone``         — SR passed + 1.5 < ratio < 2.0 (ambiguous; not counted in rate)
+
+    Returns ``None`` when fewer than *min_sample* tasks qualify.
+    """
+    qualifying = []
+    for t in tasks:
+        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        sd = (sro.get("check_results") or {}).get("scope-drift")
+        if not isinstance(sd, dict) or "passed" not in sd:
+            continue
+        if ctx.get("expansion_ratio") is None:
+            continue
+        qualifying.append(t)
+
+    if len(qualifying) < min_sample:
+        return None
+
+    stats: Dict[str, int] = {
+        "consistent": 0,
+        "miss_by_expansion": 0,
+        "hit_by_expansion": 0,
+        "fp_candidate": 0,
+        "gray_zone": 0,
+    }
+    for t in qualifying:
+        sro = (t.context or {}).get("_self_review_outcome") or {}
+        sd = (sro.get("check_results") or {}).get("scope-drift") or {}
+        sr_passed = bool(sd.get("passed"))
+        ratio = max(float((t.context or {}).get("expansion_ratio") or 1.0), 1.0)
+        if sr_passed:
+            if ratio <= 1.5:
+                stats["consistent"] += 1
+            elif ratio >= 2.0:
+                stats["miss_by_expansion"] += 1
+            else:
+                stats["gray_zone"] += 1
+        else:
+            if ratio >= 1.5:
+                stats["hit_by_expansion"] += 1
+            elif ratio <= 1.0:
+                stats["fp_candidate"] += 1
+
+    numer = stats["miss_by_expansion"]
+    denom = stats["consistent"] + stats["miss_by_expansion"]
+    rate = round(numer / denom, 3) if denom > 0 else None
+    return {
+        **stats,
+        "miss_by_expansion_rate": rate,
+        "numerator": numer,
+        "denominator": denom,
+        "sample_size": len(qualifying),
+    }
+
 
 def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]]:
-    counts: Dict[tuple, Dict[str, int]] = defaultdict(lambda: {"miss": 0, "tp": 0, "fp": 0})
+    counts: Dict[tuple, Dict[str, int]] = defaultdict(
+        lambda: {"miss": 0, "tp": 0, "fp": 0}
+    )
     for t in tasks:
         task_type = (t.first_payload or {}).get("type", "")
         if task_type not in _SR_CODE_CHANGE_TYPES:
@@ -231,7 +402,8 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, Dict[str, int]
             if isinstance(finding, dict) and finding.get("category")
         }
         sr_failed = {
-            cat for cat, result in check_results.items()
+            cat
+            for cat, result in check_results.items()
             if not result.get("passed", True)
         }
         for cat in reviewer_cats:
@@ -298,7 +470,8 @@ async def aggregate_sr_reviewer_disagreements(
 
     direction_counts = _count_reviewer_disagreement_directions(all_tasks)
     top = [
-        item for item in sorted(direction_counts.items(), key=lambda x: -x[1]["miss"])
+        item
+        for item in sorted(direction_counts.items(), key=lambda x: -x[1]["miss"])
         if item[1]["miss"] > 0
     ][:limit]
     return [
@@ -310,7 +483,9 @@ async def aggregate_sr_reviewer_disagreements(
             "true_positive_count": bucket["tp"],
             "false_positive_rate": round(
                 bucket["fp"] / (bucket["fp"] + bucket["tp"]), 3
-            ) if (bucket["fp"] + bucket["tp"]) > 0 else None,
+            )
+            if (bucket["fp"] + bucket["tp"]) > 0
+            else None,
         }
         for (cat, ttype), bucket in top
     ]

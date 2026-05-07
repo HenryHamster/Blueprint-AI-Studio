@@ -26,12 +26,35 @@ interface SelfReviewOutcome {
   verdict?: string;
   fixes_applied?: boolean;
   check_results?: Record<string, SelfReviewCheckResult>;
+  blind_spots?: string[];
+  skip_reason?: string;
 }
 
 interface SrBadgeState {
   label: string;
   tooltip: string;
-  variant: 'pass' | 'pass-fixed' | 'fail' | 'miss';
+  variant: 'pass' | 'pass-fixed' | 'fail' | 'miss' | 'skip';
+}
+
+const SR_SKIP_REASON_LABELS: Record<string, string> = {
+  diff_too_small: 'Diff too small',
+  json_parse_failed: 'JSON parsing failed',
+  json_missing: 'JSON missing',
+  reviewer_session_failed: 'Reviewer session failed',
+  reviewer_no_findings_parse: 'Reviewer findings parse failed',
+  auto_remediation: 'Auto-remediation active',
+  no_baseline: 'No baseline available',
+};
+
+function getSrSkipReason(outcome: SelfReviewOutcome): string | null {
+  if (outcome.skip_reason) return outcome.skip_reason;
+
+  const blindSpots = outcome.blind_spots ?? [];
+  for (const spot of blindSpots) {
+    if (spot.includes('self-review skipped')) return 'auto_remediation';
+    if (spot.includes('self-review JSON parsing failed')) return 'json_parse_failed';
+  }
+  return null;
 }
 
 function getSrBadgeState(task: Task): SrBadgeState | null {
@@ -42,7 +65,19 @@ function getSrBadgeState(task: Task): SrBadgeState | null {
   const verdict = outcome.verdict ?? 'unknown';
   const checkResults = outcome.check_results ?? {};
   const isSoftFallback = verdict === 'unknown' && Object.keys(checkResults).length === 0;
-  if (isSoftFallback) return null;
+
+  if (isSoftFallback) {
+    const skipReason = getSrSkipReason(outcome);
+    if (skipReason && skipReason !== 'diff_too_small') {
+      const label = SR_SKIP_REASON_LABELS[skipReason] ?? skipReason;
+      return {
+        variant: 'skip',
+        label: 'SR skipped',
+        tooltip: `Self-review skipped — ${label}`,
+      };
+    }
+    return null;
+  }
 
   const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
   const failedCategories = Object.entries(checkResults).filter(([, r]) => !(r as SelfReviewCheckResult).passed);
@@ -95,6 +130,7 @@ function SrBadge({ task, onClick }: { task: Task; onClick?: () => void }) {
     state.variant === 'pass' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400' :
     state.variant === 'pass-fixed' ? 'bg-teal-500/10 border-teal-500/20 text-teal-400' :
     state.variant === 'fail' ? 'bg-red-500/10 border-red-500/20 text-red-400' :
+    state.variant === 'skip' ? 'bg-slate-500/10 border-slate-500/20 text-slate-400' :
     'bg-amber-500/10 border-amber-500/20 text-amber-400';
 
   if (onClick) {

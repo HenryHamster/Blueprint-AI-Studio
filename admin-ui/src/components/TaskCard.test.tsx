@@ -151,4 +151,62 @@ describe('TaskCard SR badge', () => {
     render(<TaskCard task={task} {...baseProps} />);
     expect(screen.getByText('SR ✓')).toBeInTheDocument();
   });
+
+  it('renders SR skipped badge when skip_reason is present', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'unknown',
+          check_results: {},
+          skip_reason: 'json_missing',
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('SR skipped')).toBeInTheDocument();
+    expect(screen.getByTitle('Self-review skipped — JSON missing')).toBeInTheDocument();
+  });
+
+  it('renders SR skipped badge with reviewer_session_failed reason', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'unknown',
+          check_results: {},
+          skip_reason: 'reviewer_session_failed',
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByTitle('Self-review skipped — Reviewer session failed')).toBeInTheDocument();
+  });
+
+  it('does not render SR skipped badge when skip_reason is diff_too_small (policy intent)', () => {
+    const task = makeTask({
+      context: {
+        _self_review_outcome: {
+          verdict: 'unknown',
+          check_results: {},
+          skip_reason: 'diff_too_small',
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText('SR skipped')).toBeNull();
+  });
+
+  it('does not render SR skipped badge for IN_PROGRESS status even with skip_reason', () => {
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      context: {
+        _self_review_outcome: {
+          verdict: 'unknown',
+          check_results: {},
+          skip_reason: 'json_missing',
+        },
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText('SR skipped')).toBeNull();
+  });
 });

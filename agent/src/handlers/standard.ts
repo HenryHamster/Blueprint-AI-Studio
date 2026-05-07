@@ -311,7 +311,23 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
   }
 
   const findings = parsed.reviewer_findings as Array<{ category: string; severity: string; description: string }>;
-  sendLog(ws, `[FreshReview] ${findings.length} reviewer finding(s).\n`);
+  const changedFiles = extractChangedFilesFromDiff(diff);
+  const groundedFindings: typeof findings = [];
+  let hallucinatedCount = 0;
+
+  for (const f of findings) {
+    if (isHallucinatedFinding(f, changedFiles)) {
+      hallucinatedCount++;
+    } else {
+      groundedFindings.push(f);
+    }
+  }
+
+  if (hallucinatedCount > 0) {
+    sendLog(ws, `[FreshReview] ${groundedFindings.length} grounded finding(s), ${hallucinatedCount} filtered (phantom file refs).\n`);
+  } else {
+    sendLog(ws, `[FreshReview] ${findings.length} reviewer finding(s).\n`);
+  }
 
   const srPath = `/tmp/self_review_${taskId}.json`;
   let sr: Record<string, unknown> = {};
@@ -319,7 +335,7 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
   const checkResults = (sr.check_results as Record<string, Record<string, unknown>> | undefined) ?? {};
   const checkResultsLookup = checkResults as Record<string, Record<string, unknown> | undefined>;
-  for (const f of findings) {
+  for (const f of groundedFindings) {
     const existing = checkResultsLookup[f.category];
     if (!existing || existing.passed === true) {
       const entry: Record<string, unknown> = { passed: false, issue: `[reviewer] ${f.description}` };
@@ -396,6 +412,72 @@ export function extractSelfReviewJson(output: string): Record<string, unknown> |
     }
   }
   return null;
+}
+
+/**
+ * Extracts candidate file paths from text (e.g., "path/to/file.ext", "app/foo.py").
+ * Returns a deduplicated set of potential file references mentioned in the text.
+ */
+function extractCandidateFilePaths(text: string): Set<string> {
+  const paths = new Set<string>();
+  // Match patterns like: path/to/file.ext, app/foo.py, agent/src/bar.ts
+  // Pattern: one or more path segments (word/dash/dot/slash) ending in a file extension
+  const filePathRegex = /\b([\w\-./]*[\w\-/]+\.[\w]+)\b/g;
+  let match;
+  while ((match = filePathRegex.exec(text)) !== null) {
+    const path = match[1];
+    // Filter to paths that contain at least one slash (is actually a path)
+    if (path.includes('/')) {
+      paths.add(path);
+    }
+  }
+  return paths;
+}
+
+/**
+ * Extracts changed file paths from git diff output.
+ * Returns a set of file paths that appear in "diff --git a/... b/..." lines.
+ */
+function extractChangedFilesFromDiff(diff: string): Set<string> {
+  const files = new Set<string>();
+  const lines = diff.split('\n');
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      // Extract the b/ path from: diff --git a/path b/path
+      const match = line.match(/\s+b\/(.+)$/);
+      if (match) {
+        files.add(match[1]);
+      }
+    }
+  }
+  return files;
+}
+
+/**
+ * Returns true if a finding is likely hallucinated: it mentions specific file paths
+ * but none of them appear in the set of changed files. Findings with no path
+ * references are not considered hallucinated (we can't verify them).
+ */
+function isHallucinatedFinding(
+  finding: { description: string },
+  changedFiles: Set<string>,
+): boolean {
+  const candidatePaths = extractCandidateFilePaths(finding.description);
+
+  // No path references in the finding description → keep it (unverifiable)
+  if (candidatePaths.size === 0) {
+    return false;
+  }
+
+  // At least one mentioned path is in the changed files → keep it (grounded)
+  for (const path of candidatePaths) {
+    if (changedFiles.has(path)) {
+      return false;
+    }
+  }
+
+  // Finding mentions specific paths but none match the diff → hallucinated
+  return true;
 }
 
 

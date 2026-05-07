@@ -5,9 +5,11 @@ import {
   SrTrendBreakdown,
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
+  SrScopeDriftVsExpansionCard,
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
+  type SrScopeDriftVsExpansion,
 } from './SrTrendBreakdown';
 
 function makeTrends(): SrTrendData {
@@ -475,5 +477,78 @@ describe('EdgesTrendBreakdown', () => {
     })} />);
     expect(screen.getByText('correctness rej w/wo')).toBeTruthy();
     expect(container.querySelector('[title*="positive = edges correlate"]')).toBeNull();
+  });
+});
+
+describe('SrScopeDriftVsExpansionCard', () => {
+  it('renders nothing when data is null', () => {
+    const { container } = render(<SrScopeDriftVsExpansionCard data={null} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it('renders miss-by-expansion rate with numerator/denominator and sample size', () => {
+    const data: SrScopeDriftVsExpansion = {
+      miss_by_expansion_rate: 0.3,
+      numerator: 3,
+      denominator: 10,
+      sample_size: 12,
+      consistent: 7,
+      miss_by_expansion: 3,
+    };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.getByTestId('sr-scope-drift-vs-expansion')).toBeInTheDocument();
+    expect(screen.getByText('30%')).toBeInTheDocument();
+    expect(screen.getByText('3/10')).toBeInTheDocument();
+    expect(screen.getByText('n=12')).toBeInTheDocument();
+  });
+
+  it('shows consistent bucket — SR passed + ratio ≤ 1.5 (true-pass)', () => {
+    const data: SrScopeDriftVsExpansion = { consistent: 8, miss_by_expansion_rate: 0 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.getByText('consistent: 8')).toBeInTheDocument();
+  });
+
+  it('shows miss_by_expansion bucket — SR passed + ratio ≥ 2.0 (scope-drift miss)', () => {
+    const data: SrScopeDriftVsExpansion = { miss_by_expansion: 5, miss_by_expansion_rate: 0.5 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.getByText('miss: 5')).toBeInTheDocument();
+  });
+
+  it('shows hit_by_expansion bucket — SR failed scope-drift + ratio ≥ 1.5 (SR caught it)', () => {
+    const data: SrScopeDriftVsExpansion = { hit_by_expansion: 4, miss_by_expansion_rate: 0 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.getByText('hit: 4')).toBeInTheDocument();
+  });
+
+  it('shows fp_candidate bucket — SR failed scope-drift + ratio ≤ 1.0 (likely false positive)', () => {
+    const data: SrScopeDriftVsExpansion = { fp_candidate: 2, miss_by_expansion_rate: 0 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.getByText('fp: 2')).toBeInTheDocument();
+  });
+
+  it('hides gray_zone row when count is zero', () => {
+    const data: SrScopeDriftVsExpansion = { gray_zone: 0, miss_by_expansion_rate: 0.1 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.queryByText(/gray:/)).not.toBeInTheDocument();
+  });
+
+  it('shows gray_zone when count is non-zero', () => {
+    const data: SrScopeDriftVsExpansion = { gray_zone: 3, miss_by_expansion_rate: 0.1 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    expect(screen.getByText('gray: 3')).toBeInTheDocument();
+  });
+
+  it('applies red color when miss-by-expansion rate ≥ 30%', () => {
+    const data: SrScopeDriftVsExpansion = { miss_by_expansion_rate: 0.4 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    const rateEl = screen.getByText('40%');
+    expect(rateEl.className).toContain('text-red-400');
+  });
+
+  it('applies emerald color when miss-by-expansion rate < 15%', () => {
+    const data: SrScopeDriftVsExpansion = { miss_by_expansion_rate: 0.05 };
+    render(<SrScopeDriftVsExpansionCard data={data} />);
+    const rateEl = screen.getByText('5%');
+    expect(rateEl.className).toContain('text-emerald-400');
   });
 });
