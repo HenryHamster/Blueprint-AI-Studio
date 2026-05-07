@@ -1061,7 +1061,7 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                 />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />
                 {digest?.fresh_reviewer_effectiveness != null && (() => {
-                  const fre = digest.fresh_reviewer_effectiveness!;
+                  const fre = digest.fresh_reviewer_effectiveness;
                   const n = fre.fresh_reviewer_sample_size;
                   const freRate = fre.fresh_reviewer_first_attempt_approval_rate;
                   const baseRate = fre.baseline_first_attempt_approval_rate;
@@ -1176,7 +1176,8 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                         <span className="text-[9px] text-neutral-600 shrink-0">n={d.sample_size}</span>
                       </div>
                       {d.worst_category && d.categories[d.worst_category] && (() => {
-                        const worst = d.categories[d.worst_category!]!;
+                        const worst = d.categories[d.worst_category];
+                        if (!worst) return null;
                         return (
                           <p className="text-[9px] text-neutral-500">
                             worst: <span className="text-orange-400 font-mono">{d.worst_category}</span>

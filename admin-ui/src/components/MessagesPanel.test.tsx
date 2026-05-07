@@ -159,7 +159,7 @@ describe('MessagesPanel grouping', () => {
       );
     });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
-    return host!;
+    return host as HTMLDivElement;
   }
 
   test('routine ops group is collapsed by default', async () => {

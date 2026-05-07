@@ -26,7 +26,7 @@ describe('SettingsNotificationsSection — viewport regression', () => {
   let host: HTMLDivElement | null = null;
 
   afterEach(() => {
-    if (root) act(() => root!.unmount());
+    if (root) act(() => { root?.unmount(); });
     root = null;
     host?.remove();
     host = null;

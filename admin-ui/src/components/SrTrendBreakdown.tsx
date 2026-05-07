@@ -385,10 +385,10 @@ export function FreshReviewerTrendBreakdown({ trend }: { trend: FreshReviewerTre
           <span className="text-[9px] text-neutral-600 font-mono ml-auto">n={trend.current_sample_size}</span>
         )}
       </div>
-      {hasCats && (
+      {cats && Object.keys(cats).length > 0 && (
         <div className="flex flex-col gap-0.5 mb-1">
           <p className="text-[9px] text-neutral-600">Hit rate by category</p>
-          {Object.entries(cats!).map(([cat, m]) => (
+          {Object.entries(cats).map(([cat, m]) => (
             <div key={cat} className="flex items-center gap-2 text-[10px]">
               <span className="text-neutral-300 flex-1 truncate">{cat}</span>
               <span className={`font-mono tabular-nums ${frTrendColor(m.trend)}`}>

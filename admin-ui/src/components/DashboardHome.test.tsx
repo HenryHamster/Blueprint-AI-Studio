@@ -88,7 +88,16 @@ vi.mock('./StrategicAuditPanel', () => ({
 function jsonResponse(data: unknown): Response {
   return {
     ok: true,
+    status: 200,
     json: async () => data,
+  } as Response;
+}
+
+function notFoundResponse(): Response {
+  return {
+    ok: false,
+    status: 404,
+    json: async () => ({}),
   } as Response;
 }
 
@@ -142,7 +151,11 @@ function setupApiMocks({
     if (url.includes('/api/admin/scope-baselines')) return Promise.resolve(jsonResponse(scopeBaselines ?? {}));
     if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse(accountHealth ?? { accounts: [] }));
     if (url.includes('/system-maturity')) return Promise.resolve(jsonResponse(systemMaturity ?? []));
-    return Promise.resolve(jsonResponse({}));
+    // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements, direction-sr-breakdown,
+    // sr-recent-misses, regression-cases, task-duration-stats, etc.) return 404 so the
+    // component leaves the corresponding state slot at its initial null/[] sentinel rather
+    // than ingesting an empty {} that would crash truthy-but-shapeless guards in JSX.
+    return Promise.resolve(notFoundResponse());
   });
 }
 

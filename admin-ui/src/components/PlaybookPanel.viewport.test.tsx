@@ -86,7 +86,7 @@ describe('PlaybookPanel — viewport regression', () => {
   });
 
   afterEach(() => {
-    if (root) act(() => root!.unmount());
+    if (root) act(() => { root?.unmount(); });
     root = null;
     host?.remove();
     host = null;

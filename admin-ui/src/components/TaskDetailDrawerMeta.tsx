@@ -474,11 +474,13 @@ function SelfReviewPanel({ task }: { task: Task }) {
   const failedCategories = Object.entries(checkResults).filter(([, r]) => !r.passed);
   const passedCategories = Object.entries(checkResults).filter(([, r]) => r.passed);
 
-  const hasHumanCategories = !!humanCategories && Object.keys(humanCategories).length > 0;
-  const allCategories = hasHumanCategories
-    ? Array.from(new Set([...Object.keys(checkResults), ...Object.keys(humanCategories!)]))
+  const humanCats = humanCategories && Object.keys(humanCategories).length > 0 ? humanCategories : null;
+  const allCategories = humanCats
+    ? Array.from(new Set([...Object.keys(checkResults), ...Object.keys(humanCats)]))
     : [];
-  const missedCount = allCategories.filter(cat => cat in humanCategories! && !(checkResults[cat] && !checkResults[cat].passed)).length;
+  const missedCount = humanCats
+    ? allCategories.filter(cat => cat in humanCats && !(checkResults[cat] && !checkResults[cat].passed)).length
+    : 0;
 
   return (
     <div className="bg-neutral-900/50 rounded-lg border border-neutral-800 mb-2">
@@ -619,7 +621,7 @@ function SelfReviewPanel({ task }: { task: Task }) {
                 </div>
               )}
 
-              {hasHumanCategories && allCategories.length > 0 && (
+              {humanCats && allCategories.length > 0 && (
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Agent vs. Human review categories</p>
                   <div className="rounded border border-neutral-700 overflow-hidden text-[10px]">
@@ -630,7 +632,7 @@ function SelfReviewPanel({ task }: { task: Task }) {
                     </div>
                     {allCategories.map(cat => {
                       const agentResult = checkResults[cat];
-                      const humanFlagged = cat in humanCategories!;
+                      const humanFlagged = humanCats != null && cat in humanCats;
                       const agentFailed = agentResult && !agentResult.passed;
                       const agentPassed = agentResult && agentResult.passed;
                       const missed = humanFlagged && !agentFailed;
