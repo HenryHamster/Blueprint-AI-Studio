@@ -263,7 +263,15 @@ async def lifespan(app):
         from app.shared_state import background_tasks as _bg_tasks_nl
         _bg_tasks_nl["config_sync"] = config_sync_task
 
-        # Minimal watchdog: restart per-instance services if they crash.
+        # Minimal watchdog: restart per-instance services if they crash, AND
+        # periodically probe the leader advisory lock so we can take over
+        # when the prior leader dies. Without this probe, Cloud Run can sit
+        # in a leadership gap indefinitely: instances that booted while a
+        # leader existed picked the non-leader path and never retry, so
+        # when the leader is killed (e.g. by a /health 503 from a stuck
+        # background loop) the existing instances stay non-leader and no
+        # orchestrator cycles run until a new instance happens to start.
+        # Incident 2026-05-07: ~10 min leadership gap after liveness kill.
         async def _monitor_non_leader():
             while True:
                 try:
@@ -272,6 +280,46 @@ async def lifespan(app):
                         exc = config_sync_task.exception() if not config_sync_task.cancelled() else None
                         logger.error(f"[MONITOR] config_sync DIED on non-leader (exc={exc}); restarting")
                         _bg_tasks_nl["config_sync"] = asyncio.create_task(runtime_config_sync_service())
+
+                    # Leader-lock probe. Try to acquire on a fresh session;
+                    # if we win, the previous leader's session has closed and
+                    # we should be running the leader path. Release the lock
+                    # immediately and hard-exit so Cloud Run respawns us
+                    # through the lifespan startup, where the leader path is
+                    # selected cleanly.
+                    try:
+                        async with AsyncSessionLocal() as _probe_session:
+                            _probe_acquired = bool((await _probe_session.execute(
+                                _text("SELECT pg_try_advisory_lock(:lock_id)"),
+                                {"lock_id": _BACKGROUND_LOCK_ID},
+                            )).scalar())
+                            if _probe_acquired:
+                                # Release before exiting so the respawned
+                                # process (or a peer that probes during our
+                                # shutdown) can acquire the lock without
+                                # waiting for connection-close detection.
+                                await _probe_session.execute(
+                                    _text("SELECT pg_advisory_unlock(:lock_id)"),
+                                    {"lock_id": _BACKGROUND_LOCK_ID},
+                                )
+                        if _probe_acquired:
+                            logger.warning(
+                                "[MONITOR] Acquired leader lock from non-leader "
+                                "watchdog (prior leader died). Hard-exiting so "
+                                "Cloud Run respawns this instance through the "
+                                "leader path."
+                            )
+                            # _exit bypasses the lifespan teardown which is
+                            # fine here — non-leader instances hold no
+                            # leader-only state and the per-instance services
+                            # we own (config_sync) are restartable.
+                            import os as _os
+                            _os._exit(0)
+                    except Exception as _probe_exc:
+                        logger.warning(
+                            f"[MONITOR] Leader-lock probe failed "
+                            f"(stays non-leader this cycle): {_probe_exc}"
+                        )
                 except asyncio.CancelledError:
                     break
                 except Exception as _e:
