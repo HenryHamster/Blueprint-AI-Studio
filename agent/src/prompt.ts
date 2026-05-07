@@ -2054,6 +2054,8 @@ fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"b
 envelope is acceptable when you have nothing useful to record, but the
 file MUST exist for code-change tasks.
 
+**\`blind_spots\` semantics:** correctness uncertainties about what your changes actually do — not a log of intentional scope decisions. **Do NOT** list things like "did not run the full backend test suite", "did not run docker pytest", "did not run viewport tests" — skipping the full suite is by design (CI runs it; you target only your touched files). Valid blind_spots: "did not re-read c.ts after diff truncated", "unsure whether retry path handles concurrent calls", "no test for the empty-list edge case I added handling for". If you have nothing of that kind, leave the array empty.
+
 **Optional verification-coverage fields (advisory — do NOT block \`./done\`):**
 - \`truncated_files_read\`: list the changed file paths you actually re-opened/re-read during self-review for verification. Only include files you re-inspected — it is fine for this list to be a subset of the diff. Reviewers use it to focus on unverified files.
 - \`categories: ["incomplete_review"]\`: set this marker when the diff was truncated and you could not verify all changed files even after retrying the read. \`categories\` is a top-level array (separate from \`check_results\`) reserved for coverage markers like this.
