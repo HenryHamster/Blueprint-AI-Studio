@@ -93,7 +93,7 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
               <div className="space-y-2 ml-4">
                 {diagnostics.stuck_tasks.map((task) => (
                   <div key={task.task_id}>
-                    <div className="flex items-start gap-2">
+                    <div className="flex items-start gap-2 flex-wrap">
                       <button
                         onClick={() => onViewTask(task.task_id)}
                         className="text-neutral-300 hover:text-blue-400 transition-colors truncate max-w-[200px] text-left"

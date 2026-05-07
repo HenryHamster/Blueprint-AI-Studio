@@ -6,17 +6,22 @@ modified by agents. If an agent changes a safety value, CI catches it.
 
 Run with: pytest testing/test_invariants.py -v --noconftest
 """
+
 import os
+import re
+import subprocess
 
 import pytest
 
 
 # ── Safety Constants ────────────────────────────────────────────────────────
 
+
 class TestSafetyConstants:
     def test_max_review_fix_iterations(self):
         """MAX_REVIEW_FIX_ITERATIONS must stay at 16."""
         from app.review_pipeline import MAX_REVIEW_FIX_ITERATIONS
+
         assert MAX_REVIEW_FIX_ITERATIONS == 16, (
             f"MAX_REVIEW_FIX_ITERATIONS changed to {MAX_REVIEW_FIX_ITERATIONS} — "
             "this controls review-fix loop runaway. Do not change without approval."
@@ -25,19 +30,24 @@ class TestSafetyConstants:
     def test_max_retries_default(self):
         """Default max_retries must be 3."""
         from app.shared_state import runtime_config
+
         # The default is set from env var with fallback to 3
         assert runtime_config["max_retries"] == int(os.getenv("MAX_RETRIES", "3"))
 
     def test_max_autonomous_tasks_per_hour(self):
         """Rate limit for autonomous task spawning."""
         from app.shared_state import runtime_config
+
         assert runtime_config["max_autonomous_tasks_per_hour"] == 12
 
     def test_max_rollup_retries_default(self):
         """Default max_rollup_retries must be 5 — controls rollup PR creation retry ceiling."""
         import os
         from app.shared_state import runtime_config
-        assert runtime_config["max_rollup_retries"] == int(os.getenv("MAX_ROLLUP_RETRIES", "5"))
+
+        assert runtime_config["max_rollup_retries"] == int(
+            os.getenv("MAX_ROLLUP_RETRIES", "5")
+        )
 
     def test_provision_slots_geq_concurrent_vms(self):
         """MAX_PROVISION_SLOTS must be >= MAX_CONCURRENT_VMS default.
@@ -48,6 +58,7 @@ class TestSafetyConstants:
         provisioning can complete.
         """
         from app.compute import _MAX_GLOBAL_PROVISIONS
+
         max_concurrent_vms = int(os.getenv("MAX_CONCURRENT_VMS", "8"))
         assert _MAX_GLOBAL_PROVISIONS >= max_concurrent_vms, (
             f"MAX_PROVISION_SLOTS ({_MAX_GLOBAL_PROVISIONS}) < MAX_CONCURRENT_VMS ({max_concurrent_vms}) — "
@@ -56,6 +67,7 @@ class TestSafetyConstants:
 
 
 # ── Schema Revision Sync ───────────────────────────────────────────────────
+
 
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
@@ -68,7 +80,9 @@ class TestSchemaRevisionSync:
         import glob as globmod
         from app.main import EXPECTED_SCHEMA_REVISION
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
         assert files, "No migration files found"
 
@@ -76,6 +90,63 @@ class TestSchemaRevisionSync:
         assert EXPECTED_SCHEMA_REVISION == latest, (
             f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but latest "
             f"migration is '{latest}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
+        )
+
+    def test_agent_helper_exclusions_match_prompt_and_gitignore(self):
+        """Agent helper exclusions must stay aligned with prompt.ts and gitignore.
+
+        Skipped when running in environments without the agent/ source tree
+        or repo root checkout (e.g. CI's backend-only Docker build context,
+        which excludes agent/, .gitignore, and .git). Locally and in any
+        environment that does see the repo root the check fires normally.
+        """
+        prompt_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "agent", "src", "prompt.ts"
+        )
+        gitignore_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", ".gitignore"
+        )
+        repo_root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+        if not (
+            os.path.exists(prompt_path)
+            and os.path.exists(gitignore_path)
+            and os.path.isdir(os.path.join(repo_root, ".git"))
+        ):
+            pytest.skip(
+                "repo root sources not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+
+        with open(prompt_path) as f:
+            prompt = f.read()
+        match = re.search(r"export const AGENT_HELPER_NAMES = \[(.*?)\];", prompt, re.S)
+        assert match, "Could not find AGENT_HELPER_NAMES literal in agent/src/prompt.ts"
+        helpers = [
+            name.strip().strip("'\"")
+            for name in match.group(1).split(",")
+            if name.strip()
+        ]
+
+        with open(gitignore_path) as f:
+            gitignore = f.read().splitlines()
+        for helper in helpers:
+            assert f"/{helper}" in gitignore, f".gitignore is missing /{helper}"
+        assert "*.bak" in gitignore, ".gitignore is missing *.bak"
+
+        tracked = subprocess.run(
+            ["git", "ls-files"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        pattern = re.compile(rf"^(?:{'|'.join(map(re.escape, helpers))})$|\.bak$")
+        leaked = [path for path in tracked if pattern.search(path)]
+        assert not leaked, "Tracked helper or backup files found:\n  " + "\n  ".join(
+            leaked
         )
 
     def test_schema_gate_raises_on_mismatch(self):
@@ -107,8 +178,10 @@ class TestSchemaRevisionSync:
 
         # Ensure K_REVISION is unset so we exercise the "non-Cloud-Run still raises" path.
         env = {k: v for k, v in os.environ.items() if k != "K_REVISION"}
-        with patch.dict(os.environ, env, clear=True), \
-             patch("app.main.AsyncSessionLocal", return_value=session_cm):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("app.main.AsyncSessionLocal", return_value=session_cm),
+        ):
             with pytest.raises(RuntimeError, match="Schema version mismatch"):
                 asyncio.run(_verify_schema_version())
 
@@ -140,7 +213,9 @@ class TestSchemaRevisionSync:
         import glob as globmod
         import re
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
         rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
         mismatches: list[str] = []
@@ -158,7 +233,9 @@ class TestSchemaRevisionSync:
                     f"{os.path.basename(path)}: filename says {filename_rev}, "
                     f"internal revision says {internal_rev}"
                 )
-        assert not mismatches, "Migration revision mismatches:\n  " + "\n  ".join(mismatches)
+        assert not mismatches, "Migration revision mismatches:\n  " + "\n  ".join(
+            mismatches
+        )
 
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
@@ -167,11 +244,15 @@ class TestSchemaRevisionSync:
         import glob as globmod
         import re
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
         rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
         # Match either down_revision = '0033' or down_revision = None
-        down_re = re.compile(r"^down_revision\s*=\s*(?:['\"](\w+)['\"]|None)", re.MULTILINE)
+        down_re = re.compile(
+            r"^down_revision\s*=\s*(?:['\"](\w+)['\"]|None)", re.MULTILINE
+        )
 
         chain: dict[str, str | None] = {}  # revision -> down_revision
         for path in files:
@@ -181,7 +262,9 @@ class TestSchemaRevisionSync:
             down_match = down_re.search(content)
             if rev_match:
                 # group(1) is the quoted revision string or None if matched 'None' literal
-                down = down_match.group(1) if down_match and down_match.group(1) else None
+                down = (
+                    down_match.group(1) if down_match and down_match.group(1) else None
+                )
                 chain[rev_match.group(1)] = down
 
         # Every down_revision must point to a revision that exists (or None for the root)
@@ -190,15 +273,21 @@ class TestSchemaRevisionSync:
             for rev, down in chain.items()
             if down is not None and down not in chain
         ]
-        assert not missing_parents, "Broken migration chain:\n  " + "\n  ".join(missing_parents)
+        assert not missing_parents, "Broken migration chain:\n  " + "\n  ".join(
+            missing_parents
+        )
 
         # Exactly one root (down_revision=None) and one head (no one points to it)
         roots = [r for r, d in chain.items() if d is None]
-        assert len(roots) == 1, f"Expected exactly 1 root migration, found {len(roots)}: {roots}"
+        assert len(roots) == 1, (
+            f"Expected exactly 1 root migration, found {len(roots)}: {roots}"
+        )
 
         pointed_to = {d for d in chain.values() if d is not None}
         heads = [r for r in chain if r not in pointed_to]
-        assert len(heads) == 1, f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
+        assert len(heads) == 1, (
+            f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
+        )
 
     def test_model_columns_covered_by_migrations(self):
         """Every column defined on a SQLModel table must exist in the alembic
@@ -215,12 +304,16 @@ class TestSchemaRevisionSync:
         # Import models so SQLModel registers all tables
         from app import models  # noqa: F401
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
 
         # Collect all (table, column) pairs present in migrations
         migration_columns: set[tuple[str, str]] = set()
-        add_col_re = re.compile(r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]")
+        add_col_re = re.compile(
+            r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]"
+        )
         create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
         col_in_create_re = re.compile(r"sa\.Column\(\s*['\"](\w+)['\"]")
         # Renames: alter_column('table', 'old', new_column_name='new') → new column exists
@@ -249,9 +342,9 @@ class TestSchemaRevisionSync:
                 depth = 1
                 end = start
                 while end < len(content) and depth > 0:
-                    if content[end] == '(':
+                    if content[end] == "(":
                         depth += 1
-                    elif content[end] == ')':
+                    elif content[end] == ")":
                         depth -= 1
                     end += 1
                 block = content[start:end]
@@ -292,8 +385,17 @@ class TestSchemaRevisionSync:
 
         def family(name: str) -> str:
             n = name.upper()
-            if n in {"STRING", "TEXT", "VARCHAR", "UNICODE", "UNICODETEXT",
-                     "AUTOSTRING", "CHAR", "NCHAR", "NVARCHAR"}:
+            if n in {
+                "STRING",
+                "TEXT",
+                "VARCHAR",
+                "UNICODE",
+                "UNICODETEXT",
+                "AUTOSTRING",
+                "CHAR",
+                "NCHAR",
+                "NVARCHAR",
+            }:
                 return "STRING"
             if n in {"INTEGER", "BIGINTEGER", "SMALLINTEGER", "INT"}:
                 return "INTEGER"
@@ -311,7 +413,9 @@ class TestSchemaRevisionSync:
                 return "NUMERIC"
             return n  # JSONB, JSON, BOOLEAN, FLOAT, DATE, ARRAY, ENUM, etc.
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
 
         # Extract (table, col) -> type class name from migration files. Later files win.
@@ -335,9 +439,9 @@ class TestSchemaRevisionSync:
                 table = ct.group(1)
                 start, depth, end = ct.end(), 1, ct.end()
                 while end < len(content) and depth > 0:
-                    if content[end] == '(':
+                    if content[end] == "(":
                         depth += 1
-                    elif content[end] == ')':
+                    elif content[end] == ")":
                         depth -= 1
                     end += 1
                 for col_m in col_in_create_re.finditer(content[start:end]):
@@ -378,7 +482,9 @@ class TestSchemaRevisionSync:
         from sqlmodel import SQLModel
         from app import models  # noqa: F401
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
 
         # op.create_index('name', 'table', ['col', ...], ...) — handle optional op.f(...) wrapper
@@ -395,12 +501,12 @@ class TestSchemaRevisionSync:
         def _matched_block(text: str, start: int) -> str:
             depth, end = 1, start
             while end < len(text) and depth > 0:
-                if text[end] == '(':
+                if text[end] == "(":
                     depth += 1
-                elif text[end] == ')':
+                elif text[end] == ")":
                     depth -= 1
                 end += 1
-            return text[start:end - 1]
+            return text[start : end - 1]
 
         idx_by_name: dict[str, tuple[str, frozenset[str]]] = {}
         effective: set[tuple[str, frozenset[str]]] = set()
@@ -443,7 +549,9 @@ class TestSchemaRevisionSync:
             for idx in table.indexes:
                 cols = frozenset(c.name for c in idx.columns)
                 if (table_name, cols) not in effective:
-                    missing.append(f"  - {table_name}({', '.join(sorted(cols))}) [name={idx.name}]")
+                    missing.append(
+                        f"  - {table_name}({', '.join(sorted(cols))}) [name={idx.name}]"
+                    )
 
         assert not missing, (
             "Indexes defined on models but missing from alembic migrations:\n"
@@ -466,14 +574,26 @@ class TestSchemaRevisionSync:
         import glob as globmod
 
         SUBSTANTIVE_OPS = {
-            "drop_column", "drop_table", "drop_index", "alter_column",
-            "execute", "drop_constraint", "rename_table", "create_table",
-            "create_index", "add_column", "create_foreign_key",
-            "drop_foreign_key", "create_unique_constraint",
-            "create_check_constraint", "batch_alter_table",
+            "drop_column",
+            "drop_table",
+            "drop_index",
+            "alter_column",
+            "execute",
+            "drop_constraint",
+            "rename_table",
+            "create_table",
+            "create_index",
+            "add_column",
+            "create_foreign_key",
+            "drop_foreign_key",
+            "create_unique_constraint",
+            "create_check_constraint",
+            "batch_alter_table",
         }
 
-        migrations_dir = os.path.join(os.path.dirname(__file__), "..", "alembic", "versions")
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
         assert files, "No migration files found"
 
@@ -483,8 +603,11 @@ class TestSchemaRevisionSync:
                 source = f.read()
             tree = ast.parse(source)
             downgrade = next(
-                (n for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and n.name == "downgrade"),
+                (
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "downgrade"
+                ),
                 None,
             )
             if downgrade is None:
@@ -493,21 +616,31 @@ class TestSchemaRevisionSync:
 
             # Strip leading docstring/expression statements; what remains must be substantive.
             body = downgrade.body
-            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+            ):
                 body = body[1:]
 
             # Pure data-only migrations (upgrade body is only op.execute calls)
             # are inherently one-way — accept any downgrade body for them.
             upgrade = next(
-                (n for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and n.name == "upgrade"),
+                (
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "upgrade"
+                ),
                 None,
             )
             if upgrade is not None:
                 up_calls = [
-                    n for n in ast.walk(upgrade)
-                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "op"
+                    n
+                    for n in ast.walk(upgrade)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "op"
                 ]
                 if up_calls and all(c.func.attr == "execute" for c in up_calls):
                     continue
@@ -524,9 +657,15 @@ class TestSchemaRevisionSync:
             raises_nie = any(
                 isinstance(n, ast.Raise)
                 and (
-                    (isinstance(n.exc, ast.Call) and isinstance(n.exc.func, ast.Name)
-                     and n.exc.func.id == "NotImplementedError")
-                    or (isinstance(n.exc, ast.Name) and n.exc.id == "NotImplementedError")
+                    (
+                        isinstance(n.exc, ast.Call)
+                        and isinstance(n.exc.func, ast.Name)
+                        and n.exc.func.id == "NotImplementedError"
+                    )
+                    or (
+                        isinstance(n.exc, ast.Name)
+                        and n.exc.id == "NotImplementedError"
+                    )
                 )
                 for n in ast.walk(downgrade)
             )
@@ -556,11 +695,13 @@ class TestSchemaRevisionSync:
 
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
+
 class TestSecurityIntegrity:
     def test_injection_pattern_count(self):
         """Security scanner must have at least 20 injection patterns.
         If this count drops, an agent may have silently removed patterns."""
         from app.security import INJECTION_PATTERNS
+
         assert len(INJECTION_PATTERNS) >= 20, (
             f"Only {len(INJECTION_PATTERNS)} injection patterns compiled — "
             "expected at least 20. Patterns may have been removed."
@@ -569,14 +710,21 @@ class TestSecurityIntegrity:
     def test_raw_pattern_categories(self):
         """All critical categories must be present."""
         from app.security import INJECTION_PATTERNS
+
         categories = {p["category"] for p in INJECTION_PATTERNS}
-        required = {"instruction_override", "role_injection", "boundary_marker", "prompt_leak"}
+        required = {
+            "instruction_override",
+            "role_injection",
+            "boundary_marker",
+            "prompt_leak",
+        }
         missing = required - categories
         assert not missing, f"Missing security pattern categories: {missing}"
 
     def test_high_severity_patterns_exist(self):
         """Must have high-severity patterns for critical injection types."""
         from app.security import INJECTION_PATTERNS
+
         high_patterns = [p for p in INJECTION_PATTERNS if p["severity"] == "high"]
         assert len(high_patterns) >= 10, (
             f"Only {len(high_patterns)} high-severity patterns — expected at least 10"
@@ -585,21 +733,27 @@ class TestSecurityIntegrity:
 
 # ── Deployment State Model ──────────────────────────────────────────────────
 
+
 class TestDeploymentStateModel:
     def test_deployment_status_values(self):
         """DeploymentStatus enum must have all expected states."""
         from app.models import DeploymentStatus
+
         expected = {"MONITORING", "STABLE", "ROLLED_BACK", "PAUSED", "HALTED"}
         actual = {s.value for s in DeploymentStatus}
-        assert expected == actual, f"DeploymentStatus values changed: expected {expected}, got {actual}"
+        assert expected == actual, (
+            f"DeploymentStatus values changed: expected {expected}, got {actual}"
+        )
 
 
 # ── Agent Model Forward Compatibility ───────────────────────────────────────
+
 
 class TestAgentModels:
     def test_agent_models_ignore_extra(self):
         """Agent-facing Pydantic models must accept unknown fields (forward compat)."""
         from app.schemas import AgentStatusPayload, HeartbeatRequest, SpawnTaskRequest
+
         for model_cls in [AgentStatusPayload, HeartbeatRequest, SpawnTaskRequest]:
             config = model_cls.model_config
             assert config.get("extra") == "ignore", (
@@ -609,16 +763,22 @@ class TestAgentModels:
 
 # ── CLAUDE.md Agent Restrictions ────────────────────────────────────────────
 
+
 def _find_claude_md() -> str:
     """Find CLAUDE.md — either copied into Docker image root or at repo root."""
     candidates = [
-        os.path.join(os.path.dirname(__file__), "..", "CLAUDE.md"),       # /app/CLAUDE.md (Docker, copied by CI)
-        os.path.join(os.path.dirname(__file__), "..", "..", "CLAUDE.md"), # repo root (local dev)
+        os.path.join(
+            os.path.dirname(__file__), "..", "CLAUDE.md"
+        ),  # /app/CLAUDE.md (Docker, copied by CI)
+        os.path.join(
+            os.path.dirname(__file__), "..", "..", "CLAUDE.md"
+        ),  # repo root (local dev)
     ]
     for path in candidates:
         if os.path.isfile(path):
             return path
     return ""
+
 
 _CLAUDE_MD = _find_claude_md()
 
@@ -626,7 +786,9 @@ _CLAUDE_MD = _find_claude_md()
 class TestAgentRestrictions:
     def test_claude_md_exists(self):
         """CLAUDE.md must exist in the repo root."""
-        assert _CLAUDE_MD, "CLAUDE.md not found — expected at repo root or copied into Docker image by CI"
+        assert _CLAUDE_MD, (
+            "CLAUDE.md not found — expected at repo root or copied into Docker image by CI"
+        )
 
     def test_claude_md_restricts_workflows(self):
         """CLAUDE.md must restrict agents from modifying CI workflows."""
@@ -649,10 +811,12 @@ class TestAgentRestrictions:
 
 # -- Direction Lifecycle Regression Guards --
 
+
 class TestDirectionLifecycleInvariants:
     def test_max_active_directions_default(self):
         """max_active_directions must remain at 10 — controls direction sprawl."""
         from app.shared_state import runtime_config
+
         assert runtime_config["max_active_directions"] == 10, (
             f"max_active_directions changed to {runtime_config['max_active_directions']} — "
             "this controls direction sprawl and must not change without approval."
@@ -661,6 +825,7 @@ class TestDirectionLifecycleInvariants:
     def test_direction_text_limits(self):
         """DIRECTION_TEXT_MAX and COMPLETION_CRITERIA_MAX must match spec."""
         from app.routers.directions import DIRECTION_TEXT_MAX, COMPLETION_CRITERIA_MAX
+
         assert DIRECTION_TEXT_MAX == 2000, (
             f"DIRECTION_TEXT_MAX changed to {DIRECTION_TEXT_MAX} — expected 2000."
         )
@@ -671,13 +836,20 @@ class TestDirectionLifecycleInvariants:
     def test_momentum_factor_contract(self):
         """_compute_momentum_factor must return canonical values for known inputs."""
         from app.direction_metrics import _compute_momentum_factor
+
         # Hot streak: last 2 cycles productive → 2.0
         hot = {"research_history": [{"tasks_created": 3}, {"tasks_created": 2}]}
         assert _compute_momentum_factor(hot) == 2.0, (
             f"Hot streak returned {_compute_momentum_factor(hot)}, expected 2.0"
         )
         # Stalled: last 3 cycles empty → 0.5
-        stalled = {"research_history": [{"tasks_created": 0}, {"tasks_created": 0}, {"tasks_created": 0}]}
+        stalled = {
+            "research_history": [
+                {"tasks_created": 0},
+                {"tasks_created": 0},
+                {"tasks_created": 0},
+            ]
+        }
         assert _compute_momentum_factor(stalled) == 0.5, (
             f"Stalled returned {_compute_momentum_factor(stalled)}, expected 0.5"
         )
@@ -703,7 +875,7 @@ class TestDirectionLifecycleInvariants:
             if not os.path.exists(path):
                 continue
             with open(path) as f:
-                if 'auto_completed' in f.read():
+                if "auto_completed" in f.read():
                     found = True
                     break
         assert found, (
@@ -714,10 +886,12 @@ class TestDirectionLifecycleInvariants:
 
     def test_direction_cap_enforced_in_post(self):
         """directions.py POST endpoint must check max_active_directions cap — lost in PR #832."""
-        directions_path = os.path.join(os.path.dirname(__file__), "..", "app", "routers", "directions.py")
+        directions_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "routers", "directions.py"
+        )
         with open(directions_path) as f:
             content = f.read()
-        assert 'max_active_directions' in content, (
+        assert "max_active_directions" in content, (
             "'max_active_directions' cap check is missing from directions.py. "
             "Direction cap enforcement was lost in PR #832 and must not be removed again."
         )
@@ -736,6 +910,7 @@ def _load_size_limits() -> dict:
     and frontend ceilings; updated by agents via the size_breach annotation
     flow when a justified change pushes a file over its limit."""
     import json
+
     with open(_SIZE_LIMITS_JSON) as f:
         return json.load(f)
 
@@ -744,7 +919,9 @@ _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
 
 
-def _size_breach_message(rel_path: str, count: int, limit: int, module_kind: str) -> str:
+def _size_breach_message(
+    rel_path: str, count: int, limit: int, module_kind: str
+) -> str:
     """Structured assertion error directing the failing agent to the
     size_breach annotation flow.  The agent should NOT refactor in this PR
     (that's a strategic decision); they may bump the limit + emit the
@@ -777,7 +954,9 @@ class TestBackendModuleSizeGuardrails:
         path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
         with open(path) as f:
             count = len(f.readlines())
-        assert count <= max_lines, _size_breach_message(relative_path, count, max_lines, "backend")
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "backend"
+        )
 
     def test_main_py(self):
         self._check_module("main.py")
@@ -912,6 +1091,7 @@ class TestFrontendSizeGuardrails:
     @staticmethod
     def _require_admin_ui_src() -> None:
         import pytest
+
         if os.getenv("SKIP_FRONTEND_SIZE_GUARDRAILS") == "1":
             pytest.skip("SKIP_FRONTEND_SIZE_GUARDRAILS=1 set")
         if _ADMIN_UI_SRC_ROOT is None:
@@ -934,7 +1114,9 @@ class TestFrontendSizeGuardrails:
         path = _get_frontend_path(relative_path)
         with open(path) as f:
             count = len(f.readlines())
-        assert count <= max_lines, _size_breach_message(relative_path, count, max_lines, "frontend")
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "frontend"
+        )
 
     def test_useappstate(self):
         self._check_frontend("useAppState.ts")
@@ -1035,6 +1217,7 @@ class TestFrontendSizeGuardrails:
     def test_task_duration_widget(self):
         self._check_frontend("components/TaskDurationWidget.tsx")
 
+
 # ── Failure Classification Taxonomy ────────────────────────────────────────
 
 
@@ -1057,14 +1240,17 @@ class TestFailureClassificationInvariants:
             RATE_LIMIT,
             SCOPE_OVERFLOW,
         )
-        assert INFRA_CLASSES == frozenset({
-            PROVISION_FAILURE,
-            RATE_LIMIT,
-            AGENT_TIMEOUT,
-            EXTERNAL_API,
-            SCOPE_OVERFLOW,
-            BLOCKED_PRECONDITION,
-        }), (
+
+        assert INFRA_CLASSES == frozenset(
+            {
+                PROVISION_FAILURE,
+                RATE_LIMIT,
+                AGENT_TIMEOUT,
+                EXTERNAL_API,
+                SCOPE_OVERFLOW,
+                BLOCKED_PRECONDITION,
+            }
+        ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "
             "research_completion rely on this exact set to distinguish infra "
             "failures from code failures."
@@ -1081,6 +1267,7 @@ class TestFailureClassificationInvariants:
             RATE_LIMIT,
             SCOPE_OVERFLOW,
         )
+
         canonical = [
             CODE_ERROR,
             PROVISION_FAILURE,
@@ -1102,19 +1289,22 @@ class TestFailureClassificationInvariants:
 # MUST stay in sync with the bullet list under '## Required: self-review before `./done`'
 # in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE). Mirrored in backend for
 # invariant testing.
-AGENT_SELF_REVIEW_CATEGORIES = frozenset({
-    'correctness',
-    'error-handling',
-    'security',
-    'style-conventions',
-    'type-safety',
-    'documentation',
-    'performance',
-    'architecture',
-    'test-coverage',
-    'scope-drift',
-    'regression_risk',
-})
+AGENT_SELF_REVIEW_CATEGORIES = frozenset(
+    {
+        "correctness",
+        "error-handling",
+        "security",
+        "style-conventions",
+        "type-safety",
+        "documentation",
+        "performance",
+        "architecture",
+        "test-coverage",
+        "scope-drift",
+        "regression_risk",
+    }
+)
+
 
 class TestPromptVocabularyParity:
     """Cross-check that agent self-review categories and backend categorizer
@@ -1130,7 +1320,8 @@ class TestPromptVocabularyParity:
         (_REVIEW_CATEGORIES dict). Add the missing category to _REVIEW_CATEGORIES with its keyword list.
         """
         from app.playbook_learning import _REVIEW_CATEGORIES
-        _valid_categories = set(_REVIEW_CATEGORIES.keys()) | {'other'}
+
+        _valid_categories = set(_REVIEW_CATEGORIES.keys()) | {"other"}
 
         missing = AGENT_SELF_REVIEW_CATEGORIES - _valid_categories
         assert not missing, (
@@ -1146,9 +1337,9 @@ class TestPromptVocabularyParity:
 # playbook_learning._compute_edges_stats.
 
 # Required keys for each edges_considered entry in the self-review JSON.
-EDGES_CONSIDERED_REQUIRED_KEYS = frozenset({'case', 'handled'})
+EDGES_CONSIDERED_REQUIRED_KEYS = frozenset({"case", "handled"})
 # Optional keys that may appear in an edges_considered entry.
-EDGES_CONSIDERED_OPTIONAL_KEYS = frozenset({'evidence', 'blind_spot'})
+EDGES_CONSIDERED_OPTIONAL_KEYS = frozenset({"evidence", "blind_spot"})
 
 
 class TestEdgesConsideredInvariants:
@@ -1172,9 +1363,7 @@ class TestEdgesConsideredInvariants:
         from app.routers.admin_digest import _compute_edges_considered_metrics
 
         result = _compute_edges_considered_metrics([])
-        assert result is None, (
-            "_compute_edges_considered_metrics([]) must return None."
-        )
+        assert result is None, "_compute_edges_considered_metrics([]) must return None."
 
     def test_compute_edges_considered_metrics_return_shape(self):
         """_compute_edges_considered_metrics must return a dict with the
@@ -1216,7 +1405,9 @@ class TestEdgesConsideredInvariants:
 
         tasks = [
             _make_task([{"case": "empty list", "handled": True}]),
-            _make_task([{"case": "null payload", "handled": False, "blind_spot": "unchecked"}]),
+            _make_task(
+                [{"case": "null payload", "handled": False, "blind_spot": "unchecked"}]
+            ),
             _make_task([]),
         ]
         result = _compute_edges_considered_metrics(tasks)
@@ -1268,10 +1459,12 @@ class TestEdgesConsideredInvariants:
             return t
 
         tasks = [
-            _make_task([
-                {"case": "empty list", "handled": True, "origin": "author"},
-                {"case": "null payload", "handled": False, "origin": "reviewer"},
-            ]),
+            _make_task(
+                [
+                    {"case": "empty list", "handled": True, "origin": "author"},
+                    {"case": "null payload", "handled": False, "origin": "reviewer"},
+                ]
+            ),
             _make_task([{"case": "c2", "handled": True, "origin": "author"}]),
             _make_task([{"case": "c3", "handled": True, "origin": "author"}]),
         ]
@@ -1294,10 +1487,12 @@ class TestEdgesConsideredInvariants:
             return t
 
         tasks = [
-            _make_task([
-                {"case": "shared", "handled": True, "origin": "author"},
-                {"case": "shared", "handled": False, "origin": "reviewer"},
-            ]),
+            _make_task(
+                [
+                    {"case": "shared", "handled": True, "origin": "author"},
+                    {"case": "shared", "handled": False, "origin": "reviewer"},
+                ]
+            ),
             _make_task([{"case": "c2", "handled": True}]),
             _make_task([{"case": "c3", "handled": True}]),
         ]
@@ -1319,10 +1514,12 @@ class TestEdgesConsideredInvariants:
             return t
 
         tasks = [
-            _make_task([
-                {"case": "Empty List ", "handled": True, "origin": "author"},
-                {"case": "empty list", "handled": True, "origin": "reviewer"},
-            ]),
+            _make_task(
+                [
+                    {"case": "Empty List ", "handled": True, "origin": "author"},
+                    {"case": "empty list", "handled": True, "origin": "reviewer"},
+                ]
+            ),
             _make_task([{"case": "c2", "handled": True}]),
             _make_task([{"case": "c3", "handled": True}]),
         ]

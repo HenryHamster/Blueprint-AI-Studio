@@ -199,7 +199,12 @@ export function WarmVmPanel({ onViewTask }: Props) {
               {vmCount === 0 ? (
                 <div className="text-neutral-500 italic py-2">No active VMs. Cold-only operation.</div>
               ) : (
-                <div className="overflow-x-auto">
+                // The wrapper is itself a horizontal scroll region — the
+                // table intentionally exceeds it on narrow viewports so
+                // the operator can swipe through dense per-VM columns.
+                // Opt out of the global overflow gate; matches the same
+                // pattern used by ProviderCostPanel's per-provider table.
+                <div className="overflow-x-auto" data-viewport-allow-overflow>
                   <table className="w-full text-[11px] border-collapse">
                     <thead>
                       <tr className="text-neutral-500 text-[10px] uppercase tracking-wide">
