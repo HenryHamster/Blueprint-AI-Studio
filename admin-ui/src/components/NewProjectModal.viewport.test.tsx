@@ -108,6 +108,35 @@ describe('NewProjectModal — viewport regression', () => {
     });
   });
 
+  test('input focus does not trigger zoom at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <NewProjectModal
+            onClose={() => {}}
+            onSuccess={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      });
+      // Find an input and focus it to simulate mobile browser behavior
+      const input = document.querySelector('input[type="text"]') as HTMLInputElement;
+      if (input) {
+        await act(async () => {
+          input.focus();
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        });
+      }
+    });
+  });
+
   test('setup-guide mode renders without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');

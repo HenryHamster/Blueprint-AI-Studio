@@ -110,3 +110,46 @@ export function formatProjectBlindSpotSummary(
     `Focus extra scrutiny on files or patterns that match these themes.\n\n`
   );
 }
+
+// Generate the execution-evidence category instructions for injection into the agent's
+// self-review prompt. Instructs the agent to populate three sub-categories in
+// check_results — tests_executed_cleanly, lint_executed_cleanly, typecheck_executed_cleanly —
+// and to PASS only when the command was actually run on this VM with a zero exit code.
+export function formatExecutionEvidenceForSrPrompt(): string {
+  return (
+    `## Execution-evidence categories (required in check_results)\n` +
+    `You MUST populate these three sub-categories every time you write a self-review:\n\n` +
+    `- **tests_executed_cleanly** — did the test suite run on this VM and exit 0?\n` +
+    `- **lint_executed_cleanly** — did the linter / style checker run on this VM and exit 0?\n` +
+    `- **typecheck_executed_cleanly** — did the type-checker run on this VM and exit 0?\n\n` +
+    `Each entry MUST have this shape:\n` +
+    `  { "passed": <bool>, "severity": "major", "evidence": "exit_code=0 from <command>" }\n\n` +
+    `**PASS rules (both must hold):**\n` +
+    `1. You personally ran the command on this VM during this task — not in a prior session, not assumed from context.\n` +
+    `2. You captured the output and the exit code was 0.\n\n` +
+    `**FAIL rules:**\n` +
+    `- If you did NOT run the command, set passed=false, severity="major", evidence="command not run".\n` +
+    `- If the command exited non-zero, set passed=false, severity="major", evidence="exit_code=<N> from <command>".\n` +
+    `- Claiming a command passed when you have no execution log is a FAIL with severity=major.\n\n` +
+    `Do not skip these categories or mark them passed without a real exit-code record.\n\n`
+  );
+}
+
+// Format blind-spot themes for injection into the agent's own self-review prompt.
+// Unlike formatProjectBlindSpotSummary (which addresses a reviewer reading the diff),
+// this section is written TO the agent — framing themes as categories it has historically
+// missed to make the agent more skeptical of its own PASS verdicts.
+// Returns '' when themes is empty, null, or undefined.
+export function formatSrBlindSpotThemesForSrPrompt(
+  themes: Array<{ theme: string; count: number }> | null | undefined,
+): string {
+  if (!themes || themes.length === 0) return '';
+  const top = themes.slice(0, 8);
+  const rows = top.map(t => `- ${t.theme} (${t.count} task${t.count === 1 ? '' : 's'})`).join('\n');
+  return (
+    `## Your historical blind spots\n` +
+    `These are areas where your self-review has historically missed issues that a reviewer later caught. ` +
+    `Apply extra skepticism to PASS verdicts in these categories — if evidence is thin, lean toward flagging rather than clearing:\n` +
+    `${rows}\n\n`
+  );
+}

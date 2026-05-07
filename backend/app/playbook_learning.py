@@ -107,6 +107,13 @@ _IDLE_RETIRE_DAYS = 30
 _REVIEW_PLAYBOOK_REFRESH_DAYS = 30
 _REVIEW_PLAYBOOK_STALE_DAYS = 60
 
+# Execution-evidence SR check categories. These track whether the agent
+# actually ran verification commands (pytest, lint, typecheck) and got exit 0.
+# Miss rate = fraction of tasks where the agent reported passed: false.
+_EXECUTION_EVIDENCE_CATEGORIES = frozenset(
+    ["tests_executed_cleanly", "lint_executed_cleanly", "typecheck_executed_cleanly"]
+)
+
 # Regex patterns that match source-file paths embedded in playbook entry content.
 # Used to detect references to files that may have been renamed or removed.
 _FILE_PATH_RE = re.compile(
@@ -2647,6 +2654,43 @@ def _sr_skip_stats(
     return round(skipped / total, 3), dist
 
 
+def _compute_execution_evidence_miss_rates(
+    tasks: list,
+) -> dict[str, dict[str, Any]]:
+    """Aggregate miss-rates for execution-evidence SR categories.
+
+    For each task that has ``_self_review_outcome`` with ``check_results``,
+    count how many include each execution-evidence category and how many
+    reported ``passed: false``. Returns miss_rate, miss_count, sample_count
+    per category; omits categories with zero samples.
+    """
+    totals: dict[str, dict[str, int]] = {}
+    for t in tasks:
+        ctx = t.context or {}
+        check_results = (ctx.get("_self_review_outcome") or {}).get(
+            "check_results"
+        ) or {}
+        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
+            result = check_results.get(cat)
+            if result is None:
+                continue
+            if cat not in totals:
+                totals[cat] = {"sample_count": 0, "miss_count": 0}
+            totals[cat]["sample_count"] += 1
+            if not result.get("passed", True):
+                totals[cat]["miss_count"] += 1
+    out: dict[str, dict[str, Any]] = {}
+    for cat, s in totals.items():
+        if s["sample_count"] == 0:
+            continue
+        out[cat] = {
+            "miss_rate": round(s["miss_count"] / s["sample_count"], 3),
+            "miss_count": s["miss_count"],
+            "sample_count": s["sample_count"],
+        }
+    return out
+
+
 def compute_sr_catch_rate_by_direction(
     all_tasks: list,
 ) -> dict[str, dict[str, Any]]:
@@ -3152,6 +3196,10 @@ async def compute_sr_catch_rate_trends(
     by_direction = compute_sr_catch_rate_by_direction(all_tasks)
     if by_direction:
         result["by_direction"] = by_direction
+
+    exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
+    if exec_evidence:
+        result["execution_evidence_miss_rates"] = exec_evidence
 
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc

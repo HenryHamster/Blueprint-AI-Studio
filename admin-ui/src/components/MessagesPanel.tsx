@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, type EventPref } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, type EventPref, groupRoutineMessages } from './MessagesPanel.utils';
 
 interface ProjectMessage {
   id: string;
@@ -207,9 +207,12 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
   const [showResolved, setShowResolved] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).showResolved);
   // Routine ops group collapsed by default
   const [routineExpanded, setRoutineExpanded] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).routineExpanded);
+  // Track which grouped-chip event_type keys are expanded
+  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(new Set());
   // Per-event-type mute/surface preferences
   const [eventPrefs, setEventPrefs] = useState<Record<string, EventPref>>(loadEventPrefs);
   const [showPrefsPanel, setShowPrefsPanel] = useState(false);
+  const [sortMode, setSortMode] = useState<'importance' | 'recent'>('importance');
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
@@ -233,13 +236,29 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     return ta - tb;
   };
 
+  const byTimeDesc = (a: ProjectMessage, b: ProjectMessage) => -byTime(a, b);
+
+  const SEVERITY_RANK: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
+  const bySeverity = (a: ProjectMessage, b: ProjectMessage) => {
+    const ra = SEVERITY_RANK[a.message_type] ?? 3;
+    const rb = SEVERITY_RANK[b.message_type] ?? 3;
+    if (ra !== rb) return ra - rb;
+    return byTimeDesc(a, b);
+  };
+
   const openMessages = messages.filter(m => m.status === 'open');
   const resolvedMessages = messages.filter(m => m.status === 'resolved');
   const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK');
 
   // Split open messages by signal level, respecting per-event-type prefs
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high')].sort(byTime);
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine')].sort(byTime);
+  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'high')]
+    .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
+  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs) === 'routine')]
+    .sort(byTimeDesc);
+
+  // In importance mode, pin BLOCKERs at the top with a visual divider
+  const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
+  const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
 
   const allEventTypes = [...new Set([
     ...Object.keys(eventPrefs),
@@ -504,7 +523,22 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
     if (count > 0) addToast(`${count} direction${count > 1 ? 's' : ''} created`, 'success');
   }
 
-  function renderBubble(msg: ProjectMessage, faded = false) {
+  async function handleResolveGroup(msgs: ProjectMessage[]) {
+    try {
+      for (const m of msgs) {
+        await apiFetch(`${API_BASE_URL}/api/admin/messages/${m.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution: '' }),
+        });
+      }
+      await fetchMessages();
+    } catch {
+      addToast('Failed to resolve messages', 'error');
+    }
+  }
+
+  function renderBubble(msg: ProjectMessage, faded = false, readOnly = false) {
     const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
     const Icon = config.icon;
     const userMsg = isUserMessage(msg);
@@ -547,13 +581,13 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
             </div>
           )}
 
-          {/* Action buttons (open messages only, not faded) */}
-          {!faded && msg.status === 'open' && (
+          {/* Action buttons (open messages only, not faded, not read-only grouped rows) */}
+          {!faded && !readOnly && msg.status === 'open' && (
             <div className={`flex items-center gap-1 mt-1 ${userMsg ? 'self-end mr-1' : 'self-start ml-1'}`}>
               {selectMode && msg.message_type === 'FEEDBACK' && (
                 <button
                   onClick={() => toggleSelect(msg.id)}
-                  className={`p-1.5 rounded transition-colors ${
+                  className={`p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${
                     selectedIds.has(msg.id) ? 'text-purple-400 bg-purple-500/20' : 'text-neutral-600 hover:text-neutral-400'
                   }`}
                 >
@@ -566,7 +600,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   textareaRef.current?.focus();
                 }}
                 title="Reply"
-                className="text-neutral-600 hover:text-blue-400 p-1.5 rounded transition-colors"
+                className="text-neutral-600 hover:text-blue-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 <Reply className="w-3.5 h-3.5" />
               </button>
@@ -575,7 +609,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                   onClick={() => handleCreateDirection(msg)}
                   disabled={creatingDirectionIds.has(msg.id)}
                   title="Create Direction"
-                  className="text-purple-500/70 hover:text-purple-400 p-1.5 rounded transition-colors disabled:opacity-30"
+                  className="text-purple-500/70 hover:text-purple-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                 >
                   <PlusCircle className="w-3.5 h-3.5" />
                 </button>
@@ -584,7 +618,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 <button
                   onClick={() => { setResolvingId(msg.id); setResolveInput(''); }}
                   title="Resolve"
-                  className="text-emerald-500/70 hover:text-emerald-400 p-1.5 rounded transition-colors"
+                  className="text-emerald-500/70 hover:text-emerald-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                 >
                   <Check className="w-3.5 h-3.5" />
                 </button>
@@ -619,7 +653,7 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 onClick={() => handleDelete(msg.id)}
                 disabled={deletingIds.has(msg.id)}
                 title="Delete"
-                className="text-neutral-600 hover:text-red-400 p-1.5 rounded transition-colors disabled:opacity-30"
+                className="text-neutral-600 hover:text-red-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
@@ -654,6 +688,13 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           )}
         </div>
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
+            title="Toggle sort order"
+            className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[36px]"
+          >
+            {sortMode === 'importance' ? 'Importance' : 'Recent'}
+          </button>
           {openFeedbackMessages.length > 1 && (
             <button
               onClick={() => {
@@ -724,8 +765,19 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
           </div>
         ) : (
           <>
-            {/* High-signal open messages */}
-            {highSignalOpen.map(msg => renderBubble(msg))}
+            {/* Pinned BLOCKERs (importance mode only) */}
+            {pinnedBlockers.length > 0 && (
+              <>
+                <div className="flex items-center gap-1.5 text-[11px] text-amber-400/70 font-semibold uppercase tracking-wide px-1">
+                  <AlertTriangle className="w-3 h-3" />
+                  <span>Pinned · Blockers</span>
+                </div>
+                {pinnedBlockers.map(msg => renderBubble(msg))}
+                {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
+              </>
+            )}
+            {/* Other high-signal open messages */}
+            {otherHighSignal.map(msg => renderBubble(msg))}
 
             {/* Routine ops group — collapsed by default */}
             {routineOpen.length > 0 && (
@@ -740,7 +792,39 @@ export function MessagesPanel({ selectedProjectId, onClose, addToast, onMessageC
                 </button>
                 {routineExpanded && (
                   <div className="space-y-3 p-3 border-t border-neutral-800/40">
-                    {routineOpen.map(msg => renderBubble(msg))}
+                    {groupRoutineMessages(routineOpen).map(row => {
+                      if (row.kind === 'single') return renderBubble(row.msg);
+                      const isGroupExpanded = expandedGroupKeys.has(row.key);
+                      return (
+                        <div key={row.key} className="border border-neutral-800/40 rounded-xl overflow-hidden">
+                          <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
+                            <button
+                              onClick={() => setExpandedGroupKeys(prev => {
+                                const next = new Set(prev);
+                                if (next.has(row.key)) next.delete(row.key); else next.add(row.key);
+                                return next;
+                              })}
+                              className="flex-1 flex items-center gap-2 text-left"
+                            >
+                              <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
+                              <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}</span>
+                            </button>
+                            <button
+                              onClick={() => handleResolveGroup(row.msgs)}
+                              title="Resolve all"
+                              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                          </div>
+                          {isGroupExpanded && (
+                            <div className="space-y-2 p-2 border-t border-neutral-800/40">
+                              {row.msgs.map(msg => renderBubble(msg, false, true))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

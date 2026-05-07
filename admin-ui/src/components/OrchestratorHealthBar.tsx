@@ -169,9 +169,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const autonomousFailures = detailedHealth?.autonomous.consecutive_failures ?? 0;
 
   return (
-    <div className={`h-7 flex items-center justify-between px-3 bg-neutral-900 border border-neutral-800 rounded-lg text-xs mb-3 shrink-0${apiHealthy ? '' : ' bg-red-950/20'}`}>
+    <div className={`min-h-7 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-1 bg-neutral-900 border border-neutral-800 rounded-lg text-xs mb-3 shrink-0${apiHealthy ? '' : ' bg-red-950/20'}`}>
       {/* Left: API + WS status */}
-      <div className="flex items-center gap-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
         <div className="flex items-center gap-1.5" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
           <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
           <span className={apiHealthy ? 'text-neutral-400' : 'text-red-400'}>
@@ -187,7 +187,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
       </div>
 
       {/* Center: Orchestrator cycle + task counts + deps + detailed health */}
-      <div className="flex items-center gap-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
         {health && (
           <>
             <div
@@ -424,9 +424,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {pipelineThrottle && (
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
-            <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-900/40 text-amber-400 text-xs rounded">
+            <span className="inline-flex max-w-full min-w-0 items-center gap-1 px-2 py-0.5 bg-amber-900/40 text-amber-400 text-xs rounded">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-              Throttled: {pipelineThrottle.detail}
+              <span className="min-w-0 truncate">Throttled: {pipelineThrottle.detail}</span>
               {pipelineThrottle.recovery_seconds != null && ` (~${pipelineThrottle.recovery_seconds}s)`}
             </span>
           </>

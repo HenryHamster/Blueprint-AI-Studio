@@ -285,7 +285,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                         value={repoFilter}
                         onChange={e => setRepoFilter(e.target.value)}
                         placeholder="Filter repositories…"
-                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg pl-8 pr-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg pl-8 pr-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
                       />
                     </div>
                     <div className="max-h-48 overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950 mb-1">
@@ -339,7 +339,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                       onChange={e => { setRepoInput(e.target.value); setRepoError(''); }}
                       onKeyDown={e => e.key === 'Enter' && handleRepoNext()}
                       placeholder="owner/repo or https://github.com/owner/repo"
-                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${
+                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${
                         repoError ? 'border-red-500' : 'border-neutral-800'
                       }`}
                     />
@@ -374,7 +374,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   value={projectName}
                   onChange={e => setProjectName(e.target.value)}
                   placeholder={parsed ? `${parsed.owner}/${parsed.repo}` : 'Defaults to owner/repo'}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
                 />
               </div>
 

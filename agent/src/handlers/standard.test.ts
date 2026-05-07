@@ -313,6 +313,31 @@ describe('handleRefactor configuration', () => {
   });
 });
 
+// ── Execution-evidence SR categories ─────────────────────────────────────────
+describe('execution-evidence SR categories in prompt', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('includes execution-evidence category instructions in handleCreate prompt', async () => {
+    const task = { title: 'Task', description: '' };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('tests_executed_cleanly');
+    expect(prompt).toContain('lint_executed_cleanly');
+    expect(prompt).toContain('typecheck_executed_cleanly');
+  });
+
+  it('includes execution-evidence category instructions in handleRefactor prompt', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('tests_executed_cleanly');
+    expect(prompt).toContain('lint_executed_cleanly');
+    expect(prompt).toContain('typecheck_executed_cleanly');
+  });
+});
+
 // ── Module interface extraction (scope-conditional) ───────────────────────────
 describe('module interface extraction', () => {
   beforeEach(() => {

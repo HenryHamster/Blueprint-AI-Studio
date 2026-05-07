@@ -18,6 +18,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 import { runCodeChangeTask } from './code-change.js';
+import { formatExecutionEvidenceForSrPrompt } from '../prompts/self-review.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -533,7 +534,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const executionEvidenceSection = formatExecutionEvidenceForSrPrompt();
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);

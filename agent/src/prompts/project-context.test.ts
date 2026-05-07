@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatProjectContext } from './project-context.js';
+import { formatProjectContext, formatSrCatchRateForSrPrompt } from './project-context.js';
 
 describe('formatProjectContext — Self-Review False-Positive Calibration', () => {
   it('renders the FP calibration block when a category exceeds the FP threshold and has adequate sample size', () => {
@@ -112,7 +112,7 @@ describe('formatProjectContext — Self-Review False-Positive Calibration', () =
     expect(result).not.toContain('**security**: flagged');
   });
 
-  it('caps the FP calibration block to top-5 categories by FP rate', () => {
+  it('caps the FP calibration block to top-5 categories by FP rate (regression check)', () => {
     const cats: Record<string, { miss_rate: number; false_positive_rate: number; sr_flag_sample_size: number }> = {};
     for (let i = 0; i < 8; i++) {
       cats[`cat-${i}`] = {
@@ -129,5 +129,57 @@ describe('formatProjectContext — Self-Review False-Positive Calibration', () =
     expect(result).not.toContain('**cat-0**');
     expect(result).not.toContain('**cat-1**');
     expect(result).not.toContain('**cat-2**');
+  });
+});
+
+describe('formatSrCatchRateForSrPrompt', () => {
+  it('renders miss-rate categories with percentages', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          correctness: { miss_rate: 0.35 },
+          security: { miss_rate: 0.20 },
+        },
+      },
+    };
+    const result = formatSrCatchRateForSrPrompt(ctx);
+    expect(result).toContain('Categories you historically miss');
+    expect(result).toContain('correctness: miss rate 35%');
+    expect(result).toContain('security: miss rate 20%');
+    expect(result).toContain('extra skepticism');
+  });
+
+  it('includes trend delta when previous and current hit rates are present', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'error-handling': {
+            miss_rate: 0.40,
+            previous_hit_rate: 0.75, // prev miss 25%
+            current_hit_rate: 0.60,  // curr miss 40% → +15pp
+          },
+        },
+      },
+    };
+    const result = formatSrCatchRateForSrPrompt(ctx);
+    expect(result).toContain('+15pp vs last cycle');
+  });
+
+  it('uses for_task_type when present and tags scope note', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: { correctness: { miss_rate: 0.10 } },
+        for_task_type: { 'type-safety': { miss_rate: 0.45 } },
+      },
+    };
+    const result = formatSrCatchRateForSrPrompt(ctx, 'create');
+    expect(result).toContain('type-safety');
+    expect(result).toContain('(create tasks)');
+    expect(result).not.toContain('correctness');
+  });
+
+  it('returns empty string when no catch-rate data is present', () => {
+    expect(formatSrCatchRateForSrPrompt({})).toBe('');
+    expect(formatSrCatchRateForSrPrompt({ self_review_catch_rate: null })).toBe('');
   });
 });

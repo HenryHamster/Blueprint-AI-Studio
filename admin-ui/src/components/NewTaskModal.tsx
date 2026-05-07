@@ -155,7 +155,7 @@ export function NewTaskModal({
                     required
                     value={newTaskRepo}
                     onChange={e => onRepoChange(e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="owner/repo"
                   />
                   {repoError && <p className="text-[10px] text-amber-500 mt-1">{repoError}</p>}
@@ -165,7 +165,7 @@ export function NewTaskModal({
                   required
                   value={newTaskRepo}
                   onChange={e => onRepoChange(e.target.value)}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && repoError ? 'border-red-500' : 'border-neutral-800'}`}
                 >
                   <option value="" disabled>Select a repository</option>
                   {repoOptions.map(r => (
@@ -197,7 +197,7 @@ export function NewTaskModal({
                     type="text"
                     value={newTaskBranch}
                     onChange={e => setNewTaskBranch(e.target.value)}
-                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
                     placeholder="main"
                   />
                   {branchError && <p className="text-[10px] text-amber-500 mt-1">{branchError}</p>}
@@ -206,7 +206,7 @@ export function NewTaskModal({
                 <select
                   value={newTaskBranch}
                   onChange={e => setNewTaskBranch(e.target.value)}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all font-mono appearance-none cursor-pointer ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
                 >
                   {branchOptions.map(b => (
                     <option key={b} value={b}>{b}</option>
@@ -252,7 +252,7 @@ export function NewTaskModal({
                   value={newTaskPrNumber}
                   onChange={e => { setNewTaskPrNumber(e.target.value); if (prNumberError) setPrNumberError(false); }}
                   onBlur={() => setPrNumberError(!isPrNumberValid(newTaskPrNumber))}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${prNumberError ? 'border-red-500' : 'border-neutral-800'}`}
+                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${prNumberError ? 'border-red-500' : 'border-neutral-800'}`}
                   placeholder="e.g., 15"
                 />
                 {prNumberError && <p className="text-[10px] text-red-500 mt-1">PR number must be a positive integer.</p>}
@@ -263,7 +263,7 @@ export function NewTaskModal({
                   type="text"
                   value={newTaskPrBranch}
                   onChange={e => setNewTaskPrBranch(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
                   placeholder="e.g., blueprint/task-abc123"
                 />
               </div>
@@ -277,7 +277,7 @@ export function NewTaskModal({
               autoFocus
               value={newTaskTitle}
               onChange={e => setNewTaskTitle(e.target.value)}
-              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
               placeholder="e.g., Add user authentication"
             />
           </div>
@@ -288,7 +288,7 @@ export function NewTaskModal({
                 required
                 value={newTaskPrompt}
                 onChange={e => setNewTaskPrompt(e.target.value)}
-                className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"
+                className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[160px] max-h-[400px] transition-all placeholder:text-neutral-600"
                 placeholder="Describe what Claude Code should do in this repository. Be specific about files, patterns, and expected outcomes..."
               />
               <span className="text-[10px] text-neutral-600 absolute bottom-2 right-2 pointer-events-none">{newTaskPrompt.length} chars</span>
@@ -310,7 +310,7 @@ export function NewTaskModal({
                   <select
                     value={newTaskModel}
                     onChange={e => setNewTaskModel(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
                   >
                     <option value="">Default</option>
                     <option value="claude-opus-4-7">claude-opus-4-7</option>
@@ -321,7 +321,7 @@ export function NewTaskModal({
                   <select
                     value={newTaskEffort}
                     onChange={e => setNewTaskEffort(e.target.value)}
-                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
                   >
                     <option value="">Default</option>
                     <option value="low">low</option>

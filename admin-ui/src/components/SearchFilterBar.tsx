@@ -211,7 +211,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           value={inputValue}
           onChange={e => setInputValue(e.target.value)}
           placeholder="Search by title, ID, or status..."
-          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg pl-9 pr-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:ring-1 focus:ring-neutral-700 w-64 outline-none"
+          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg pl-9 pr-3 py-2 text-base md:text-sm text-neutral-100 placeholder-neutral-600 focus:ring-1 focus:ring-neutral-700 w-64 outline-none"
         />
       </div>
 

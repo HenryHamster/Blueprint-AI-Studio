@@ -52,6 +52,31 @@ export function classifySignalLevel(msg: {
   return 'routine';
 }
 
+export type RoutineRow<T> =
+  | { kind: 'single'; msg: T }
+  | { kind: 'group'; key: string; event_type: string; label: string; msgs: T[] };
+
+export function groupRoutineMessages<T extends { id: string; context: Record<string, unknown> }>(
+  msgs: T[],
+): RoutineRow<T>[] {
+  const rows: RoutineRow<T>[] = [];
+  let i = 0;
+  while (i < msgs.length) {
+    const et = msgs[i].context.event_type as string | undefined;
+    let j = i + 1;
+    while (j < msgs.length && (msgs[j].context.event_type as string | undefined) === et) j++;
+    const run = msgs.slice(i, j);
+    if (run.length >= 3 && et) {
+      const label = ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ');
+      rows.push({ kind: 'group', key: run[0].id, event_type: et, label, msgs: run });
+    } else {
+      run.forEach(m => rows.push({ kind: 'single', msg: m }));
+    }
+    i = j;
+  }
+  return rows;
+}
+
 export function routineSummary(msgs: { message_type: string; context: Record<string, unknown> }[]): string {
   const counts: Record<string, number> = {};
   for (const m of msgs) {

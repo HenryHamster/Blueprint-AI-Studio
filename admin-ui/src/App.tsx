@@ -19,6 +19,7 @@ import { AlertsBanner } from './components/AlertsBanner';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
+import { TaskLaunchFAB } from './components/TaskLaunchFAB';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
@@ -943,6 +944,11 @@ export default function App() {
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
+
+      <TaskLaunchFAB
+        onClick={s.openNewTaskModal}
+        visible={!s.showNewTaskModal && !s.logTask && !showNewProjectModal && !s.showMessages}
+      />
 
       {s.confirmDialog && (
         <ConfirmDialog

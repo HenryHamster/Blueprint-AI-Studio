@@ -72,4 +72,35 @@ describe('TaskDetailDrawer — viewport regression', () => {
       });
     });
   });
+
+  test('header buttons meet 44px touch target at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask()}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+      const buttons = document.querySelectorAll('[title="Fullscreen (f)"], [title*="Exit fullscreen"]') as NodeListOf<HTMLElement>;
+      buttons.forEach(btn => {
+        const rect = btn.getBoundingClientRect();
+        if (rect.height < 44 || rect.width < 44) {
+          throw new Error(`Header button ${btn.title} too small: ${rect.width}x${rect.height}px (need >=44px)`);
+        }
+      });
+    });
+  });
 });

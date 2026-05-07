@@ -201,7 +201,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
               })()}
               <button
                 onClick={() => onDismiss(alert.id)}
-                className="shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+                className="shrink-0 opacity-60 hover:opacity-100 transition-opacity p-2.5 md:p-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                 title="Dismiss"
               >
                 <X className="w-4 h-4" />

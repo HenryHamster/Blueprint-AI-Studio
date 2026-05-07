@@ -3487,3 +3487,105 @@ async def test_fix_completion_preserves_agent_stamped_fix_iteration(tl_db, mocke
     await session.refresh(task)
     sro = (task.context or {}).get("_self_review_outcome") or {}
     assert sro.get("fix_iteration") == 3  # agent stamp wins, not overwritten by backend
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Auto-merge failure → mergeable_state='dirty' → fix task gets a prompt
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
+    """When auto-merge fails and mergeable_state='dirty', the spawned fix task
+    must carry a non-empty fix_prompt with rebase guidance.
+
+    Regression guard for the bug where spawn_kwargs lacked 'fix_prompt',
+    causing the agent to throw 'Fatal error: Fix task missing prompt'.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    captured_kwargs: list[dict] = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "fix"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    # Merge fails
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge conflict"},
+    )
+    # GitHub reports mergeable_state='dirty'
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": "dirty",
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    # intermediate branch so is_intermediate=True and the auto-merge path fires
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature X",
+            "base_branch": "research/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    fix_spawns = [
+        kw for kw in captured_kwargs if kw.get("fix_reason") == "merge_conflict"
+    ]
+    assert fix_spawns, "Expected a merge_conflict fix task to be spawned"
+    fix_kw = fix_spawns[0]
+    fix_prompt = fix_kw.get("fix_prompt", "")
+    assert fix_prompt, (
+        "fix_prompt must be non-empty (was missing, causing Fatal error in agent)"
+    )
+    assert "rebase" in fix_prompt.lower(), "fix_prompt must contain rebase guidance"
+    assert "77" in fix_prompt, "fix_prompt must reference the PR number"
+    assert "research/cycle-1" in fix_prompt, "fix_prompt must reference the base branch"

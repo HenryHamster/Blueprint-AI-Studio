@@ -33,7 +33,7 @@ export function SettingsAdvancedSection({ healthCheckUrlsInput, onHealthCheckUrl
           onChange={e => onHealthCheckUrlsChange(e.target.value)}
           placeholder="https://example.com/health"
           rows={4}
-          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-y"
+          className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600 resize-y"
         />
         <button
           onClick={() => onUpdateHealthCheckUrls(healthCheckUrlsInput.split('\n').filter(Boolean))}

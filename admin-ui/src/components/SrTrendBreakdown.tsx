@@ -78,6 +78,12 @@ export interface SrTrendData {
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
 
+const EXECUTION_EVIDENCE_CATS = [
+  'tests_executed_cleanly',
+  'lint_executed_cleanly',
+  'typecheck_executed_cleanly',
+] as const;
+
 function trendPriority(t: SrCategoryTrend['trend']): number {
   if (t === 'decreasing') return 0;
   if (t === 'stable') return 1;
@@ -886,11 +892,29 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick }: SrTrendBr
         {trends?.by_severity && Object.keys(trends.by_severity).length > 0 && (
           <SeveritySection bySeverity={trends.by_severity} />
         )}
-        <div className="flex flex-col gap-0.5">
-          {entries.map(([cat, c]) => (
-            <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
-          ))}
-        </div>
+        {(() => {
+          const execEntries = entries.filter(([cat]) => (EXECUTION_EVIDENCE_CATS as readonly string[]).includes(cat));
+          const regularEntries = entries.filter(([cat]) => !(EXECUTION_EVIDENCE_CATS as readonly string[]).includes(cat));
+          return (
+            <>
+              <div className="flex flex-col gap-0.5">
+                {regularEntries.map(([cat, c]) => (
+                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+                ))}
+              </div>
+              {execEntries.length > 0 && (
+                <div className="mt-1.5 pt-1.5 border-t border-neutral-800/60" data-testid="execution-evidence-section">
+                  <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Execution Evidence</p>
+                  <div className="flex flex-col gap-0.5">
+                    {execEntries.map(([cat, c]) => (
+                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          );
+        })()}
         {trends?.by_task_type && Object.keys(trends.by_task_type).length > 0 && (
           <ByTaskTypeSection byTaskType={trends.by_task_type} />
         )}

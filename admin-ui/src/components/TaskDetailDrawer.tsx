@@ -197,13 +197,13 @@ export function TaskDetailDrawer({
               <button
                 onClick={() => setIsFullscreen(prev => !prev)}
                 title={isFullscreen ? 'Exit fullscreen (f)' : 'Fullscreen (f)'}
-                className="p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors"
+                className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
               </button>
               <button
                 onClick={onClose}
-                className="p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors"
+                className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -241,7 +241,7 @@ export function TaskDetailDrawer({
               <button
                 onClick={() => setShowLineNumbers(v => !v)}
                 title="Toggle line numbers"
-                className={`p-1.5 rounded transition-colors ${
+                className={`p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${
                   showLineNumbers
                     ? 'text-blue-400 bg-blue-500/10'
                     : 'text-neutral-500 hover:text-neutral-300'
@@ -253,7 +253,7 @@ export function TaskDetailDrawer({
                 onClick={handleCopyLogs}
                 disabled={logLines.length === 0}
                 title="Copy logs"
-                className="p-1.5 rounded transition-colors text-neutral-500 hover:text-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed"
+                className="p-2.5 md:p-1.5 rounded transition-colors text-neutral-500 hover:text-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 {copiedLogs ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
               </button>
@@ -261,7 +261,7 @@ export function TaskDetailDrawer({
                 onClick={handleDownloadLogs}
                 disabled={logLines.length === 0}
                 title="Download logs"
-                className="p-1.5 rounded transition-colors text-neutral-500 hover:text-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed"
+                className="p-2.5 md:p-1.5 rounded transition-colors text-neutral-500 hover:text-neutral-300 disabled:text-neutral-700 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
               >
                 <Download className="w-3.5 h-3.5" />
               </button>

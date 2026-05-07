@@ -127,7 +127,7 @@ export function SettingsNotificationsSection({
                 const v = parseFloat(e.target.value);
                 onUpdateDailyCostCeiling(isNaN(v) || v <= 0 ? 0 : v);
               }}
-              className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
             <p className="text-[11px] text-neutral-600 mt-1">
               {dailyCostCeilingUsd === 0 ? 'No ceiling — pipeline runs without a daily cost limit.' : `Pipeline will alert and pause autonomous tasks if daily cost exceeds $${dailyCostCeilingUsd}.`}
@@ -151,7 +151,7 @@ export function SettingsNotificationsSection({
               onChange={e => setUrlDraft(e.target.value)}
               onBlur={handleUrlBlur}
               placeholder="https://hooks.slack.com/services/..."
-              className={`w-full bg-neutral-950 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 ${
+              className={`w-full bg-neutral-950 border rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 ${
                 !urlIsValid ? 'border-red-600 text-red-400' : 'border-neutral-700 text-neutral-100'
               }`}
             />
@@ -211,7 +211,7 @@ export function SettingsNotificationsSection({
               const v = parseInt(e.target.value);
               if (!isNaN(v) && v >= 0 && v <= 3600) onUpdateThrottleSeconds(v);
             }}
-            className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            className="w-32 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
           />
         ) : (
           <div className="bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-400 w-32 font-mono">

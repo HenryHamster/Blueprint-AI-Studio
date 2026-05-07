@@ -181,7 +181,7 @@ export function ProjectBuildConfigSection({
                       value={dir.path}
                       onChange={e => updateDir(i, 'path', e.target.value)}
                       placeholder="backend/"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>
                   <div className="flex-1">
@@ -191,7 +191,7 @@ export function ProjectBuildConfigSection({
                       value={dir.type}
                       onChange={e => updateDir(i, 'type', e.target.value)}
                       placeholder="python"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>
                   <button
@@ -210,7 +210,7 @@ export function ProjectBuildConfigSection({
                       value={dir.lint_cmd ?? ''}
                       onChange={e => updateDir(i, 'lint_cmd', e.target.value)}
                       placeholder="ruff check ."
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>
                   <div>
@@ -220,7 +220,7 @@ export function ProjectBuildConfigSection({
                       value={dir.test_cmd ?? ''}
                       onChange={e => updateDir(i, 'test_cmd', e.target.value)}
                       placeholder="pytest"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>
                   <div>
@@ -230,7 +230,7 @@ export function ProjectBuildConfigSection({
                       value={dir.build_cmd ?? ''}
                       onChange={e => updateDir(i, 'build_cmd', e.target.value)}
                       placeholder="npm run build"
-                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                      className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>
                 </div>
@@ -262,7 +262,7 @@ export function ProjectBuildConfigSection({
                 value={gitEmail}
                 onChange={e => setGitEmail(e.target.value)}
                 placeholder="blueprint-agent@automated.dev"
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
             </div>
             <div>
@@ -272,7 +272,7 @@ export function ProjectBuildConfigSection({
                 value={gitName}
                 onChange={e => setGitName(e.target.value)}
                 placeholder="Blueprint Agent"
-                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
               />
             </div>
           </div>

@@ -480,6 +480,50 @@ describe('EdgesTrendBreakdown', () => {
   });
 });
 
+describe('SrTrendBreakdown execution-evidence categories', () => {
+  it('renders execution-evidence section when any of the three categories are present', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.2, trend: 'stable' },
+        tests_executed_cleanly: { miss_rate: 0.15, trend: 'stable' },
+        lint_executed_cleanly: { miss_rate: 0.05, trend: 'increasing' },
+        typecheck_executed_cleanly: { miss_rate: 0.1, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('execution-evidence-section')).toBeInTheDocument();
+    expect(screen.getByText('Execution Evidence')).toBeInTheDocument();
+    expect(screen.getByText('tests_executed_cleanly')).toBeInTheDocument();
+    expect(screen.getByText('lint_executed_cleanly')).toBeInTheDocument();
+    expect(screen.getByText('typecheck_executed_cleanly')).toBeInTheDocument();
+  });
+
+  it('does not render execution-evidence section when none of the three categories are present', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.2, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('execution-evidence-section')).not.toBeInTheDocument();
+  });
+
+  it('execution-evidence categories are separated from regular categories in the card', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.2, trend: 'stable' },
+        tests_executed_cleanly: { miss_rate: 0.15, trend: 'stable' },
+      },
+    };
+    const { container } = render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const execSection = container.querySelector('[data-testid="execution-evidence-section"]');
+    expect(execSection).not.toBeNull();
+    // correctness should NOT be inside the execution-evidence section
+    expect(execSection?.textContent).not.toContain('correctness');
+    expect(execSection?.textContent).toContain('tests_executed_cleanly');
+  });
+});
+
 describe('SrScopeDriftVsExpansionCard', () => {
   it('renders nothing when data is null', () => {
     const { container } = render(<SrScopeDriftVsExpansionCard data={null} />);

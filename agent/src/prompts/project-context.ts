@@ -2,6 +2,58 @@ import { strVal } from '../prompt.js';
 import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
 import { formatProjectBlindSpotSummary } from './self-review.js';
 
+type SRCatData = {
+  miss_rate: number;
+  weighted_miss_rate?: number;
+  previous_hit_rate?: number;
+  current_hit_rate?: number;
+};
+
+// Format per-category SR miss-rate trends for injection into the agent's own
+// self-review prompt. Gives the SR agent awareness of categories it historically
+// misses so it applies extra skepticism to its own PASS verdicts.
+// Returns '' when no actionable catch-rate data is present.
+export function formatSrCatchRateForSrPrompt(
+  ctx: Record<string, unknown>,
+  taskType = '',
+): string {
+  const srCatchRate = ctx.self_review_catch_rate as {
+    categories?: Record<string, SRCatData>;
+    for_task_type?: Record<string, SRCatData>;
+  } | null | undefined;
+
+  const forTaskType = srCatchRate?.for_task_type;
+  const srSource = (forTaskType && Object.keys(forTaskType).length > 0) ? forTaskType : srCatchRate?.categories;
+  const srIsTypeFiltered = srSource === forTaskType && !!forTaskType;
+
+  if (!srSource || Object.keys(srSource).length === 0) return '';
+
+  const qualifying = Object.entries(srSource)
+    .filter(([, d]) => typeof d.miss_rate === 'number' && d.miss_rate > 0)
+    .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate) - (a[1].weighted_miss_rate ?? a[1].miss_rate))
+    .slice(0, 5);
+
+  if (qualifying.length === 0) return '';
+
+  const scopeNote = srIsTypeFiltered && taskType ? ` (${taskType} tasks)` : '';
+  const catLines = qualifying.map(([cat, d]) => {
+    const pct = Math.round(d.miss_rate * 100);
+    let trend = '';
+    if (typeof d.previous_hit_rate === 'number' && typeof d.current_hit_rate === 'number') {
+      const prevMiss = Math.round((1 - d.previous_hit_rate) * 100);
+      const currMiss = Math.round((1 - d.current_hit_rate) * 100);
+      const delta = currMiss - prevMiss;
+      trend = `, ${delta > 0 ? '+' : ''}${delta}pp vs last cycle`;
+    }
+    return `- ${cat}: miss rate ${pct}%${trend}`;
+  });
+
+  return (
+    `**Categories you historically miss${scopeNote}** — apply extra skepticism to PASS verdicts:\n` +
+    catLines.join('\n') + '\n\n'
+  );
+}
+
 function parseResearchSummary(raw: string): string {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;

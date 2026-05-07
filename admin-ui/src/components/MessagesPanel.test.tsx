@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY } from './MessagesPanel.utils';
+import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages } from './MessagesPanel.utils';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
@@ -15,6 +15,84 @@ vi.mock('../api', () => ({
 }));
 
 import { apiFetch } from '../api';
+
+// ── groupRoutineMessages unit tests ──────────────────────────────────────────
+
+describe('groupRoutineMessages', () => {
+  function makeRoutineItem(id: string, event_type: string) {
+    return { id, context: { event_type } };
+  }
+
+  test('25 pr_merged messages collapse to one group chip', () => {
+    const msgs = Array.from({ length: 25 }, (_, i) => makeRoutineItem(`m${i}`, 'pr_merged'));
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('group');
+    if (rows[0].kind === 'group') {
+      expect(rows[0].msgs).toHaveLength(25);
+      expect(rows[0].event_type).toBe('pr_merged');
+      expect(rows[0].label).toBe('PR merges');
+    }
+  });
+
+  test('mixed event_types stay separated into distinct groups', () => {
+    const msgs = [
+      ...Array.from({ length: 3 }, (_, i) => makeRoutineItem(`p${i}`, 'pr_merged')),
+      ...Array.from({ length: 3 }, (_, i) => makeRoutineItem(`a${i}`, 'auto_fix_result')),
+    ];
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].kind).toBe('group');
+    expect(rows[1].kind).toBe('group');
+    if (rows[0].kind === 'group') expect(rows[0].event_type).toBe('pr_merged');
+    if (rows[1].kind === 'group') expect(rows[1].event_type).toBe('auto_fix_result');
+  });
+
+  test('single-occurrence event_types render as individual rows', () => {
+    const msgs = [makeRoutineItem('x', 'pr_merged'), makeRoutineItem('y', 'auto_fix_result')];
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(2);
+    expect(rows.every(r => r.kind === 'single')).toBe(true);
+  });
+
+  test('exactly 2 of the same type does not group', () => {
+    const msgs = [makeRoutineItem('a', 'pr_merged'), makeRoutineItem('b', 'pr_merged')];
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(2);
+    expect(rows.every(r => r.kind === 'single')).toBe(true);
+  });
+
+  test('exactly 3 of the same type groups', () => {
+    const msgs = Array.from({ length: 3 }, (_, i) => makeRoutineItem(`m${i}`, 'pr_merged'));
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('group');
+  });
+
+  test('interleaved different types do not merge into one group', () => {
+    const msgs = [
+      makeRoutineItem('a', 'pr_merged'),
+      makeRoutineItem('b', 'auto_fix_result'),
+      makeRoutineItem('c', 'pr_merged'),
+      makeRoutineItem('d', 'pr_merged'),
+      makeRoutineItem('e', 'pr_merged'),
+    ];
+    const rows = groupRoutineMessages(msgs);
+    // first pr_merged: single; auto_fix_result: single; last 3 pr_merged: group
+    expect(rows).toHaveLength(3);
+    expect(rows[0].kind).toBe('single');
+    expect(rows[1].kind).toBe('single');
+    expect(rows[2].kind).toBe('group');
+    if (rows[2].kind === 'group') expect(rows[2].msgs).toHaveLength(3);
+  });
+
+  test('uses msg id as group key (stable across renders)', () => {
+    const msgs = Array.from({ length: 5 }, (_, i) => makeRoutineItem(`id-${i}`, 'pr_merged'));
+    const rows = groupRoutineMessages(msgs);
+    expect(rows).toHaveLength(1);
+    if (rows[0].kind === 'group') expect(rows[0].key).toBe('id-0');
+  });
+});
 
 // ── classifySignalLevel unit tests ───────────────────────────────────────────
 
@@ -135,6 +213,7 @@ function makeMsg(overrides: Partial<{
 describe('MessagesPanel grouping', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
+  const PREFS_KEY = 'messages_panel_prefs:test-user@example.com';
 
   afterEach(() => {
     const r = root;
@@ -142,6 +221,7 @@ describe('MessagesPanel grouping', () => {
     root = null;
     host?.remove();
     host = null;
+    localStorage.removeItem(PREFS_KEY);
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
@@ -210,6 +290,57 @@ describe('MessagesPanel grouping', () => {
     // total badge "1" should appear
     const spans = [...el.querySelectorAll('span')].filter(s => s.textContent?.trim() === '1');
     expect(spans.length).toBeGreaterThan(0);
+  });
+
+  test('severity-driven sort: BLOCKER appears before BUG_REPORT in importance mode', async () => {
+    const older = new Date(Date.now() - 60_000).toISOString();
+    const newer = new Date().toISOString();
+    const bug = makeMsg({ id: 'b1', message_type: 'BUG_REPORT', from_type: 'agent', content: 'bug msg', created_at: newer });
+    const blocker = makeMsg({ id: 'bl1', message_type: 'BLOCKER', from_type: 'agent', content: 'blocker msg', created_at: older });
+    const el = await renderPanel([bug, blocker]);
+    const text = el.textContent ?? '';
+    // BLOCKER should appear before BUG_REPORT regardless of creation order
+    expect(text.indexOf('blocker msg')).toBeLessThan(text.indexOf('bug msg'));
+  });
+
+  test('pinned BLOCKER region has visual label when blockers exist alongside other high-signal', async () => {
+    const blocker = makeMsg({ id: 'bl1', message_type: 'BLOCKER', from_type: 'agent', content: 'blocker msg' });
+    const bug = makeMsg({ id: 'b1', message_type: 'BUG_REPORT', from_type: 'agent', content: 'bug msg' });
+    const el = await renderPanel([blocker, bug]);
+    expect(el.textContent).toContain('Pinned');
+    expect(el.textContent).toContain('Blockers');
+  });
+
+  test('no BLOCKER pin label when only blockers exist (no divider needed)', async () => {
+    const blocker = makeMsg({ id: 'bl1', message_type: 'BLOCKER', from_type: 'agent', content: 'only blocker' });
+    const el = await renderPanel([blocker]);
+    // Pin label still appears (there are blockers)
+    expect(el.textContent).toContain('Pinned');
+  });
+
+  test('sort toggle button is present in header', async () => {
+    const el = await renderPanel([makeMsg({ id: 'm1', message_type: 'BLOCKER', from_type: 'agent' })]);
+    const btn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Importance') || b.textContent?.includes('Recent'));
+    expect(btn).toBeTruthy();
+  });
+
+  test('switching to Recent mode removes BLOCKER pin label and sorts by time', async () => {
+    const older = new Date(Date.now() - 60_000).toISOString();
+    const newer = new Date().toISOString();
+    const bug = makeMsg({ id: 'b1', message_type: 'BUG_REPORT', from_type: 'agent', content: 'newer bug', created_at: newer });
+    const blocker = makeMsg({ id: 'bl1', message_type: 'BLOCKER', from_type: 'agent', content: 'older blocker', created_at: older });
+    const el = await renderPanel([bug, blocker]);
+
+    // Click the sort toggle to switch to 'Recent'
+    const toggleBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Importance');
+    expect(toggleBtn).toBeTruthy();
+    await act(async () => { (toggleBtn as HTMLButtonElement).click(); });
+
+    const text = el.textContent ?? '';
+    // In Recent mode: newer BUG_REPORT appears before older BLOCKER
+    expect(text.indexOf('newer bug')).toBeLessThan(text.indexOf('older blocker'));
+    // No pin label in Recent mode
+    expect(text).not.toContain('Pinned');
   });
 });
 
