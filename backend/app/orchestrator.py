@@ -4694,8 +4694,13 @@ async def orchestrator_worker():
                             source="poll",
                         )
                     except Exception as e:
+                        # ci_task may be expired after handle_ci_completion's
+                        # internal commit path; accessing ci_task.id would fire
+                        # a sync lazy-load on the async session and raise
+                        # MissingGreenlet. Use the loop-variable id (already a
+                        # plain UUID/str from the SELECT projection) instead.
                         logger.exception(
-                            f"[CI] Error checking CI for task {ci_task.id}"
+                            f"[CI] Error checking CI for task {ci_task_id}"
                         )
                         try:
                             status_code = getattr(e, "status_code", None)
