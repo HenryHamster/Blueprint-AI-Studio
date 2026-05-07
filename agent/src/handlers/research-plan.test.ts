@@ -22,6 +22,10 @@ vi.mock('../index.js', () => ({
   apiPost: vi.fn().mockResolvedValue({}),
   apiGet: vi.fn().mockResolvedValue({}),
   getProviderRunner: vi.fn().mockReturnValue('claude'),
+  // handlePlan/handleResearch read these via dynamic property access — vitest
+  // browser-mode resolves them statically so they must exist on the factory.
+  setCurrentPromptFingerprint: vi.fn(),
+  sendHeartbeatSync: vi.fn(),
 }));
 
 vi.mock('child_process', () => ({

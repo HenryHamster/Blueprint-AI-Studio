@@ -530,8 +530,17 @@ function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   const script = `#!/bin/bash
 # ./check — run lint/build (and optionally tests) for changed paths.
 # Usage:
-#   ./check        # lint+build only — fast, run before each iteration
-#   ./check test   # also run tests (slow; mainly before ./pr open)
+#   ./check         # lint+build only — fast, run before each iteration
+#   ./check test    # also run tests (slow; mainly before ./pr open)
+#   ./check full    # run repo-wide lint (eslint .) + full viewport suite
+#                   # WITHOUT scoping. Skips the baseline recheck on
+#                   # failure (because the result IS the new baseline).
+#                   # Use sparingly — when you're confident your edits
+#                   # affect a shared rule / config / global selector
+#                   # whose effect a scoped check can't surface, OR
+#                   # when a baseline-warned WARN is hiding a real
+#                   # regression you want to confirm. Combine with
+#                   # 'test' (./check full test) to also run tests.
 # Exits 0 on green, non-zero on any failure. Output is the actual error tail
 # so you can act on it. Re-run after edits.
 
@@ -548,9 +557,13 @@ git rev-parse --git-dir >/dev/null 2>&1 || {
 }
 
 WITH_TESTS=0
-if [ "\${1:-}" = "test" ] || [ "\${1:-}" = "--tests" ]; then
-  WITH_TESTS=1
-fi
+FULL_SCOPE=0
+for arg in "$@"; do
+  case "$arg" in
+    test|--tests) WITH_TESTS=1 ;;
+    full|--full)  FULL_SCOPE=1  ;;
+  esac
+done
 
 # Determine changed paths: committed since base + uncommitted. Verify at
 # least one diff source actually worked — silently-empty CHANGED used to
@@ -588,7 +601,24 @@ if touches admin-ui/; then
     tail -30 /tmp/check_npm_ci.log
     FAILED+=("admin-ui npm ci")
   }
-  run "admin-ui eslint"  bash -c 'cd admin-ui && npx eslint . 2>&1'
+  # Scope eslint to changed files. PR gates shouldn't be blocked by
+  # pre-existing errors in untouched files (same rationale as ruff). We
+  # do NOT baseline-warn eslint: errors in files the agent edited are
+  # the agent's responsibility to fix (or carve out scope for) per the
+  # "don't leave preexisting issues" principle. --full forces repo-wide.
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run "admin-ui eslint (full, --full)" bash -c 'cd admin-ui && npx eslint . 2>&1'
+  else
+    : > /tmp/check_admin_ui_lint.txt
+    printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/.*\\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\\0' "\${f#admin-ui/}" >> /tmp/check_admin_ui_lint.txt
+    done
+    if [ -s /tmp/check_admin_ui_lint.txt ]; then
+      run "admin-ui eslint (changed)" bash -c 'cd admin-ui && xargs -0 -a /tmp/check_admin_ui_lint.txt npx eslint 2>&1'
+    else
+      echo "[check] no admin-ui JS/TS files changed, skipping eslint"
+    fi
+  fi
 
   # Viewport gate: scoped run + baseline recheck.
   #
@@ -609,7 +639,7 @@ if touches admin-ui/; then
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
   NON_COMPONENT=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -vE '^admin-ui/src/components/[^/]+\\.(viewport\\.test\\.tsx|tsx)$' || true)
   : > /tmp/check_viewport_tests.txt
-  if [ -z "$NON_COMPONENT" ]; then
+  if [ "$FULL_SCOPE" = "0" ] && [ -z "$NON_COMPONENT" ]; then
     printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
       [ -f "$f" ] && printf '%s\\n' "\${f#admin-ui/}" >> /tmp/check_viewport_tests.txt
     done
@@ -620,7 +650,10 @@ if touches admin-ui/; then
   fi
   VIEWPORT_FILTER=$(sort -u /tmp/check_viewport_tests.txt 2>/dev/null | tr '\\n' ' ' | sed 's/ *$//')
   VIEWPORT_RUN=1
-  if [ -n "$NON_COMPONENT" ]; then
+  if [ "$FULL_SCOPE" = "1" ]; then
+    VIEWPORT_FILTER=""
+    VIEWPORT_LABEL="admin-ui viewport (full, --full)"
+  elif [ -n "$NON_COMPONENT" ]; then
     VIEWPORT_LABEL="admin-ui viewport (full)"
   elif [ -n "$VIEWPORT_FILTER" ]; then
     VIEWPORT_LABEL="admin-ui viewport (changed: $(echo "$VIEWPORT_FILTER" | wc -w | tr -d ' ') file(s))"
@@ -640,6 +673,11 @@ if touches admin-ui/; then
     if ( cd admin-ui && npx playwright install --with-deps chromium >/tmp/check_pw_install.log 2>&1 && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$PR_VP_LOG" 2>&1; then
       tail -20 "$PR_VP_LOG"
       echo "[check] $VIEWPORT_LABEL OK"
+    elif [ "$FULL_SCOPE" = "1" ]; then
+      # --full mode: skip baseline recheck. The result IS the new baseline.
+      echo "[check] $VIEWPORT_LABEL FAILED (--full, no baseline recheck)"
+      tail -100 "$PR_VP_LOG" || true
+      FAILED+=("$VIEWPORT_LABEL")
     else
       echo "[check] $VIEWPORT_LABEL FAILED on PR — checking baseline on origin/$BASE..."
       BASELINE_FAILED=0
@@ -696,7 +734,23 @@ if touches agent/; then
     FAILED+=("agent npm ci")
   }
   run "agent tsc"        bash -c 'cd agent && npx tsc --noEmit 2>&1'
-  run "agent eslint"     bash -c 'cd agent && npx eslint . 2>&1'
+
+  # Scope agent eslint to changed files. Errors in files the agent
+  # edited are the agent's responsibility ("don't leave preexisting
+  # issues" principle). --full forces repo-wide.
+  if [ "$FULL_SCOPE" = "1" ]; then
+    run "agent eslint (full, --full)" bash -c 'cd agent && npx eslint . 2>&1'
+  else
+    : > /tmp/check_agent_lint.txt
+    printf '%s\\n' "$CHANGED" | grep -E '^agent/.*\\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\\0' "\${f#agent/}" >> /tmp/check_agent_lint.txt
+    done
+    if [ -s /tmp/check_agent_lint.txt ]; then
+      run "agent eslint (changed)" bash -c 'cd agent && xargs -0 -a /tmp/check_agent_lint.txt npx eslint 2>&1'
+    else
+      echo "[check] no agent JS/TS files changed, skipping eslint"
+    fi
+  fi
 fi
 
 if touches backend/; then
@@ -1093,8 +1147,55 @@ function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 # (writes /tmp/pr_url_${cfg.taskId} which this reads). Posts the COMPLETED
 # status to the orchestrator with the PR URL, then writes a marker so the
 # wrapper exits cleanly without re-doing commit/push.
+#
+# Usage:
+#   ./done                                     # standard: ./check must pass
+#   ./done --warn-out-of-scope "<reason>"      # judgment-call escape hatch:
+#       ship despite ./check failures when those failures are PRE-EXISTING
+#       on origin/${cfg.baseBranch} and out of scope for this PR. Posts a FEEDBACK
+#       project message describing the pre-existing issues + your reason
+#       so strategic/operators can spawn cleanup work later. The reason
+#       text MUST include the specific gates/files that failed and why
+#       fixing them is out of scope (e.g., "admin-ui eslint reports 4
+#       errors in DashboardHome.tsx that pre-date this PR; fixing them
+#       requires refactoring the digest-card layout which is not in
+#       scope for this auth-flow change").
+#
+#       USE ./blocked INSTEAD when the failure requires introducing a
+#       new bug or precondition (missing package, infra gap, agent
+#       can't even start the work). --warn-out-of-scope is for issues
+#       that already existed on main BEFORE this PR.
 
 set -uo pipefail
+
+WARN_OUT_OF_SCOPE_REASON=""
+SKIP_NEXT=0
+for i in "$@"; do
+  if [ "$SKIP_NEXT" = "1" ]; then
+    WARN_OUT_OF_SCOPE_REASON="$i"
+    SKIP_NEXT=0
+    continue
+  fi
+  case "$i" in
+    --warn-out-of-scope)
+      SKIP_NEXT=1
+      ;;
+    --warn-out-of-scope=*)
+      WARN_OUT_OF_SCOPE_REASON="\${i#--warn-out-of-scope=}"
+      ;;
+  esac
+done
+if [ "$SKIP_NEXT" = "1" ] && [ -z "$WARN_OUT_OF_SCOPE_REASON" ]; then
+  echo "Error: --warn-out-of-scope requires a reason argument" >&2
+  echo "Usage: ./done --warn-out-of-scope \\"<reason>\\"" >&2
+  exit 2
+fi
+if [ -n "$WARN_OUT_OF_SCOPE_REASON" ] && [ \${#WARN_OUT_OF_SCOPE_REASON} -lt 30 ]; then
+  echo "Error: --warn-out-of-scope reason must be at least 30 chars (you gave \${#WARN_OUT_OF_SCOPE_REASON})." >&2
+  echo "       Be specific: which gates failed, which files, why fixing is out of scope." >&2
+  exit 2
+fi
+
 PR_FILE="/tmp/pr_url_${cfg.taskId}"
 if [ ! -s "$PR_FILE" ]; then
   echo "Error: $PR_FILE missing or empty — run ./pr open first." >&2
@@ -1164,14 +1265,41 @@ fi
 # contention with Retry-After: 5. Without retry, contended completions
 # never reach the orchestrator and the task stays IN_PROGRESS until the
 # reaper kicks in minutes later.
+# --warn-out-of-scope: post a FEEDBACK project message BEFORE the
+# COMPLETED post so the warning is visible to strategic even if the
+# COMPLETED post stalls or fails. Best-effort: a message-post failure
+# does not block ./done — the warn_out_of_scope_reason field on the
+# COMPLETED payload is the durable record.
+if [ -n "$WARN_OUT_OF_SCOPE_REASON" ]; then
+  WARN_MSG="[shipped via ./done --warn-out-of-scope by task ${cfg.taskId}]
+PR: $PR_URL
+
+The agent shipped this diff despite ./check failures, asserting that
+the failures are pre-existing on origin/${cfg.baseBranch} and out of
+scope for this PR. Reason given:
+
+$WARN_OUT_OF_SCOPE_REASON
+
+Strategic / operators: this is a signal to spawn cleanup work for the
+referenced files/gates. The PR itself is intended to merge as-is."
+  jq -n --arg tid "$TASK" --arg c "$WARN_MSG" \\
+    '{task_id: $tid, op: "create_message", data: {type: "FEEDBACK", content: $c}}' | \\
+    curl -sS --max-time 30 --connect-timeout 10 -X POST "$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @- \\
+    > /tmp/done_warn_msg_${cfg.taskId}.log 2>&1 || \\
+    echo "[done] warn-out-of-scope FEEDBACK message post failed (best-effort) — see /tmp/done_warn_msg_${cfg.taskId}.log" >&2
+fi
+
 PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
   --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
   --argjson self_review "$SELF_REVIEW_JSON" \\
   --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
+  --arg warn_reason "\${WARN_OUT_OF_SCOPE_REASON:-}" \\
   '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}
    + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
    + {self_review_outcome: $self_review}
-   + (if $changed_files then {changed_files: $changed_files} else {} end)')
+   + (if $changed_files then {changed_files: $changed_files} else {} end)
+   + (if ($warn_reason | length) > 0 then {warn_out_of_scope_reason: $warn_reason} else {} end)')
 
 # Stale-result envelope: persist BEFORE attempting the POST so that if
 # the VM is killed mid-retry, the next agent boot can scan for the
@@ -1627,6 +1755,22 @@ the workspace, executable):
   with a clear message on failure — fix and call again.
 - \`./done\` — marks the task COMPLETED with the PR URL. Requires
   \`./pr open\` to have run first. Idempotent (safe to re-run).
+  - \`./done --warn-out-of-scope "<reason>"\` — judgment-call escape hatch.
+    Use when \`./check\` fails but the failures are in **files you edited**
+    and are **pre-existing on the base branch (origin/<BASE>)** AND
+    fixing them is materially out of scope for this PR (e.g., a refactor of an
+    unrelated layout, a sweeping rename, a new dep introduction). Posts a
+    FEEDBACK project message naming the gates/files/reason so strategic
+    can spawn cleanup work. The reason MUST be specific (≥30 chars):
+    which gates failed, which files, why the fix is out of scope.
+    DO try to fix related preexisting issues first ("don't leave
+    preexisting issues" principle). DO NOT use this for issues a single
+    edit could resolve.
+    NOTE: if the failure requires a new bug to be introduced (missing
+    package, infra gap, agent can't even start), use \`./blocked\` instead.
+    \`./blocked\` is for "I cannot start until X is fixed upstream";
+    \`./done --warn-out-of-scope\` is for "I shipped a real change but
+    pre-existing issues in touched files remain — flag for follow-up".
 - \`./fail "<reason>"\` — marks the task FAILED. Use ONLY when the task
   fundamentally can't be completed: scope is wrong, conflicting
   requirements, you genuinely don't know how to make the change. Don't
