@@ -219,6 +219,8 @@ interface DigestData {
     clean_verdict_approval_rate?: number | null;
     fixed_verdict_approval_rate?: number | null;
     sample_size?: number | null;
+    sr_fixed_count?: number | null;
+    sr_clean_count?: number | null;
   } | null;
   review_accuracy?: {
     total_reviews?: number | null;
@@ -1097,6 +1099,63 @@ export function DashboardHome({ tasks, selectedProjectId, onViewTask, onDirectio
                     })()}
                   </div>
                 )}
+                {(() => {
+                  const sre = digest?.self_review_effectiveness;
+                  const sample = sre?.sample_size ?? 0;
+                  const fixedCount = sre?.sr_fixed_count;
+                  const cleanCount = sre?.sr_clean_count;
+                  if (
+                    sre == null ||
+                    sample < 5 ||
+                    fixedCount == null ||
+                    cleanCount == null
+                  ) {
+                    return null;
+                  }
+                  const fixedShare = fixedCount / sample;
+                  const cleanShare = cleanCount / sample;
+                  const fixedApproval = sre.fixed_verdict_approval_rate;
+                  const cleanApproval = sre.clean_verdict_approval_rate;
+                  const approvalColor = (rate: number | null | undefined) =>
+                    rate == null
+                      ? 'text-neutral-500'
+                      : rate >= 0.7
+                        ? 'text-emerald-400'
+                        : rate >= 0.5
+                          ? 'text-amber-400'
+                          : 'text-red-400';
+                  return (
+                    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[200px]">
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Self-Fix Path</p>
+                      <div className="space-y-0.5">
+                        <div className="flex items-baseline justify-between gap-3">
+                          <span className="text-[10px] text-neutral-400">Self-fixed</span>
+                          <span className="text-xs font-mono text-neutral-200">
+                            {Math.round(fixedShare * 100)}%
+                            <span className="text-[9px] text-neutral-600 ml-1">(n={fixedCount} of {sample})</span>
+                            {fixedApproval != null && (
+                              <span className={`text-[9px] ml-1 ${approvalColor(fixedApproval)}`}>
+                                {Math.round(fixedApproval * 100)}% approved
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex items-baseline justify-between gap-3">
+                          <span className="text-[10px] text-neutral-400">Clean SR</span>
+                          <span className="text-xs font-mono text-neutral-200">
+                            {Math.round(cleanShare * 100)}%
+                            <span className="text-[9px] text-neutral-600 ml-1">(n={cleanCount})</span>
+                            {cleanApproval != null && (
+                              <span className={`text-[9px] ml-1 ${approvalColor(cleanApproval)}`}>
+                                {Math.round(cleanApproval * 100)}% approved
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
                 {digest?.self_review_prediction_accuracy?.prediction_hit_rate != null && (
                   <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
                     <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>

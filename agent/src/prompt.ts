@@ -2854,6 +2854,7 @@ export function buildRetryContext(task: Record<string, unknown>): string {
     : [];
   const previousTestFailureSummary = strVal(ctx._previous_test_failure_summary);
   const previousSelfReviewOutcome = ctx._previous_self_review_outcome as Record<string, unknown> | undefined;
+  const firstAttemptRejectionCategories = (ctx._first_attempt_rejection_categories as Record<string, number> | undefined) || {};
   const previousAnalysisPlan = strVal(ctx._previous_analysis_plan);
   const prevAttempt = attemptNumber - 1;
 
@@ -2919,10 +2920,42 @@ export function buildRetryContext(task: Record<string, unknown>): string {
 
   if (previousSelfReviewOutcome) {
     const fixesApplied = Boolean(previousSelfReviewOutcome.fixes_applied);
-    const selfReviewStatus = fixesApplied
-      ? 'Self-review found issues and applied fixes (but the task still failed after review)'
-      : 'Self-review ran and found no critical issues';
-    lines.push(`Self-review outcome: ${selfReviewStatus}`);
+    const checkResults = (previousSelfReviewOutcome.check_results as Record<string, Record<string, unknown>> | undefined) || {};
+    const verdict = strVal(previousSelfReviewOutcome.verdict);
+
+    // Detect SR-missed categories: where SR said passed/absent but reviewer found issues
+    const isSoftFallback = verdict === 'unknown' && Object.keys(checkResults).length === 0;
+    const srMissedCategories: Array<[string, number]> = [];
+
+    if (!isSoftFallback && Object.keys(firstAttemptRejectionCategories).length > 0) {
+      for (const [category, count] of Object.entries(firstAttemptRejectionCategories)) {
+        // SR missed this category if it's absent from check_results or marked as passed
+        if (category in checkResults) {
+          const srResult = checkResults[category];
+          if (srResult.passed) {
+            srMissedCategories.push([category, count]);
+          }
+        } else {
+          // Category not in check_results, so SR missed it
+          srMissedCategories.push([category, count]);
+        }
+      }
+    }
+
+    if (srMissedCategories.length > 0) {
+      // Enumerate missed categories with issue counts
+      const missedLines = srMissedCategories
+        .map(([cat, count]) => `   - ${cat} (reviewer found ${count} ${count === 1 ? 'issue' : 'issues'})`)
+        .join('\n');
+      lines.push(
+        `Previous attempt's self-review missed these categories (your SR claimed they passed, but the reviewer flagged issues):\n${missedLines}\nOn THIS retry, scrutinize these categories carefully — re-read the changed files and verify each.`,
+      );
+    } else {
+      const selfReviewStatus = fixesApplied
+        ? 'Self-review found issues and applied fixes (but the task still failed after review)'
+        : 'Self-review ran and found no critical issues';
+      lines.push(`Self-review outcome: ${selfReviewStatus}`);
+    }
   }
 
   if (previousAnalysisPlan) {

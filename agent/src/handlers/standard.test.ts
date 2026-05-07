@@ -1501,6 +1501,38 @@ describe('runFreshReviewerPass', () => {
     expect(prompt).not.toContain('- type_safety:');
     expect(prompt).toContain('Scrutinize these categories extra carefully.');
   });
+
+  it('adds a false-positive calibration line for meaningful high-FP categories', async () => {
+    const idx = await import('../index.js');
+    vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+
+    await runFreshReviewerPass(
+      't8',
+      'Title',
+      'Desc',
+      [],
+      null,
+      { value: '' },
+      undefined,
+      {
+        self_review_catch_rate: {
+          categories: {
+            security: {
+              miss_rate: 0.6,
+              false_positive_rate: 0.6,
+              precision: 0.4,
+              sr_flag_sample_size: 12,
+            },
+          },
+        },
+      },
+    );
+
+    const prompt = vi.mocked(idx.runClaudeCode).mock.calls.at(-1)?.[0];
+    if (typeof prompt !== 'string') throw new Error('expected reviewer prompt');
+    expect(prompt).toContain('60% of past flags were not confirmed by review (40% precision; sample size 12) — apply lighter scrutiny unless evidence is concrete.');
+  });
 });
 
 // ── enable_fresh_reviewer flag integration ────────────────────────────────────

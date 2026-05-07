@@ -877,6 +877,101 @@ describe('DashboardHome', () => {
     expect(screen.queryByText('Pipeline stabilized')).not.toBeInTheDocument();
   });
 
+  describe('SR Self-Fix Path card', () => {
+    const baseSre = {
+      with_self_review_approval_rate: 0.8,
+      without_self_review_approval_rate: 0.6,
+      clean_verdict_approval_rate: 0.75,
+      fixed_verdict_approval_rate: 0.85,
+    };
+
+    it('renders self-fix and clean shares with per-bucket approval rates', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          self_review_effectiveness: {
+            ...baseSre,
+            sample_size: 120,
+            sr_fixed_count: 22,
+            sr_clean_count: 98,
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      expect(await screen.findByText('SR Self-Fix Path')).toBeInTheDocument();
+      // Existing SR Approval Lift tile keeps rendering.
+      expect(screen.getByText('SR Approval Lift')).toBeInTheDocument();
+      // Self-fix share = 22/120 = 18%; clean share = 98/120 = 82%.
+      expect(screen.getByText('Self-fixed')).toBeInTheDocument();
+      expect(screen.getByText(/18%/)).toBeInTheDocument();
+      expect(screen.getByText(/n=22 of 120/)).toBeInTheDocument();
+      expect(screen.getByText('Clean SR')).toBeInTheDocument();
+      expect(screen.getByText(/82%/)).toBeInTheDocument();
+      expect(screen.getByText(/n=98/)).toBeInTheDocument();
+      // Per-bucket approval rates: 85% fixed, 75% clean.
+      expect(screen.getByText(/85% approved/)).toBeInTheDocument();
+      expect(screen.getByText(/75% approved/)).toBeInTheDocument();
+    });
+
+    it('does not render the card when sample_size is below the threshold', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          self_review_effectiveness: {
+            ...baseSre,
+            sample_size: 4,
+            sr_fixed_count: 1,
+            sr_clean_count: 3,
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      // SR Approval Lift still renders (its own threshold), but the new card does not.
+      await screen.findByText('SR Approval Lift');
+      expect(screen.queryByText('SR Self-Fix Path')).not.toBeInTheDocument();
+    });
+
+    it('does not render the card when count fields are missing', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+          self_review_effectiveness: {
+            ...baseSre,
+            sample_size: 120,
+            // sr_fixed_count and sr_clean_count omitted.
+          },
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('SR Approval Lift');
+      expect(screen.queryByText('SR Self-Fix Path')).not.toBeInTheDocument();
+    });
+  });
+
   it('renders fix-iteration SR breakdown buckets when by_fix_iteration data is present', async () => {
     setupApiMocks({
       digest: {

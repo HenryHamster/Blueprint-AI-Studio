@@ -11141,3 +11141,108 @@ async def test_sr_alert_drilldown_invalid_alert_type(client: AsyncClient, db_ses
         params={"categories": "correctness", "alert_type": "invalid"},
     )
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# self_review_effectiveness sr_fixed_count / sr_clean_count counts
+# ---------------------------------------------------------------------------
+
+
+def _sr_outcome(fixes_applied: bool) -> dict:
+    return {
+        "verdict": "pass",
+        "fixes_applied": fixes_applied,
+        "check_results": {},
+        "blind_spots": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_effectiveness_includes_clean_and_fixed_counts(
+    client: AsyncClient, db_session
+):
+    """sr_fixed_count and sr_clean_count are present and equal the integer counts of
+    the fixed vs clean subsets of tasks_with_sr."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # 2 fixed, 3 clean → sample_size=5
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+                payloads=[{"type": "fix"}],
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_outcome(fixes_applied=True),
+                },
+            )
+        )
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+                payloads=[{"type": "fix"}],
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_outcome(fixes_applied=False),
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    sre = response.json()["self_review_effectiveness"]
+    assert sre is not None
+    assert sre["sample_size"] == 5
+    assert sre["sr_fixed_count"] == 2
+    assert sre["sr_clean_count"] == 3
+    # Existing fields are unchanged.
+    assert "with_self_review_approval_rate" in sre
+    assert "fixed_verdict_approval_rate" in sre
+    assert "clean_verdict_approval_rate" in sre
+
+
+@pytest.mark.asyncio
+async def test_digest_self_review_effectiveness_below_threshold_is_none(
+    client: AsyncClient, db_session
+):
+    """When tasks_with_sr is below the existing threshold (3), the entire
+    self_review_effectiveness block remains None — the new count fields do not
+    cause the block to render at smaller sample sizes."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # 2 tasks with SR — below the threshold of 3.
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+                payloads=[{"type": "fix"}],
+                context={
+                    "_first_attempt_succeeded": True,
+                    "_self_review_outcome": _sr_outcome(fixes_applied=False),
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    assert response.json()["self_review_effectiveness"] is None

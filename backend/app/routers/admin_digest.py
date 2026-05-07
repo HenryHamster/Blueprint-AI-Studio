@@ -502,6 +502,8 @@ def _compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any
             "clean_verdict_approval_rate": _fa_rate(sr_clean),
             "fixed_verdict_approval_rate": _fa_rate(sr_fixed),
             "sample_size": len(tasks_with_sr),
+            "sr_clean_count": len(sr_clean),
+            "sr_fixed_count": len(sr_fixed),
         }
 
     review_tasks = [
@@ -1436,6 +1438,8 @@ async def compute_pipeline_health_summary(
             "clean_verdict_approval_rate": _first_attempt_rate(tasks_self_review_clean),
             "fixed_verdict_approval_rate": _first_attempt_rate(tasks_self_review_fixed),
             "sample_size": len(tasks_with_self_review),
+            "sr_clean_count": len(tasks_self_review_clean),
+            "sr_fixed_count": len(tasks_self_review_fixed),
             "category_correlation": category_correlation,
         }
 

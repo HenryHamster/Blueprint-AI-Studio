@@ -2515,6 +2515,106 @@ describe('buildRetryContext', () => {
     expect(result).toContain('Self-review ran and found no critical issues');
   });
 
+  it('renders SR-missed categories when SR incorrectly marked them as passed', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: {
+          verdict: 'pass',
+          fixes_applied: false,
+          check_results: {
+            correctness: { passed: true },
+            'error-handling': { passed: true },
+          },
+        },
+        _first_attempt_rejection_categories: {
+          correctness: 2,
+          'error-handling': 1,
+        },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('missed these categories');
+    expect(result).toContain('correctness (reviewer found 2 issues)');
+    expect(result).toContain('error-handling (reviewer found 1 issue)');
+    expect(result).toContain('scrutinize these categories carefully');
+  });
+
+  it('detects SR-missed categories even when category was absent from SR check_results', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: {
+          verdict: 'pass',
+          fixes_applied: false,
+          check_results: {
+            correctness: { passed: true },
+          },
+        },
+        _first_attempt_rejection_categories: {
+          correctness: 2,
+          'test-coverage': 1,
+        },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('missed these categories');
+    expect(result).toContain('correctness (reviewer found 2 issues)');
+    expect(result).toContain('test-coverage (reviewer found 1 issue)');
+  });
+
+  it('uses existing wording when SR correctly identified all reviewer categories', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: {
+          verdict: 'pass',
+          fixes_applied: true,
+          check_results: {
+            correctness: { passed: false },
+            'error-handling': { passed: false },
+          },
+        },
+        _first_attempt_rejection_categories: {
+          correctness: 2,
+          'error-handling': 1,
+        },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Self-review outcome:');
+    expect(result).toContain('found issues and applied fixes');
+    expect(result).not.toContain('missed these categories');
+  });
+
+  it('uses existing wording when soft-fallback envelope (verdict=unknown, empty check_results)', () => {
+    const task = {
+      context: {
+        _attempt_number: 2,
+        _previous_failure_class: 'CODE_ERROR',
+        _previous_error: 'error',
+        _previous_self_review_outcome: {
+          verdict: 'unknown',
+          fixes_applied: false,
+          check_results: {},
+        },
+        _first_attempt_rejection_categories: {
+          correctness: 2,
+          'error-handling': 1,
+        },
+      },
+    };
+    const result = buildRetryContext(task);
+    expect(result).toContain('Self-review outcome:');
+    expect(result).not.toContain('missed these categories');
+  });
+
   it('renders previous analysis plan when _previous_analysis_plan is present', () => {
     const task = {
       context: {

@@ -182,6 +182,9 @@ type SRCatchRateExample = { severity: string; desc: string };
 type SRCatchRateCategory = {
   miss_rate?: number;
   weighted_miss_rate?: number;
+  false_positive_rate?: number;
+  precision?: number;
+  sr_flag_sample_size?: number;
   examples?: SRCatchRateExample[];
 };
 
@@ -211,6 +214,11 @@ function formatFreshReviewerCalibrationSection(
       ? `${missRate}% missed (${Math.round(weightedMissRate * 100)}% severity-weighted)`
       : `${missRate}% missed`;
     lines.push(`- ${category}: ${rateText}`);
+    if ((data.false_positive_rate ?? 0) >= 0.5 && (data.sr_flag_sample_size ?? 0) >= 10) {
+      const falsePositiveRate = Math.round((data.false_positive_rate ?? 0) * 100);
+      const precision = data.precision !== undefined ? `${Math.round(data.precision * 100)}% precision; ` : '';
+      lines.push(`  - ${falsePositiveRate}% of past flags were not confirmed by review (${precision}sample size ${data.sr_flag_sample_size ?? 0}) — apply lighter scrutiny unless evidence is concrete.`);
+    }
     const examples = (data.examples || []).slice(0, 2);
     for (const ex of examples) {
       lines.push(`  - [${ex.severity}] ${ex.desc}`);
