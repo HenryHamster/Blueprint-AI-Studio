@@ -136,7 +136,13 @@ async def _lock_task_for_mutation(
                 reason,
                 task_id,
             )
-            await session.rollback()
+            # SKIP LOCKED returned no row — no row lock was acquired by this
+            # call, so there's nothing to release. Calling session.rollback()
+            # here would silently wipe any uncommitted dirty state from
+            # earlier iterations of the caller's loop (observed 2026-05-07:
+            # stale-PROVISIONING recovery loop kept logging "marking FAILED"
+            # 17 times because each iteration's FAILED commit was reverted
+            # by the next iteration's rollback-on-skipped-lock).
             return None
         if allowed_statuses is not None and task.status not in allowed_statuses:
             logger.info(
@@ -145,7 +151,14 @@ async def _lock_task_for_mutation(
                 task_id,
                 task.status,
             )
-            await session.rollback()
+            # We DID acquire a row lock and the status check failed. Release
+            # by committing rather than rolling back: this terminates the
+            # transaction (releasing the lock as a side effect) while
+            # preserving any prior dirty state from earlier iterations of
+            # the caller's loop. The current call's only mutation effect is
+            # the SELECT FOR UPDATE itself, which has no row-data side
+            # effect — committing it is a no-op for the locked row.
+            await session.commit()
             return None
         if expected_snapshot is not None and snapshot_fn is not None:
             current_snapshot = snapshot_fn(task)
@@ -158,7 +171,7 @@ async def _lock_task_for_mutation(
                     expected_snapshot,
                     current_snapshot,
                 )
-                await session.rollback()
+                await session.commit()
                 return None
         return task
 

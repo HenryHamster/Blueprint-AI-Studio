@@ -752,6 +752,83 @@ async def test_lock_task_for_mutation_no_snapshot_means_no_validation(db_session
     await db_session.rollback()
 
 
+@pytest.mark.asyncio
+async def test_lock_task_for_mutation_preserves_prior_dirty_state_on_skip(
+    db_session,
+):
+    """A failed lock attempt (status mismatch / row contended) must NOT wipe
+    uncommitted dirty state from earlier in the caller's loop.
+
+    Bug observed 2026-05-07: stale-PROVISIONING recovery loop logged
+    'marking FAILED' 17 times in a row because each iteration's session.add
+    was reverted by the next iteration's rollback-on-skipped-lock. The fix
+    was to commit (rather than rollback) when releasing a held lock and to
+    skip release entirely when no lock was acquired.
+    """
+    from app.orchestrator import _lock_task_for_mutation
+
+    project = Project(name="rollback-preserves-state", user_id="user-rps")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Task A: caller mutates this in iteration 1.
+    task_a = Task(
+        project_id=project.id,
+        title="A",
+        status=TaskStatus.PROVISIONING,
+        payloads=[{"type": "create"}],
+    )
+    # Task B: caller's iteration-2 lock against this fails the
+    # allowed_statuses check (B is COMPLETED, not PROVISIONING).
+    task_b = Task(
+        project_id=project.id,
+        title="B",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(task_a)
+    db_session.add(task_b)
+    await db_session.commit()
+    a_id = task_a.id
+    b_id = task_b.id
+
+    # Iteration 1: mutate task A in the session (uncommitted).
+    fresh_a = await _lock_task_for_mutation(
+        db_session,
+        a_id,
+        allowed_statuses=(TaskStatus.PROVISIONING,),
+        reason="iter1",
+    )
+    assert fresh_a is not None
+    fresh_a.status = TaskStatus.FAILED
+    fresh_a.latest_status_message = "iter1 marked FAILED"
+    db_session.add(fresh_a)
+
+    # Iteration 2: try to lock B; status check fails → helper releases lock.
+    # In the buggy version this called session.rollback(), wiping A's mutation.
+    fresh_b = await _lock_task_for_mutation(
+        db_session,
+        b_id,
+        allowed_statuses=(TaskStatus.PROVISIONING,),
+        reason="iter2",
+    )
+    assert fresh_b is None  # status check failed (COMPLETED != PROVISIONING)
+
+    # Loop body would normally do its end-of-cycle commit here, but the helper
+    # already committed on the lock-release path (commit-instead-of-rollback),
+    # so A's FAILED state should already be persisted.
+    refreshed = await db_session.execute(
+        select(Task).where(Task.id == a_id).execution_options(populate_existing=True)
+    )
+    persisted_a = refreshed.scalars().first()
+    assert persisted_a.status == TaskStatus.FAILED, (
+        "_lock_task_for_mutation rolled back the caller's prior dirty state "
+        "instead of preserving it. The lock-release path must commit (not "
+        "rollback) when prior iterations have made uncommitted mutations."
+    )
+    assert persisted_a.latest_status_message == "iter1 marked FAILED"
+
+
 # ── CI-polling snapshot coverage (R6-W4-A, audit MED-4) ─────────────────────
 
 

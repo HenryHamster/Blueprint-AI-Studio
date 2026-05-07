@@ -1113,6 +1113,15 @@ async def reaper_service():
                         in (
                             "heartbeat_timeout_post_claim",
                             "provision_timeout_pre_claim",
+                            # absolute_timeout: a PROVISIONING task that aged past
+                            # the 15-min absolute ceiling before earlier reaper
+                            # codes had a chance to classify it (typically because
+                            # the reaper itself was lagging — e.g., 2026-05-07
+                            # MissingGreenlet crash on last_tool_use_at). Without
+                            # this branch, the spot check is skipped and the
+                            # account gets blacklisted for what's actually a GCE
+                            # capacity issue.
+                            "absolute_timeout",
                         )
                     ):
                         prov_zone_for_status = (task.context or {}).get(
