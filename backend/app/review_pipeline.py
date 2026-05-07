@@ -27,7 +27,7 @@ from app.time_utils import _utcnow
 from app.spawn_calibration import (
     _compute_scope_budget_utilization,
     _compute_scope_overflow_warning,
-)  # noqa: F401
+)
 
 logger = logging.getLogger(__name__)
 
@@ -386,7 +386,7 @@ def should_auto_approve_diff(
         return (False, f"{lines_changed} lines > {max_lines}")
 
     if direction_data is not None:
-        from app.research_completion import _compute_acceptance_rate  # noqa: PLC0415
+        from app.research_completion import _compute_acceptance_rate
 
         acceptance_rate = _compute_acceptance_rate(direction_data)
         if (
@@ -534,13 +534,13 @@ async def _handle_cap_exhaustion(
     ``scope`` is either "global" (cross-chain) or "per-chain" — used only for
     human-readable messages.
     """
-    from app.failure_classification import CODE_ERROR, persist_failure_category  # noqa: PLC0415
-    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
-    from app.github import close_pull_request, create_pr_comment  # noqa: PLC0415
-    from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
-    from app.routers.agent_status import record_task_result  # noqa: PLC0415
-    from app.shared_state import record_direction_result  # noqa: PLC0415
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from app.failure_classification import CODE_ERROR, persist_failure_category
+    from app.main import _maybe_create_failure_alert
+    from app.github import close_pull_request, create_pr_comment
+    from app.routers.agent import get_github_token_for_task
+    from app.routers.agent_status import record_task_result
+    from app.shared_state import record_direction_result
+    from sqlalchemy.orm.attributes import flag_modified
 
     cap_label = "global" if scope == "global" else "per-chain"
     source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
@@ -548,7 +548,7 @@ async def _handle_cap_exhaustion(
 
     try:
         orig = await session.get(Task, uuid.UUID(resolved_original_id))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to load orig {resolved_original_id[:8]}: {e}"
         )
@@ -590,7 +590,7 @@ async def _handle_cap_exhaustion(
     session.add(orig)
     try:
         await session.commit()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to commit orig {resolved_original_id[:8]}: {e}",
             exc_info=True,
@@ -617,17 +617,17 @@ async def _handle_cap_exhaustion(
     # Cap exhaustion bypasses the normal status-update handler; call
     # _record_remediation_if_terminal directly to keep direction state consistent.
     try:
-        from app.task_completion import _record_remediation_if_terminal  # noqa: PLC0415
+        from app.task_completion import _record_remediation_if_terminal
 
         await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
         await session.commit()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}"
         )
     investigation_id: str | None = None
     try:
-        from app.autonomous_research import _spawn_review_convergence_investigation  # noqa: PLC0415
+        from app.autonomous_research import _spawn_review_convergence_investigation
 
         _inv = await _spawn_review_convergence_investigation(
             orig,
@@ -640,7 +640,7 @@ async def _handle_cap_exhaustion(
         if _inv is not None:
             investigation_id = str(_inv)
             await session.commit()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}",
             exc_info=True,
@@ -669,7 +669,7 @@ async def _handle_cap_exhaustion(
                 f"Auto-closed: review-fix cap reached ({iterations} iterations, {cap_label}). "
                 f"{investigation_note}{fingerprint_note}",
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"[PIPELINE] Cap-exhaustion: failed to comment on PR #{pr_number}: {e}"
             )
@@ -684,7 +684,7 @@ async def _handle_cap_exhaustion(
             logger.warning(
                 f"[PIPELINE] close_pull_request returned False for PR #{pr_number}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to close PR #{pr_number}: {e}",
             exc_info=True,
@@ -697,7 +697,7 @@ async def _handle_cap_exhaustion(
             f"PR #{pr_number} hit review-fix cap ({iterations} iterations, {cap_label}) — "
             f"auto-closed, manual review required",
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}"
         )
@@ -840,7 +840,7 @@ async def _post_repeat_fingerprint_blocker_message(
     with ``from_type="system"`` and ``message_type=BLOCKER`` so it sorts
     correctly in the strategic agent's context block.
     """
-    from app.models import MessageType, ProjectMessage  # noqa: PLC0415
+    from app.models import MessageType, ProjectMessage
 
     body = (
         f"Pipeline halt — repeat-fingerprint detected on PR #{pr_number}.\n\n"
@@ -935,7 +935,7 @@ async def maybe_spawn_cross_cutting_safeguard(
     Returns True if a safeguard was spawned, False otherwise.
     Idempotent: no-ops if orig.context already has a safeguard_task_id.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
     ctx = orig.context or {}
     if ctx.get("safeguard_task_id"):
@@ -1097,7 +1097,7 @@ async def _spawn_pipeline_task(
             _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
             session.add(source_task)
             return (None, False)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug(
             f"[PIPELINE] Could not verify pr_merged for original task {resolved_original_id[:8]}: skipping check"
         )
@@ -1165,7 +1165,7 @@ async def _spawn_pipeline_task(
             from app.failure_classification import (
                 AGENT_TIMEOUT,
                 persist_failure_category,
-            )  # noqa: PLC0415
+            )
 
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
@@ -1199,7 +1199,7 @@ async def _spawn_pipeline_task(
             from app.failure_classification import (
                 AGENT_TIMEOUT,
                 persist_failure_category,
-            )  # noqa: PLC0415
+            )
 
             t.status = TaskStatus.CANCELLED
             t.latest_status_message = (
@@ -1244,7 +1244,7 @@ async def _spawn_pipeline_task(
     # filter remains Python-side because INFRA_CLASSES is composed dynamically.
     # ``load_only`` keeps the row narrow — we only need status/context/payloads
     # for the post-filter; status_log and other JSONB columns stay deferred.
-    from app.failure_classification import INFRA_CLASSES  # noqa: PLC0415
+    from app.failure_classification import INFRA_CLASSES
 
     # Dialect-conditional WHERE for the per-PR cap query (audit 2026-04-29
     # round 2 / finding C2). Postgres requires byte-exact expression match
@@ -1403,7 +1403,7 @@ async def _spawn_pipeline_task(
                                     f"review or strategic-agent decision required."
                                 )
                                 session.add(_orig)
-                        except Exception as _orig_err:
+                        except Exception as _orig_err:  # noqa: BLE001
                             logger.warning(
                                 f"[PIPELINE] Failed to mark requires_approval on chain "
                                 f"original {resolved_original_id[:8]}: {_orig_err}",
@@ -1417,7 +1417,7 @@ async def _spawn_pipeline_task(
                                 fingerprint=fp_b,
                                 prior_task_id=a.id,
                             )
-                        except Exception as _msg_err:
+                        except Exception as _msg_err:  # noqa: BLE001
                             logger.warning(
                                 f"[PIPELINE] Failed to post repeat-fingerprint BLOCKER "
                                 f"message for PR #{pr_number}: {_msg_err}",
@@ -1537,7 +1537,7 @@ async def _spawn_pipeline_task(
             parent_id = orig.id
         if orig:
             inherited_priority = orig.priority
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug(
             f"[PIPELINE] Could not inherit properties from original task {resolved_original_id[:8] if resolved_original_id else '?'}"
         )
@@ -1551,7 +1551,7 @@ async def _spawn_pipeline_task(
             await maybe_spawn_cross_cutting_safeguard(
                 orig, pr_number, branch, base_branch, session
             )
-        except Exception as _sg_err:
+        except Exception as _sg_err:  # noqa: BLE001
             logger.warning(
                 f"[PIPELINE] Cross-cutting safeguard spawn failed for PR #{pr_number}: {_sg_err}",
                 exc_info=True,
@@ -1759,7 +1759,7 @@ async def _spawn_pipeline_task(
                             dispatch_external_notification,
                         )
 
-                        _asyncio.ensure_future(
+                        _asyncio.ensure_future(  # noqa: RUF006
                             dispatch_external_notification(
                                 stuck_orig.project_id,
                                 "APPROVAL_NEEDED",
@@ -1773,14 +1773,14 @@ async def _spawn_pipeline_task(
                                 },
                             )
                         )
-                    except Exception as _ne:
+                    except Exception as _ne:  # noqa: BLE001
                         logger.warning(
                             f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
                         )
                     try:
                         from app.autonomous_research import (
                             _spawn_review_convergence_investigation,
-                        )  # noqa: PLC0415
+                        )
 
                         if await _spawn_review_convergence_investigation(
                             stuck_orig,
@@ -1792,12 +1792,12 @@ async def _spawn_pipeline_task(
                             review_history=new_review_history,
                         ):
                             await session.commit()
-                    except Exception as _ie:
+                    except Exception as _ie:  # noqa: BLE001
                         logger.warning(
                             f"[PIPELINE] Stuck-cycle convergence investigation spawn failed for PR #{pr_number}: {_ie}",
                             exc_info=True,
                         )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"[PIPELINE] Failed to mark stuck cycle on {resolved_original_id}: {e}",
                     exc_info=True,
@@ -1978,8 +1978,8 @@ async def _spawn_pipeline_task(
         )
         if not signal_already_emitted:
             try:
-                from app.github import add_issue_label, create_pr_comment  # noqa: PLC0415
-                from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                from app.github import add_issue_label, create_pr_comment
+                from app.routers.agent import get_github_token_for_task
 
                 token_task_id = orig.id if orig is not None else source_task.id
                 gh_token, owner, repo = await get_github_token_for_task(
@@ -2009,7 +2009,7 @@ async def _spawn_pipeline_task(
                     orig_ctx[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
                     orig.context = orig_ctx
                     session.add(orig)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"[PIPELINE] Failed to emit scope-overflow PR signal for PR #{pr_number}: {e}",
                     exc_info=True,

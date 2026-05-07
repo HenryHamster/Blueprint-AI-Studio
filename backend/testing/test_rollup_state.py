@@ -19,7 +19,7 @@ class TestClearRollupTransientState:
         assert _clear_rollup_transient_state({}) == {}
 
     def test_strips_all_ten_transient_keys(self):
-        ctx = {k: "v" for k in _ROLLUP_TRANSIENT_CTX_KEYS}
+        ctx = dict.fromkeys(_ROLLUP_TRANSIENT_CTX_KEYS, "v")
         assert len(ctx) == 10
         assert _clear_rollup_transient_state(ctx) == {}
 

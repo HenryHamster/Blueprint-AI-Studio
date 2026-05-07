@@ -306,7 +306,7 @@ def test_standard_effort_values_accepted(effort):
 
 def test_returns_plain_dict():
     result = validate_task_payload({"type": "research"})
-    assert type(result) is dict  # noqa: E721
+    assert type(result) is dict
 
 
 # ---------------------------------------------------------------------------
