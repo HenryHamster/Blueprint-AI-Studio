@@ -1213,6 +1213,122 @@ async def _check_evaluating_timeouts():
             for task in evaluating_tasks:
                 ctx = task.context or {}
 
+                # _pr_state_check_pending consumer. The agent_status FAILED→
+                # EVALUATING recovery (agent_status.py ~1567) sets this flag
+                # before its GH PR check; if the post-GH lock re-acquire
+                # races a concurrent writer (skip_locked returns None at
+                # ~1616) the recovery returns ``accepted_pr_check_deferred``
+                # leaving the flag stuck and no review task spawned. Without
+                # this consumer the task sits until the 48h reaper backstop.
+                if ctx.get("_pr_state_check_pending"):
+                    pr_num = (ctx.get("review_loop") or {}).get("pr_number") or ctx.get("rollup_pr_number")
+                    if not pr_num:
+                        for entry in reversed(task.status_log or []):
+                            m = re.search(r"open PR #(\d+)", entry.get("msg", "") or "")
+                            if m:
+                                pr_num = int(m.group(1))
+                                break
+                    # 5-min grace: let the original recovery's lock finish if it's
+                    # going to. Without this we'd race the same code path.
+                    flag_set_at = None
+                    for entry in reversed(task.status_log or []):
+                        if "checking PR state" in (entry.get("msg", "") or ""):
+                            with contextlib.suppress(KeyError, ValueError, TypeError):
+                                flag_set_at = datetime.fromisoformat(entry["t"])
+                            break
+                    if flag_set_at and (now - flag_set_at).total_seconds() < 300:
+                        continue
+
+                    from sqlalchemy.orm.attributes import flag_modified
+                    _ctx2 = dict(ctx)
+                    _ctx2.pop("_pr_state_check_pending", None)
+
+                    if not pr_num:
+                        # No PR number recoverable — clear flag, fall through to
+                        # the normal evaluating timeout logic below.
+                        task.context = _ctx2
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        ctx = _ctx2
+                    else:
+                        gh_pr_state = "open"
+                        gh_pr_merged = False
+                        try:
+                            from app.routers.agent import get_github_token_for_task  # noqa: PLC0415
+                            from app.github import get_pull_request  # noqa: PLC0415
+                            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+                            pr_data = await get_pull_request(gh_token, owner, repo, pr_num)
+                            gh_pr_state = pr_data.get("state") or "open"
+                            gh_pr_merged = bool(pr_data.get("merged"))
+                        except Exception as gh_exc:
+                            logger.warning(
+                                f"[EVAL TIMEOUT pr_check] Task {str(task.id)[:8]} "
+                                f"PR #{pr_num} GH lookup failed: {type(gh_exc).__name__}: "
+                                f"{gh_exc} — assuming open"
+                            )
+
+                        if gh_pr_state == "closed" and gh_pr_merged:
+                            task.status = TaskStatus.COMPLETED
+                            task.vm_instance_id = None
+                            task.last_heartbeat = None
+                            task.latest_status_message = (
+                                f"Recovered _pr_state_check_pending: PR #{pr_num} merged out-of-band"
+                            )
+                            _ctx2["pr_merged"] = True
+                        elif gh_pr_state == "closed" and not gh_pr_merged:
+                            task.status = TaskStatus.FAILED
+                            task.vm_instance_id = None
+                            task.last_heartbeat = None
+                            task.latest_status_message = (
+                                f"Recovered _pr_state_check_pending: PR #{pr_num} closed without merge"
+                            )
+                            _ctx2["pr_closed_unmerged"] = True
+                        else:
+                            task.vm_instance_id = None
+                            task.last_heartbeat = None
+                            try:
+                                from app.review_pipeline import _spawn_pipeline_task  # noqa: PLC0415
+                                short_id = str(task.id).replace("-", "")[:8]
+                                task_type_str = (task.first_payload or {}).get("type", "") or ""
+                                type_prefix_map = {
+                                    "docs": "docs", "deps": "deps", "migrate": "migrate",
+                                    "refactor": "refactor", "perf": "task", "qa": "task",
+                                    "security_audit": "task", "debug": "task", "smoketest": "task",
+                                }
+                                branch_prefix = type_prefix_map.get(task_type_str, "task")
+                                branch = f"blueprint/{branch_prefix}-{short_id}"
+                                base_branch = (task.first_payload or {}).get("base_branch", "main")
+                                original_prompt = (task.first_payload or {}).get("prompt", task.description or "")
+                                await _spawn_pipeline_task(
+                                    task, "review", session, pr_num, branch, base_branch,
+                                    original_prompt=original_prompt,
+                                    original_task_id=str(task.id),
+                                )
+                                task.latest_status_message = (
+                                    f"Recovered _pr_state_check_pending: spawned review for PR #{pr_num}"
+                                )
+                            except Exception as spawn_exc:
+                                logger.warning(
+                                    f"[EVAL TIMEOUT pr_check] Review spawn failed for "
+                                    f"task {str(task.id)[:8]}: {type(spawn_exc).__name__}: "
+                                    f"{spawn_exc}",
+                                    exc_info=True,
+                                )
+                                task.latest_status_message = (
+                                    f"Recovered _pr_state_check_pending: review spawn failed, will retry"
+                                )
+
+                        task.context = _ctx2
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        await broadcast_to_project(
+                            str(task.project_id), "task_updated",
+                            {"task_id": str(task.id), "status": task.status},
+                        )
+                        continue
+
                 # Approval-gate hard timeout. Parents with requires_approval=True
                 # remain in EVALUATING waiting for human approval; the
                 # evaluating_fail_hours backstop can be deferred by an active
