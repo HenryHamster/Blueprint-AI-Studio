@@ -668,18 +668,18 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
         {/* Add direction form */}
         {selectedProjectId && (
           <div className="px-5 py-3 border-b border-neutral-800 shrink-0">
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <input
                 value={form.newText}
                 onChange={e => form.setNewText(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && addDirection()}
                 placeholder="New direction..."
-                className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+                className="flex-1 min-w-0 basis-full sm:basis-auto bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
               />
               <select
                 value={form.newPriority}
                 onChange={e => form.setNewPriority(e.target.value as 'high' | 'medium' | 'low')}
-                className="bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="min-w-0 shrink bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="high">High</option>
                 <option value="medium">Medium</option>
@@ -688,7 +688,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               <select
                 value={form.newCategory ?? ''}
                 onChange={e => form.setNewCategory((e.target.value || null) as 'product' | 'structural' | 'mixed' | null)}
-                className="bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                className="min-w-0 shrink bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="">Type…</option>
                 <option value="product">Product</option>
@@ -698,7 +698,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               <button
                 onClick={addDirection}
                 disabled={!form.newText.trim()}
-                className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 min-h-[44px] sm:min-h-0 rounded text-xs transition-colors border border-neutral-700 flex items-center"
+                className="shrink-0 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 rounded text-xs transition-colors border border-neutral-700 flex items-center"
+                aria-label="Add direction"
               >
                 <Plus className="w-3.5 h-3.5" />
               </button>

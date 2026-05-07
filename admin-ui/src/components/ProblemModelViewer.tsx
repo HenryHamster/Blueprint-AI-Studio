@@ -96,6 +96,8 @@ function CapabilityBar({ capability }: { capability: Capability }) {
 }
 
 function GapCard({ gap }: { gap: Gap }) {
+  const activeMoves = gap.active_moves ?? [];
+  const pastMoves = gap.past_moves ?? [];
   return (
     <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/40">
       <div className="flex items-start justify-between gap-2 mb-1">
@@ -124,13 +126,13 @@ function GapCard({ gap }: { gap: Gap }) {
       {gap.evidence && (
         <p className="text-xs text-neutral-500 mt-1 italic">Evidence: {gap.evidence}</p>
       )}
-      {(gap.active_moves.length > 0 || gap.past_moves.length > 0) && (
+      {(activeMoves.length > 0 || pastMoves.length > 0) && (
         <div className="mt-2 text-xs text-neutral-500 flex flex-wrap gap-2">
-          {gap.active_moves.length > 0 && (
-            <span><span className="text-neutral-400">Active:</span> {gap.active_moves.length} direction{gap.active_moves.length === 1 ? '' : 's'}</span>
+          {activeMoves.length > 0 && (
+            <span><span className="text-neutral-400">Active:</span> {activeMoves.length} direction{activeMoves.length === 1 ? '' : 's'}</span>
           )}
-          {gap.past_moves.length > 0 && (
-            <span><span className="text-neutral-400">Past:</span> {gap.past_moves.length}</span>
+          {pastMoves.length > 0 && (
+            <span><span className="text-neutral-400">Past:</span> {pastMoves.length}</span>
           )}
         </div>
       )}
@@ -376,7 +378,7 @@ export default function ProblemModelViewer({
           <section>
             <SectionHeader icon={<Circle size={14} />} count={sortedGaps.length}>Active gaps</SectionHeader>
             <div className="space-y-2">
-              {sortedGaps.map((g) => <GapCard key={g.id} gap={g} />)}
+              {sortedGaps.map((g, i) => <GapCard key={g.id ?? `gap-${i}`} gap={g} />)}
             </div>
           </section>
         )}

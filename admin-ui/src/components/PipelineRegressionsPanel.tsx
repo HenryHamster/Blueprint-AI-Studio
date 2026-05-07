@@ -127,7 +127,9 @@ export function ManualInterventionPanel({ projectId }: Props) {
                     <span className="text-xs text-red-300 font-medium capitalize">
                       {c.signal_name}
                     </span>
-                    <span className="text-[10px] text-neutral-500 font-mono">{c.regression_class}</span>
+                    <span className="text-[10px] text-neutral-500 font-mono break-all min-w-0">
+                      {c.regression_class}
+                    </span>
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
                       {c.attempts} attempt{c.attempts !== 1 ? 's' : ''}
                     </span>
@@ -176,7 +178,7 @@ export function ManualInterventionPanel({ projectId }: Props) {
                         </span>
                       )}
                       {c.last_failure_class && (
-                        <span className="text-[10px] text-neutral-500 font-mono">
+                        <span className="text-[10px] text-neutral-500 font-mono break-all min-w-0">
                           last fail: {c.last_failure_class}
                         </span>
                       )}

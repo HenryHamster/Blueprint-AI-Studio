@@ -3915,9 +3915,9 @@ describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () 
 // create/fix/docs/deps focus blocks were added. If this test fails, bump the
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "3" after adding stale-verdict guard to FIX_TASK_FOCUS', async () => {
+  it('is "4" (current pinned version)', async () => {
     const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
-    expect(SELF_REVIEW_PROMPT_VERSION).toBe('3');
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('4');
   });
 
   it('is a non-empty string (used as prompt_version field in self-review JSON)', async () => {

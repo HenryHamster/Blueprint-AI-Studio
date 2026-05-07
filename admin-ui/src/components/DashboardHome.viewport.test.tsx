@@ -7,6 +7,9 @@ import { expectNoOverflowAt } from '../test/viewport';
 // DashboardHome (and its sub-components) transitively import apiFetch from
 // '../api', which pulls in Firebase. Mock the module so the test does not
 // require real auth and so we can control the digest payload.
+// NOTE: must be a complete mock — TaskCard (transitively imported via
+// `isSafeUrl`) destructures both `API_BASE_URL` and `authGet`, so the mock
+// has to provide them or the test file fails to load with a SyntaxError.
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async (url: string) => {
     if (url.includes('/digest')) {
@@ -50,10 +53,40 @@ vi.mock('../api', () => ({
         { status: 200 },
       );
     }
-    // All other endpoints return empty/ok so sub-components enter their
-    // idle/empty states without throwing.
-    return new Response('{}', { status: 200 });
+    if (url.includes('/task-duration-stats')) {
+      // Shape required by TaskDurationWidget — empty maps yield an early
+      // null-render rather than a TypeError on undefined keys.
+      return new Response(
+        JSON.stringify({
+          stats: {},
+          scope_duration_stats: {},
+          phase_duration_stats: {},
+        }),
+        { status: 200 },
+      );
+    }
+    // All other endpoints return 404 so sub-components see their `if (!res.ok)`
+    // / `if (!data)` early-exits and render their idle/empty states. Returning
+    // `{}` with 200 instead causes widgets that destructure specific shapes
+    // (rows, stats, etc.) to throw TypeErrors during render.
+    return new Response('not found', { status: 404 });
   }),
+  API_BASE_URL: 'http://localhost',
+  COST_PER_VM_HR: 0.067,
+  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
+  authHeaders: vi.fn(async () => ({})),
+  fetchTask: vi.fn(async () => ({})),
+  fetchTaskSerialConsole: vi.fn(async () => ({ available: false })),
+  fetchAutonomyDebug: vi.fn(async () => ({})),
+  fetchRetirementCritiques: vi.fn(async () => ({ critiques: [] })),
+  fetchResearchActionability: vi.fn(async () => ({
+    cycles: [],
+    summary: null,
+  })),
+  fetchSrMissedRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
+  fetchSrRecentMisses: vi.fn(async () => ({ items: [] })),
+  fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
+  onboardProject: vi.fn(async () => ({})),
 }));
 
 describe('DashboardHome — viewport regression', () => {

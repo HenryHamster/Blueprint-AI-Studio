@@ -217,7 +217,7 @@ export function NewTaskModal({
           </div>
           <div className="mb-4">
             <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">Task Type</label>
-            <div className="flex gap-2">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
               {USER_LAUNCHABLE_TASK_TYPE_OPTIONS.map(opt => {
                 const Icon = TASK_TYPE_OPTION_ICONS[opt.value];
                 return (
@@ -225,16 +225,16 @@ export function NewTaskModal({
                     key={opt.value}
                     type="button"
                     onClick={() => handleTaskTypeChange(opt.value)}
-                    className={`flex-1 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
+                    className={`min-w-0 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all ${
                       newTaskType === opt.value
                         ? 'bg-white/5 border-neutral-600 text-neutral-100'
                         : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
                     }`}
                   >
-                    <Icon className="w-3.5 h-3.5" />
-                    <div className="text-left">
-                      <div>{opt.label}</div>
-                      <div className="text-[10px] text-neutral-500 font-normal">{opt.description}</div>
+                    <Icon className="w-3.5 h-3.5 shrink-0" />
+                    <div className="text-left min-w-0">
+                      <div className="truncate">{opt.label}</div>
+                      <div className="text-[10px] text-neutral-500 font-normal truncate">{opt.description}</div>
                     </div>
                   </button>
                 );

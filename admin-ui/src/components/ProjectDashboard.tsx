@@ -102,7 +102,10 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
       )}
 
       {!collapsed && (
-        <div className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar">
+        <div
+          className="flex gap-3 overflow-x-auto pb-2 custom-scrollbar"
+          data-viewport-allow-overflow
+        >
           {/* All Projects option */}
           <button
             onClick={() => onSelectProject(null)}

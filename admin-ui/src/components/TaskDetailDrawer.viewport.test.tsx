@@ -5,11 +5,16 @@ import { TaskDetailDrawer } from './TaskDetailDrawer';
 import type { Task } from '../types/task';
 import { expectNoOverflowAt } from '../test/viewport';
 
-// Stub firebase before any module that transitively imports it
+// Stub firebase before any module that transitively imports it.
+// Browser-mode vitest validates ESM exports statically, so the mock must
+// expose every name `../firebase` actually exports (api.ts pulls in
+// getIdToken; other call sites use onAuthChange).
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
   signOut: vi.fn(),
+  getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
 }));
 
 function makeTask(overrides: Partial<Task> = {}): Task {

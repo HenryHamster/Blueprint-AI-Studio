@@ -300,18 +300,31 @@ export function TimelineView({ tasks, hasActiveFilters, onViewLogs }: TimelineVi
             <div className="flex-1 overflow-x-auto">
               {/* Time ruler */}
               <div className="h-8 border-b border-neutral-800 relative bg-neutral-900/80">
-                {ticks.map((tick) => (
-                  <div
-                    key={tick.pct}
-                    className="absolute top-0 h-full flex flex-col items-center"
-                    style={{ left: `${tick.pct}%` }}
-                  >
-                    <div className="w-px h-2 bg-neutral-700 mt-1" />
-                    <span className="text-xs text-neutral-500 mt-0.5 whitespace-nowrap" style={{ transform: 'translateX(-50%)' }}>
-                      {tick.label}
-                    </span>
-                  </div>
-                ))}
+                {ticks.map((tick) => {
+                  // Clamp label horizontal alignment near edges to prevent overflow
+                  // past the timeline container at narrow viewports. The outer
+                  // wrapper is zero-width so the tick mark and label position
+                  // independently from layout via translateX.
+                  const labelTransform =
+                    tick.pct >= 85 ? 'translateX(-100%)' :
+                    tick.pct <= 15 ? 'translateX(0)' :
+                    'translateX(-50%)';
+                  return (
+                    <div
+                      key={tick.pct}
+                      className="absolute top-0 h-full"
+                      style={{ left: `${tick.pct}%`, width: 0 }}
+                    >
+                      <div className="w-px h-2 bg-neutral-700 mt-1" />
+                      <span
+                        className="block text-xs text-neutral-500 mt-0.5 whitespace-nowrap"
+                        style={{ transform: labelTransform }}
+                      >
+                        {tick.label}
+                      </span>
+                    </div>
+                  );
+                })}
                 {/* "now" marker */}
                 <div
                   className="absolute top-0 h-full w-px bg-amber-500/50"

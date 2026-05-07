@@ -394,7 +394,7 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;
@@ -589,7 +589,103 @@ if touches admin-ui/; then
     FAILED+=("admin-ui npm ci")
   }
   run "admin-ui eslint"  bash -c 'cd admin-ui && npx eslint . 2>&1'
-  run "admin-ui viewport" bash -c 'cd admin-ui && npx playwright install --with-deps chromium && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport 2>&1 || { status=$?; echo ""; echo "[check] admin-ui viewport suite requires Playwright Chromium. If this VM is missing it, run: cd admin-ui && npx playwright install --with-deps chromium"; exit $status; }'
+
+  # Viewport gate: scoped run + baseline recheck.
+  #
+  # 1) SCOPING: by default, run only the viewport tests whose component
+  #    .tsx (or .viewport.test.tsx) was touched. Repo-wide viewport stays
+  #    a CI/main concern; on PRs we don't want pre-existing overflow or
+  #    import drift in untouched components to block unrelated fixes.
+  #    If a non-component admin-ui file changed (shared types, App.tsx,
+  #    package.json, src/test/*), fall back to the full suite — that
+  #    edit could break any component.
+  #
+  # 2) BASELINE: if the (scoped or full) run fails, re-run the SAME
+  #    subset against origin/$BASE in a detached worktree. Both fail →
+  #    pre-existing → warn-pass (mirrors frontend CI's BROKEN/OK
+  #    pattern at .github/workflows/ci.yml line 111-143). PR-only fail →
+  #    real regression → block. Worktree path keeps the agent's working
+  #    tree untouched.
+  ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
+  NON_COMPONENT=$(printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -vE '^admin-ui/src/components/[^/]+\\.(viewport\\.test\\.tsx|tsx)$' || true)
+  : > /tmp/check_viewport_tests.txt
+  if [ -z "$NON_COMPONENT" ]; then
+    printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\\n' "\${f#admin-ui/}" >> /tmp/check_viewport_tests.txt
+    done
+    printf '%s\\n' "$ADMIN_UI_CHANGED" | grep -E '^admin-ui/src/components/[^/]+\\.tsx$' | grep -v '\\.viewport\\.test\\.tsx$' | while IFS= read -r f; do
+      vt="\${f%.tsx}.viewport.test.tsx"
+      [ -f "$vt" ] && printf '%s\\n' "\${vt#admin-ui/}" >> /tmp/check_viewport_tests.txt
+    done
+  fi
+  VIEWPORT_FILTER=$(sort -u /tmp/check_viewport_tests.txt 2>/dev/null | tr '\\n' ' ' | sed 's/ *$//')
+  VIEWPORT_RUN=1
+  if [ -n "$NON_COMPONENT" ]; then
+    VIEWPORT_LABEL="admin-ui viewport (full)"
+  elif [ -n "$VIEWPORT_FILTER" ]; then
+    VIEWPORT_LABEL="admin-ui viewport (changed: $(echo "$VIEWPORT_FILTER" | wc -w | tr -d ' ') file(s))"
+  else
+    echo "[check] no viewport test matches changed components, skipping viewport suite"
+    VIEWPORT_RUN=0
+  fi
+
+  if [ "$VIEWPORT_RUN" = "1" ]; then
+    # Browser-mode vitest runs Playwright Chromium under the hood. The
+    # packer image pre-installs the system libs; the install line below
+    # is a no-op then. On a developer's local machine without Playwright,
+    # the install pulls Chromium + libs.
+    echo "[check] $VIEWPORT_LABEL..."
+    PR_VP_LOG=/tmp/check_viewport_pr.log
+    export VIEWPORT_FILTER
+    if ( cd admin-ui && npx playwright install --with-deps chromium >/tmp/check_pw_install.log 2>&1 && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$PR_VP_LOG" 2>&1; then
+      tail -20 "$PR_VP_LOG"
+      echo "[check] $VIEWPORT_LABEL OK"
+    else
+      echo "[check] $VIEWPORT_LABEL FAILED on PR — checking baseline on origin/$BASE..."
+      BASELINE_FAILED=0
+      BASELINE_REASON=""
+      BASE_REF="origin/$BASE"
+      if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+        BASE_REF="$BASE"
+        git rev-parse --verify "$BASE_REF" >/dev/null 2>&1 || BASELINE_REASON="base ref unavailable"
+      fi
+      if [ -z "$BASELINE_REASON" ]; then
+        WT=/tmp/check_viewport_baseline_wt
+        # Stale worktree from a prior run can wedge \`worktree add\`.
+        # \`worktree remove --force\` is the safe cleanup (no rm -rf).
+        git worktree remove --force "$WT" >/dev/null 2>&1 || true
+        if ! git worktree add --detach "$WT" "$BASE_REF" >/tmp/check_viewport_wt.log 2>&1; then
+          BASELINE_REASON="worktree add failed (see /tmp/check_viewport_wt.log)"
+        else
+          MAIN_VP_LOG=/tmp/check_viewport_main.log
+          # Baseline run uses the SAME scoped subset — VIEWPORT_FILTER
+          # is exported above. If the test files don't exist on main
+          # (newly added in this PR), vitest exits 0 with "no tests"
+          # and we treat baseline as PASSING (so PR-side failure is
+          # real). Acceptable: new test files should pass when added.
+          if ( cd "$WT/admin-ui" && npm ci >/tmp/check_viewport_main_npmci.log 2>&1 && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport -- $VIEWPORT_FILTER 2>&1 ) > "$MAIN_VP_LOG" 2>&1; then
+            BASELINE_FAILED=0
+          else
+            BASELINE_FAILED=1
+          fi
+          git worktree remove --force "$WT" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ "$BASELINE_FAILED" = "1" ]; then
+        echo "[check] $VIEWPORT_LABEL WARN — also broken on $BASE_REF; not blocking PR"
+        echo "[check] PR-side tail:"
+        tail -30 "$PR_VP_LOG" || true
+        echo "[check] Baseline-side tail:"
+        tail -30 /tmp/check_viewport_main.log || true
+      else
+        echo "[check] $VIEWPORT_LABEL FAILED — passes on $BASE_REF, fails on PR. Real regression."
+        [ -n "$BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BASELINE_REASON — treating PR failure as real)"
+        tail -100 "$PR_VP_LOG" || true
+        FAILED+=("$VIEWPORT_LABEL")
+      fi
+    fi
+  fi
+
   run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
 fi
 

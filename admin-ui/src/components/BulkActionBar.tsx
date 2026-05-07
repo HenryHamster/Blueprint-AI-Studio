@@ -40,7 +40,7 @@ export function BulkActionBar({
   toggleSelectionMode,
 }: BulkActionBarProps) {
   return (
-    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 shadow-2xl">
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 flex flex-wrap items-center justify-center gap-2 bg-neutral-800 border border-neutral-700 rounded-xl px-4 py-2.5 shadow-2xl max-w-[calc(100vw-1rem)]">
       <span className="flex items-center gap-1.5 text-xs text-neutral-300 font-medium mr-1">
         <CheckSquare className="w-3.5 h-3.5 text-amber-400" />
         {selectedCount} selected

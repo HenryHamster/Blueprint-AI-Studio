@@ -4,9 +4,16 @@ import { act } from 'react';
 import { CatchUpPanel } from './CatchUpPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 
-// Mock the api module so CatchUpPanel doesn't try to fetch real data
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(async (url: string) => {
+// Mock the api module so CatchUpPanel doesn't try to fetch real data.
+// Use a partial mock (vi.importActual) so transitively-imported helpers
+// like `authGet` (used by TaskCard.tsx, which CatchUpPanel imports) keep
+// their real exports — otherwise the static factory replaces the whole
+// module surface and ESM import resolution fails at load time.
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  return {
+    ...actual,
+    apiFetch: vi.fn(async (url: string) => {
     if (url.includes('/digest')) {
       return new Response(
         JSON.stringify({
@@ -79,8 +86,9 @@ vi.mock('../api', () => ({
     }
     return new Response('{}', { status: 200 });
   }),
-  API_BASE_URL: 'http://localhost:8000',
-}));
+    API_BASE_URL: 'http://localhost:8000',
+  };
+});
 
 describe('CatchUpPanel — viewport regression', () => {
   let root: Root | null = null;

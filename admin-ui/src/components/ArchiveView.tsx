@@ -191,10 +191,10 @@ export default function ArchiveView({
               return (
                 <div
                   key={task.id}
-                  className={`bg-neutral-900 border border-neutral-800 border-l-2 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} rounded-lg px-4 py-3 hover:bg-neutral-800/50 transition-colors flex items-center gap-4`}
+                  className={`bg-neutral-900 border border-neutral-800 border-l-2 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} rounded-lg px-4 py-3 hover:bg-neutral-800/50 transition-colors flex flex-wrap items-center gap-x-4 gap-y-2`}
                 >
                   {/* Title & description */}
-                  <div className="flex-1 min-w-0">
+                  <div className="flex-1 min-w-0 basis-full sm:basis-0">
                     <p className="text-sm font-medium text-neutral-100 truncate">
                       {task.title}
                     </p>
@@ -279,7 +279,7 @@ export default function ArchiveView({
       </div>
 
       {/* Pagination footer */}
-      <div className="flex items-center justify-between px-6 py-2 border-t border-neutral-800 shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-6 py-2 border-t border-neutral-800 shrink-0">
         <div className="flex items-center gap-2">
           <label className="text-xs text-neutral-500">Per page</label>
           <select

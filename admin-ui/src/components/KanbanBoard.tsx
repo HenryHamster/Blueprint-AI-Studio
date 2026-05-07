@@ -367,8 +367,11 @@ export function KanbanBoard({
       onDragEnd={handleDragEnd}
     >
       {/* Mobile: tab bar + single active column */}
-      <div className="flex flex-col flex-1 overflow-hidden md:hidden">
-        <div className="flex gap-1 overflow-x-auto pb-2 sticky top-0 z-20 bg-neutral-950 px-2 pt-2 shrink-0">
+      <div className="flex flex-col flex-1 min-w-0 overflow-hidden md:hidden">
+        <div
+          className="flex flex-nowrap gap-1 overflow-x-auto pb-2 sticky top-0 z-20 bg-neutral-950 px-2 pt-2 shrink-0 min-w-0 max-w-full"
+          data-viewport-allow-overflow
+        >
           {columns.map(col => {
             const count = (tasksByColumn[col.id] ?? []).length;
             const isActive = effectiveActiveColId === col.id;
@@ -376,7 +379,7 @@ export function KanbanBoard({
               <button
                 key={col.id}
                 onClick={() => setActiveColumnId(col.id)}
-                className={`flex items-center gap-1.5 px-3 rounded-lg text-xs font-semibold whitespace-nowrap min-h-[44px] transition-colors ${
+                className={`flex items-center gap-1.5 px-3 rounded-lg text-xs font-semibold whitespace-nowrap min-h-[44px] shrink-0 transition-colors ${
                   isActive
                     ? 'bg-neutral-700 text-neutral-100'
                     : 'bg-neutral-900 text-neutral-400 hover:text-neutral-200'

@@ -8,6 +8,12 @@ import { expectNoOverflowAt } from '../test/viewport';
 vi.mock('../api', () => ({
   API_BASE_URL: '',
   authHeaders: vi.fn(() => Promise.resolve({})),
+  authGet: vi.fn(() =>
+    Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) }),
+  ),
+  apiFetch: vi.fn(() =>
+    Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) }),
+  ),
 }));
 
 // Stub the directions fetch to bail harmlessly.
