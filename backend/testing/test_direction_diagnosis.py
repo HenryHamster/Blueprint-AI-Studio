@@ -20,7 +20,10 @@ from sqlalchemy.orm.attributes import flag_modified
 
 import app.shared_state as _ss
 from app.anomaly_detection import _error_fingerprint
-from app.autonomous_research_diagnosis import _spawn_unproductive_diagnosis
+from app.autonomous_research_diagnosis import (
+    _spawn_remediation_stall_diagnosis,
+    _spawn_unproductive_diagnosis,
+)
 from app.direction_lifecycle import (
     _compute_direction_error_fingerprint,
     _process_direction_lifecycle,
@@ -2642,3 +2645,123 @@ async def test_full_task_failure_remediation_loop_failed_outcome(db_session, moc
     assert len(history) == 1
     assert history[0]["task_id"] == str(remediation.id)
     assert history[0]["result"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# _spawn_remediation_stall_diagnosis tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_remediation_stall_diagnosis_with_open_child(db_session):
+    """With an open child task the function spawns a stall-diagnosis investigate."""
+    from app.models import RegressionRemediationCase
+
+    project = Project(
+        name="stall-diag-test", user_id="u-stall-1", directions=[], design_doc={}
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Original investigate",
+        payloads=[{"type": "investigate", "prompt": "investigate X"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(child)
+    await db_session.flush()
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="test_failure_rate",
+        last_remediation_task_id=child.id,
+        auto_escalation_count=0,
+    )
+    db_session.add(case)
+    await db_session.flush()
+
+    spawned = await _spawn_remediation_stall_diagnosis(project, case, db_session)
+    await db_session.commit()
+
+    assert spawned is True
+    from sqlalchemy import select as sa_select
+
+    tasks = (
+        (
+            await db_session.execute(
+                sa_select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["signal_name"].as_string()
+                    == "remediation_stall_diagnosis",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+    meta = tasks[0]
+    assert meta.status == TaskStatus.QUEUED
+    assert (meta.context or {}).get("auto_escalation") is True
+    assert case.regression_class in (meta.payloads[0] or {}).get("prompt", "")
+    assert str(child.id) in (meta.payloads[0] or {}).get("prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_spawn_remediation_stall_diagnosis_no_open_child_skips(db_session):
+    """Without an open child task (last child completed) the function returns False."""
+    from app.models import RegressionRemediationCase
+
+    project = Project(
+        name="stall-diag-no-child", user_id="u-stall-2", directions=[], design_doc={}
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Finished investigate",
+        payloads=[{"type": "investigate", "prompt": "investigate X"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(child)
+    await db_session.flush()
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="test_failure_rate",
+        last_remediation_task_id=child.id,
+        auto_escalation_count=0,
+    )
+    db_session.add(case)
+    await db_session.flush()
+
+    spawned = await _spawn_remediation_stall_diagnosis(project, case, db_session)
+    assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_remediation_stall_diagnosis_no_child_id_skips(db_session):
+    """Without any last_remediation_task_id the function returns False immediately."""
+    from app.models import RegressionRemediationCase
+
+    project = Project(
+        name="stall-diag-null-child", user_id="u-stall-3", directions=[], design_doc={}
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="test_failure_rate",
+        last_remediation_task_id=None,
+        auto_escalation_count=0,
+    )
+    db_session.add(case)
+    await db_session.flush()
+
+    spawned = await _spawn_remediation_stall_diagnosis(project, case, db_session)
+    assert spawned is False

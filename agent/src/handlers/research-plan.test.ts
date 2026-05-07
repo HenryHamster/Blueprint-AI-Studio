@@ -1058,6 +1058,7 @@ describe('buildThinkerPrompt', () => {
     outcomeSection: '',
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
     dirSummaryText: 'No active directions.',
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',

@@ -593,6 +593,33 @@ export function formatPastRetirementCritiques(raw: unknown): string {
   return '\n' + lines.join('\n') + '\n';
 }
 
+export function formatRetiredDirectionsSummary(raw: unknown): string {
+  if (!Array.isArray(raw) || raw.length === 0) return '';
+  const items = raw as Array<Record<string, unknown>>;
+  const lines: string[] = ['## Recently retired directions (last 90d — avoid re-proposing overlapping work)'];
+  for (const d of items) {
+    const id = typeof d.id === 'string' ? d.id : '?';
+    const text = typeof d.text === 'string' ? d.text : '';
+    const status = typeof d.status === 'string' ? d.status : '';
+    const cycles = typeof d.cycles === 'number' ? d.cycles : 0;
+    const merged = typeof d.prs_merged === 'number' ? d.prs_merged : 0;
+    const reason = typeof d.retirement_reason === 'string' ? d.retirement_reason
+      : typeof d.auto_completed_reason === 'string' ? d.auto_completed_reason : '';
+    const tax = typeof d.dominant_taxonomy === 'string' ? d.dominant_taxonomy : '';
+    const cpm = typeof d.cost_per_merge === 'number' ? `, $${d.cost_per_merge}/merge` : '';
+    const failed = Array.isArray(d.failed_approaches) ? d.failed_approaches as string[] : [];
+
+    let line = `- **${id}** [${status}]: "${text.slice(0, 120)}" — ${cycles} cycles, ${merged} merged${cpm}`;
+    if (tax) line += `, dominant: ${tax}`;
+    if (reason) line += `; reason: ${reason.slice(0, 120)}`;
+    lines.push(line);
+    if (failed.length > 0) {
+      lines.push(`  Failed approaches: ${failed.slice(0, 3).join('; ')}`);
+    }
+  }
+  return '\n' + lines.join('\n') + '\n';
+}
+
 // Portfolio-level view computed from per-direction data — surfaces imbalances
 // (category skew, system coverage gaps, concentration, age) as explicit
 // decision inputs for the strategic thinker.
@@ -864,6 +891,7 @@ export interface ThinkerPromptParams {
   outcomeSection: string;
   previousDecisionOutcomes: string;
   pastRetirementCritiquesSection: string;
+  retiredDirectionsSummarySection: string;
   dirSummaryText: string;
   dirHealthSummary: string;
   userPausedSection: string;
@@ -898,7 +926,7 @@ ${p.runningUpdateSection}
 ${p.designDocJson || 'No design document yet.'}
 
 ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
-${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}
+${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
 ## Current research directions
 ${p.dirSummaryText}
 
@@ -2078,6 +2106,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       outcomeSection,
       previousDecisionOutcomes: formatPreviousDecisionOutcomes(payload.previous_decision_outcomes),
       pastRetirementCritiquesSection,
+      retiredDirectionsSummarySection: formatRetiredDirectionsSummary(payload.retired_directions_summary),
       dirSummaryText,
       dirHealthSummary,
       userPausedSection: buildUserPausedSection(directionsSummary),

@@ -3376,6 +3376,17 @@ async def _spawn_investigation_remediation(
     session: AsyncSession,
 ) -> Optional[Task]:
     """Build and persist a targeted `create` task from a high/medium-confidence diagnosis."""
+    parent_ctx_early = task.context or {}
+    plan_output = task.plan_output if isinstance(task.plan_output, dict) else {}
+    is_cross_layer = (
+        parent_ctx_early.get("escalation") == "cross_layer"
+        or parent_ctx_early.get("cross_layer") is True
+        or plan_output.get("escalation") == "cross_layer"
+    )
+    layer_context = parent_ctx_early.get("layer_context")
+    if not isinstance(layer_context, dict):
+        layer_context = None
+
     prompt_parts = [recommended_fix.strip()]
     if root_cause:
         prompt_parts.append(f"\nRoot cause (from diagnosis):\n{root_cause[:1500]}")
@@ -3383,6 +3394,25 @@ async def _spawn_investigation_remediation(
         prompt_parts.append(
             "\nKey files to review or modify:\n"
             + "\n".join(f"- {p}" for p in affected_paths[:10])
+        )
+    if is_cross_layer:
+        layer_names = []
+        if layer_context and isinstance(layer_context.get("layers"), list):
+            layer_names = [
+                str(entry.get("layer"))
+                for entry in layer_context["layers"]
+                if isinstance(entry, dict) and entry.get("layer")
+            ]
+        layers_phrase = (
+            ", ".join(layer_names) if layer_names else "multiple infrastructure layers"
+        )
+        prompt_parts.append(
+            "\nCROSS-LAYER REMEDIATION: this regression class surfaced across "
+            f"{layers_phrase}. Plan a coordinated change that touches all affected "
+            "layers in a single cluster rather than serializing one PR per layer. "
+            "Note: .github/workflows/ files cannot be edited by the agent — if a "
+            "fix would target workflow YAML, capture it as a finding/note in the "
+            "remediation rather than a direct edit."
         )
     prompt_parts.append(
         f"\nThis task was spawned from investigation {task.id} to remediate a "
@@ -3400,6 +3430,11 @@ async def _spawn_investigation_remediation(
     scope = _calculate_remediation_scope(
         affected_paths, severity_tag, remediation_attempts
     )
+    if is_cross_layer:
+        # Cross-layer remediations get plan-based decomposition so the agent can
+        # bundle multi-layer changes into a single cluster plan instead of
+        # serializing one PR per layer.
+        scope = "large"
 
     payload_dict: Dict[str, Any] = {
         "type": "create",
@@ -3447,6 +3482,12 @@ async def _spawn_investigation_remediation(
         remediation_context["trigger_failure_taxonomy"] = trigger_failure_taxonomy
     if parent_ctx.get("proactive_pattern_fix"):
         remediation_context["proactive_pattern_fix"] = True
+    if is_cross_layer:
+        remediation_context["escalation"] = "cross_layer"
+        remediation_context["escalation_reason"] = "cross_layer"
+        remediation_context["cross_layer"] = True
+        if layer_context is not None:
+            remediation_context["layer_context"] = layer_context
     regression_class = parent_ctx.get("regression_class")
     if regression_class:
         remediation_context["regression_class"] = regression_class

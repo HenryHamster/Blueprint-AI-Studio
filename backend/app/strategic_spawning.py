@@ -173,11 +173,13 @@ def _summarize_drift_signals(drift: dict) -> dict:
     # consistency dropped below 0.8.
     interesting_directions = {}
     for did, sig in by_direction.items():
-        if sig.get("over_claim_flag") or sig.get("stalled_despite_churn_flag"):
-            interesting_directions[did] = sig
-        elif (
-            sig.get("claim_shipped_consistency", 1.0) < 0.8
-            and sig.get("claimed_changes_count", 0) > 0
+        if (
+            sig.get("over_claim_flag")
+            or sig.get("stalled_despite_churn_flag")
+            or (
+                sig.get("claim_shipped_consistency", 1.0) < 0.8
+                and sig.get("claimed_changes_count", 0) > 0
+            )
         ):
             interesting_directions[did] = sig
     return {
@@ -364,6 +366,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "drift_signals": {"priority": "medium"},
     # Lessons from retired directions — helps the agent avoid repeating patterns.
     "past_retirement_critiques": {"priority": "low"},
+    # Raw retired-direction context (metrics + failed_approaches). Lower priority
+    # than past_retirement_critiques (curated) — dropped first when budget is tight.
+    "retired_directions_summary": {"priority": "low"},
 }
 
 
@@ -1292,7 +1297,7 @@ async def _spawn_strategic_review(
             stat_entry["research_context"] = ctx[:3000]
         _rfe = d.get("recent_findings_evidence") or []
         if _rfe:
-            from app.research_context import filter_direction_evidence  # noqa: PLC0415
+            from app.research_context import filter_direction_evidence
 
             _filtered_ev = filter_direction_evidence(ctx, _rfe)
             if _filtered_ev:
@@ -1419,6 +1424,7 @@ async def _spawn_strategic_review(
 
     from app.strategic_analysis import (
         _build_outcome_evaluation,
+        _build_retired_directions_summary,
         _compute_prediction_calibration,
     )
 
@@ -1450,7 +1456,7 @@ async def _spawn_strategic_review(
             drift_summary = await _enrich_drift_with_trend(
                 session, project.id, drift_summary
             )
-    except Exception:  # noqa: BLE001 — drift signals are best-effort
+    except Exception:
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
     payload: dict = pack_under_budget(
@@ -1511,6 +1517,11 @@ async def _spawn_strategic_review(
             **(
                 {"past_retirement_critiques": _past_critiques}
                 if (_past_critiques := _build_past_retirement_critiques(cycle_history))
+                else {}
+            ),
+            **(
+                {"retired_directions_summary": _retired_summary}
+                if (_retired_summary := _build_retired_directions_summary(project))
                 else {}
             ),
             "base_branch": "main",

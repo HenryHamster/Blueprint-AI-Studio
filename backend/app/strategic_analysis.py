@@ -3,11 +3,160 @@
 Extracted from app.strategic_completion to keep that module under its line ceiling.
 """
 
+from datetime import timedelta
+
 from app.time_utils import _utcnow
 
 # Directions whose cost_per_merged_pr exceeds median * multiplier are flagged
 # for retirement consideration by the strategic agent.
 _HIGH_COST_PER_MERGE_MULTIPLIER = 2.0
+
+# Caps for _build_retired_directions_summary. 90d keeps context relevant;
+# 800 chars/entry lets the agent recognize overlap without inflating the prompt.
+_RETIRED_WINDOW_DAYS = 90
+_RETIRED_MAX_COUNT = 20
+_RETIRED_PER_ENTRY_CHAR_CAP = 800
+
+
+def _build_retired_directions_summary(
+    project,
+    window_days: int = _RETIRED_WINDOW_DAYS,
+    max_count: int = _RETIRED_MAX_COUNT,
+    per_entry_char_cap: int = _RETIRED_PER_ENTRY_CHAR_CAP,
+) -> list[dict]:
+    """Summarize recently retired directions so the strategic agent avoids
+    re-proposing semantically duplicate work.
+
+    Includes directions with status in {retired, completed, superseded} or
+    expired directions that have a final-disposition marker
+    (auto_completed_reason). Caps at max_count entries within window_days,
+    with per_entry_char_cap chars per JSON-serialized entry so the summary
+    never blows the prompt budget.
+
+    Cap rationale: 90d window is long enough to cover recent strategic cycles
+    while excluding ancient history; 800 chars/entry fits id + text + metrics
+    + top failed_approaches; 20 entries covers active projects without
+    exceeding a ~16 KB total footprint.
+    """
+    import json as _json
+
+    from app.research_context import _parse_research_context
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    directions = project.directions or []
+    cutoff_iso = (_utcnow() - timedelta(days=window_days)).isoformat()
+
+    retired_statuses = {"retired", "completed", "superseded"}
+    results: list[dict] = []
+
+    for d in directions:
+        status = d.get("status", "")
+        is_expired_with_disposition = status == "expired" and bool(
+            d.get("auto_completed_reason")
+        )
+        if status not in retired_statuses and not is_expired_with_disposition:
+            continue
+
+        # Time-window filter: use retired_at, auto_completed_at, or last history entry
+        retired_at = d.get("retired_at") or d.get("auto_completed_at")
+        if not retired_at:
+            history_list = d.get("research_history") or []
+            retired_at = history_list[-1].get("timestamp") if history_list else None
+        if retired_at and retired_at < cutoff_iso:
+            continue
+
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        total_cycles = len(history) + (agg.get("total_cycles") or 0)
+        total_merged = sum(h.get("prs_merged", 0) for h in history) + (
+            agg.get("total_prs_merged") or 0
+        )
+        total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
+            agg.get("total_prs_rejected") or 0
+        )
+
+        # Dominant taxonomy across lifetime
+        taxonomy_totals: dict[str, int] = {}
+        for h in history:
+            for tkey, tval in (h.get("taxonomy_summary") or {}).items():
+                if tval:
+                    taxonomy_totals[tkey] = taxonomy_totals.get(tkey, 0) + tval
+        dominant_taxonomy = (
+            max(taxonomy_totals, key=lambda k: taxonomy_totals[k])
+            if taxonomy_totals
+            else None
+        )
+
+        # Estimated cost per merge
+        cost_seconds = 0.0
+        for h in history:
+            tcount = h.get("tasks_created", 0) or 0
+            hours = h.get("avg_time_to_merge_hours")
+            if tcount and hours:
+                cost_seconds += tcount * hours * 3600
+        estimated_cost_usd = round(cost_seconds * ON_DEMAND_RATE, 2)
+        cost_per_merge = (
+            round(estimated_cost_usd / total_merged, 2)
+            if total_merged > 0 and estimated_cost_usd > 0
+            else None
+        )
+
+        # Top failed approaches from research_context
+        ctx = d.get("research_context", "")
+        failed_approaches: list[str] = []
+        if ctx:
+            parsed = _parse_research_context(ctx)
+            failed_approaches = parsed.get("failed", [])[:5]
+
+        # Most recent 1-2 history entries (compact)
+        recent_history = [
+            {
+                "timestamp": h.get("timestamp"),
+                "prs_merged": h.get("prs_merged", 0),
+                "prs_rejected": h.get("prs_rejected", 0),
+                "tasks_failed": h.get("tasks_failed", 0),
+            }
+            for h in history[-2:]
+        ]
+
+        entry: dict = {
+            "id": d.get("id"),
+            "text": (d.get("text") or "")[:200],
+            "status": status,
+            "cycles": total_cycles,
+            "prs_merged": total_merged,
+        }
+        if total_rejected > 0:
+            entry["prs_rejected"] = total_rejected
+        if d.get("retirement_reason"):
+            entry["retirement_reason"] = str(d["retirement_reason"])[:200]
+        if d.get("auto_completed_reason"):
+            entry["auto_completed_reason"] = str(d["auto_completed_reason"])[:200]
+        if cost_per_merge is not None:
+            entry["cost_per_merge"] = cost_per_merge
+        if dominant_taxonomy:
+            entry["dominant_taxonomy"] = dominant_taxonomy
+        if failed_approaches:
+            entry["failed_approaches"] = failed_approaches
+        if recent_history:
+            entry["recent_history"] = recent_history
+
+        # Apply per-entry char cap: trim optional bulky fields first
+        if len(_json.dumps(entry)) > per_entry_char_cap:
+            entry.pop("failed_approaches", None)
+            entry.pop("recent_history", None)
+        if len(_json.dumps(entry)) > per_entry_char_cap:
+            entry["text"] = entry["text"][:100]
+
+        results.append(entry)
+        if len(results) >= max_count:
+            break
+
+    # Newest retired first (best proxy: sort by id descending is unreliable;
+    # use retired_at / last history timestamp via original iteration order, or
+    # sort by prs_merged descending as a stable tiebreak — not time-ordered
+    # but good enough for the agent's dedup use case).
+    return results
 
 
 def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dict:
@@ -21,9 +170,9 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
     Falls back to an empty list if the caller didn't provide one — the
     sub-helpers handle that gracefully.
     """
-    from app.research_context import _parse_research_context  # noqa: PLC0415
-    from app.direction_metrics import _compute_difficulty_index  # noqa: PLC0415
-    from app.routers.admin_analytics import ON_DEMAND_RATE  # noqa: PLC0415
+    from app.research_context import _parse_research_context
+    from app.direction_metrics import _compute_difficulty_index
+    from app.routers.admin_analytics import ON_DEMAND_RATE
 
     vision = project.vision or {}
     directions = project.directions or []
@@ -149,7 +298,7 @@ def _build_outcome_evaluation(project, cycle_history: list | None = None) -> dic
             outcome["failed_approaches"] = failed_approaches[:10]
         raw_evidence = d.get("recent_findings_evidence") or []
         if raw_evidence:
-            from app.research_context import filter_direction_evidence  # noqa: PLC0415
+            from app.research_context import filter_direction_evidence
 
             filtered = filter_direction_evidence(ctx, raw_evidence)
             if filtered:
@@ -412,7 +561,7 @@ def _build_decision_accuracy(directions: list, cycle_history: list) -> dict:
     ``vision._strategic_cycle_history``); the async caller pre-fetches via
     ``strategic_cycle.recent_for_agent_context``.
     """
-    from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+    from app.direction_metrics import _compute_direction_quality_score
 
     cycle_history = list(cycle_history or [])
     target = None

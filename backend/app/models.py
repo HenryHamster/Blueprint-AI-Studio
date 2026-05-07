@@ -1487,6 +1487,15 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
+    # Number of one-shot autonomous escalations the watchdog has fired before
+    # promoting the case to NEEDS_MANUAL_INTERVENTION. Capped at 1 today: when
+    # the original investigate task is still active but the case has gone
+    # stale, the dispatcher gets ONE additional autonomous attempt at the
+    # remediation blocker before paging the operator.
+    auto_escalation_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
     last_remediation_pr_number: Optional[int] = Field(default=None)
     last_remediation_result: Optional[str] = Field(default=None)
     last_failure_class: Optional[str] = Field(default=None)
@@ -1527,6 +1536,14 @@ class RegressionRemediationCase(SQLModel, table=True):
     escalation_reason: Optional[str] = Field(
         default=None,
         sa_column=Column(String, nullable=True),
+    )
+    # Per-layer symptom log: {layer_name: [{fingerprint, observed_at, sample}]}.
+    # Written by the dispatcher when classify_layers() matches; bounded to 10
+    # entries per layer so the column doesn't grow unboundedly.
+    # Migration: alembic 0085 adds this column with server_default='{}').
+    symptoms_by_layer: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,

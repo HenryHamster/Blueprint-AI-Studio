@@ -14,7 +14,14 @@ from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import DeploymentState, Project, Task, TaskHistory, TaskStatus
+from app.models import (
+    DeploymentState,
+    Project,
+    RegressionRemediationCase,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.strategic_completion import _is_code_failure_pause_reason
@@ -451,5 +458,124 @@ async def _spawn_unproductive_diagnosis(
     logger.info(
         f"[DIAGNOSIS] Spawned unproductive investigate {new_task.id} for direction {did}: "
         f"{pause_reason[:60]}"
+    )
+    return True
+
+
+_ACTIVE_TASK_STATUSES = frozenset(
+    [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+)
+
+
+async def _spawn_remediation_stall_diagnosis(
+    project: Project,
+    case: RegressionRemediationCase,
+    session: AsyncSession,
+) -> bool:
+    """Spawn an enriched stall-diagnosis investigate for a stalled ACTIVE remediation.
+
+    Richer companion to the dispatcher's inline auto-escalation: includes recent
+    deployment changes and a full child-task inventory in the prompt so the
+    investigating agent has maximum context about what is blocking convergence.
+
+    Returns True if a new task was created, False if skipped (no open child).
+    """
+    if case.last_remediation_task_id is None:
+        return False
+
+    child = await session.get(Task, case.last_remediation_task_id)
+    if child is None or child.status not in _ACTIVE_TASK_STATUSES:
+        return False
+
+    recent_changes = await _get_recent_changes_context(session)
+    changes_block = ""
+    if recent_changes.get("deployed_at"):
+        sha_note = (
+            f", sha {recent_changes['current_sha']}"
+            if recent_changes.get("current_sha")
+            else ""
+        )
+        commit_lines = (
+            "\n".join(f"  {c}" for c in recent_changes["commits"])
+            if recent_changes["commits"]
+            else "  (no commits found since last deploy)"
+        )
+        changes_block = (
+            f"\n\nRecent changes (since deploy at {recent_changes['deployed_at']}"
+            f"{sha_note}):\n{commit_lines}"
+        )
+
+    child_summary = (
+        f"  task_id={child.id} status={child.status} "
+        f"message={(child.latest_status_message or '')[:200]!r}"
+    )
+    prompt = (
+        f"A remediation for regression class '{case.regression_class}' has been "
+        f"ACTIVE for >24h without resolving the underlying signal.\n\n"
+        f"Existing children:\n{child_summary}\n\n"
+        f"Diagnose the REMEDIATION BLOCKER (not the original signal): "
+        f"merge conflict patterns, reviewer/CI disagreement on prior fix attempts, "
+        f"infrastructure preconditions (toolchain, missing system libs), or "
+        f"leader-election / orchestrator cascade issues are the most common "
+        f"stall classes. Produce the structured diagnosis JSON "
+        f"({{summary, root_cause, recommended_fix, severity, confidence, "
+        f"affected_files}}). Do NOT re-investigate the original signal."
+        f"{changes_block}"
+    )
+    payload = validate_internal_payload(
+        {
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": "main",
+            "effort": "low",
+            "recent_changes": recent_changes,
+        },
+        "autonomous_research_diagnosis:remediation_stall",
+    )
+    new_task = Task(
+        project_id=project.id,
+        title=f"Diagnose stalled remediation: {case.regression_class}"[:200],
+        description=(
+            "Auto-escalation: remediation case ACTIVE >24h with open child. "
+            "Diagnosing the remediation blocker."
+        )[:500],
+        payloads=[payload],
+        context={
+            "spawned_by": "autonomous_research_diagnosis",
+            "regression_class": case.regression_class,
+            "signal_name": "remediation_stall_diagnosis",
+            "auto_escalation": True,
+            "prior_remediation_task_id": str(case.last_remediation_task_id),
+            "remediation_case_id": str(case.id),
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "AUTONOMOUS_RESEARCH_DIAGNOSIS",
+                "regression_class": case.regression_class,
+                "signal_name": "remediation_stall_diagnosis",
+                "auto_escalation": True,
+            },
+        )
+    )
+    logger.info(
+        "[DIAGNOSIS] Spawned remediation stall investigation %s for class '%s' "
+        "(child=%s is still %s)",
+        new_task.id,
+        case.regression_class,
+        case.last_remediation_task_id,
+        child.status,
     )
     return True

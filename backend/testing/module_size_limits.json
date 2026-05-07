@@ -23,7 +23,8 @@
     "rollup_management.py": 2950,
     "reaper.py": 2950,
     "review_pipeline.py": 2350,
-    "deploy_health.py": 1250
+    "deploy_health.py": 1250,
+    "regression_layer_classifier.py": 250
   },
   "frontend": {
     "useAppState.ts": 3000,

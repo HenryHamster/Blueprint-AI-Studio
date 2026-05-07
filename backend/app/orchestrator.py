@@ -1107,6 +1107,7 @@ async def orchestrator_worker():
             global _last_regression_dispatch
             if (_utcnow() - _last_regression_dispatch).total_seconds() >= 60:
                 from app.pipeline_regression_dispatcher import (
+                    run_dispatcher_watchdog_alarms as _run_watchdog_alarms,
                     run_once as _run_regression_dispatcher,
                 )  # noqa: PLC0415
 
@@ -1131,6 +1132,13 @@ async def orchestrator_worker():
                         "[REGRESSION_DISPATCHER] project enumeration failed"
                     )
                     _project_ids = []
+                # Watchdog alarms run BEFORE run_once so staleness fires even
+                # when run_once hangs or raises on the subsequent project loop.
+                try:
+                    async with AsyncSessionLocal() as _wa_session:
+                        await _run_watchdog_alarms(_wa_session, list(_project_ids))
+                except Exception:
+                    logger.exception("[REGRESSION_DISPATCHER] watchdog alarms failed")
                 for _pid in _project_ids:
                     try:
                         async with AsyncSessionLocal() as _rd_session:

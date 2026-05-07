@@ -24,6 +24,7 @@ from app.pipeline_regression_dispatcher import (
     _WATCHDOG_ACTIVE_STALE_THRESHOLD,
     _WATCHDOG_MERGED_STALE_THRESHOLD,
     get_dispatcher_cycle_records,
+    run_dispatcher_watchdog_alarms,
     run_once,
     run_recovery_once,
     run_watchdog_once,
@@ -1125,7 +1126,7 @@ def _merged_case(
     regression_class: str = "sr_catch_rate:correctness",
     attempts: int = 0,
     minutes_since_merge: int = 20,
-) -> "RegressionRemediationCase":  # noqa: F821
+) -> RegressionRemediationCase:  # noqa: F821
     """Build a MERGED RegressionRemediationCase whose cooldown has elapsed."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
 
@@ -1518,10 +1519,10 @@ async def _make_stale_case(
     db_session,
     project_id,
     *,
-    status: "RegressionCaseStatus",  # noqa: F821
+    status: RegressionCaseStatus,  # noqa: F821
     hours_stale: int,
     regression_class: str = "sr_catch_rate:correctness",
-) -> "RegressionRemediationCase":  # noqa: F821
+) -> RegressionRemediationCase:  # noqa: F821
     """Create a case and backdate its updated_at to simulate staleness."""
     from sqlalchemy import update
     from app.models import RegressionRemediationCase as RRC
@@ -1763,6 +1764,202 @@ async def test_watchdog_merged_escalation_idempotent(db_session):
         .all()
     )
     assert len(alerts_2) == 1  # No new alert created
+
+
+# ---------------------------------------------------------------------------
+# Watchdog auto-escalation (one-shot meta-investigate) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_active_stale_with_open_child_auto_escalates(db_session):
+    """ACTIVE-stale case with an in-flight child spawns a meta-investigate before NMI.
+
+    The original investigation is still running, so the watchdog gives the
+    autonomous loop ONE more attempt at the remediation blocker before paging
+    the operator. Status stays ACTIVE; auto_escalation_count goes 0 → 1; the
+    new task is tagged with `auto_escalation=True` and an INFO Alert is opened.
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # In-flight child task that the case points at — keeps `_has_active_remediation_child` True.
+    child = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"spawned_by": "pipeline_regression_dispatcher"},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    stale_hours = int(_WATCHDOG_ACTIVE_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.ACTIVE,
+        hours_stale=stale_hours,
+    )
+    # Wire the child onto the case directly via SQL so the test does not depend
+    # on _make_stale_case accepting the link as an argument. Re-stamp updated_at
+    # in the same UPDATE so the onupdate hook does not refresh it back to "now".
+    from sqlalchemy import update as sql_update
+    from app.models import RegressionRemediationCase as RRC
+
+    stale_ts = _utcnow() - timedelta(hours=stale_hours)
+    await db_session.execute(
+        sql_update(RRC)
+        .where(RRC.id == case.id)
+        .values(last_remediation_task_id=child.id, updated_at=stale_ts)
+    )
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    mutated = await run_watchdog_once(db_session, project.id)
+    assert mutated == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.ACTIVE
+    assert case.auto_escalation_count == 1
+    assert case.last_remediation_task_id != child.id  # now points at meta task
+
+    # The new meta-investigate task exists with the expected tagging.
+    meta_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.id != child.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(meta_tasks) == 1
+    meta = meta_tasks[0]
+    assert (meta.context or {}).get("auto_escalation") is True
+    assert (meta.context or {}).get("signal_name") == "auto_escalation_meta_investigate"
+    assert (meta.context or {}).get("regression_class") == case.regression_class
+    assert (meta.first_payload or {}).get("type") == "investigate"
+
+    # Alert is INFO, not WARNING — the operator is informed but not paged.
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+
+
+@pytest.mark.asyncio
+async def test_watchdog_active_stale_already_auto_escalated_promotes_to_nmi(db_session):
+    """A second 24h stall after auto-escalation transitions to NEEDS_MANUAL_INTERVENTION.
+
+    `auto_escalation_count` is the cooldown gate — capped at 1. Once the
+    auto-escalation has fired and another 24h has elapsed without resolution,
+    the watchdog falls through to the legacy NMI + WARNING Alert path.
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+    from sqlalchemy import update as sql_update
+    from app.models import RegressionRemediationCase as RRC
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Even with an in-flight child, count >= 1 forces NMI.
+    child = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"spawned_by": "pipeline_regression_dispatcher_watchdog"},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    stale_hours = int(_WATCHDOG_ACTIVE_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.ACTIVE,
+        hours_stale=stale_hours,
+    )
+    stale_ts = _utcnow() - timedelta(hours=stale_hours)
+    await db_session.execute(
+        sql_update(RRC)
+        .where(RRC.id == case.id)
+        .values(
+            last_remediation_task_id=child.id,
+            auto_escalation_count=1,
+            updated_at=stale_ts,
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    mutated = await run_watchdog_once(db_session, project.id)
+    assert mutated == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.needs_manual_intervention_at is not None
+    assert case.auto_escalation_count == 1  # not incremented again
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+
+
+@pytest.mark.asyncio
+async def test_watchdog_active_stale_no_open_child_skips_auto_escalation(db_session):
+    """ACTIVE-stale case with NO open child goes straight to NMI (different bug class).
+
+    When `last_remediation_task_id` is None or the child has terminated, the
+    investigation finished but no fix landed — that's the original bug class
+    the watchdog has always paged on. Auto-escalation only applies when the
+    child is genuinely still working.
+    """
+    from app.models import Alert, AlertSeverity, RegressionCaseStatus
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_hours = int(_WATCHDOG_ACTIVE_STALE_THRESHOLD.total_seconds() / 3600) + 2
+    case = await _make_stale_case(
+        db_session,
+        project.id,
+        status=RegressionCaseStatus.ACTIVE,
+        hours_stale=stale_hours,
+    )
+    # No last_remediation_task_id — the case has no in-flight child.
+
+    mutated = await run_watchdog_once(db_session, project.id)
+    assert mutated == 1
+
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+    assert case.auto_escalation_count == 0  # untouched
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
 
 
 # ---------------------------------------------------------------------------
@@ -3903,7 +4100,7 @@ async def _make_crash_case(
     service_name: str,
     attempts: int = 0,
     merged_at_offset_minutes: int = 20,
-) -> "RegressionRemediationCase":  # noqa: F821
+) -> RegressionRemediationCase:  # noqa: F821
     """Create a MERGED background-service crash RegressionRemediationCase."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase as RRC
 
@@ -4046,3 +4243,609 @@ async def test_crash_case_per_service_independent(db_session):
     assert case_reaper.status == RegressionCaseStatus.ACTIVE
     # "orchestrator_worker" no recent crashes → closed.
     assert case_worker.status == RegressionCaseStatus.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# Cross-layer regression escalation
+# ---------------------------------------------------------------------------
+
+
+def _seed_anomaly(project_id, fingerprint: str, *, message: str, count: int = 5):
+    """Seed a persistent anomaly entry that will trip _evaluate_anomaly_signal.
+
+    Caller is responsible for popping the entry from
+    `app.shared_state.persistent_anomalies` after the test.
+    """
+    import app.shared_state as _ss
+
+    now = _utcnow()
+    _ss.persistent_anomalies[str(project_id)] = {
+        fingerprint: {
+            "occurrence_count": count,
+            "last_seen": now.isoformat(),
+            "first_seen": (now - timedelta(hours=1)).isoformat(),
+            "example_message": message,
+            "latest_details": message,
+            "severity": "high",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_one_layer_no_escalation(db_session):
+    """A regression class with only ONE layer in the window does NOT escalate."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "PROVISION_FAILURE"
+    _seed_anomaly(
+        project.id,
+        fingerprint,
+        message="error while loading shared libraries: libatk-1.0.so.0",
+    )
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        task = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert task is not None
+        ctx = task.context or {}
+        assert ctx.get("cross_layer") is not True
+        assert ctx.get("escalation") != "cross_layer"
+        payload = task.first_payload or {}
+        assert "CROSS-LAYER REGRESSION DETECTED" not in (payload.get("prompt") or "")
+        assert payload.get("layer_context") in (
+            None,
+            {},
+            {"layers": [], "escalation": "cross_layer"},
+        )
+    finally:
+        import app.shared_state as _ss
+
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_two_layers_escalates(db_session):
+    """>=2 distinct layers in 48h window → cross-layer investigate w/ layer_context."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.regression_layer_classifier import (
+        LAYER_AGENT_VM,
+        LAYER_CI_WORKFLOW,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "PROVISION_FAILURE"
+    regression_class = f"anomaly:{fingerprint}"
+    now = _utcnow()
+    # Prior observation already classified to AGENT_VM.
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class=regression_class,
+        status=RegressionCaseStatus.ACTIVE,
+        signal_snapshot_at_spawn={"signal_name": "persistent_anomaly"},
+        last_seen_at=now - timedelta(hours=2),
+        hit_count=1,
+        signal_first_crossed_at=now - timedelta(hours=2),
+        signal_first_seen_at=now - timedelta(hours=2),
+        symptoms_by_layer={
+            LAYER_AGENT_VM: [
+                {
+                    "fingerprint": "agentvm-fp-1",
+                    "observed_at": (now - timedelta(hours=2)).isoformat(),
+                    "sample": "error while loading shared libraries: libatk-1.0.so.0",
+                }
+            ]
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    # New observation classifies to CI_WORKFLOW. The case has no last_spawn task,
+    # so cooldown does not block; the existing-case path updates symptoms.
+    _seed_anomaly(
+        project.id,
+        fingerprint,
+        message="no jobs ran for changed files; workflow not triggered",
+    )
+    try:
+        spawned = await run_once(db_session, project.id)
+        assert spawned == 1
+
+        task = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(Task.project_id == project.id)
+                    .order_by(Task.created_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert task is not None
+        ctx = task.context or {}
+        assert ctx.get("cross_layer") is True
+        assert ctx.get("escalation") == "cross_layer"
+        assert ctx.get("escalation_reason") == "cross_layer"
+        layers = sorted(ctx.get("cross_layer_layers") or [])
+        assert LAYER_AGENT_VM in layers
+        assert LAYER_CI_WORKFLOW in layers
+        assert ctx.get("regression_class") == regression_class
+
+        payload = task.first_payload or {}
+        prompt = payload.get("prompt") or ""
+        assert "CROSS-LAYER REGRESSION DETECTED" in prompt
+        assert LAYER_AGENT_VM in prompt
+        assert LAYER_CI_WORKFLOW in prompt
+
+        # InvestigatePayload.layer_context populated with per-layer evidence.
+        layer_ctx = payload.get("layer_context") or {}
+        assert layer_ctx.get("escalation") == "cross_layer"
+        layer_entries = layer_ctx.get("layers") or []
+        layer_set = {e.get("layer") for e in layer_entries if isinstance(e, dict)}
+        assert LAYER_AGENT_VM in layer_set
+        assert LAYER_CI_WORKFLOW in layer_set
+    finally:
+        import app.shared_state as _ss
+
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_cooldown_still_blocks(db_session):
+    """Same regression class re-trips within 6h → cooldown blocks (no double-dispatch)."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fingerprint = "PROVISION_FAILURE"
+    _seed_anomaly(
+        project.id,
+        fingerprint,
+        message="error while loading shared libraries: libatk-1.0.so.0",
+    )
+    try:
+        first = await run_once(db_session, project.id)
+        assert first == 1
+
+        # Mark first task COMPLETED so it is no longer in-flight; cooldown alone
+        # must still block. Re-seed with a DIFFERENT-layer message that would
+        # otherwise escalate cross-layer.
+        first_task = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        first_task.status = TaskStatus.COMPLETED
+        db_session.add(first_task)
+        await db_session.commit()
+
+        _seed_anomaly(
+            project.id,
+            fingerprint,
+            message="no jobs ran for changed files; workflow not triggered",
+        )
+        second = await run_once(db_session, project.id)
+        assert second == 0
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1  # cooldown blocked the second spawn
+    finally:
+        import app.shared_state as _ss
+
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_counts_as_one_against_system_cap(db_session):
+    """A cross-layer escalation occupies exactly one spawn slot, not multiple."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.pipeline_regression_dispatcher import (
+        _REGRESSION_DISPATCHER_SYSTEM_CAP,
+    )
+    from app.regression_layer_classifier import LAYER_AGENT_VM
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Three persistent anomalies, each with prior AGENT_VM history. The first
+    # two will spawn (bucket cross_layer + cross_layer); the third must be
+    # capped by _REGRESSION_DISPATCHER_SYSTEM_CAP (=2).
+    fingerprints = ["A_PROVISION", "B_PROVISION", "C_PROVISION"]
+    for fp in fingerprints:
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=f"anomaly:{fp}",
+            status=RegressionCaseStatus.ACTIVE,
+            signal_snapshot_at_spawn={"signal_name": "persistent_anomaly"},
+            last_seen_at=now - timedelta(hours=2),
+            hit_count=1,
+            signal_first_crossed_at=now - timedelta(hours=2),
+            signal_first_seen_at=now - timedelta(hours=2),
+            symptoms_by_layer={
+                LAYER_AGENT_VM: [
+                    {
+                        "fingerprint": f"prior-{fp}",
+                        "observed_at": (now - timedelta(hours=1)).isoformat(),
+                        "sample": "error while loading shared libraries: libatk.so",
+                    }
+                ]
+            },
+        )
+        db_session.add(case)
+    await db_session.commit()
+
+    import app.shared_state as _ss
+
+    _ss.persistent_anomalies[str(project.id)] = {
+        fp: {
+            "occurrence_count": 5,
+            "last_seen": now.isoformat(),
+            "first_seen": (now - timedelta(hours=1)).isoformat(),
+            "example_message": "no jobs ran for changed files; workflow not triggered",
+            "latest_details": "no jobs ran for changed files; workflow not triggered",
+            "severity": "high",
+        }
+        for fp in fingerprints
+    }
+    try:
+        spawned = await run_once(db_session, project.id)
+        # System cap is 2 — even though all three would cross-layer escalate,
+        # only the first two get spawn slots.
+        assert spawned == _REGRESSION_DISPATCHER_SYSTEM_CAP
+        assert _REGRESSION_DISPATCHER_SYSTEM_CAP == 2
+
+        cross_layer_tasks = (
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.context["cross_layer"].as_string() == "true",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(cross_layer_tasks) == 2
+    finally:
+        _ss.persistent_anomalies.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_cross_layer_idempotent_repeated_fingerprint(db_session):
+    """Repeated identical fingerprint observations don't grow symptoms_by_layer unboundedly."""
+    from app.pipeline_regression_dispatcher import (
+        _LAYER_SYMPTOM_BOUND,
+        _record_layer_observation,
+    )
+    from app.regression_layer_classifier import LAYER_AGENT_VM
+
+    now = _utcnow()
+    symptoms: dict = {}
+    # Append same fingerprint 20 times — should stay 1 entry per layer.
+    for i in range(20):
+        symptoms = _record_layer_observation(
+            symptoms,
+            [LAYER_AGENT_VM],
+            fingerprint="dupe-fp",
+            sample=f"sample iter {i}",
+            now=now + timedelta(minutes=i),
+        )
+    assert len(symptoms[LAYER_AGENT_VM]) == 1
+    only = symptoms[LAYER_AGENT_VM][0]
+    assert only["fingerprint"] == "dupe-fp"
+    # observed_at refreshed to latest write.
+    assert only["observed_at"] == (now + timedelta(minutes=19)).isoformat()
+
+    # Now append distinct fingerprints past the bound — bound enforced.
+    for i in range(_LAYER_SYMPTOM_BOUND + 5):
+        symptoms = _record_layer_observation(
+            symptoms,
+            [LAYER_AGENT_VM],
+            fingerprint=f"fresh-fp-{i}",
+            sample="x",
+            now=now + timedelta(minutes=100 + i),
+        )
+    # Expect: original "dupe-fp" + bounded set of fresh entries, capped at bound.
+    assert len(symptoms[LAYER_AGENT_VM]) <= _LAYER_SYMPTOM_BOUND + 1
+    # The dispatcher must have trimmed the oldest fresh entries — newest kept.
+    fps = [e["fingerprint"] for e in symptoms[LAYER_AGENT_VM]]
+    assert f"fresh-fp-{_LAYER_SYMPTOM_BOUND + 4}" in fps
+
+
+# ---------------------------------------------------------------------------
+# Watchdog alarm tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_staleness_alarm_fires_after_threshold(db_session, monkeypatch):
+    """Staleness alarm opens an ERROR alert when last cycle is >300s ago."""
+    import time
+    import app.pipeline_regression_dispatcher as _disp
+    from app.models import Alert, AlertSeverity
+    from app.pipeline_regression_dispatcher import (
+        _DISPATCHER_STALENESS_THRESHOLD_SECONDS,
+        _STALENESS_ALERT_TITLE_PREFIX,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Inject a stale monotonic timestamp (well past threshold).
+    stale_mono = time.monotonic() - (_DISPATCHER_STALENESS_THRESHOLD_SECONDS + 60)
+    _disp._last_cycle_monotonic[str(project.id)] = stale_mono
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title.startswith(_STALENESS_ALERT_TITLE_PREFIX)
+
+    # Cleanup
+    del _disp._last_cycle_monotonic[str(project.id)]
+
+
+@pytest.mark.asyncio
+async def test_staleness_alarm_auto_resolves(db_session):
+    """Staleness alert is dismissed when a fresh cycle is recorded."""
+    import time
+    import app.pipeline_regression_dispatcher as _disp
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import (
+        _STALENESS_ALERT_TITLE_PREFIX,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-create an open staleness alert.
+    db_session.add(
+        Alert(
+            project_id=project.id,
+            severity="ERROR",
+            title=f"{_STALENESS_ALERT_TITLE_PREFIX} 400s since last cycle",
+            message="stale",
+        )
+    )
+    await db_session.commit()
+
+    # Now record a fresh cycle (within threshold).
+    _disp._last_cycle_monotonic[str(project.id)] = time.monotonic()
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+    del _disp._last_cycle_monotonic[str(project.id)]
+
+
+@pytest.mark.asyncio
+async def test_staleness_alarm_no_false_positive_on_first_boot(db_session):
+    """No alarm fires when _last_cycle_monotonic has no entry for the project."""
+    import app.pipeline_regression_dispatcher as _disp
+    from app.models import Alert
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Ensure no entry exists.
+    _disp._last_cycle_monotonic.pop(str(project.id), None)
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_spawn_streak_alarm_fires(db_session):
+    """Zero-spawn streak alert opens after K consecutive suppressed cycles."""
+    import app.pipeline_regression_dispatcher as _disp
+    from app.models import Alert, AlertSeverity
+    from app.pipeline_regression_dispatcher import (
+        _DISPATCHER_ZERO_SPAWN_STREAK_K,
+        _ZERO_SPAWN_ALERT_TITLE_PREFIX,
+    )
+
+    project = make_project(design_doc=_design_doc_with_sr_regression())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pid_str = str(project.id)
+    # Inject K cycle records: all have signals_tripped>0 and spawns_emitted==0.
+    for _ in range(_DISPATCHER_ZERO_SPAWN_STREAK_K):
+        _disp._dispatcher_cycle_records.append(
+            {
+                "project_id": pid_str,
+                "cycle_started_at": _utcnow().isoformat(),
+                "cycle_finished_at": _utcnow().isoformat(),
+                "spawns_emitted": 0,
+                "signals_tripped": 1,
+                "rejections_by_reason": {"cooldown": 1},
+            }
+        )
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].title.startswith(_ZERO_SPAWN_ALERT_TITLE_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_zero_spawn_streak_alarm_auto_resolves(db_session):
+    """Zero-spawn streak alert is dismissed when a spawn succeeds."""
+    import app.pipeline_regression_dispatcher as _disp
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import (
+        _DISPATCHER_ZERO_SPAWN_STREAK_K,
+        _ZERO_SPAWN_ALERT_TITLE_PREFIX,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-create an open zero-spawn-streak alert.
+    db_session.add(
+        Alert(
+            project_id=project.id,
+            severity="WARNING",
+            title=f"{_ZERO_SPAWN_ALERT_TITLE_PREFIX} 10 consecutive cycles suppressed",
+            message="streak",
+        )
+    )
+    await db_session.commit()
+
+    pid_str = str(project.id)
+    # Inject K-1 suppressed + 1 successful spawn → streak broken.
+    for i in range(_DISPATCHER_ZERO_SPAWN_STREAK_K):
+        _disp._dispatcher_cycle_records.append(
+            {
+                "project_id": pid_str,
+                "cycle_started_at": _utcnow().isoformat(),
+                "cycle_finished_at": _utcnow().isoformat(),
+                "spawns_emitted": 1 if i == _DISPATCHER_ZERO_SPAWN_STREAK_K - 1 else 0,
+                "signals_tripped": 1,
+                "rejections_by_reason": {
+                    "cooldown": 0 if i == _DISPATCHER_ZERO_SPAWN_STREAK_K - 1 else 1
+                },
+            }
+        )
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_staleness_alarm_dedup(db_session):
+    """Calling watchdog twice while stale creates exactly one open Alert."""
+    import time
+    import app.pipeline_regression_dispatcher as _disp
+    from app.models import Alert
+    from app.pipeline_regression_dispatcher import (
+        _DISPATCHER_STALENESS_THRESHOLD_SECONDS,
+        _STALENESS_ALERT_TITLE_PREFIX,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_mono = time.monotonic() - (_DISPATCHER_STALENESS_THRESHOLD_SECONDS + 120)
+    _disp._last_cycle_monotonic[str(project.id)] = stale_mono
+
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+    await run_dispatcher_watchdog_alarms(db_session, [project.id])
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title.like(_STALENESS_ALERT_TITLE_PREFIX + "%"),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+    del _disp._last_cycle_monotonic[str(project.id)]

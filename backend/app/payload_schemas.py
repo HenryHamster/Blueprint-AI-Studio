@@ -131,6 +131,7 @@ class RecentChangesContext(BaseModel):
 
 class InvestigatePayload(_PromptRequired):
     recent_changes: RecentChangesContext | None = None
+    layer_context: dict | None = None
 
 
 # ---------------------------------------------------------------------------

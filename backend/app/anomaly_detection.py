@@ -293,6 +293,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
 
         # Build top error patterns when there are enough failures to be interesting
         top_patterns: list[dict] = []
+        per_layer_counts: dict[str, int] = {}
         if count > 3:
             pattern_counts: dict[str, dict] = {}
             for t in tasks:
@@ -310,6 +311,22 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                 pattern_counts.values(), key=lambda x: x["count"], reverse=True
             )[:3]
 
+            # Per-layer counts give downstream cross-layer dispatch logic
+            # structured input without re-scanning the failures.
+            try:
+                from app.failure_stage import _derive_failure_stage  # noqa: PLC0415
+                from app.regression_layer_classifier import (  # noqa: PLC0415
+                    classify_layers,
+                )
+
+                for t in tasks:
+                    msg = t.latest_status_message or ""
+                    stage = _derive_failure_stage(cls or "", msg)
+                    for layer in classify_layers(cls or "", msg, stage):
+                        per_layer_counts[layer] = per_layer_counts.get(layer, 0) + 1
+            except Exception:  # noqa: BLE001
+                per_layer_counts = {}
+
         if count > 3 and prior_count > 0 and count >= prior_count * 2:
             anomaly: dict = {
                 "signal": f"{cls} failures increased {prior_count}x → {count}x in last 48h",
@@ -321,6 +338,8 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             }
             if top_patterns:
                 anomaly["top_patterns"] = top_patterns
+            if per_layer_counts:
+                anomaly["per_layer_counts"] = dict(per_layer_counts)
             anomalies.append(anomaly)
         elif count > 3:
             pattern_summary = (
@@ -344,6 +363,8 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             }
             if top_patterns:
                 anomaly["top_patterns"] = top_patterns
+            if per_layer_counts:
+                anomaly["per_layer_counts"] = dict(per_layer_counts)
             anomalies.append(anomaly)
 
     # --- Failure rate momentum analysis ---
@@ -617,6 +638,12 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
             if fp and fp in fp_counts:
                 entry["failure_count"] = fp_counts[fp]
                 entry["example_message"] = fp_example.get(fp, "")[:500]
+        # Persist per-layer counts for failure-class anomalies so the
+        # pipeline-regression dispatcher can read structured layer evidence.
+        if a.get("per_layer_counts"):
+            proj_anomalies[anomaly_key]["per_layer_counts"] = dict(
+                a["per_layer_counts"]
+            )
         if anomaly_key.startswith("IntraDirectionFingerprint_"):
             entry = proj_anomalies[anomaly_key]
             fp = a.get("fingerprint")

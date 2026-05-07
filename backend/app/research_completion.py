@@ -42,6 +42,7 @@ from app.failure_classification import classify_failure
 from app.finding_deduplication import (
     build_dedup_state,
     deduplicate_findings,
+    extract_retired_failed_approaches,
     finding_hash as _finding_hash,  # noqa: F401 — re-exported for callers/tests
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
 )
@@ -969,9 +970,41 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if p.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
         }
 
+    # Cross-cycle suppression: load previously filtered hashes and retired direction
+    # failed approaches so findings rejected last cycle stay rejected, and findings
+    # overlapping retired directions' known-bad approaches are pre-emptively skipped.
+    _direction_id_for_dedup = (task.context or {}).get("direction_id")
+    _previously_filtered_hashes: set[str] = set()
+    _retired_failed_approaches: list[str] = []
+    _dedup_project_dirs = list((project_obj.directions if project_obj else None) or [])
+    for _d in _dedup_project_dirs:
+        if _d.get("id") == _direction_id_for_dedup:
+            _pfh = _d.get("recently_filtered_finding_hashes") or []
+            _previously_filtered_hashes = set(_pfh)
+            break
+    _RETIRED_STATUSES = frozenset({"retired", "expired", "completed", "superseded"})
+    _retired_ctx_list: list[dict] = []
+    for _d in _dedup_project_dirs:
+        if (
+            _d.get("status") in _RETIRED_STATUSES
+            and _d.get("id") != _direction_id_for_dedup
+        ):
+            _rc = _d.get("research_context", "") or ""
+            _parsed_rc = _parse_research_context(_rc) if _rc else {}
+            _retired_ctx_list.append(
+                {
+                    "failed_approaches": _parsed_rc.get("failed", []),
+                    "recently_completed_finding_titles": _parsed_rc.get(
+                        "confirmed", []
+                    ),
+                }
+            )
+    _retired_failed_approaches = extract_retired_failed_approaches(_retired_ctx_list)
+
     recent_finding_hashes, failed_hashes, prior_failure_by_hash = build_dedup_state(
         recent_tasks_for_dedup,
         failed_parent_ids,
+        previously_filtered_hashes=_previously_filtered_hashes,
     )
 
     # Query open PR artifacts to detect file-scope conflicts with in-flight work
@@ -1003,6 +1036,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # word-overlap, and file-overlap dedup stages. The orchestrator dispatches
     # by (status, priority, created_at), so higher-priority tasks naturally
     # run first without needing artificial wave dependencies.
+    # Pre-build title→hash map so filtered-finding hashes can be persisted for
+    # cross-cycle suppression after dedup runs.
+    _title_to_fhash: dict[str, str] = {
+        f.get("title", f"Research finding #{i + 1}"): _finding_hash(
+            f.get("title", f"Research finding #{i + 1}"),
+            f.get("description", f.get("prompt", "")),
+        )
+        for i, f in enumerate(findings)
+    }
     _dedup_outcome = deduplicate_findings(
         findings,
         task.context,
@@ -1010,6 +1052,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         failed_hashes,
         existing_tasks_with_dirs,
         open_pr_files,
+        retired_failed_approaches=_retired_failed_approaches,
     )
     deduplicated = _dedup_outcome.deduplicated
     hash_dedup_count = _dedup_outcome.hash_dedup_count
@@ -1050,6 +1093,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for _d in _scope_cal_project.directions or []:
             if _d.get("id"):
                 _directions_by_id[_d["id"]] = _d
+    # Persist filtered finding hashes to the current direction so next cycle's
+    # build_dedup_state can fold them in and keep them suppressed (bounded at 50).
+    _new_filtered_hashes = {
+        _title_to_fhash[f["title"]]
+        for f in _dedup_outcome.filtered
+        if f.get("title") in _title_to_fhash
+    }
+    if _new_filtered_hashes and _scope_cal_project and _scope_cal_project.directions:
+        _fh_dirs = list(_scope_cal_project.directions)
+        _fh_changed = False
+        for _d in _fh_dirs:
+            if _d.get("id") == _direction_id_for_dedup:
+                _existing_fh = _d.get("recently_filtered_finding_hashes") or []
+                _combined_fh = list(
+                    dict.fromkeys(_existing_fh + list(_new_filtered_hashes))
+                )
+                _d["recently_filtered_finding_hashes"] = _combined_fh[-50:]
+                _fh_changed = True
+                break
+        if _fh_changed:
+            _scope_cal_project.directions = _fh_dirs
+            flag_modified(_scope_cal_project, "directions")
+            session.add(_scope_cal_project)
+
     # Also index by parent_direction_id in task context as fallback
     _parent_direction_id = (task.context or {}).get("direction_id")
 

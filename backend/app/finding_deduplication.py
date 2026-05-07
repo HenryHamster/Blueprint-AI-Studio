@@ -126,6 +126,7 @@ def build_dedup_state(
     recent_tasks: Iterable[Task],
     failed_parent_ids: set,
     now: Optional[datetime] = None,
+    previously_filtered_hashes: Optional[set[str]] = None,
 ) -> tuple[set[str], dict[str, object], dict[str, Task]]:
     """Build hash-dedup state from a list of recent tasks.
 
@@ -201,7 +202,47 @@ def build_dedup_state(
                 recent_finding_hashes.add(fhash)
                 failed_hashes.setdefault(fhash, "suppressed")
 
+    # Fold in hashes filtered in a previous cycle so they stay suppressed.
+    for fhash in previously_filtered_hashes or set():
+        recent_finding_hashes.add(fhash)
+        failed_hashes.setdefault(fhash, "filtered-last-cycle")
+
     return recent_finding_hashes, failed_hashes, prior_failure_by_hash
+
+
+def extract_retired_failed_approaches(retired_context: list[dict]) -> list[str]:
+    """Extract failed approach strings from retired direction context dicts.
+
+    Each dict may have 'failed_approaches' (list[str]) and/or
+    'recently_completed_finding_titles' (list[str]). Both are used as
+    suppression signals — the system already explored them.
+    """
+    approaches: list[str] = []
+    for ctx in retired_context or []:
+        for approach in ctx.get("failed_approaches", []):
+            if isinstance(approach, str) and approach.strip():
+                approaches.append(approach)
+        for title in ctx.get("recently_completed_finding_titles", []):
+            if isinstance(title, str) and title.strip():
+                approaches.append(title)
+    return approaches
+
+
+def _find_retired_approach_match(
+    finding_title: str,
+    retired_failed_approaches: list[str],
+) -> Optional[str]:
+    """Return the first retired approach whose words overlap finding_title.
+
+    Uses a lower threshold (3 words) than active-task matching (4/6) because
+    the system has already concluded these approaches don't work.
+    """
+    words = set(finding_title.lower().split()) - _STOPWORDS
+    for approach in retired_failed_approaches:
+        overlap = words & (set(approach.lower().split()) - _STOPWORDS)
+        if len(overlap) >= 3:
+            return approach[:60]
+    return None
 
 
 def _normalize_source_ref(ref: str) -> str:
@@ -325,6 +366,7 @@ class DedupOutcome:
     word_overlap_count: int = 0
     file_overlap_count: int = 0
     evidence_overlap_count: int = 0
+    retired_approach_count: int = 0
     # Per-skip reason records: {title, direction_id, reason} for each filtered
     # finding, so the research agent can be told exactly what was rejected and
     # why on its next cycle. Reasons are short literals (≤80 chars).
@@ -338,6 +380,7 @@ def deduplicate_findings(
     failed_hashes: dict[str, object],
     existing_tasks_with_dirs: list[tuple],
     open_pr_files: set[str],
+    retired_failed_approaches: Optional[list[str]] = None,
 ) -> DedupOutcome:
     """Apply hash, word-overlap, file-overlap, and evidence-overlap dedup to ``findings``.
 
@@ -395,6 +438,25 @@ def deduplicate_findings(
                 }
             )
             continue
+
+        if retired_failed_approaches:
+            matched_approach = _find_retired_approach_match(
+                title, retired_failed_approaches
+            )
+            if matched_approach is not None:
+                logger.info(
+                    f"[RESEARCH] Skipping finding '{title}' — matches retired direction failed approach"
+                )
+                outcome.retired_approach_count += 1
+                reason = f"retired approach: {matched_approach}"
+                outcome.filtered.append(
+                    {
+                        "title": title[:120],
+                        "direction_id": finding_dir_id,
+                        "reason": reason[:80],
+                    }
+                )
+                continue
 
         finding_files = set(finding.get("related_files", []))
         if finding_files and finding_files.issubset(open_pr_files):

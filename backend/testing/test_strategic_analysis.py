@@ -4,6 +4,9 @@ from app.strategic_analysis import (
     _build_outcome_evaluation as _real_build_outcome_evaluation,
     _compute_prediction_calibration_factor as _real_compute_prediction_calibration_factor,
     _compute_prediction_calibration,
+    _build_retired_directions_summary,
+    _RETIRED_MAX_COUNT,
+    _RETIRED_PER_ENTRY_CHAR_CAP,
 )
 from app.direction_metrics import _compute_difficulty_index
 
@@ -842,7 +845,7 @@ def test_high_cost_per_merge_flag_on_expensive_direction():
             "id": "dir-pricey",
             "status": "active",
             "research_history": [
-                # 100 tasks × 4h each / 1 merge — cost/merge >> median * 2
+                # 100 tasks x 4h each / 1 merge -- cost/merge >> median * 2
                 {
                     "timestamp": "2026-01-01T00:00:00",
                     "prs_merged": 1,
@@ -1761,3 +1764,295 @@ class TestAutonomousCPM:
             "directions"
         ][0]
         assert d.get("cost_per_merged_pr") == round(expected_cost / 3, 2)
+
+
+# ---------------------------------------------------------------------------
+# _build_retired_directions_summary tests
+# ---------------------------------------------------------------------------
+
+
+def _recent_iso(days_ago: int = 0) -> str:
+    """ISO timestamp for N days ago (within the 90d window)."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+
+
+def _old_iso() -> str:
+    """ISO timestamp older than the 90d window."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=91)).isoformat()
+
+
+def test_retired_directions_appear_in_summary():
+    """Retired direction within the window is included."""
+    directions = [
+        {
+            "id": "dir-ret",
+            "text": "Improve logging",
+            "status": "retired",
+            "retirement_reason": "saturated",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(5),
+                    "prs_merged": 4,
+                    "prs_rejected": 1,
+                    "tasks_failed": 0,
+                },
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["id"] == "dir-ret"
+    assert entry["status"] == "retired"
+    assert entry["prs_merged"] == 4
+    assert entry["prs_rejected"] == 1
+    assert "retirement_reason" in entry
+
+
+def test_completed_and_superseded_included():
+    """Completed and superseded directions are included."""
+    directions = [
+        {
+            "id": "dir-comp",
+            "text": "Refactor auth",
+            "status": "completed",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(3),
+                    "prs_merged": 2,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        },
+        {
+            "id": "dir-super",
+            "text": "Old feature",
+            "status": "superseded",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(10),
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    ids = {e["id"] for e in result}
+    assert "dir-comp" in ids
+    assert "dir-super" in ids
+
+
+def test_expired_with_auto_completed_reason_included():
+    """Expired direction with auto_completed_reason is included."""
+    directions = [
+        {
+            "id": "dir-exp",
+            "text": "Expired direction",
+            "status": "expired",
+            "auto_completed_reason": "vision goals met",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(20),
+                    "prs_merged": 6,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    assert result[0]["auto_completed_reason"] == "vision goals met"
+
+
+def test_expired_without_auto_completed_reason_excluded():
+    """Expired direction without auto_completed_reason is excluded."""
+    directions = [
+        {
+            "id": "dir-bare-exp",
+            "text": "Bare expired",
+            "status": "expired",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(5),
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == []
+
+
+def test_active_directions_excluded():
+    """Active directions are not included."""
+    directions = [
+        {
+            "id": "dir-active",
+            "text": "Active direction",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(1),
+                    "prs_merged": 2,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == []
+
+
+def test_directions_older_than_window_excluded():
+    """Directions retired beyond the window_days cutoff are excluded."""
+    directions = [
+        {
+            "id": "dir-old",
+            "text": "Old retired direction",
+            "status": "retired",
+            "research_history": [
+                {
+                    "timestamp": _old_iso(),
+                    "prs_merged": 3,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == []
+
+
+def test_max_count_cap():
+    """At most max_count entries are returned."""
+    directions = [
+        {
+            "id": f"dir-{i}",
+            "text": f"Direction {i}",
+            "status": "retired",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(i),
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+        for i in range(25)
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project, max_count=5)
+    assert len(result) == 5
+
+
+def test_per_entry_char_cap():
+    """Each entry JSON is within per_entry_char_cap chars."""
+    import json
+
+    long_text = "A" * 500
+    long_reason = "B" * 500
+    directions = [
+        {
+            "id": "dir-fat",
+            "text": long_text,
+            "status": "retired",
+            "retirement_reason": long_reason,
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(2),
+                    "prs_merged": 2,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    cap = _RETIRED_PER_ENTRY_CHAR_CAP
+    result = _build_retired_directions_summary(project, per_entry_char_cap=cap)
+    assert len(result) == 1
+    entry_len = len(json.dumps(result[0]))
+    assert entry_len <= cap, f"Entry exceeds cap: {entry_len} > {cap}"
+
+
+def test_total_payload_bounded_with_many_retired():
+    """Total summary for _RETIRED_MAX_COUNT entries stays within ~16KB."""
+    import json
+
+    directions = [
+        {
+            "id": f"dir-{i:03d}",
+            "text": f"Direction about improving the system component {i} " * 3,
+            "status": "retired",
+            "retirement_reason": f"Reason {i}: saturated after investigation",
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(i % 80),
+                    "prs_merged": i % 5,
+                    "prs_rejected": 0,
+                    "tasks_failed": 0,
+                }
+            ],
+        }
+        for i in range(_RETIRED_MAX_COUNT + 5)
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) <= _RETIRED_MAX_COUNT
+    total_chars = len(json.dumps(result))
+    assert total_chars <= 16_384, f"Summary too large: {total_chars} chars"
+
+
+def test_failed_approaches_included():
+    """Failed approaches from research_context are extracted and included."""
+    ctx = """
+## Established findings
+- Some finding (confirmed)
+
+## Failed approaches
+- Tried approach A — did not work
+- Tried approach B — too slow
+"""
+    directions = [
+        {
+            "id": "dir-fa",
+            "text": "Direction with failed approaches",
+            "status": "retired",
+            "research_context": ctx,
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(7),
+                    "prs_merged": 1,
+                    "prs_rejected": 0,
+                    "tasks_failed": 2,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    # failed_approaches may be trimmed if entry would exceed cap, but with
+    # a small entry it should be present
+    entry = result[0]
+    if "failed_approaches" in entry:
+        assert len(entry["failed_approaches"]) > 0

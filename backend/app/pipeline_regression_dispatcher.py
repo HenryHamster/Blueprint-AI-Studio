@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -99,6 +100,12 @@ _STRATEGIC_CYCLE_STALL_HOURS = 8
 # Task types that constitute a strategic cycle completion.
 _STRATEGIC_TASK_TYPES = frozenset({"strategic_review", "design_doc_update"})
 
+# Self-watchdog alarm constants.
+_DISPATCHER_STALENESS_THRESHOLD_SECONDS = 300  # 5 min; cycle interval is 60s
+_DISPATCHER_ZERO_SPAWN_STREAK_K = 10  # ≈10 min of suppressed spawns
+_STALENESS_ALERT_TITLE_PREFIX = "Dispatcher cycle staleness:"
+_ZERO_SPAWN_ALERT_TITLE_PREFIX = "Dispatcher zero-spawn streak:"
+
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
@@ -140,6 +147,18 @@ _signal_first_tripped: dict[tuple[str, str], datetime] = {}
 # from a prior case lifecycle cannot let a re-opened case bypass the window.
 _signal_healthy_since: dict[tuple[str, str], datetime] = {}
 
+# Per-project last cycle timestamp (monotonic). Updated in run_once finally
+# block even when run_once raises. Used by the staleness watchdog alarm.
+# An absent entry means no cycle has ever completed for this process boot.
+_last_cycle_monotonic: dict[str, float] = {}
+
+# ContextVar for per-cycle signal-trip count. Incremented in _maybe_spawn
+# at entry, before any guard, so cooldown/dedup/cap rejections are counted.
+_cycle_signals_tripped_var: contextvars.ContextVar[list] = contextvars.ContextVar(
+    "_cycle_signals_tripped",
+    default=None,
+)
+
 
 def get_dispatcher_cycle_records(
     project_id: str | None = None,
@@ -164,7 +183,7 @@ async def _last_spawn_for_class(
     session: AsyncSession,
     project_id: uuid.UUID,
     regression_class: str,
-) -> Optional[Task]:
+) -> Task | None:
     """Return the most recent dispatcher-spawned task for this class, if any.
 
     Filters by ``context['spawned_by']`` and ``context['regression_class']`` in
@@ -194,7 +213,7 @@ async def _in_flight_for_class(
     session: AsyncSession,
     project_id: uuid.UUID,
     regression_class: str,
-) -> Optional[Task]:
+) -> Task | None:
     """Return the in-flight investigation for this regression class, if any.
 
     Only catches dispatcher-spawned tasks: any task with
@@ -263,8 +282,8 @@ async def _count_active_research_for_project(
 def _format_signal_lines(
     signal_name: str,
     regression_class: str,
-    prior_rate: Optional[float],
-    current_rate: Optional[float],
+    prior_rate: float | None,
+    current_rate: float | None,
     sample_size: int,
     extras: list[str] | None = None,
 ) -> str:
@@ -288,7 +307,7 @@ def _format_signal_lines(
     return "\n".join(lines)
 
 
-def _format_prior_attempt_context(case: "RegressionRemediationCase") -> str:
+def _format_prior_attempt_context(case: RegressionRemediationCase) -> str:
     """Build a prior-attempt notice to append when re-spawning after >= 2 failures.
 
     Only called when existing_case.attempts >= 2 so the first re-arm (attempts==1)
@@ -352,9 +371,9 @@ async def _current_signal_value_for_class(
     project_id: uuid.UUID,
     regression_class: str,
     project_design_doc: dict | None = None,
-) -> Optional[dict[str, Any]]:
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
-    from app.models import Task as TaskModel  # noqa: PLC0415
+) -> dict[str, Any] | None:
+    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
+    from app.models import Task as TaskModel
 
     # Bucket-level checks: tripped=True if any constituent signal is still tripped.
     if regression_class == "sr_catch_rate":
@@ -454,7 +473,7 @@ async def _current_signal_value_for_class(
                 bucket_hist = (t.fix_loop_history or {}).get(loop) or []
                 if not bucket_hist:
                     continue
-                last_exit: Optional[str] = None
+                last_exit: str | None = None
                 for ev in reversed(bucket_hist):
                     reason = ev.get("exit_reason") if isinstance(ev, dict) else None
                     if reason and reason != "in_progress":
@@ -484,7 +503,7 @@ async def _current_signal_value_for_class(
         }
 
     if regression_class.startswith("sr_blind_spot:theme:"):
-        from app.sr_blind_spots import aggregate_sr_blind_spot_themes  # noqa: PLC0415
+        from app.sr_blind_spots import aggregate_sr_blind_spot_themes
 
         theme = regression_class.split(":", 2)[2]
         themes = await aggregate_sr_blind_spot_themes(
@@ -504,8 +523,8 @@ async def _current_signal_value_for_class(
         }
 
     if regression_class.startswith("sr_blind_spot:"):
-        from app.sr_blind_spots import _count_reviewer_disagreement_directions  # noqa: PLC0415
-        from app.models import Task as TaskModel  # noqa: PLC0415
+        from app.sr_blind_spots import _count_reviewer_disagreement_directions
+        from app.models import Task as TaskModel
 
         cat = regression_class.split(":", 1)[1]
         now = _utcnow()
@@ -553,8 +572,8 @@ async def _current_signal_value_for_class(
         }
 
     if regression_class == "pipeline_success_rate":
-        from app.models import Task as TaskModel  # noqa: PLC0415
-        from app.routers.admin_digest import compute_pipeline_health_summary  # noqa: PLC0415
+        from app.models import Task as TaskModel
+        from app.routers.admin_digest import compute_pipeline_health_summary
 
         summary = await compute_pipeline_health_summary(
             session, project_id, lookback_hours=24
@@ -592,8 +611,8 @@ async def _current_signal_value_for_class(
 
     if regression_class.startswith("anomaly:"):
         anomaly_key = regression_class[len("anomaly:") :]
-        import app.shared_state as _ss  # noqa: PLC0415
-        from app.shared_state import _ANOMALY_FINGERPRINTS_KEY  # noqa: PLC0415
+        import app.shared_state as _ss
+        from app.shared_state import _ANOMALY_FINGERPRINTS_KEY
 
         entry = (_ss.persistent_anomalies.get(str(project_id)) or {}).get(anomaly_key)
         if entry is None:
@@ -629,7 +648,7 @@ async def _current_signal_value_for_class(
 
     if regression_class.startswith("background_service_crash:"):
         service = regression_class[len("background_service_crash:") :]
-        from app.models import Task as TaskModel  # noqa: PLC0415
+        from app.models import Task as TaskModel
 
         now = _utcnow()
         # Considered still crashing if a crash investigation task was spawned
@@ -682,9 +701,9 @@ async def _collect_fix_loop_divergence_fingerprints(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> list[dict[str, Any]]:
-    from app.failure_classification import _fingerprint_message  # noqa: PLC0415
-    from app.fix_loop_telemetry import DIVERGENCE_EXIT_REASONS  # noqa: PLC0415
-    from app.models import Task as TaskModel  # noqa: PLC0415
+    from app.failure_classification import _fingerprint_message
+    from app.fix_loop_telemetry import DIVERGENCE_EXIT_REASONS
+    from app.models import Task as TaskModel
 
     now = _utcnow()
     cutoff = now - timedelta(days=_FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS)
@@ -766,11 +785,244 @@ async def _collect_fix_loop_divergence_fingerprints(
     return sorted(trips, key=lambda item: (-item["count"], item["fingerprint"]))
 
 
+# ---------------------------------------------------------------------------
+# Cross-layer regression detection
+# ---------------------------------------------------------------------------
+
+# Bound and trim parameters for the per-case symptoms_by_layer log. Bounded
+# entries-per-layer prevents unbounded JSONB growth; the 48h window matches
+# the anomaly recency horizon in _ANOMALY_DISPATCH_RECENCY_HOURS.
+_LAYER_SYMPTOM_BOUND = 10
+_LAYER_SYMPTOM_WINDOW = timedelta(hours=48)
+
+
+def _derive_observation_for_layer_classify(
+    *,
+    signal_name: str,
+    regression_class: str,
+    extras: list[str] | None,
+    extra_snapshot_fields: dict | None,
+) -> tuple[str, str, str]:
+    """Derive (failure_class, message, stage) inputs for ``classify_layers``.
+
+    Maps the dispatcher's signal vocabulary onto the layer classifier's
+    fingerprint inputs without coupling either side to the other.
+    """
+    extras = extras or []
+    extra_snapshot_fields = extra_snapshot_fields or {}
+
+    if regression_class.startswith("anomaly:"):
+        anomaly_key = regression_class.split(":", 1)[1]
+        first_token = anomaly_key.split("_", 1)[0]
+        failure_class = first_token if first_token.isupper() else anomaly_key
+    else:
+        failure_class = signal_name.upper()
+
+    stage = ""
+    if regression_class.startswith("fix_loop_divergence:"):
+        stage = regression_class.split(":", 1)[1]
+    elif regression_class.startswith("fix_loop_divergence_fingerprint"):
+        stage = "lint"
+    elif regression_class.startswith("background_service_crash"):
+        stage = "provision"
+    elif signal_name in ("sr_catch_rate", "sr_blind_spot"):
+        stage = "review"
+    elif signal_name == "pipeline_success_rate":
+        stage = ""
+
+    parts: list[str] = list(extras)
+    sample_msg = extra_snapshot_fields.get("sample_message")
+    if sample_msg:
+        parts.append(str(sample_msg))
+    latest = extra_snapshot_fields.get("latest_details")
+    if latest:
+        parts.append(str(latest))
+    message = "\n".join(p for p in parts if p)
+    return failure_class, message, stage
+
+
+def _record_layer_observation(
+    symptoms_by_layer: dict[str, Any] | None,
+    layers: list[str],
+    *,
+    fingerprint: str,
+    sample: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Idempotently append a layer observation; return the new dict.
+
+    - Per-layer entries are bounded to ``_LAYER_SYMPTOM_BOUND`` (most-recent kept).
+    - Entries older than ``_LAYER_SYMPTOM_WINDOW`` are trimmed on write.
+    - If ``fingerprint`` already exists for a layer, ``observed_at`` is refreshed
+      and the entry is moved to the tail rather than duplicated, so repeated
+      identical fingerprints don't grow the list unboundedly.
+    """
+    cutoff = now - _LAYER_SYMPTOM_WINDOW
+    base: dict[str, Any] = dict(symptoms_by_layer or {})
+    sample_short = (sample or "")[:500]
+    observed_at_iso = now.isoformat()
+
+    for layer in layers:
+        existing = list(base.get(layer) or [])
+        # Trim entries with parseable timestamps older than the window
+        trimmed: list[dict[str, Any]] = []
+        for entry in existing:
+            if not isinstance(entry, dict):
+                continue
+            obs_raw = entry.get("observed_at")
+            keep = True
+            if isinstance(obs_raw, str) and obs_raw:
+                try:
+                    obs_dt = datetime.fromisoformat(obs_raw.replace("Z", "+00:00"))
+                    if obs_dt.tzinfo is not None:
+                        obs_dt = obs_dt.replace(tzinfo=None)
+                    if obs_dt < cutoff:
+                        keep = False
+                except ValueError:
+                    pass
+            if keep:
+                trimmed.append(entry)
+
+        # Idempotent merge by fingerprint
+        merged: list[dict[str, Any]] = []
+        replaced = False
+        for entry in trimmed:
+            if entry.get("fingerprint") == fingerprint:
+                replaced = True
+                continue  # we'll re-append the refreshed entry at the tail
+            merged.append(entry)
+        merged.append(
+            {
+                "fingerprint": fingerprint,
+                "observed_at": observed_at_iso,
+                "sample": sample_short,
+            }
+        )
+        if not replaced and len(merged) > _LAYER_SYMPTOM_BOUND:
+            merged = merged[-_LAYER_SYMPTOM_BOUND:]
+        base[layer] = merged
+    return base
+
+
+def _distinct_recent_layers(
+    symptoms_by_layer: dict[str, Any] | None,
+    *,
+    now: datetime,
+    window: timedelta = _LAYER_SYMPTOM_WINDOW,
+) -> list[str]:
+    """Return layer names with at least one observation inside ``window``."""
+    if not symptoms_by_layer:
+        return []
+    cutoff = now - window
+    out: list[str] = []
+    for layer, entries in symptoms_by_layer.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            obs_raw = entry.get("observed_at")
+            try:
+                obs_dt = datetime.fromisoformat(str(obs_raw).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            if obs_dt.tzinfo is not None:
+                obs_dt = obs_dt.replace(tzinfo=None)
+            if obs_dt >= cutoff:
+                out.append(layer)
+                break
+    return sorted(out)
+
+
+def _representative_per_layer(
+    symptoms_by_layer: dict[str, Any] | None,
+    layers: list[str],
+    *,
+    now: datetime,
+    window: timedelta = _LAYER_SYMPTOM_WINDOW,
+) -> list[dict[str, Any]]:
+    """Pick the most-recent in-window entry per layer for the prompt."""
+    if not symptoms_by_layer:
+        return []
+    cutoff = now - window
+    chosen: list[dict[str, Any]] = []
+    for layer in layers:
+        entries = symptoms_by_layer.get(layer) or []
+        latest: tuple[datetime, dict[str, Any]] | None = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                obs_dt = datetime.fromisoformat(
+                    str(entry.get("observed_at")).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                continue
+            if obs_dt.tzinfo is not None:
+                obs_dt = obs_dt.replace(tzinfo=None)
+            if obs_dt < cutoff:
+                continue
+            if latest is None or obs_dt > latest[0]:
+                latest = (obs_dt, entry)
+        if latest is not None:
+            chosen.append(
+                {
+                    "layer": layer,
+                    "fingerprint": str(latest[1].get("fingerprint") or ""),
+                    "sample": str(latest[1].get("sample") or "")[:500],
+                    "observed_at": latest[1].get("observed_at"),
+                }
+            )
+    return chosen
+
+
+def _format_cross_layer_prompt(
+    *,
+    signal_name: str,
+    regression_class: str,
+    layers_evidence: list[dict[str, Any]],
+    base_lines: str,
+) -> str:
+    """Build the cross-layer investigate prompt enumerating per-layer evidence."""
+    layer_count = len(layers_evidence)
+    layer_names = ", ".join(e["layer"] for e in layers_evidence)
+    header = [
+        f"CROSS-LAYER REGRESSION DETECTED ({signal_name} / class={regression_class}).",
+        (
+            f"This regression class has surfaced on {layer_count} distinct "
+            f"infrastructure layer(s) within the last 48h: {layer_names}."
+        ),
+        (
+            "Diagnose the SHARED root cause and propose a coordinated fix that "
+            "addresses all of the layers below — do NOT bias toward whichever "
+            "layer surfaced most recently. Each layer below shows one "
+            "representative fingerprint + sample from this window."
+        ),
+        "",
+        "PER-LAYER EVIDENCE",
+    ]
+    for ev in layers_evidence:
+        header.append(f"\nLayer: {ev['layer']}")
+        if ev.get("fingerprint"):
+            header.append(f"  Fingerprint: {ev['fingerprint']}")
+        sample = ev.get("sample") or ""
+        if sample:
+            header.append(f"  Sample: {sample[:300]}")
+    header.append(
+        "\nNote: .github/workflows/ files cannot be modified by the agent. "
+        "If the recommended fix would touch workflow YAML, treat it as a "
+        "finding/note in the diagnosis report rather than a direct edit."
+    )
+    header.append("")
+    header.append(base_lines)
+    return "\n".join(header)
+
+
 async def _get_remediation_case(
     session: AsyncSession,
     project_id: uuid.UUID,
     regression_class: str,
-) -> Optional[RegressionRemediationCase]:
+) -> RegressionRemediationCase | None:
     return (
         (
             await session.execute(
@@ -791,17 +1043,17 @@ async def _maybe_spawn(
     *,
     signal_name: str,
     regression_class: str,
-    prior_rate: Optional[float],
-    current_rate: Optional[float],
+    prior_rate: float | None,
+    current_rate: float | None,
     sample_size: int,
-    magnitude: Optional[float],
+    magnitude: float | None,
     extras: list[str] | None = None,
     title_hint: str,
     extra_snapshot_fields: dict | None = None,
     prompt_override: str | None = None,
     extra_context_fields: dict | None = None,
-    signal_first_seen_at: Optional[datetime] = None,
-) -> Optional[Task]:
+    signal_first_seen_at: datetime | None = None,
+) -> Task | None:
     """Apply dedup + cooldown gates and spawn an investigate task on green light."""
     logger.info(
         "[REGRESSION_DISPATCHER] signal-tripped project=%s class=%s prior=%s "
@@ -812,6 +1064,10 @@ async def _maybe_spawn(
         current_rate,
         sample_size,
     )
+    # Count every _maybe_spawn entry as a tripped signal (before guard gates).
+    _st = _cycle_signals_tripped_var.get()
+    if _st is not None:
+        _st[0] += 1
     _rj = _cycle_rejections_var.get()
 
     in_flight = await _in_flight_for_class(session, project_id, regression_class)
@@ -885,8 +1141,50 @@ async def _maybe_spawn(
     if signal_first_seen_at is None:
         signal_first_seen_at = _signal_first_tripped.setdefault(_trip_key, now)
 
+    # ---- Cross-layer regression accumulation ----------------------------------
+    # Classify this observation into layer tags and merge into the case's
+    # symptoms_by_layer log. Cross-layer escalation fires when the merged log
+    # contains observations on >=2 distinct layers within the 48h window. The
+    # regression_class itself is unchanged so the existing 6h cooldown still
+    # applies and a cross-layer escalation occupies exactly one spawn slot.
+    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+
+    obs_failure_class, obs_message, obs_stage = _derive_observation_for_layer_classify(
+        signal_name=signal_name,
+        regression_class=regression_class,
+        extras=extras,
+        extra_snapshot_fields=extra_snapshot_fields,
+    )
+    obs_layers = classify_layers(obs_failure_class, obs_message, obs_stage or None)
+    obs_fingerprint = ""
+    if obs_message:
+        try:
+            from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+
+            obs_fingerprint = _error_fingerprint(obs_message, obs_stage or None)
+        except Exception:  # noqa: BLE001
+            obs_fingerprint = ""
+    obs_sample = obs_message[:500] if obs_message else (extras[0] if extras else "")
+
+    prior_symptoms = (
+        existing_case.symptoms_by_layer if existing_case is not None else {}
+    ) or {}
+    merged_symptoms = (
+        _record_layer_observation(
+            prior_symptoms,
+            obs_layers,
+            fingerprint=obs_fingerprint or regression_class,
+            sample=obs_sample,
+            now=now,
+        )
+        if obs_layers
+        else dict(prior_symptoms)
+    )
+    distinct_layers = _distinct_recent_layers(merged_symptoms, now=now)
+    is_cross_layer = len(distinct_layers) >= 2
+
     cooldown_until = (now + _REGRESSION_COOLDOWN).isoformat()
-    prompt = (
+    base_prompt = (
         prompt_override
         if prompt_override is not None
         else _format_signal_lines(
@@ -898,15 +1196,35 @@ async def _maybe_spawn(
             extras=extras,
         )
     )
+    if is_cross_layer:
+        layers_evidence = _representative_per_layer(
+            merged_symptoms, distinct_layers, now=now
+        )
+        prompt = _format_cross_layer_prompt(
+            signal_name=signal_name,
+            regression_class=regression_class,
+            layers_evidence=layers_evidence,
+            base_lines=base_prompt,
+        )
+    else:
+        prompt = base_prompt
+        layers_evidence = []
+
     if existing_case is not None and (existing_case.attempts or 0) >= 2:
         prompt += _format_prior_attempt_context(existing_case)
+    payload_dict: dict[str, Any] = {
+        "type": "investigate",
+        "prompt": prompt,
+        "base_branch": "main",
+        "effort": "low",
+    }
+    if is_cross_layer:
+        payload_dict["layer_context"] = {
+            "layers": layers_evidence,
+            "escalation": "cross_layer",
+        }
     payload = validate_internal_payload(
-        {
-            "type": "investigate",
-            "prompt": prompt,
-            "base_branch": "main",
-            "effort": "low",
-        },
+        payload_dict,
         "pipeline_regression_dispatcher:investigate",
     )
     context: dict[str, Any] = {
@@ -919,6 +1237,15 @@ async def _maybe_spawn(
         "sample_size": sample_size,
         "dispatcher_cooldown_until_iso": cooldown_until,
     }
+    if is_cross_layer:
+        context["cross_layer"] = True
+        context["escalation"] = "cross_layer"
+        context["escalation_reason"] = "cross_layer"
+        context["layer_context"] = {
+            "layers": layers_evidence,
+            "escalation": "cross_layer",
+        }
+        context["cross_layer_layers"] = list(distinct_layers)
     if extra_context_fields:
         context.update(extra_context_fields)
     new_task = Task(
@@ -983,6 +1310,7 @@ async def _maybe_spawn(
                 hit_count=1,
                 signal_first_crossed_at=now,
                 signal_first_seen_at=signal_first_seen_at or now,
+                symptoms_by_layer=merged_symptoms,
             )
         )
     else:
@@ -990,6 +1318,7 @@ async def _maybe_spawn(
         existing_case.hit_count = (existing_case.hit_count or 0) + 1
         existing_case.last_seen_at = now
         existing_case.last_remediation_task_id = new_task.id
+        existing_case.symptoms_by_layer = merged_symptoms
         # A CLOSED case re-tripping starts a new regression cycle — reset
         # signal_first_crossed_at so time-to-detect reflects the new episode.
         # For still-ACTIVE cases, preserve the original crossing time.
@@ -1016,11 +1345,12 @@ async def _maybe_spawn(
         else None
     )
     logger.info(
-        "[REGRESSION_DISPATCHER] spawn-success project=%s class=%s task_id=%s mttd_seconds=%s",
+        "[REGRESSION_DISPATCHER] spawn-success project=%s class=%s task_id=%s mttd_seconds=%s cross_layer=%s",
         project_id,
         regression_class,
         new_task.id,
         mttd_seconds,
+        is_cross_layer,
     )
     return new_task
 
@@ -1214,12 +1544,12 @@ async def _probe_sr_blind_spot_any_trip(
     project_id: uuid.UUID,
 ) -> bool:
     """Side-effect-free probe: would any sr_blind_spot signal trip right now?"""
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
-    from app.sr_blind_spots import (  # noqa: PLC0415
+    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
+    from app.sr_blind_spots import (
         _count_reviewer_disagreement_directions,
         aggregate_sr_blind_spot_themes,
     )
-    from app.models import Task as TaskModel  # noqa: PLC0415
+    from app.models import Task as TaskModel
 
     now = _utcnow()
 
@@ -1280,12 +1610,12 @@ async def _evaluate_sr_blind_spot_signal(
     (b) a recurring blind_spot theme reaches _SR_BLIND_SPOT_THEME_FLOOR
         occurrences in the 14d window.
     """
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD  # noqa: PLC0415
-    from app.sr_blind_spots import (  # noqa: PLC0415
+    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
+    from app.sr_blind_spots import (
         _count_reviewer_disagreement_directions,
         aggregate_sr_blind_spot_themes,
     )
-    from app.models import Task as TaskModel  # noqa: PLC0415
+    from app.models import Task as TaskModel
 
     if spawn_budget_left <= 0:
         return 0
@@ -1320,7 +1650,7 @@ async def _evaluate_sr_blind_spot_signal(
     # Dedupe by category: one spawn per category regardless of task_type.
     # Iterate sorted pairs; for each category, try each (cat, task_type)
     # until one trips (or none do for that category).
-    from collections import defaultdict  # noqa: PLC0415
+    from collections import defaultdict
 
     cat_to_pairs: dict[str, list[str]] = defaultdict(list)
     for cat, task_type in sorted(curr_dirs):
@@ -1549,7 +1879,7 @@ async def _evaluate_strategic_cycle_stall_signal(
 
 async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Re-evaluate merged regression cases and close or re-arm them."""
-    from app.models import Project  # noqa: PLC0415
+    from app.models import Project
 
     project = await session.get(Project, project_id)
     if project is None:
@@ -1615,15 +1945,15 @@ async def _evaluate_anomaly_signal(
     spawn_budget_left: int,
 ) -> int:
     """Trip on persistent anomalies that have exceeded the occurrence threshold."""
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     if spawn_budget_left <= 0:
         return 0
 
     proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
     if not proj_anomalies:
-        from app.models import Project as _Proj  # noqa: PLC0415
-        from app.shared_state import _ANOMALY_FINGERPRINTS_KEY  # noqa: PLC0415
+        from app.models import Project as _Proj
+        from app.shared_state import _ANOMALY_FINGERPRINTS_KEY
 
         _proj = await session.get(_Proj, project_id)
         if _proj is not None:
@@ -1653,7 +1983,7 @@ async def _evaluate_anomaly_signal(
         regression_class = f"anomaly:{anomaly_key}"
         sample_msg = entry.get("example_message") or entry.get("latest_details") or ""
         _first_seen_raw = entry.get("first_seen")
-        _anomaly_first_seen: Optional[datetime] = None
+        _anomaly_first_seen: datetime | None = None
         if _first_seen_raw:
             try:
                 _anomaly_first_seen = datetime.fromisoformat(
@@ -1690,6 +2020,124 @@ async def _evaluate_anomaly_signal(
     return spawned
 
 
+async def _has_active_remediation_child(
+    session: AsyncSession,
+    case: RegressionRemediationCase,
+) -> bool:
+    """Return True if the case's most-recent child task is still running.
+
+    Used by the watchdog to distinguish two ACTIVE-stale failure modes:
+    a child task that is genuinely still working (auto-escalate one more
+    autonomous round) vs. a child that finished without spawning a fix
+    (page the operator immediately).
+    """
+    if case.last_remediation_task_id is None:
+        return False
+    child = await session.get(Task, case.last_remediation_task_id)
+    if child is None:
+        return False
+    return child.status in _ACTIVE_INVESTIGATE_STATUSES
+
+
+async def _spawn_auto_escalation_meta_investigate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    case: RegressionRemediationCase,
+) -> Task:
+    """Spawn the one-shot meta-investigation for a stalled ACTIVE case.
+
+    The prompt is intentionally distinct from the original signal-tripped
+    investigate: it tells the agent the remediation has stalled and to
+    diagnose the BLOCKER (merge conflict, reviewer/CI disagreement,
+    infrastructure precondition, leader-election issue) rather than
+    re-investigate the original signal. Bypasses ``_maybe_spawn`` because
+    the cooldown/dedup guards there are designed to prevent peer
+    investigations for the same regression_class — here we explicitly
+    want a peer investigation alongside the existing in-flight child.
+    """
+    prior_id = case.last_remediation_task_id
+    prior_status_line = ""
+    if prior_id is not None:
+        prior = await session.get(Task, prior_id)
+        if prior is not None:
+            prior_status_line = (
+                f"Prior remediation task: {prior.id} (status={prior.status}). "
+            )
+    prompt_lines = [
+        f"A remediation for regression class '{case.regression_class}' has been "
+        f"ACTIVE for >24h without resolving the underlying signal. "
+        f"{prior_status_line}"
+        "Diagnose the REMEDIATION BLOCKER (not the original signal): merge "
+        "conflict patterns, reviewer/CI disagreement on prior fix attempts, "
+        "infrastructure preconditions (toolchain, missing system libs), or "
+        "leader-election / orchestrator cascade issues are the most common "
+        "stall classes.",
+        "Produce the structured diagnosis JSON ({summary, root_cause, "
+        "recommended_fix, severity, confidence, affected_files}). Do NOT "
+        "re-investigate the original signal — focus on what is preventing "
+        "remediation from converging.",
+    ]
+    prompt = "\n\n".join(prompt_lines)
+    payload = validate_internal_payload(
+        {
+            "type": "investigate",
+            "prompt": prompt,
+            "base_branch": "main",
+            "effort": "low",
+        },
+        "pipeline_regression_dispatcher:auto_escalation_meta_investigate",
+    )
+    context: dict[str, Any] = {
+        "spawned_by": "pipeline_regression_dispatcher_watchdog",
+        "regression_class": case.regression_class,
+        "signal_name": "auto_escalation_meta_investigate",
+        "auto_escalation": True,
+        "prior_remediation_task_id": str(prior_id) if prior_id else None,
+        "remediation_case_id": str(case.id),
+    }
+    new_task = Task(
+        project_id=project_id,
+        title=f"Auto-escalate stalled remediation: {case.regression_class}"[:200],
+        description=(
+            "Watchdog auto-escalation: the prior investigate child has been "
+            "ACTIVE for >24h without resolving the signal. Diagnose the "
+            "remediation blocker."
+        )[:500],
+        payloads=[payload],
+        context=context,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "PIPELINE_REGRESSION_DISPATCHER_WATCHDOG",
+                "regression_class": case.regression_class,
+                "signal_name": "auto_escalation_meta_investigate",
+                "auto_escalation": True,
+            },
+        )
+    )
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.INFO,
+            title=f"Auto-escalating stalled remediation: {case.regression_class}"[:200],
+            message=(
+                f"Remediation case for '{case.regression_class}' has been ACTIVE "
+                f"for >24h. Spawned meta-investigate task {new_task.id} to "
+                f"diagnose the remediation blocker before paging operators."
+            )[:1000],
+        )
+    )
+    return new_task
+
+
 async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Escalate stale ACTIVE/MERGED cases and auto-close recovered NMI cases.
 
@@ -1722,7 +2170,7 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
         .all()
     )
 
-    escalated = 0
+    mutated = 0
     for case in rows:
         updated = case.updated_at
         if updated.tzinfo is not None:
@@ -1739,6 +2187,43 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
 
         if now < updated + threshold:
             continue
+
+        # ACTIVE-stale auto-escalation: if the original investigation child is
+        # still running and we have not yet auto-escalated this case, give the
+        # autonomous loop ONE more attempt — spawn a meta-investigate task
+        # focused on the remediation BLOCKER (merge conflicts, reviewer/CI
+        # disagreement, leader-death cascade) and let the 24h window restart
+        # from the auto-escalation moment. `auto_escalation_count` is the
+        # cooldown gate (capped at 1 — the next stale tick goes straight to
+        # NMI). We scope the meta task with `signal_name=auto_escalation_meta_investigate`
+        # so the existing _last_spawn_for_class cooldown — keyed on
+        # (spawned_by, regression_class) — does not block the meta-investigate;
+        # `_in_flight_for_class` likewise dedups on regression_class, but here
+        # we deliberately want a peer task running alongside the original
+        # investigation, so we bypass _maybe_spawn entirely and emit the
+        # task/history/alert inline.
+        if (
+            case.status == RegressionCaseStatus.ACTIVE
+            and (case.auto_escalation_count or 0) == 0
+        ):
+            child_alive = await _has_active_remediation_child(session, case)
+            if child_alive:
+                meta_task = await _spawn_auto_escalation_meta_investigate(
+                    session, project_id, case
+                )
+                case.auto_escalation_count = (case.auto_escalation_count or 0) + 1
+                case.last_remediation_task_id = meta_task.id
+                case.updated_at = now
+                session.add(case)
+                logger.info(
+                    "[REGRESSION_WATCHDOG] auto-escalate project=%s class=%s "
+                    "meta_task=%s (one-shot, count=1)",
+                    project_id,
+                    case.regression_class,
+                    meta_task.id,
+                )
+                mutated += 1
+                continue
 
         logger.warning(
             "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
@@ -1764,13 +2249,13 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
                 )[:1000],
             )
         )
-        escalated += 1
+        mutated += 1
 
-    if escalated:
+    if mutated:
         await session.commit()
 
     auto_closed = await _auto_close_recovered_manual_intervention(session, project_id)
-    return escalated + auto_closed
+    return mutated + auto_closed
 
 
 async def _auto_close_recovered_manual_intervention(
@@ -1790,7 +2275,7 @@ async def _auto_close_recovered_manual_intervention(
     lock so the operator ``Clear`` button (which transitions back to ACTIVE) can't
     race against this auto-close pass into a double-write.
     """
-    from app.models import Project  # noqa: PLC0415
+    from app.models import Project
 
     project = await session.get(Project, project_id)
     if project is None:
@@ -1936,7 +2421,7 @@ async def _any_signal_would_trip(
     )
     if ps_state is not None and ps_state["tripped"]:
         return True
-    import app.shared_state as _ss  # noqa: PLC0415
+    import app.shared_state as _ss
 
     proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
     recency_cutoff = (
@@ -2007,6 +2492,125 @@ async def _probe_strategic_stall_any_trip(
     )
 
 
+async def _ensure_watchdog_alert_open(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    title_prefix: str,
+    title: str,
+    message: str,
+    severity: AlertSeverity,
+) -> None:
+    """Open a watchdog alert if none is already open (deduped by title prefix)."""
+    existing = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title.like(title_prefix + "%"),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if existing is None:
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=severity,
+                title=title[:200],
+                message=message[:1000],
+            )
+        )
+        await session.commit()
+
+
+async def _resolve_watchdog_alert(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    title_prefix: str,
+) -> None:
+    """Auto-resolve an open watchdog alert by setting dismissed_at."""
+    open_alert = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title.like(title_prefix + "%"),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if open_alert is not None:
+        open_alert.dismissed_at = _utcnow()
+        await session.commit()
+
+
+async def run_dispatcher_watchdog_alarms(
+    session: AsyncSession,
+    project_ids: list[uuid.UUID],
+) -> None:
+    """Check cycle-staleness and zero-spawn-streak alarms for all projects.
+
+    Must be called BEFORE the per-project run_once loop so the staleness alarm
+    fires even when run_once hangs or raises on the subsequent tick.
+    """
+    now_mono = time.monotonic()
+    all_records = list(_dispatcher_cycle_records)
+
+    for pid in project_ids:
+        pid_str = str(pid)
+
+        # --- Alarm 1: cycle staleness (HIGH / ERROR) ---
+        last_mono = _last_cycle_monotonic.get(pid_str)
+        if last_mono is not None:
+            elapsed = now_mono - last_mono
+            if elapsed > _DISPATCHER_STALENESS_THRESHOLD_SECONDS:
+                await _ensure_watchdog_alert_open(
+                    session,
+                    pid,
+                    _STALENESS_ALERT_TITLE_PREFIX,
+                    f"{_STALENESS_ALERT_TITLE_PREFIX} {int(elapsed)}s since last cycle",
+                    f"Dispatcher has not completed a cycle for project {pid} in "
+                    f"{int(elapsed)}s (threshold {_DISPATCHER_STALENESS_THRESHOLD_SECONDS}s). "
+                    "The dispatcher session may be wedged or the orchestrator tick stalled.",
+                    AlertSeverity.ERROR,
+                )
+            else:
+                await _resolve_watchdog_alert(
+                    session, pid, _STALENESS_ALERT_TITLE_PREFIX
+                )
+        # No baseline yet → don't alert; clock starts from first completed cycle.
+
+        # --- Alarm 2: zero-spawn streak (MEDIUM / WARNING) ---
+        project_records = [r for r in all_records if r["project_id"] == pid_str]
+        recent = project_records[-_DISPATCHER_ZERO_SPAWN_STREAK_K:]
+        if len(recent) >= _DISPATCHER_ZERO_SPAWN_STREAK_K:
+            streak_broken = any(
+                r["spawns_emitted"] > 0 or r.get("signals_tripped", 0) == 0
+                for r in recent
+            )
+            if not streak_broken:
+                await _ensure_watchdog_alert_open(
+                    session,
+                    pid,
+                    _ZERO_SPAWN_ALERT_TITLE_PREFIX,
+                    f"{_ZERO_SPAWN_ALERT_TITLE_PREFIX} {_DISPATCHER_ZERO_SPAWN_STREAK_K} consecutive cycles suppressed",
+                    f"The last {_DISPATCHER_ZERO_SPAWN_STREAK_K} dispatcher cycles for project {pid} "
+                    "all had tripped signals but zero spawns (cooldown/cap/dedup/manual-intervention). "
+                    "Review active remediation cases or adjust spawn-suppression config.",
+                    AlertSeverity.WARNING,
+                )
+            else:
+                await _resolve_watchdog_alert(
+                    session, pid, _ZERO_SPAWN_ALERT_TITLE_PREFIX
+                )
+
+
 async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     """Evaluate all subscribed pipeline-regression signals for ``project_id``.
 
@@ -2016,7 +2620,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     ``anomaly_detection`` and lets the orchestrator coalesce dispatcher work
     with its existing 60s tick.
     """
-    from app.models import Project  # noqa: PLC0415
+    from app.models import Project
 
     cycle_started_at = _utcnow()
     _rj: dict = {
@@ -2026,6 +2630,8 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         "manual_intervention_suppressed": 0,
     }
     _token = _cycle_rejections_var.set(_rj)
+    _st_counter: list = [0]
+    _st_token = _cycle_signals_tripped_var.set(_st_counter)
     _spawned = 0
     try:
         # Force a full SELECT rather than session.get(): a caller that left a
@@ -2133,12 +2739,15 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         return _spawned
     finally:
         _cycle_rejections_var.reset(_token)
+        _cycle_signals_tripped_var.reset(_st_token)
         _dispatcher_cycle_records.append(
             {
                 "project_id": str(project_id),
                 "cycle_started_at": cycle_started_at.isoformat(),
                 "cycle_finished_at": _utcnow().isoformat(),
                 "spawns_emitted": _spawned,
+                "signals_tripped": _st_counter[0],
                 "rejections_by_reason": dict(_rj),
             }
         )
+        _last_cycle_monotonic[str(project_id)] = time.monotonic()

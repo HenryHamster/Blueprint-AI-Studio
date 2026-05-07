@@ -11,10 +11,12 @@ from app.finding_deduplication import (
     _check_evidence_overlap,
     _extract_normalized_claims,
     _extract_source_refs,
+    _find_retired_approach_match,
     _jaccard_overlap,
     _normalize_source_ref,
     build_dedup_state,
     deduplicate_findings,
+    extract_retired_failed_approaches,
     finding_hash,
     is_duplicate,
 )
@@ -745,3 +747,99 @@ def test_check_evidence_overlap_empty_guard():
     assert _check_evidence_overlap(
         [{"ref": "foo.py"}], [], [("t", [{"ref": "foo.py"}], ["claim A"])]
     ) == (False, "")
+
+
+# --- Retired-direction suppression and cross-cycle filtered hash tests ---
+
+
+def test_extract_retired_failed_approaches_combines_approaches_and_titles():
+    retired = [
+        {
+            "failed_approaches": [
+                "cache invalidation strategy",
+                "redis cluster approach",
+            ],
+            "recently_completed_finding_titles": ["fix logging timestamps"],
+        },
+        {"failed_approaches": ["async migration approach"]},
+    ]
+    result = extract_retired_failed_approaches(retired)
+    assert result == [
+        "cache invalidation strategy",
+        "redis cluster approach",
+        "fix logging timestamps",
+        "async migration approach",
+    ]
+
+
+def test_extract_retired_failed_approaches_empty_and_none():
+    assert extract_retired_failed_approaches([]) == []
+    assert extract_retired_failed_approaches(None) == []
+    assert extract_retired_failed_approaches([{"unrelated_key": "x"}]) == []
+
+
+def test_find_retired_approach_match_3_word_threshold():
+    approaches = [
+        "cache invalidation performance problem",
+        "redis migration strategy gone",
+    ]
+    # 3 non-stopword overlap → match
+    assert (
+        _find_retired_approach_match("cache invalidation performance redux", approaches)
+        is not None
+    )
+    # Only 2 non-stopword overlap → no match
+    assert _find_retired_approach_match("cache invalidation only", approaches) is None
+
+
+def test_build_dedup_state_previously_filtered_hashes_suppresses():
+    filtered_hash = "prevfiltered1234"
+    hashes, failed, _ = build_dedup_state(
+        [], failed_parent_ids=set(), previously_filtered_hashes={filtered_hash}
+    )
+    assert filtered_hash in hashes
+    assert failed[filtered_hash] == "filtered-last-cycle"
+
+
+def test_deduplicate_findings_retired_approach_suppresses():
+    finding = {
+        "title": "cache invalidation performance problem revisited",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        retired_failed_approaches=["cache invalidation performance problem"],
+    )
+    assert outcome.retired_approach_count == 1
+    assert outcome.deduplicated == []
+    assert outcome.filtered[0]["reason"].startswith("retired approach:")
+
+
+def test_deduplicate_findings_distinct_finding_passes_through_both_filters():
+    finding = {
+        "title": "completely novel unrelated topic here",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+    }
+    fhash = finding_hash(finding["title"], finding["description"])
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes={"someotherhashabcd"},
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        retired_failed_approaches=["cache invalidation performance problem"],
+    )
+    assert len(outcome.deduplicated) == 1
+    assert outcome.deduplicated[0][2] == fhash
+    assert outcome.retired_approach_count == 0
+    assert outcome.hash_dedup_count == 0
